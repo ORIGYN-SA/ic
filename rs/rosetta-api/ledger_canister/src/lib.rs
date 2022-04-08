@@ -55,8 +55,8 @@ where
 pub const HASH_LENGTH: usize = 32;
 pub const TOKEN_OWNER: &str = "co3tn-y5tnx-jgerr-xakdk-d54wf-7fbp7-woq6e-rapde-t4w6z-mtrfc-5qe";
 pub const TOKEN_SYMBOL: &str = "OGY";
-pub const TOKEN_NAME: &str = "OrigynToken";
-pub const TOKEN_LOGO: &str = "Logo";
+pub const DEFAULT_TOKEN_NAME: &str = "OrigynToken";
+pub const DEFAULT_TOKEN_LOGO: &str = "Logo";
 
 #[derive(CandidType, Clone, Hash, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct HashOf<T> {
@@ -208,7 +208,8 @@ pub type Certification = Option<Vec<u8>>;
 
 pub type LedgerBalances = Balances<HashMap<AccountIdentifier, ICPTs>>;
 
-pub type LedgerAllowances = Allowances<HashMap<PrincipalId, HashMap<PrincipalId, (u64, SystemTime)>>>;
+pub type LedgerAllowances =
+    Allowances<HashMap<PrincipalId, HashMap<PrincipalId, (u64, SystemTime)>>>;
 
 pub trait BalancesStore {
     fn get_balance(&self, k: &AccountIdentifier) -> Option<&ICPTs>;
@@ -237,8 +238,8 @@ pub type TxReceipt = Result<u64, TxError>;
 #[allow(non_snake_case)]
 #[derive(Deserialize, CandidType, Clone, Debug)]
 pub struct Metadata {
-    logo: String,
-    name: String,
+    pub logo: String,
+    pub name: String,
     symbol: String,
     decimals: u32,
     totalSupply: u64,
@@ -246,17 +247,31 @@ pub struct Metadata {
     fee: u64,
 }
 
-impl Default for Metadata {
-    fn default() -> Self {
+impl Metadata {
+    pub fn new() -> Metadata {
         Self {
-            logo: TOKEN_LOGO.to_string(),
-            name: TOKEN_NAME.to_string(),
+            logo: DEFAULT_TOKEN_LOGO.to_string(),
+            name: DEFAULT_TOKEN_NAME.to_string(),
             symbol: TOKEN_SYMBOL.to_string(),
             decimals: DECIMAL_PLACES,
             totalSupply: LEDGER.read().unwrap().balances.total_supply().get_e8s(),
             owner: TOKEN_OWNER.to_string(),
             fee: TRANSACTION_FEE.get_e8s(),
         }
+    }
+
+    pub fn get_fee(&self) -> ICPTs {
+        ICPTs::from_e8s(self.fee)
+    }
+
+    pub fn set_fee(&mut self, fee: u64) {
+        self.fee = fee;
+    }
+}
+
+impl Default for Metadata {
+    fn default() -> Self {
+        Metadata::new()
     }
 }
 
@@ -325,15 +340,15 @@ pub struct GetAllowanceArgs {
     pub spender: PrincipalId,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, CandidType)]
 pub struct TxRecord {
     pub caller: Option<PrincipalId>,
     pub index: u64,
-    pub from: PrincipalId,
-    pub to: PrincipalId,
+    pub from: AccountIdentifier,
+    pub to: AccountIdentifier,
     pub amount: u64,
     pub fee: u64,
-    pub timestamp: u32,
+    pub timestamp: TimeStamp,
     pub status: TransactionStatus,
     pub operation: Operation,
 }
@@ -373,34 +388,50 @@ impl TransactionStatus {
 
 pub trait AllowancesStore {
     fn get_allowance(&self, owner: &PrincipalId, spender: &PrincipalId) -> TxReceipt;
-    fn set_allowance(&mut self, owner: &PrincipalId, spender: &PrincipalId, amount: u64) -> TxReceipt;
+    fn set_allowance(
+        &mut self,
+        owner: &PrincipalId,
+        spender: &PrincipalId,
+        amount: u64,
+    ) -> TxReceipt;
     fn drop_allowance(&mut self, owner: &PrincipalId, spender: &PrincipalId) -> TxReceipt;
 }
 
 impl AllowancesStore for HashMap<PrincipalId, HashMap<PrincipalId, (u64, SystemTime)>> {
     fn get_allowance(&self, owner: &PrincipalId, spender: &PrincipalId) -> TxReceipt {
         match &self.get(owner) {
-            Some(allowances) => {
-                match allowances.get(spender) {
-                    Some(allowance) => {
-                        let (amount, _) = allowance;
-                        return Ok(amount.clone() as u64);
-                    }
-                    None => { return Err(TxError::InsufficientAllowance); }
+            Some(allowances) => match allowances.get(spender) {
+                Some(allowance) => {
+                    let (amount, _) = allowance;
+                    return Ok(amount.clone() as u64);
                 }
+                None => {
+                    return Err(TxError::InsufficientAllowance);
+                }
+            },
+            None => {
+                return Err(TxError::InsufficientAllowance);
             }
-            None => { return Err(TxError::InsufficientAllowance); }
         }
     }
 
-    fn set_allowance(&mut self, owner: &PrincipalId, spender: &PrincipalId, amount: u64) -> TxReceipt {
+    fn set_allowance(
+        &mut self,
+        owner: &PrincipalId,
+        spender: &PrincipalId,
+        amount: u64,
+    ) -> TxReceipt {
         if let Some(allowances) = self.get_mut(owner) {
             if let Some(allowance) = allowances.get_mut(spender) {
                 allowances.remove(spender);
             }
             match allowances.insert(spender.clone(), (amount, SystemTime::now())) {
-                Some((amount, _)) => { () }
-                None => { return Err(TxError::Other(String::from("Impossible to create Allowance."))); }
+                Some((amount, _)) => (),
+                None => {
+                    return Err(TxError::Other(String::from(
+                        "Impossible to create Allowance.",
+                    )));
+                }
             }
         }
 
@@ -565,7 +596,6 @@ impl<S: Default + AllowancesStore> Allowances<S> {
             store: S::default(),
         }
     }
-
 }
 
 impl LedgerBalances {
@@ -1064,10 +1094,7 @@ impl Ledger {
         send_whitelist: HashSet<CanisterId>,
         admin: PrincipalId,
     ) {
-        print(format!(
-            "[ledger] from_init(): admin {}",
-            admin
-        ));
+        print(format!("[ledger] from_init(): admin {}", admin));
         self.balances.icpt_pool = ICPTs::MAX;
         self.minting_account_id = Some(minting_account);
         self.admin = admin;
@@ -1253,6 +1280,9 @@ lazy_static! {
     pub static ref LEDGER: RwLock<Ledger> = RwLock::new(Ledger::default());
     // Maximum inter-canister message size in bytes
     pub static ref MAX_MESSAGE_SIZE_BYTES: RwLock<usize> = RwLock::new(1024 * 1024);
+    pub static ref TOKEN_METADATA: RwLock<Metadata> = RwLock::new(Metadata::default());
+//    pub static ref TOKEN_LOGO: RwLock<String> = RwLock::new(DEFAULT_TOKEN_LOGO.to_string());
+//    pub static ref LEDGER_TRANSACTION_FEE: RwLock<ICPTs> = RwLock::new(TRANSACTION_FEE);
 }
 
 pub fn set_send_whitelist(new_send_whitelist: HashSet<CanisterId>) {
@@ -1271,7 +1301,10 @@ pub fn get_admin() -> PrincipalId {
 }
 
 pub fn set_minting_account_id(new_minting_account: AccountIdentifier) {
-    LEDGER.write().unwrap().set_minting_account_id(new_minting_account)
+    LEDGER
+        .write()
+        .unwrap()
+        .set_minting_account_id(new_minting_account)
 }
 
 pub fn set_admin(new_admin: PrincipalId) {
@@ -2026,6 +2059,20 @@ pub struct GetSendWhitelistArgs {}
 #[derive(Serialize, Deserialize, CandidType, Clone, Hash, Debug, PartialEq, Eq)]
 pub struct GetMintingAccountArgs {}
 
+//Optinal DIP20 call struct
+/// Argument taken by the mint endpoint
+#[derive(Serialize, Deserialize, CandidType, Clone, Hash, Debug, PartialEq, Eq)]
+pub struct DIP20MintArgs {
+    pub to: PrincipalId,
+    pub amount: u64,
+}
+/// Argument taken by the burn endpoint
+#[derive(Serialize, Deserialize, CandidType, Clone, Hash, Debug, PartialEq, Eq)]
+pub struct DIP20BurnArgs {
+    pub from: PrincipalId,
+    pub amount: u64,
+}
+
 impl NotifyCanisterArgs {
     /// Construct a `notify` call to notify a canister about the
     /// transaction created by a previous `send` call. `block_height`
@@ -2108,7 +2155,7 @@ pub struct IterBlocksRes(pub Vec<EncodedBlock>);
 #[derive(Serialize, Deserialize, CandidType, Clone, Hash, Debug, PartialEq, Eq)]
 pub struct BlockArg(pub BlockHeight);
 
-#[derive(CandidType)]
+#[derive(CandidType, Serialize, Deserialize, Clone, Debug)]
 pub struct BlockRes(pub Option<Result<EncodedBlock, CanisterId>>);
 
 // A helper function for ledger/get_blocks and archive_node/get_blocks endpoints
