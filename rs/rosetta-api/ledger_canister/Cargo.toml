@@ -5,6 +5,8 @@ authors = ["The Internet Computer Project Developers"]
 description = "Like an accountant, but on the blockchain!"
 edition = "2018"
 
+
+
 [dependencies]
 candid = "0.7.10"
 ciborium = { git = "https://github.com/enarx/ciborium", rev = "e719537c99b564c3674a56defe53713c702c6f46" }
