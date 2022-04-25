@@ -49,12 +49,12 @@ impl ArchiveNodeState {
 
 
 // Append the Blocks to the internal Vec
-fn remove_last_block(mut something : Nat) {
-    let mut archive_state = ARCHIVE_STATE.write().unwrap();
-    
-    let last_block = archive_state.blocks.pop();
-    archive_state.total_block_size -= last_block.unwrap().size_bytes()
-}
+//fn remove_last_block(mut something : Nat) {
+//    let mut archive_state = ARCHIVE_STATE.write().unwrap();
+//    
+//    let last_block = archive_state.blocks.pop();
+//    archive_state.total_block_size -= last_block.unwrap().size_bytes()
+//}
 
 // Append the Blocks to the internal Vec
 fn append_blocks(mut blocks: Vec<EncodedBlock>)  {
@@ -160,10 +160,10 @@ fn append_blocks_() {
     dfn_core::over(dfn_candid::candid_one, append_blocks);
 }
 
-#[export_name = "canister_update remove_last_block"]
-fn remove_last_block_() {
-    dfn_core::over(dfn_candid::candid_one, remove_last_block);
-}
+//#[export_name = "canister_update remove_last_block"]
+//fn remove_last_block_() {
+//    dfn_core::over(dfn_candid::candid_one, remove_last_block);
+//}
 
 /// Get multiple blocks by *offset into the container* (not BlockHeight) and
 /// length. Note that this simply iterates the blocks available in the this
