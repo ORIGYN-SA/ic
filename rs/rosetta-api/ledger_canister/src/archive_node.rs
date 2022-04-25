@@ -3,7 +3,7 @@ use ledger_canister::{
     GetBlocksArgs, GetBlocksError, GetBlocksResult, IterBlocksArgs, MAX_BLOCKS_PER_REQUEST,
 };
 
-use candid::candid_method;
+use candid::{candid_method, Nat};
 use dfn_candid::candid_one;
 use dfn_core::api::{print, stable_memory_size_in_pages};
 use dfn_core::{over_init, stable, BytesS};
@@ -47,8 +47,17 @@ impl ArchiveNodeState {
     }
 }
 
+
 // Append the Blocks to the internal Vec
-fn append_blocks(mut blocks: Vec<EncodedBlock>) {
+fn remove_last_block(mut something : Nat) {
+    let mut archive_state = ARCHIVE_STATE.write().unwrap();
+    
+    let last_block = archive_state.blocks.pop();
+    archive_state.total_block_size -= last_block.unwrap().size_bytes()
+}
+
+// Append the Blocks to the internal Vec
+fn append_blocks(mut blocks: Vec<EncodedBlock>)  {
     let mut archive_state = ARCHIVE_STATE.write().unwrap();
     assert_eq!(
         dfn_core::api::caller(),
@@ -151,6 +160,11 @@ fn append_blocks_() {
     dfn_core::over(dfn_candid::candid_one, append_blocks);
 }
 
+#[export_name = "canister_update remove_last_block"]
+fn remove_last_block_() {
+    dfn_core::over(dfn_candid::candid_one, remove_last_block);
+}
+
 /// Get multiple blocks by *offset into the container* (not BlockHeight) and
 /// length. Note that this simply iterates the blocks available in the this
 /// particular archive node without taking into account the ledger or the
@@ -232,6 +246,9 @@ fn post_upgrade() {
         *state = ciborium::de::from_reader(std::io::Cursor::new(&bytes))
             .expect("Decoding stable memory failed");
         state.last_upgrade_timestamp = dfn_core::api::time_nanos();
+
+        //remove the last block
+        //remove the total size from the size array
     });
 }
 
