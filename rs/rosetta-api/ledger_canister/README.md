@@ -7,7 +7,7 @@ This package contains the implementation of the ICP ledger canister.
 To build the ledger, 2 canister has to be build. The archive node canister must be build first because its code is embedded in the ledger canister.
 
  1. To build the archive node use the following commands:
-    ```bash
+   ```bash
    cargo build --target wasm32-unknown-unknown --bin ledger-archive-node-canister --release --target-dir build-output
    ic-cdk-optimizer --output ledger-archive-node-canister-new-min.wasm ./build-output/wasm32-unknown-unknown/release/ledger-archive-node-canister.wasm
    ```

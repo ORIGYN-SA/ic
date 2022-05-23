@@ -653,6 +653,25 @@ fn send_() {
     );
 }
 
+#[export_name = "canister_update update_archive_option"]
+fn update_archive_option() {
+    over(candid_one, |options| {
+        let ledger_guard = LEDGER.write().expect("Failed to get ledger write lock");
+
+        let caller_principal_id = caller();
+        if !ledger_guard.is_admin(&caller_principal_id) {
+            panic!("Not authorized {}", caller_principal_id);
+        };
+
+        let mut archive_guard = ledger_guard.blockchain.archive.write().unwrap();
+
+        (*archive_guard)
+            .as_mut()
+            .map(|archive| archive.update_archive_option(options));
+        print("[Ledger] update archive options done.");
+    });
+}
+
 async fn set_send_whitelist(new_send_whitelist: HashSet<CanisterId>) {
     let caller_principal_id = caller();
 

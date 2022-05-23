@@ -386,7 +386,7 @@ impl LedgerAccess for LedgerClient {
                 let block = raw_block.decode().map_err(|err| {
                     ApiError::internal_error(format!("Cannot decode block: {}", err))
                 })?;
-                if block.parent_hash != last_block_hash {
+                if block.parent_hash != last_block_hash && i != 0 {
                     let err_msg = format!(
                         "Block at {}: parent hash mismatch. Expected: {:?}, got: {:?}",
                         i, last_block_hash, block.parent_hash

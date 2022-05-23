@@ -133,6 +133,17 @@ impl Archive {
         }
     }
 
+    pub fn update_archive_option(&mut self, options: ArchiveOptions) {
+        self.controller_id = options.controller_id;
+        self.node_max_memory_size_bytes = options
+            .node_max_memory_size_bytes
+            .unwrap_or(1024 * 1024 * 1024);
+        self.max_message_size_bytes = options.max_message_size_bytes.unwrap_or(2 * 1024 * 1024);
+        self.trigger_threshold = options.trigger_threshold;
+        self.num_blocks_to_archive = options.num_blocks_to_archive;
+        self.cycles_for_archive_creation = options.cycles_for_archive_creation.unwrap_or(0);
+    }
+
     fn last_node_index(&self) -> usize {
         self.nodes.len() - 1
     }
