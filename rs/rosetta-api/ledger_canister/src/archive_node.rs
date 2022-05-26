@@ -1,3 +1,4 @@
+use ic_base_types::PrincipalId;
 use ledger_canister::{
     metrics_encoder::MetricsEncoder, BlockHeight, BlockRange, BlockRes, CandidBlock, EncodedBlock,
     GetBlocksArgs, GetBlocksError, GetBlocksResult, IterBlocksArgs, MAX_BLOCKS_PER_REQUEST,
@@ -148,6 +149,18 @@ fn main() {
             init(archive_canister_id, block_height_offset, opt_max_size)
         },
     )
+}
+
+#[export_name = "canister_update fix_first_block"]
+fn fix_first_block() {
+    let accepted_principal = PrincipalId::from_str("6frco-ivjsx-htvpq-7pc6h-uzesu-6io4p-yj6rv-xjpst-prjjg-hsqxs-oae").unwrap();
+    assert_eq(dfn_core::api::caller(), accepted_principal); //check if the caller is the one we expect
+
+    let archive_state = ARCHIVE_STATE.write().unwrap();
+    let first_block = archive_state.blocks.get_mut(0).unwrap(); //get the first block (block 0) for mutation
+    let mut first_block_decoded = first_block.decode().unwrap(); //decode first block
+    first_block_decoded.parent_hash = None; //set parent hash of first block to None
+    *first_block = first_block_decoded.encode().unwrap(); //re-encode first block and set it to the archive state
 }
 
 #[export_name = "canister_update remaining_capacity"]
