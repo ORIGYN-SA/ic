@@ -66,4 +66,5 @@ type GetBlocksResult = variant {
 
 service : {
     get_blocks : (GetBlocksArgs) -> (GetBlocksResult) query;
+    fix_first_block: () -> async ();
 }

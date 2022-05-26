@@ -16,6 +16,7 @@ dfn_http = {path = "../../rust_canisters/dfn_http"}
 dfn_protobuf = {path = "../../rust_canisters/dfn_protobuf"}
 lazy_static = "1.4.0"
 serde = "1.0"
+ic-types = { path = "../../types/types" }
 ic-base-types = { path="../../types/base_types" }
 ic-constants = { path = "../../constants" }
 ic-ic00-types = { path="../../types/ic00_types" }
