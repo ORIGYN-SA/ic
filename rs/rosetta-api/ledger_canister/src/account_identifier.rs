@@ -13,6 +13,23 @@ use std::{
 
 use crate::protobuf as proto;
 
+pub type ICRC1_Subaccount = [u8; 32];
+
+pub const DEFAULT_ICRC1_SUBACCOUNT: &ICRC1_Subaccount = &[0; 32];
+
+#[derive(Serialize, Deserialize, CandidType, Clone, Debug)]
+pub struct Account {
+    pub owner: PrincipalId,
+    pub subaccount: Option<ICRC1_Subaccount>,
+}
+
+impl Account {
+    #[inline]
+    pub fn effective_subaccount(&self) -> &ICRC1_Subaccount {
+        self.subaccount.as_ref().unwrap_or(DEFAULT_ICRC1_SUBACCOUNT)
+    }
+}
+
 /// While this is backed by an array of length 28, it's canonical representation
 /// is a hex string of length 64. The first 8 characters are the CRC-32 encoded
 /// hash of the following 56 characters of hex. Both, upper and lower case
@@ -23,6 +40,12 @@ use crate::protobuf as proto;
 #[derive(Clone, Copy, Hash, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct AccountIdentifier {
     pub hash: [u8; 28],
+}
+
+impl From<Account> for AccountIdentifier {
+    fn from(account: Account) -> Self {
+        Self::new(account.owner, account.subaccount.map(Subaccount))
+    }
 }
 
 impl TryFrom<&proto::AccountIdentifier> for AccountIdentifier {

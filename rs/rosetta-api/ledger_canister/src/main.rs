@@ -1,3 +1,4 @@
+use candid::{candid_method, Nat, CandidType};
 use dfn_candid::{candid_one, CandidOne};
 use dfn_core::{
     api::{
@@ -509,6 +510,67 @@ async fn archive_blocks() {
         }
     }
 }
+
+// --------- ICRC_1 STANDART METHODS -------------- \\
+
+#[candid_method(query, rename = "icrc1_balance_of")]
+fn icrc1_balance_of(acc: Account) -> Nat {
+    Nat::from(
+        LEDGER
+            .read()
+            .unwrap()
+            .balances
+            .account_balance(&AccountIdentifier::from(acc))
+            .get_e8s(),
+    )
+}
+
+#[candid_method(query, rename = "icrc1_supported_standards")]
+fn icrc1_supported_standards() -> Vec<StandardRecord> {
+    vec![StandardRecord {
+        name: "ICRC-1".to_string(),
+        url: "https://github.com/dfinity/ICRC-1".to_string(),
+    }]
+}
+
+#[candid_method(query, rename = "icrc1_minting_account")]
+fn icrc1_minting_account() -> std::string::String { // -> Option<Account> {
+    "icrc1_minting_account".to_string() // LEDGER.read().unwrap().icrc1_minting_account.clone()
+}
+
+#[candid_method(query, rename = "icrc1_metadata")]
+fn icrc1_metadata() -> Vec<(String, Value)> {
+    vec![
+        Value::entry("icrc1:decimals", DECIMAL_PLACES as u64),
+        Value::entry("icrc1:name", TOKEN_NAME.to_string()),
+        Value::entry(
+            "icrc1:symbol",
+            TOKEN_SYMBOL.to_string(),
+        ),
+        Value::entry("icrc1:fee", TRANSACTION_FEE.get_e8s()),//LEDGER.read().unwrap().transfer_fee.get_e8s()),
+    ]
+}
+
+#[export_name = "canister_query icrc1_supported_standards"]
+fn icrc1_supported_standards_candid() {
+    over(candid_one, |()| icrc1_supported_standards())
+}
+
+#[export_name = "canister_query icrc1_minting_account"]
+fn icrc1_minting_account_candid() {
+    over(candid_one, |()| "icrc1_minting_account".to_string() ) //icrc1_minting_account())
+}
+#[export_name = "canister_query icrc1_symbol"]
+fn icrc1_symbol_candid() {
+    over(candid_one, |()| TOKEN_SYMBOL.to_string())
+}
+
+#[export_name = "canister_query icrc1_metadata"]
+fn icrc1_metadata_candid() {
+    over(candid_one, |()| icrc1_metadata())
+}
+
+// ----------------------- \\
 
 /// Canister endpoints
 #[export_name = "canister_update send_pb"]
