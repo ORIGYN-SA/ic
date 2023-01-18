@@ -10,6 +10,8 @@ use std::{
     fmt::{Display, Formatter},
     str::FromStr,
 };
+use serde_bytes::ByteBuf;
+use std::fmt;
 
 use crate::protobuf as proto;
 
@@ -27,6 +29,110 @@ impl Account {
     #[inline]
     pub fn effective_subaccount(&self) -> &ICRC1_Subaccount {
         self.subaccount.as_ref().unwrap_or(DEFAULT_ICRC1_SUBACCOUNT)
+    }
+}
+
+impl PartialEq for Account {
+    fn eq(&self, other: &Self) -> bool {
+        self.owner == other.owner && self.effective_subaccount() == other.effective_subaccount()
+    }
+}
+
+impl Eq for Account {}
+
+impl std::cmp::PartialOrd for Account {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl std::cmp::Ord for Account {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.owner.cmp(&other.owner).then_with(|| {
+            self.effective_subaccount()
+                .cmp(other.effective_subaccount())
+        })
+    }
+}
+
+impl std::hash::Hash for Account {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.owner.hash(state);
+        self.effective_subaccount().hash(state);
+    }
+}
+
+impl fmt::Display for Account {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match &self.subaccount {
+            None => write!(f, "{}", self.owner),
+            Some(subaccount) => write!(f, "0x{}.{}", hex::encode(&subaccount[..]), self.owner),
+        }
+    }
+}
+
+impl From<PrincipalId> for Account {
+    fn from(owner: PrincipalId) -> Self {
+        Self {
+            owner,
+            subaccount: None,
+        }
+    }
+}
+
+impl TryFrom<CompactAccount> for Account {
+    type Error = String;
+    fn try_from(compact: CompactAccount) -> Result<Account, String> {
+        let elems = compact.0;
+        if elems.is_empty() {
+            return Err("account tuple must have at least one element".to_string());
+        }
+        if elems.len() > 2 {
+            return Err(format!(
+                "account tuple must have at most two elements, got {}",
+                elems.len()
+            ));
+        }
+
+        let principal = PrincipalId::try_from(&elems[0][..])
+            .map_err(|e| format!("invalid principal: {}", e))?;
+        let subaccount = if elems.len() > 1 {
+            Some(ICRC1_Subaccount::try_from(&elems[1][..]).map_err(|_| {
+                format!(
+                    "invalid subaccount: expected 32 bytes, got {}",
+                    elems[1].len()
+                )
+            })?)
+        } else {
+            None
+        };
+
+        Ok(Account {
+            owner: principal,
+            subaccount,
+        })
+    }
+}
+
+/// A compact representation of an Account.
+///
+/// Instead of encoding accounts as structs with named fields,
+/// we encode them as tuples with variables number of elements.
+/// ```text
+/// [bytes] <=> Account { owner: bytes, subaccount : None }
+/// [x: bytes, y: bytes] <=> Account { owner: x, subaccount: Some(y) }
+/// ```
+#[derive(Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct CompactAccount(Vec<ByteBuf>);
+
+impl From<Account> for CompactAccount {
+    fn from(acc: Account) -> Self {
+        let mut components = vec![ByteBuf::from(acc.owner.to_vec())];
+        if let Some(sub) = acc.subaccount {
+            components.push(ByteBuf::from(sub.to_vec()))
+        }
+        CompactAccount(components)
     }
 }
 
