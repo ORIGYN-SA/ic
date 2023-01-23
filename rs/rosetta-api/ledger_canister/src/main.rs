@@ -177,87 +177,88 @@ async fn send(
     height
 }
 
-// async fn icrc1_send(
-//     memo: Option<Memo>,
-//     amount: Tokens,
-//     fee: Option<Nat>,
-//     from_account: Account,
-//     to: AccountIdentifier,
-//     created_at_time: Option<TimeStamp>,
-// ) -> Result<BlockIndex, TransferError> {
-//     let caller_principal_id = caller();
-//     if !LEDGER.read().unwrap().can_send(&caller_principal_id) {
-//         return Err(TransferError::TemporarilyUnavailable);
-//     }
-//     let from = account_identifier_from_account(from_account);
-//     let minting_acc = LEDGER
-//         .read()
-//         .unwrap()
-//         .minting_account_id
-//         .expect("Minting canister id not initialized");
-//     let now = TimeStamp::from_nanos_since_unix_epoch(dfn_core::api::time()); // dfn_core::api::now().into()
-//     let operation = if to == minting_acc {
-//         if fee.is_some() && fee.as_ref() != Some(&Nat::from(0u64)) {
-//             return Err(TransferError::BadFee {
-//                 expected_fee: Nat::from(0u64),
-//             });
-//         }
-//         let balance = LEDGER.read().unwrap().balances.account_balance(&from);
-//         let min_burn_amount = TRANSACTION_FEE; // LEDGER.read().unwrap().transfer_fee.min(balance);
-//         if amount < min_burn_amount {
-//             return Err(TransferError::BadBurn {
-//                 min_burn_amount: Nat::from(min_burn_amount.get_e8s()),
-//             });
-//         }
-//         if amount == ICPTs::ZERO {
-//             return Err(TransferError::BadBurn {
-//                 min_burn_amount: Nat::from(TRANSACTION_FEE.get_e8s()),
-//             });
-//         }
-//         Operation::Burn { from, amount }
-//     } else if from == minting_acc {
-//         if fee.is_some() && fee.as_ref() != Some(&Nat::from(0u64)) {
-//             return Err(TransferError::BadFee {
-//                 expected_fee: Nat::from(0u64),
-//             });
-//         }
-//         Operation::Mint { to, amount }
-//     } else {
-//         let expected_fee = TRANSACTION_FEE; // LEDGER.read().unwrap().transfer_fee;
-//         if fee.is_some() && fee.as_ref() != Some(&Nat::from(expected_fee.get_e8s())) {
-//             return Err(TransferError::BadFee {
-//                 expected_fee: Nat::from(expected_fee.get_e8s()),
-//             });
-//         }
-//         Operation::Transfer {
-//             from,
-//             to,
-//             amount,
-//             fee: expected_fee,
-//         }
-//     };
-//     let res: BlockIndex;
-//     {
-//         let mut ledger = LEDGER.write().unwrap();
-//         let tx = Transaction {
-//             operation,
-//             memo: Memo(0),
-//             icrc1_memo: memo.map(|x| x.0),
-//             created_at_time,
-//         };
-//         let (block_index, hash) = apply_transaction(&mut *ledger, tx, now)
-//             .map_err(|e| TransferError::from(e))?;
-//         set_certified_data(&hash.into_bytes());
-//         res = block_index;
-//         // Don't put anything that could ever trap after this call or people using this
-//         // endpoint. If something did panic the payment would appear to fail, but would
-//         // actually succeed on chain.
-//     }
-//     let max_msg_size = *MAX_MESSAGE_SIZE_BYTES.read().unwrap();
-//     archive_blocks(max_msg_size).await;
-//     Ok(res)
-// }
-
+async fn icrc1_send(
+    memo: Option<Memo>,
+    amount: ICPTs,
+    fee: Option<Nat>,
+    from_account: Account,
+    to: AccountIdentifier,
+    created_at_time: Option<TimeStamp>,
+) -> Result<BlockHeight, TransferError> {
+    let caller_principal_id = caller();
+    if !LEDGER.read().unwrap().can_send(&caller_principal_id) {
+        return Err(TransferError::TemporarilyUnavailable);
+    }
+    let from = &AccountIdentifier::from(from_account);
+    let minting_acc = LEDGER
+        .read()
+        .unwrap()
+        .minting_account_id
+        .expect("Minting canister id not initialized");
+    // let now: TimeStamp = dfn_core::api::now().into(); // TimeStamp::from_nanos_since_unix_epoch(dfn_core::api::now().into()); // dfn_core::api::time()
+    let transfer = if to == minting_acc {
+        if fee.is_some() && fee.as_ref() != Some(&Nat::from(0u64)) {
+            return Err(TransferError::BadFee {
+                expected_fee: Nat::from(0u64),
+            });
+        }
+        let balance = LEDGER.read().unwrap().balances.account_balance(&from);
+        let min_burn_amount = MIN_BURN_AMOUNT; // LEDGER.read().unwrap().transfer_fee.min(balance);
+        if amount < min_burn_amount {
+            return Err(TransferError::BadBurn {
+                min_burn_amount: Nat::from(min_burn_amount.get_e8s()),
+            });
+        }
+        if amount == ICPTs::ZERO {
+            return Err(TransferError::BadBurn {
+                min_burn_amount: Nat::from(MIN_BURN_AMOUNT.get_e8s()),
+            });
+        }
+        Transfer::Burn { from: *from, amount }
+    } else if *from == minting_acc {
+        if fee.is_some() && fee.as_ref() != Some(&Nat::from(0u64)) {
+            return Err(TransferError::BadFee {
+                expected_fee: Nat::from(0u64),
+            });
+        }
+        Transfer::Mint { to, amount }
+    } else {
+        let expected_fee = TRANSACTION_FEE; // LEDGER.read().unwrap().transfer_fee;
+        if fee.is_some() && fee.as_ref() != Some(&Nat::from(expected_fee.get_e8s())) {
+            return Err(TransferError::BadFee {
+                expected_fee: Nat::from(expected_fee.get_e8s()),
+            });
+        }
+        Transfer::Send {
+            from: *from,
+            to,
+            amount,
+            fee: expected_fee,
+        }
+    };
+    let res: BlockHeight;
+    {
+        // let mut ledger = LEDGER.write().unwrap();
+        // let tx = Transaction {
+        //     operation,
+        //     memo: Memo(0),
+        //     icrc1_memo: memo.map(|x| x.0),
+        //     created_at_time,
+        // };
+        // let (block_index, hash) = apply_transaction(&mut *ledger, tx, now)
+        //     .map_err(|e| TransferError::from(e))?;
+        // set_certified_data(&hash.into_bytes());
+        let (block_index, _) = add_payment(memo.unwrap(), transfer, created_at_time);
+        res = block_index;
+        // Don't put anything that could ever trap after this call or people using this
+        // endpoint. If something did panic the payment would appear to fail, but would
+        // actually succeed on chain.
+    }
+    // let max_msg_size = *MAX_MESSAGE_SIZE_BYTES.read().unwrap();
+    archive_blocks().await;
+    // archive_blocks(max_msg_size).await;
+    Ok(res)
+}
 
 /// You can notify a canister that you have made a payment to it. The
 /// payment must have been made to the account of a canister and from the
