@@ -1942,6 +1942,21 @@ impl AccountBalanceArgs {
     }
 }
 
+#[derive(Serialize, Deserialize, CandidType, Clone, Hash, Debug, PartialEq, Eq)]
+pub struct GetMetadataArgs {}
+
+#[derive(Serialize, Deserialize, CandidType, Clone, Hash, Debug, PartialEq, Eq)]
+pub struct GetTokenNameArgs {}
+
+#[derive(Serialize, Deserialize, CandidType, Clone, Hash, Debug, PartialEq, Eq)]
+pub struct GetTokenSymbolArgs {}
+
+#[derive(Serialize, Deserialize, CandidType, Clone, Hash, Debug, PartialEq, Eq)]
+pub struct GetMintingAccArgs {}
+
+#[derive(Serialize, Deserialize, CandidType, Clone, Hash, Debug, PartialEq, Eq)]
+pub struct GetSupportedStandardsArgs {}
+
 /// Argument taken by the total_supply endpoint
 ///
 /// The reason it is a struct is so that it can be extended -- e.g., to be able

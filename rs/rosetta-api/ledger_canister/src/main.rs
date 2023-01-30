@@ -582,7 +582,6 @@ async fn archive_blocks() {
 
 // --------- ICRC_1 STANDART METHODS -------------- \\
 
-#[candid_method(query, rename = "icrc1_balance_of")]
 fn icrc1_balance_of(acc: Account) -> Nat {
     Nat::from(
         LEDGER
@@ -594,7 +593,6 @@ fn icrc1_balance_of(acc: Account) -> Nat {
     )
 }
 
-#[candid_method(query, rename = "icrc1_supported_standards")]
 fn icrc1_supported_standards() -> Vec<StandardRecord> {
     vec![StandardRecord {
         name: "ICRC-1".to_string(),
@@ -602,7 +600,6 @@ fn icrc1_supported_standards() -> Vec<StandardRecord> {
     }]
 }
 
-#[candid_method(query, rename = "icrc1_minting_account")]
 fn icrc1_minting_account() -> Option<AccountIdentifier> {
     Some(LEDGER
     .read()
@@ -612,7 +609,6 @@ fn icrc1_minting_account() -> Option<AccountIdentifier> {
     // "icrc1_minting_account".to_string() // LEDGER.read().unwrap().icrc1_minting_account.clone()
 }
 
-#[candid_method(query, rename = "icrc1_metadata")]
 fn icrc1_metadata() -> Vec<(String, Value)> {
     vec![
         Value::entry("icrc1:decimals", DECIMAL_PLACES as u64),
@@ -627,23 +623,38 @@ fn icrc1_metadata() -> Vec<(String, Value)> {
 
 #[export_name = "canister_query icrc1_supported_standards"]
 fn icrc1_supported_standards_candid() {
-    over(candid_one, |()| icrc1_supported_standards())
+    over(candid_one, |_: GetSupportedStandardsArgs| icrc1_supported_standards())
 }
 
 #[export_name = "canister_query icrc1_minting_account"]
 fn icrc1_minting_account_candid() {
-    over(candid_one, |()| icrc1_minting_account())
+    over(candid_one, |_: GetMintingAccArgs| icrc1_minting_account())
 }
+
 #[export_name = "canister_query icrc1_symbol"]
 fn icrc1_symbol_candid() {
-    over(candid_one, |()| TOKEN_SYMBOL.to_string())
+    over(candid_one, |_: GetTokenSymbolArgs| TOKEN_SYMBOL.to_string())
+}
+
+#[export_name = "canister_query icrc1_name"]
+fn icrc1_name_candid() {
+    over(candid_one, |_: GetTokenNameArgs| TOKEN_NAME.to_string())
 }
 
 #[export_name = "canister_query icrc1_metadata"]
 fn icrc1_metadata_candid() {
-    over(candid_one, |()| icrc1_metadata())
+    over(candid_one, |_: GetMetadataArgs| icrc1_metadata())
 }
 
+#[export_name = "canister_query icrc1_balance_of"]
+fn icrc1_balance_of_candid() {
+    over(candid_one, |acc: Account| { icrc1_balance_of(acc) })
+}
+
+#[export_name = "canister_query icrc1_total_supply"]
+fn icrc1_total_supply_candid() {
+    over(candid_one, |_: TotalSupplyArgs| total_supply())
+}
 // ----------------------- \\
 
 /// Canister endpoints
