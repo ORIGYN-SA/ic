@@ -195,7 +195,7 @@ async fn icrc1_send(
         .unwrap()
         .minting_account_id
         .expect("Minting canister id not initialized");
-    // let now: TimeStamp = dfn_core::api::now().into(); // TimeStamp::from_nanos_since_unix_epoch(dfn_core::api::now().into()); // dfn_core::api::time()
+
     let transfer = if to == minting_acc {
         if fee.is_some() && fee.as_ref() != Some(&Nat::from(0u64)) {
             return Err(TransferError::BadFee {
@@ -238,25 +238,11 @@ async fn icrc1_send(
     };
     let res: BlockHeight;
     {
-        // let mut ledger = LEDGER.write().unwrap();
-        // let tx = Transaction {
-        //     operation,
-        //     memo: Memo(0),
-        //     icrc1_memo: memo.map(|x| x.0),
-        //     created_at_time,
-        // };
-        // let (block_index, hash) = apply_transaction(&mut *ledger, tx, now)
-        //     .map_err(|e| TransferError::from(e))?;
-        // set_certified_data(&hash.into_bytes());
         let (block_index, _) = add_payment(memo.unwrap(), transfer, created_at_time);
         res = block_index;
-        // Don't put anything that could ever trap after this call or people using this
-        // endpoint. If something did panic the payment would appear to fail, but would
-        // actually succeed on chain.
     }
-    // let max_msg_size = *MAX_MESSAGE_SIZE_BYTES.read().unwrap();
+
     archive_blocks().await;
-    // archive_blocks(max_msg_size).await;
     Ok(res)
 }
 
