@@ -1,3 +1,5 @@
+use candid::{Int, Nat};
+use serde_bytes::ByteBuf;
 use candid::CandidType;
 use dfn_protobuf::ProtoBuf;
 use ic_crypto_sha256::Sha256;
@@ -11,6 +13,7 @@ use serde::{
     ser::SerializeMap,
     Deserialize, Serialize, Serializer,
 };
+use serde;
 use std::borrow::Cow;
 use std::collections::hash_map::Entry::{Occupied, Vacant};
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
@@ -40,7 +43,7 @@ pub use archive::ArchiveOptions;
 use dfn_core::api::now;
 
 pub mod spawn;
-pub use account_identifier::{AccountIdentifier, Subaccount};
+pub use account_identifier::{AccountIdentifier, Subaccount, Account, CompactAccount};
 pub use icpts::{ICPTs, DECIMAL_PLACES, ICP_SUBDIVIDABLE_BY, MIN_BURN_AMOUNT, TRANSACTION_FEE};
 pub use protobuf::TimeStamp;
 
@@ -50,6 +53,180 @@ where
     yansi::Paint<S>: std::string::ToString,
 {
     dfn_core::api::print(yansi::Paint::magenta(s).to_string());
+}
+
+pub const TOKEN_SYMBOL: &str = "OGY";
+pub const TOKEN_NAME: &str = "OrigynToken";
+
+#[derive(CandidType, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct StandardRecord {
+    pub name: String,
+    pub url: String,
+}
+
+pub const MAX_MEMO_LENGTH: usize = 32;
+
+/// Variant type for the `metadata` endpoint values.
+#[derive(CandidType, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub enum Value {
+    Nat(Nat),
+    Int(Int),
+    Text(String),
+    Blob(ByteBuf),
+}
+
+impl Value {
+    pub fn entry(key: impl ToString, val: impl Into<Value>) -> (String, Self) {
+        (key.to_string(), val.into())
+    }
+}
+
+impl From<i64> for Value {
+    fn from(n: i64) -> Self {
+        Value::Int(Int::from(n))
+    }
+}
+
+impl From<i128> for Value {
+    fn from(n: i128) -> Self {
+        Value::Int(Int::from(n))
+    }
+}
+
+impl From<u64> for Value {
+    fn from(n: u64) -> Self {
+        Value::Nat(Nat::from(n))
+    }
+}
+
+impl From<u128> for Value {
+    fn from(n: u128) -> Self {
+        Value::Nat(Nat::from(n))
+    }
+}
+
+impl From<String> for Value {
+    fn from(s: String) -> Self {
+        Value::Text(s)
+    }
+}
+
+impl<'a> From<&'a str> for Value {
+    fn from(s: &'a str) -> Self {
+        Value::Text(s.to_string())
+    }
+}
+
+impl From<Vec<u8>> for Value {
+    fn from(bytes: Vec<u8>) -> Value {
+        Value::Blob(ByteBuf::from(bytes))
+    }
+}
+
+impl<'a> From<&'a [u8]> for Value {
+    fn from(bytes: &'a [u8]) -> Value {
+        Value::Blob(ByteBuf::from(bytes.to_vec()))
+    }
+}
+
+
+pub type NumTokens = Nat;
+pub type BlockIndex = Nat;
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub enum CoreTransferError {
+    BadFee { expected_fee: ICPTs },
+    InsufficientFunds { balance: ICPTs },
+    TxTooOld { allowed_window_nanos: u64 },
+    TxCreatedInFuture { ledger_time: TimeStamp },
+    TxThrottled,
+    // TxDuplicate { duplicate_of: BlockIndex },
+}
+
+#[derive(CandidType, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub enum TransferError {
+    BadFee { expected_fee: NumTokens },
+    BadBurn { min_burn_amount: NumTokens },
+    InsufficientFunds { balance: NumTokens },
+    TooOld,
+    CreatedInFuture { ledger_time: u64 },
+    TemporarilyUnavailable,
+    Duplicate { duplicate_of: BlockIndex },
+    GenericError { error_code: Nat, message: String },
+}
+
+impl From<CoreTransferError> for TransferError {
+    fn from(err: CoreTransferError) -> Self {
+        use CoreTransferError as LTE;
+        use TransferError as TE;
+
+        match err {
+            LTE::BadFee { expected_fee } => TE::BadFee {
+                expected_fee: Nat::from(expected_fee.get_e8s()),
+            },
+            LTE::InsufficientFunds { balance } => TE::InsufficientFunds {
+                balance: Nat::from(balance.get_e8s()),
+            },
+            LTE::TxTooOld { .. } => TE::TooOld,
+            LTE::TxCreatedInFuture { ledger_time } => TE::CreatedInFuture {
+                ledger_time: ledger_time.as_nanos_since_unix_epoch(),
+            },
+            LTE::TxThrottled => TE::TemporarilyUnavailable,
+            // LTE::TxDuplicate { duplicate_of } => TE::Duplicate {
+            //     duplicate_of: Nat::from(duplicate_of),
+            // },
+        }
+    }
+}
+
+fn ser_compact_account<S>(acc: &Account, s: S) -> Result<S::Ok, S::Error>
+where
+    S: serde::ser::Serializer,
+{
+    CompactAccount::from(acc.clone()).serialize(s)
+}
+
+fn de_compact_account<'de, D>(d: D) -> Result<Account, D::Error>
+where
+    D: serde::de::Deserializer<'de>,
+{
+    use serde::de::Error;
+    let compact_account = CompactAccount::deserialize(d)?;
+    Account::try_from(compact_account).map_err(D::Error::custom)
+}
+
+#[derive(Serialize, Deserialize, Clone, Hash, Debug, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(tag = "op")]
+pub enum Operation {
+    #[serde(rename = "mint")]
+    Mint {
+        #[serde(serialize_with = "ser_compact_account")]
+        #[serde(deserialize_with = "de_compact_account")]
+        to: Account,
+        #[serde(rename = "amt")]
+        amount: u64,
+    },
+    #[serde(rename = "xfer")]
+    Transfer {
+        #[serde(serialize_with = "ser_compact_account")]
+        #[serde(deserialize_with = "de_compact_account")]
+        from: Account,
+        #[serde(serialize_with = "ser_compact_account")]
+        #[serde(deserialize_with = "de_compact_account")]
+        to: Account,
+        #[serde(rename = "amt")]
+        amount: u64,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        fee: Option<u64>,
+    },
+    #[serde(rename = "burn")]
+    Burn {
+        #[serde(serialize_with = "ser_compact_account")]
+        #[serde(deserialize_with = "de_compact_account")]
+        from: Account,
+        #[serde(rename = "amt")]
+        amount: u64,
+    },
 }
 
 pub const HASH_LENGTH: usize = 32;
@@ -1764,6 +1941,21 @@ impl AccountBalanceArgs {
         AccountBalanceArgs { account }
     }
 }
+
+#[derive(Serialize, Deserialize, CandidType, Clone, Hash, Debug, PartialEq, Eq)]
+pub struct GetMetadataArgs {}
+
+#[derive(Serialize, Deserialize, CandidType, Clone, Hash, Debug, PartialEq, Eq)]
+pub struct GetTokenNameArgs {}
+
+#[derive(Serialize, Deserialize, CandidType, Clone, Hash, Debug, PartialEq, Eq)]
+pub struct GetTokenSymbolArgs {}
+
+#[derive(Serialize, Deserialize, CandidType, Clone, Hash, Debug, PartialEq, Eq)]
+pub struct GetMintingAccArgs {}
+
+#[derive(Serialize, Deserialize, CandidType, Clone, Hash, Debug, PartialEq, Eq)]
+pub struct GetSupportedStandardsArgs {}
 
 /// Argument taken by the total_supply endpoint
 ///

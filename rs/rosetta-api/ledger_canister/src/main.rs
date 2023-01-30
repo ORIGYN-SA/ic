@@ -1,3 +1,4 @@
+use candid::{candid_method, Nat, CandidType};
 use dfn_candid::{candid_one, CandidOne};
 use dfn_core::{
     api::{
@@ -174,6 +175,75 @@ async fn send(
     // actually succeed on chain.
     archive_blocks().await;
     height
+}
+
+async fn icrc1_send(
+    memo: Option<Memo>,
+    amount: ICPTs,
+    fee: Option<Nat>,
+    from_account: Account,
+    to: AccountIdentifier,
+    created_at_time: Option<TimeStamp>,
+) -> Result<BlockHeight, TransferError> {
+    let caller_principal_id = caller();
+    if !LEDGER.read().unwrap().can_send(&caller_principal_id) {
+        return Err(TransferError::TemporarilyUnavailable);
+    }
+    let from = &AccountIdentifier::from(from_account);
+    let minting_acc = LEDGER
+        .read()
+        .unwrap()
+        .minting_account_id
+        .expect("Minting canister id not initialized");
+
+    let transfer = if to == minting_acc {
+        if fee.is_some() && fee.as_ref() != Some(&Nat::from(0u64)) {
+            return Err(TransferError::BadFee {
+                expected_fee: Nat::from(0u64),
+            });
+        }
+        let balance = LEDGER.read().unwrap().balances.account_balance(&from);
+        let min_burn_amount = MIN_BURN_AMOUNT; // LEDGER.read().unwrap().transfer_fee.min(balance);
+        if amount < min_burn_amount {
+            return Err(TransferError::BadBurn {
+                min_burn_amount: Nat::from(min_burn_amount.get_e8s()),
+            });
+        }
+        if amount == ICPTs::ZERO {
+            return Err(TransferError::BadBurn {
+                min_burn_amount: Nat::from(MIN_BURN_AMOUNT.get_e8s()),
+            });
+        }
+        Transfer::Burn { from: *from, amount }
+    } else if *from == minting_acc {
+        if fee.is_some() && fee.as_ref() != Some(&Nat::from(0u64)) {
+            return Err(TransferError::BadFee {
+                expected_fee: Nat::from(0u64),
+            });
+        }
+        Transfer::Mint { to, amount }
+    } else {
+        let expected_fee = TRANSACTION_FEE; // LEDGER.read().unwrap().transfer_fee;
+        if fee.is_some() && fee.as_ref() != Some(&Nat::from(expected_fee.get_e8s())) {
+            return Err(TransferError::BadFee {
+                expected_fee: Nat::from(expected_fee.get_e8s()),
+            });
+        }
+        Transfer::Send {
+            from: *from,
+            to,
+            amount,
+            fee: expected_fee,
+        }
+    };
+    let res: BlockHeight;
+    {
+        let (block_index, _) = add_payment(memo.unwrap(), transfer, created_at_time);
+        res = block_index;
+    }
+
+    archive_blocks().await;
+    Ok(res)
 }
 
 /// You can notify a canister that you have made a payment to it. The
@@ -509,6 +579,83 @@ async fn archive_blocks() {
         }
     }
 }
+
+// --------- ICRC_1 STANDART METHODS -------------- \\
+
+fn icrc1_balance_of(acc: Account) -> Nat {
+    Nat::from(
+        LEDGER
+            .read()
+            .unwrap()
+            .balances
+            .account_balance(&AccountIdentifier::from(acc))
+            .get_e8s(),
+    )
+}
+
+fn icrc1_supported_standards() -> Vec<StandardRecord> {
+    vec![StandardRecord {
+        name: "ICRC-1".to_string(),
+        url: "https://github.com/dfinity/ICRC-1".to_string(),
+    }]
+}
+
+fn icrc1_minting_account() -> Option<AccountIdentifier> {
+    Some(LEDGER
+    .read()
+    .unwrap()
+    .minting_account_id
+    .expect("Minting canister id not initialized"))
+    // "icrc1_minting_account".to_string() // LEDGER.read().unwrap().icrc1_minting_account.clone()
+}
+
+fn icrc1_metadata() -> Vec<(String, Value)> {
+    vec![
+        Value::entry("icrc1:decimals", DECIMAL_PLACES as u64),
+        Value::entry("icrc1:name", TOKEN_NAME.to_string()),
+        Value::entry(
+            "icrc1:symbol",
+            TOKEN_SYMBOL.to_string(),
+        ),
+        Value::entry("icrc1:fee", TRANSACTION_FEE.get_e8s()),//LEDGER.read().unwrap().transfer_fee.get_e8s()),
+    ]
+}
+
+#[export_name = "canister_query icrc1_supported_standards"]
+fn icrc1_supported_standards_candid() {
+    over(candid_one, |_: GetSupportedStandardsArgs| icrc1_supported_standards())
+}
+
+#[export_name = "canister_query icrc1_minting_account"]
+fn icrc1_minting_account_candid() {
+    over(candid_one, |_: GetMintingAccArgs| icrc1_minting_account())
+}
+
+#[export_name = "canister_query icrc1_symbol"]
+fn icrc1_symbol_candid() {
+    over(candid_one, |_: GetTokenSymbolArgs| TOKEN_SYMBOL.to_string())
+}
+
+#[export_name = "canister_query icrc1_name"]
+fn icrc1_name_candid() {
+    over(candid_one, |_: GetTokenNameArgs| TOKEN_NAME.to_string())
+}
+
+#[export_name = "canister_query icrc1_metadata"]
+fn icrc1_metadata_candid() {
+    over(candid_one, |_: GetMetadataArgs| icrc1_metadata())
+}
+
+#[export_name = "canister_query icrc1_balance_of"]
+fn icrc1_balance_of_candid() {
+    over(candid_one, |acc: Account| { icrc1_balance_of(acc) })
+}
+
+#[export_name = "canister_query icrc1_total_supply"]
+fn icrc1_total_supply_candid() {
+    over(candid_one, |_: TotalSupplyArgs| total_supply())
+}
+// ----------------------- \\
 
 /// Canister endpoints
 #[export_name = "canister_update send_pb"]
