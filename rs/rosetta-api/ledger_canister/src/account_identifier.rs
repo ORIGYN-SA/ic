@@ -1,4 +1,6 @@
 use candid::CandidType;
+use serde_bytes::ByteBuf;
+use std::fmt;
 use dfn_core::CanisterId;
 use ic_base_types::{CanisterIdError, PrincipalId, PrincipalIdError};
 use ic_crypto_sha::Sha224;
@@ -11,6 +13,139 @@ use std::{
 
 use crate::protobuf as proto;
 
+pub type ICRC1Subaccount = [u8; 32];
+pub const DEFAULT_ICRC1_SUBACCOUNT: &ICRC1Subaccount = &[0; 32];
+
+
+#[derive(Serialize, Deserialize, CandidType, Clone, Debug)]
+pub struct Account {
+    pub owner: PrincipalId,
+    pub subaccount: Option<ICRC1Subaccount>,
+}
+
+impl Account {
+    #[inline]
+    pub fn effective_subaccount(&self) -> &ICRC1Subaccount {
+        self.subaccount.as_ref().unwrap_or(DEFAULT_ICRC1_SUBACCOUNT)
+    }
+}
+
+impl PartialEq for Account {
+    fn eq(&self, other: &Self) -> bool {
+        self.owner == other.owner && self.effective_subaccount() == other.effective_subaccount()
+    }
+}
+
+impl Eq for Account {}
+
+impl std::cmp::PartialOrd for Account {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl std::cmp::Ord for Account {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.owner.cmp(&other.owner).then_with(|| {
+            self.effective_subaccount()
+                .cmp(other.effective_subaccount())
+        })
+    }
+}
+
+impl std::hash::Hash for Account {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.owner.hash(state);
+        self.effective_subaccount().hash(state);
+    }
+}
+
+impl fmt::Display for Account {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match &self.subaccount {
+            None => write!(f, "{}", self.owner),
+            Some(subaccount) => write!(f, "0x{}.{}", hex::encode(&subaccount[..]), self.owner),
+        }
+    }
+}
+
+impl From<PrincipalId> for Account {
+    fn from(owner: PrincipalId) -> Self {
+        Self {
+            owner,
+            subaccount: None,
+        }
+    }
+}
+
+impl TryFrom<CompactAccount> for Account {
+    type Error = String;
+    fn try_from(compact: CompactAccount) -> Result<Account, String> {
+        let elems = compact.0;
+        if elems.is_empty() {
+            return Err("account tuple must have at least one element".to_string());
+        }
+        if elems.len() > 2 {
+            return Err(format!(
+                "account tuple must have at most two elements, got {}",
+                elems.len()
+            ));
+        }
+
+        let principal = PrincipalId::try_from(&elems[0][..])
+            .map_err(|e| format!("invalid principal: {}", e))?;
+        let subaccount = if elems.len() > 1 {
+            Some(ICRC1Subaccount::try_from(&elems[1][..]).map_err(|_| {
+                format!(
+                    "invalid subaccount: expected 32 bytes, got {}",
+                    elems[1].len()
+                )
+            })?)
+        } else {
+            None
+        };
+
+        Ok(Account {
+            owner: principal,
+            subaccount,
+        })
+    }
+}
+
+impl TryFrom<AccountIdentifier> for Account {
+    type Error = String;
+    fn try_from(acc: AccountIdentifier) -> Result<Account, String> {
+        let principal = PrincipalId::try_from(acc.to_vec()).map_err(|e| format!("invalid principal: {}", e))?;
+        
+        Ok(Account {
+            owner: principal,
+            subaccount: None,
+        })
+    }
+}
+
+/// A compact representation of an Account.
+///
+/// Instead of encoding accounts as structs with named fields,
+/// we encode them as tuples with variables number of elements.
+/// ```text
+/// [bytes] <=> Account { owner: bytes, subaccount : None }
+/// [x: bytes, y: bytes] <=> Account { owner: x, subaccount: Some(y) }
+/// ```
+#[derive(Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct CompactAccount(Vec<ByteBuf>);
+
+impl From<Account> for CompactAccount {
+    fn from(acc: Account) -> Self {
+        let mut components = vec![ByteBuf::from(acc.owner.to_vec())];
+        if let Some(sub) = acc.subaccount {
+            components.push(ByteBuf::from(sub.to_vec()))
+        }
+        CompactAccount(components)
+    }
+}
+
 /// While this is backed by an array of length 28, it's canonical representation
 /// is a hex string of length 64. The first 8 characters are the CRC-32 encoded
 /// hash of the following 56 characters of hex. Both, upper and lower case
@@ -21,6 +156,12 @@ use crate::protobuf as proto;
 #[derive(Clone, Copy, Hash, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct AccountIdentifier {
     pub hash: [u8; 28],
+}
+
+impl From<Account> for AccountIdentifier {
+    fn from(account: Account) -> Self {
+        Self::new(account.owner, account.subaccount.map(Subaccount))
+    }
 }
 
 impl AsRef<[u8]> for AccountIdentifier {

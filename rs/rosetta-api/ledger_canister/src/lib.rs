@@ -1,4 +1,6 @@
+use candid::{Int, Nat};
 use candid::CandidType;
+use serde_bytes::ByteBuf;
 use dfn_protobuf::ProtoBuf;
 use ic_base_types::{CanisterId, PrincipalId};
 use ic_crypto_sha::Sha256;
@@ -41,12 +43,92 @@ pub use archive::ArchiveOptions;
 use dfn_core::api::now;
 
 pub mod spawn;
-pub use account_identifier::{AccountIdentifier, Subaccount};
+pub use account_identifier::{AccountIdentifier, Subaccount, Account, CompactAccount, ICRC1Subaccount};
 pub use protobuf::TimeStamp;
 pub use tokens::{Tokens, DECIMAL_PLACES, DEFAULT_TRANSFER_FEE, TOKEN_SUBDIVIDABLE_BY};
 
 pub const HASH_LENGTH: usize = 32;
 pub const MAX_BLOCKS_PER_REQUEST: usize = 2000;
+
+/// Argument taken by the transfer endpoint
+#[derive(Serialize, Deserialize, CandidType, Clone, Hash, Debug, PartialEq, Eq)]
+pub struct ICRC1TransferArg {
+    pub memo: Option<Memo>,
+    pub amount: Tokens,
+    pub fee: Option<Tokens>,
+    pub from_subaccount: Option<ICRC1Subaccount>,
+    pub to: Account,
+    pub created_at_time: Option<TimeStamp>,
+}
+
+#[derive(CandidType, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct StandardRecord {
+    pub name: String,
+    pub url: String,
+}
+
+/// Variant type for the `metadata` endpoint values.
+#[derive(CandidType, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub enum Value {
+    Nat(Nat),
+    Int(Int),
+    Text(String),
+    Blob(ByteBuf),
+}
+
+impl Value {
+    pub fn entry(key: impl ToString, val: impl Into<Value>) -> (String, Self) {
+        (key.to_string(), val.into())
+    }
+}
+
+impl From<i64> for Value {
+    fn from(n: i64) -> Self {
+        Value::Int(Int::from(n))
+    }
+}
+
+impl From<i128> for Value {
+    fn from(n: i128) -> Self {
+        Value::Int(Int::from(n))
+    }
+}
+
+impl From<u64> for Value {
+    fn from(n: u64) -> Self {
+        Value::Nat(Nat::from(n))
+    }
+}
+
+impl From<u128> for Value {
+    fn from(n: u128) -> Self {
+        Value::Nat(Nat::from(n))
+    }
+}
+
+impl From<String> for Value {
+    fn from(s: String) -> Self {
+        Value::Text(s)
+    }
+}
+
+impl<'a> From<&'a str> for Value {
+    fn from(s: &'a str) -> Self {
+        Value::Text(s.to_string())
+    }
+}
+
+impl From<Vec<u8>> for Value {
+    fn from(bytes: Vec<u8>) -> Value {
+        Value::Blob(ByteBuf::from(bytes))
+    }
+}
+
+impl<'a> From<&'a [u8]> for Value {
+    fn from(bytes: &'a [u8]) -> Value {
+        Value::Blob(ByteBuf::from(bytes.to_vec()))
+    }
+}
 
 #[derive(CandidType, Clone, Hash, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct HashOf<T> {
@@ -1233,6 +1315,10 @@ pub fn set_admin(new_admin: PrincipalId) {
 
 pub fn get_minting_account_id() -> Option<AccountIdentifier> {
     LEDGER.read().unwrap().get_minting_account_id()
+}
+
+pub fn get_icrc1_minting_account_id() -> Option<Account> {
+    Some(Account::try_from(LEDGER.read().unwrap().get_minting_account_id().unwrap()).ok()?)
 }
 
 pub fn add_payment(
