@@ -1307,7 +1307,11 @@ async fn icrc1_send(
         panic!("Sending from {} is not allowed", caller_principal_id);
     }
 
-    let from = AccountIdentifier::new(caller_principal_id, Some(ledger_canister::Subaccount(from_subaccount.unwrap())));
+    let from = match from_subaccount {
+        Some(s_a) => AccountIdentifier::new(caller_principal_id, Some(ledger_canister::Subaccount(s_a))),
+        None => AccountIdentifier::new(caller_principal_id, None),
+    };
+
     let minting_acc = LEDGER
         .read()
         .unwrap()
