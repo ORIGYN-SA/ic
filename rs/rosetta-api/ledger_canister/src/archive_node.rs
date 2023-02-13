@@ -4,7 +4,7 @@ use ledger_canister::{
     GetBlocksArgs, GetBlocksError, GetBlocksResult, IterBlocksArgs, MAX_BLOCKS_PER_REQUEST,
 };
 
-use candid::{candid_method, Nat};
+use candid::{candid_method};
 use dfn_candid::candid_one;
 use dfn_core::api::{print, stable_memory_size_in_pages,};
 use dfn_core::{over_init, stable, BytesS, over};

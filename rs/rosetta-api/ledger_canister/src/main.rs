@@ -1,4 +1,4 @@
-use candid::candid_method;
+use candid::{candid_method, Nat};
 use dfn_candid::{candid, candid_one, CandidOne};
 use dfn_core::api::call_with_cleanup;
 use dfn_core::{
@@ -1213,6 +1213,175 @@ fn get_canidid_interface() {
         include_str!("../ledger.did")
     })
 }
+
+// --------- ICRC_1 STANDARD METHODS -------------- \\
+
+fn icrc1_balance_of(acc: Account) -> Nat {
+    Nat::from(
+        LEDGER
+            .read()
+            .unwrap()
+            .balances
+            .account_balance(&AccountIdentifier::from(acc))
+            .get_e8s(),
+    )
+}
+
+fn icrc1_supported_standards() -> Vec<StandardRecord> {
+    vec![StandardRecord {
+        name: "ICRC-1".to_string(),
+        url: "https://github.com/dfinity/ICRC-1".to_string(),
+    }]
+}
+
+fn icrc1_metadata() -> Vec<(String, Value)> {
+    vec![
+        Value::entry("icrc1:decimals", DECIMAL_PLACES as u64),
+        Value::entry("icrc1:name", LEDGER.read().unwrap().token_name.clone()),
+        Value::entry(
+            "icrc1:symbol",
+            LEDGER.read().unwrap().token_symbol.clone(),
+        ),
+        Value::entry("icrc1:fee", LEDGER.read().unwrap().transfer_fee.clone().get_e8s()),
+    ]
+}
+
+#[export_name = "canister_query icrc1_supported_standards"]
+fn icrc1_supported_standards_candid() {
+    over(candid_one, |()| icrc1_supported_standards())
+}
+
+#[export_name = "canister_query icrc1_minting_account"]
+fn icrc1_minting_account_candid() {
+    over(candid_one, |()| {
+        ledger_canister::get_icrc1_minting_account_id()
+    });
+}
+
+#[export_name = "canister_query icrc1_symbol"]
+fn icrc1_symbol_candid() {
+    over(candid_one, |()| token_symbol().symbol)
+}
+
+#[export_name = "canister_query icrc1_name"]
+fn icrc1_name_candid() {
+    over(candid_one, |()| token_name().name)
+}
+
+#[export_name = "canister_query icrc1_metadata"]
+fn icrc1_metadata_candid() {
+    over(candid_one, |()| icrc1_metadata())
+}
+
+#[export_name = "canister_query icrc1_balance_of"]
+fn icrc1_balance_of_candid() {
+    over(candid_one, |acc: Account| { icrc1_balance_of(acc) })
+}
+
+#[export_name = "canister_query icrc1_total_supply"]
+fn icrc1_total_supply_candid() {
+    over(candid_one, |()| total_supply())
+}
+
+#[export_name = "canister_query icrc1_decimals"]
+fn icrc1_decimals_candid() {
+    over(candid_one, |()| token_decimals().decimals as u8)
+}
+
+#[export_name = "canister_query icrc1_fee"]
+fn icrc1_fee_candid() {
+    over(candid_one, |()| LEDGER.read().unwrap().transfer_fee().transfer_fee)
+}
+
+async fn icrc1_send(
+    memo: Option<Memo>,
+    amount: Tokens,
+    fee: Option<Tokens>,
+    from_subaccount: Option<ICRC1Subaccount>,
+    to: AccountIdentifier,
+    created_at_time: Option<TimeStamp>,
+) -> Result<BlockHeight, TransferError> {
+    let caller_principal_id = caller();
+
+    if !LEDGER.read().unwrap().can_send(&caller_principal_id) {
+        panic!("Sending from {} is not allowed", caller_principal_id);
+    }
+
+    let from = match from_subaccount {
+        Some(s_a) => AccountIdentifier::new(caller_principal_id, Some(ledger_canister::Subaccount(s_a))),
+        None => AccountIdentifier::new(caller_principal_id, None),
+    };
+
+    let minting_acc = LEDGER
+        .read()
+        .unwrap()
+        .minting_account_id
+        .expect("Minting canister id not initialized");
+
+    let transfer = if from == minting_acc {
+        assert_eq!(fee.unwrap().clone(), Tokens::ZERO, "Fee for minting should be zero");
+        assert_ne!(
+            to, minting_acc,
+            "It is illegal to mint to a minting_account"
+        );
+        Operation::Mint { to, amount }
+    } else if to == minting_acc {
+        assert_eq!(fee.unwrap().clone(), Tokens::ZERO, "Fee for burning should be zero");
+        let min_burn_amount = LEDGER.read().unwrap().transfer_fee;
+        if amount < min_burn_amount {
+            panic!("Burns lower than {} are not allowed", min_burn_amount);
+        }
+        Operation::Burn { from, amount }
+    } else {
+        let transfer_fee = LEDGER.read().unwrap().transfer_fee;
+        if fee != Some(transfer_fee) {
+            return Err(TransferError::BadFee {
+                expected_fee: transfer_fee,
+            });
+        }
+        Operation::Transfer {
+            from,
+            to,
+            amount,
+            fee: fee.unwrap(),
+        }
+    };
+    let (height, hash) = match LEDGER
+        .write()
+        .unwrap()
+        .add_payment(memo.unwrap(), transfer, created_at_time)
+    {
+        Ok((height, hash)) => (height, hash),
+        Err(PaymentError::TransferError(transfer_error)) => return Err(transfer_error),
+        Err(PaymentError::Reject(msg)) => panic!("{}", msg),
+    };
+    set_certified_data(&hash.into_bytes());
+
+    archive_blocks().await;
+    Ok(height)
+}
+
+#[candid_method(update, rename = "icrc1_transfer")]
+async fn icrc1_transfer_candid(arg: ICRC1TransferArg) -> Result<BlockHeight, TransferError> {
+    let to = AccountIdentifier::from(arg.to);
+
+    icrc1_send(
+        arg.memo,
+        arg.amount,
+        arg.fee,
+        arg.from_subaccount,
+        to,
+        arg.created_at_time,
+    )
+    .await
+}
+
+#[export_name = "canister_update icrc1_transfer"]
+fn icrc1_transfer() {
+    over_async(candid_one, icrc1_transfer_candid)
+}
+
+// ----------------------- \\
 
 #[cfg(test)]
 mod tests {
