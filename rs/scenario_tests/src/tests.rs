@@ -98,7 +98,7 @@ impl<'a> CanisterLocator<'a> {
 /// where refunding was successful, and finally attempts to delete the
 /// successfully stopped canisters. If there are no wallets provided it
 /// will directly stop and delete the given canisters.
-pub async fn cleanup(canisters: Vec<CanisterLocator<'_>>) {
+pub async fn cleanup(canisters: Vec<CanisterLocator<'_>>, delete_canister_retries: u64) {
     pub async fn return_cycles<'a, 'b>(
         src: Canister<'a>,
         dst: Canister<'b>,
@@ -134,8 +134,23 @@ pub async fn cleanup(canisters: Vec<CanisterLocator<'_>>) {
         canister.stop().await.map(|_| canister)
     }
 
-    pub async fn delete_canister(canister: Canister<'_>) -> Result<Canister<'_>, String> {
-        canister.delete().await.map(|_| canister)
+    pub async fn delete_canister(
+        canister: Canister<'_>,
+        max_retries: u64,
+    ) -> Result<Canister<'_>, String> {
+        let exponential_basis = 2;
+
+        let mut sleep_duration = std::time::Duration::from_secs(1);
+        let mut retries_counter = 0;
+        while let Err(errmsg) = canister.delete().await {
+            if retries_counter == max_retries {
+                return Err(errmsg);
+            }
+            std::thread::sleep(sleep_duration);
+            sleep_duration *= exponential_basis;
+            retries_counter += 1;
+        }
+        Ok(canister)
     }
 
     let canisters_to_wallets = canisters
@@ -156,11 +171,7 @@ pub async fn cleanup(canisters: Vec<CanisterLocator<'_>>) {
         )
         .await;
 
-        refunded
-            .into_iter()
-            .filter(|x| x.is_ok())
-            .map(|x| x.unwrap())
-            .collect()
+        refunded.into_iter().filter_map(|x| x.ok()).collect()
     } else {
         canisters.iter().map(|locator| locator.canister()).collect()
     };
@@ -176,10 +187,9 @@ pub async fn cleanup(canisters: Vec<CanisterLocator<'_>>) {
     let _: Vec<Result<Canister, String>> = parallel_async(
         canisters
             .into_iter()
-            .filter(|x| x.is_ok())
-            .map(|x| x.unwrap())
+            .filter_map(|x| x.ok())
             .collect::<Vec<Canister>>(),
-        delete_canister,
+        |canister| delete_canister(canister, delete_canister_retries),
         |i, res| print_error("Deleting canister", i, res),
     )
     .await;
@@ -190,9 +200,10 @@ pub async fn cleanup_canister_ids(
     canister_ids: Vec<String>,
     wallet_canisters: Vec<String>,
     ic: &dyn Ic,
+    delete_canister_retries: u64,
 ) {
     let canisters = locate_canister_ids(canister_ids, wallet_canisters, ic);
-    cleanup(canisters).await;
+    cleanup(canisters, delete_canister_retries).await;
 }
 
 /// Locates the canisters on the network relative to the given wallets and

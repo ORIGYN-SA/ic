@@ -6,12 +6,13 @@ use crate::{
     },
     CanisterId, PrincipalId, UserId,
 };
+use ic_error_types::RejectCode;
 use maplit::btreemap;
 use serde::{Deserialize, Serialize};
 use std::convert::TryFrom;
 
 /// Represents a Query that is sent by an end user to a canister.
-#[derive(Clone, PartialEq, Debug)]
+#[derive(Clone, PartialEq, Eq, Debug)]
 pub struct UserQuery {
     pub source: UserId,
     pub receiver: CanisterId,
@@ -73,8 +74,8 @@ impl HasCanisterId for UserQuery {
 }
 
 /// Represents a Query that is sent by the IC.
-#[derive(Clone, PartialEq, Debug)]
-pub struct InternalQuery {
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct AnonymousQuery {
     pub receiver: CanisterId,
     pub method_name: String,
     pub method_payload: Vec<u8>,
@@ -83,19 +84,19 @@ pub struct InternalQuery {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 #[serde(tag = "status")]
-pub enum InternalQueryResponse {
+pub enum AnonymousQueryResponse {
     Replied {
-        reply: InternalQueryResponseReply,
+        reply: AnonymousQueryResponseReply,
     },
     Rejected {
-        reject_code: u64,
+        reject_code: RejectCode,
         reject_message: String,
     },
 }
 
-/// The body of the `InternalQueryResponse`.
+/// The body of the `AnonymousQueryResponse`.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct InternalQueryResponseReply {
+pub struct AnonymousQueryResponseReply {
     pub arg: Blob,
 }
 

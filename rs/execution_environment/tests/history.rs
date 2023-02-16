@@ -1,18 +1,19 @@
+use ic_config::execution_environment::Config;
 use ic_error_types::{ErrorCode::CanisterNotFound, UserError};
 use ic_execution_environment::{IngressHistoryReaderImpl, IngressHistoryWriterImpl};
 use ic_interfaces::execution_environment::{IngressHistoryReader, IngressHistoryWriter};
 use ic_interfaces_state_manager::Labeled;
+use ic_interfaces_state_manager_mocks::MockStateManager;
 use ic_metrics::MetricsRegistry;
 use ic_registry_subnet_type::SubnetType;
 use ic_replicated_state::ReplicatedState;
 use ic_test_utilities::{
     mock_time,
-    state_manager::MockStateManager,
     types::ids::{canister_test_id, message_test_id, subnet_test_id, user_test_id},
-    with_test_replica_logger,
 };
+use ic_test_utilities_logger::with_test_replica_logger;
 use ic_types::{
-    ingress::{IngressStatus, WasmResult},
+    ingress::{IngressState, IngressStatus, WasmResult},
     Height,
 };
 use IngressStatus::*;
@@ -26,10 +27,9 @@ fn get_status_for_non_existing_message_id() {
         .returning(|| {
             Labeled::new(
                 Height::new(0),
-                std::sync::Arc::new(ReplicatedState::new_rooted_at(
+                std::sync::Arc::new(ReplicatedState::new(
                     subnet_test_id(1),
                     SubnetType::Application,
-                    "NOT_USED".into(),
                 )),
             )
         });
@@ -43,36 +43,38 @@ fn get_status_for_non_existing_message_id() {
 }
 
 fn received() -> IngressStatus {
-    Received {
+    Known {
         receiver: canister_test_id(0).get(),
         user_id: user_test_id(0),
         time: mock_time(),
+        state: IngressState::Received,
     }
 }
 
 fn processing() -> IngressStatus {
-    Processing {
+    Known {
         receiver: canister_test_id(0).get(),
         user_id: user_test_id(0),
         time: mock_time(),
+        state: IngressState::Processing,
     }
 }
 
 fn completed() -> IngressStatus {
-    Completed {
+    Known {
         receiver: canister_test_id(0).get(),
         user_id: user_test_id(0),
-        result: WasmResult::Reply(vec![]),
         time: mock_time(),
+        state: IngressState::Completed(WasmResult::Reply(vec![])),
     }
 }
 
 fn failed() -> IngressStatus {
-    Failed {
+    Known {
         receiver: canister_test_id(0).get(),
         user_id: user_test_id(0),
-        error: UserError::new(CanisterNotFound, ""),
         time: mock_time(),
+        state: IngressState::Failed(UserError::new(CanisterNotFound, "")),
     }
 }
 
@@ -90,12 +92,9 @@ fn valid_transitions() -> Vec<(IngressStatus, Vec<IngressStatus>)> {
 #[test]
 fn test_valid_transitions() {
     with_test_replica_logger(|log| {
-        let state = ReplicatedState::new_rooted_at(
-            subnet_test_id(1),
-            SubnetType::Application,
-            "NOT_USED".into(),
-        );
-        let ingress_history_writer = IngressHistoryWriterImpl::new(log, &MetricsRegistry::new());
+        let state = ReplicatedState::new(subnet_test_id(1), SubnetType::Application);
+        let ingress_history_writer =
+            IngressHistoryWriterImpl::new(Config::default(), log, &MetricsRegistry::new());
         let message_id = message_test_id(1);
 
         for (origin_state, next_states) in valid_transitions().into_iter() {
@@ -118,7 +117,8 @@ fn test_valid_transitions() {
 #[test]
 fn test_invalid_transitions() {
     with_test_replica_logger(|log| {
-        let ingress_history_writer = IngressHistoryWriterImpl::new(log, &MetricsRegistry::new());
+        let ingress_history_writer =
+            IngressHistoryWriterImpl::new(Config::default(), log, &MetricsRegistry::new());
         let message_id = message_test_id(1);
 
         // creates a set of valid transitions
@@ -149,11 +149,7 @@ fn test_invalid_transitions() {
             // unwind-safe. It doesn't matter for the purposes of this test.
             let ingress_history_writer = std::panic::AssertUnwindSafe(&ingress_history_writer);
             let result = std::panic::catch_unwind(|| {
-                let mut state = ReplicatedState::new_rooted_at(
-                    subnet_test_id(1),
-                    SubnetType::Application,
-                    "NOT_USED".into(),
-                );
+                let mut state = ReplicatedState::new(subnet_test_id(1), SubnetType::Application);
                 ingress_history_writer.set_status(
                     &mut state,
                     message_id.clone(),

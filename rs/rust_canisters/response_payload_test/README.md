@@ -1,25 +1,20 @@
 Response Payload Canister Quick Start
 ================================
 
-This canister is a simple test for response payload sizes. A call to `query` triggers a response
-with payload sized according to the `response_size` argument to the query call.
-The response will be all 0s.
+A canister that generates responses (consisting of all 0s) whose size
+is specified in the request (using the response_size field).
 
 Build
 -----
 
 ```bash
 # Build the Wasm binary
-cargo build --target wasm32-unknown-unknown --release
+bazel build //rs/rust_canisters/response_payload_test:response-payload-test-canister
 
-# Go to ic/rs
-cd ../..
-
-# Optional: install ic-cdk-optimizer
-cargo install ic-cdk-optimizer
-
-# Reduce the Wasm binary size
-ic-cdk-optimizer target/wasm32-unknown-unknown/release/response-payload-test-canister.wasm --output response-payload-test-canister.wasm
+# Find the optimized canister binary from the root `ic` directory:
+ls -l bazel-bin/rs/rust_canisters/response_payload_test/response-payload-test-canister.wasm
+# From other directories:
+ls -l $(bazel info bazel-bin)/rs/rust_canisters/response_payload_test/response-payload-test-canister.wasm
 ```
 
 Run

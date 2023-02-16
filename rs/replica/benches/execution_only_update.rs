@@ -6,7 +6,9 @@ use ic_config::{
 use ic_cycles_account_manager::CyclesAccountManager;
 use ic_error_types::{ErrorCode, UserError};
 use ic_execution_environment::ExecutionServices;
+use ic_ic00_types::{self as ic00, CanisterInstallMode, Payload};
 use ic_interfaces::{execution_environment::IngressHistoryReader, messaging::MessageRouting};
+use ic_interfaces_registry_mocks::MockRegistryClient;
 use ic_logger::{replica_logger::no_op_logger, ReplicaLogger};
 use ic_messaging::MessageRoutingImpl;
 use ic_metrics::MetricsRegistry;
@@ -15,18 +17,16 @@ use ic_state_manager::StateManagerImpl;
 use ic_test_utilities::{
     consensus::fake::FakeVerifier, mock_time, types::messages::SignedIngressBuilder,
 };
-use ic_test_utilities_registry::MockRegistryClient;
 use ic_types::{
-    batch::{Batch, BatchPayload, IngressPayload, SelfValidatingPayload, XNetPayload},
-    ic00,
-    ic00::Payload,
-    ingress::{IngressStatus, WasmResult},
-    messages::{CanisterInstallMode, SignedIngress},
+    batch::{Batch, BatchPayload, IngressPayload},
+    ingress::{IngressState, IngressStatus, WasmResult},
+    malicious_flags::MaliciousFlags,
+    messages::SignedIngress,
     Randomness, RegistryVersion,
 };
 use ic_types::{messages::MessageId, replica_config::ReplicaConfig, CanisterId};
-use std::sync::Arc;
 use std::time::{Duration, Instant};
+use std::{collections::BTreeMap, sync::Arc};
 
 const HELLO_WORLD: &str = r#"
             (module
@@ -78,7 +78,7 @@ impl BenchReplica {
                 ic00::InstallCodeArgs::new(
                     CanisterInstallMode::Install,
                     CanisterId::from(42),
-                    wabt::wat2wasm(HELLO_WORLD).unwrap(),
+                    wat::parse_str(HELLO_WORLD).unwrap(),
                     vec![],
                     None,
                     None,
@@ -113,13 +113,10 @@ fn build_batch(message_routing: &dyn MessageRouting, msgs: Vec<SignedIngress>) -
         requires_full_state_hash: !msgs.is_empty(),
         payload: BatchPayload {
             ingress: IngressPayload::from(msgs),
-            xnet: XNetPayload {
-                stream_slices: Default::default(),
-            },
-            self_validating: SelfValidatingPayload::default(),
+            ..BatchPayload::default()
         },
         randomness: Randomness::from([0; 32]),
-        ecdsa_subnet_public_key: None,
+        ecdsa_subnet_public_keys: BTreeMap::new(),
         registry_version: RegistryVersion::from(1),
         time: mock_time(),
         consensus_responses: vec![],
@@ -155,17 +152,18 @@ fn execute_ingress_message(
 
         let ingress_result = (ingress_history.get_latest_status())(msg_id);
         match ingress_result {
-            IngressStatus::Completed { result, .. } => return Ok(result),
-            IngressStatus::Failed { error, .. } => return Err(error),
-            IngressStatus::Done { .. } => {
-                return Err(UserError::new(
-                    ErrorCode::SubnetOversubscribed,
-                    "The call has completed but the reply/reject data has been pruned.",
-                ))
-            }
-            IngressStatus::Received { .. }
-            | IngressStatus::Processing { .. }
-            | IngressStatus::Unknown => (),
+            IngressStatus::Known { state, .. } => match state {
+                IngressState::Completed(result) => return Ok(result),
+                IngressState::Failed(error) => return Err(error),
+                IngressState::Done => {
+                    return Err(UserError::new(
+                        ErrorCode::SubnetOversubscribed,
+                        "The call has completed but the reply/reject data has been pruned.",
+                    ))
+                }
+                IngressState::Received | IngressState::Processing => (),
+            },
+            IngressStatus::Unknown => (),
         }
     }
     panic!("Ingress message did not finish executing within 30 seconds");
@@ -212,6 +210,7 @@ fn criterion_calls(criterion: &mut Criterion) {
             ExecutionConfig::default(),
             Arc::clone(&cycles_account_manager),
             Arc::clone(&state_manager) as Arc<_>,
+            Arc::clone(&state_manager.get_fd_factory()),
         )
         .into_parts();
 
@@ -228,6 +227,7 @@ fn criterion_calls(criterion: &mut Criterion) {
         &bench_replica.metrics_registry,
         bench_replica.log.clone(),
         registry,
+        MaliciousFlags::default(),
     );
 
     struct BenchData {

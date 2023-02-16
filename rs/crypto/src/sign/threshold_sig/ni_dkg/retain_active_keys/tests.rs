@@ -16,7 +16,6 @@ use ic_types::crypto::threshold_sig::ni_dkg::errors::key_removal_error::DkgKeyRe
 use ic_types::crypto::threshold_sig::ni_dkg::transcripts_to_retain::TranscriptsToRetain;
 use ic_types::crypto::threshold_sig::ni_dkg::{NiDkgTag, NiDkgTranscript};
 use ic_types::crypto::AlgorithmId;
-use ic_types::crypto::KeyId;
 use ic_types::RegistryVersion;
 use std::collections::BTreeMap;
 
@@ -28,7 +27,7 @@ fn should_call_csp_with_correct_parameters() {
     csp.expect_retain_threshold_keys_if_present()
         .withf(move |active_keys| *active_keys == expected_active_keys)
         .times(1)
-        .return_const(());
+        .return_const(Ok(()));
     csp.expect_update_forward_secure_epoch()
         .withf(move |algorithm_id, epoch_| {
             *algorithm_id == AlgorithmId::NiDkg_Groth20_Bls12_381 && *epoch_ == epoch(REG_V1)
@@ -49,7 +48,7 @@ fn should_return_error_from_csp() {
     csp.expect_retain_threshold_keys_if_present()
         .withf(move |active_keys| *active_keys == expected_active_keys)
         .times(1)
-        .return_const(());
+        .return_const(Ok(()));
     let key_not_found_err = key_not_found_err();
     csp.expect_update_forward_secure_epoch()
         .times(1)
@@ -76,7 +75,8 @@ fn transcripts_to_retain() -> TranscriptsToRetain {
 fn key_not_found_err() -> KeyNotFoundError {
     KeyNotFoundError {
         internal_error: "some error".to_string(),
-        key_id: KeyId::from([0; 32]),
+        key_id: "KeyId(0x0000000000000000000000000000000000000000000000000000000000000000)"
+            .to_string(),
     }
 }
 

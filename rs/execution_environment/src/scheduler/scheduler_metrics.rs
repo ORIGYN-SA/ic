@@ -5,12 +5,19 @@ use ic_metrics::{
     MetricsRegistry,
 };
 use ic_types::nominal_cycles::NominalCycles;
-use prometheus::{Gauge, Histogram, IntCounter, IntGauge, IntGaugeVec};
+use prometheus::{Gauge, Histogram, IntCounter, IntCounterVec, IntGauge, IntGaugeVec};
 
 use crate::metrics::{
-    cycles_histogram, duration_histogram, instructions_histogram, memory_histogram,
-    messages_histogram, ScopedMetrics,
+    cycles_histogram, dts_pause_or_abort_histogram, duration_histogram, instructions_histogram,
+    memory_histogram, messages_histogram, slices_histogram, ScopedMetrics,
 };
+
+pub(crate) const CANISTER_INVARIANT_BROKEN: &str = "scheduler_canister_invariant_broken";
+pub(crate) const SCHEDULER_COMPUTE_ALLOCATION_INVARIANT_BROKEN: &str =
+    "scheduler_compute_allocation_invariant_broken";
+pub(crate) const SCHEDULER_CORES_INVARIANT_BROKEN: &str = "scheduler_cores_invariant_broken";
+pub(crate) const SUBNET_MEMORY_USAGE_INVARIANT_BROKEN: &str =
+    "scheduler_subnet_memory_usage_invariant_broken";
 
 pub(super) struct SchedulerMetrics {
     pub(super) canister_age: Histogram,
@@ -29,6 +36,7 @@ pub(super) struct SchedulerMetrics {
     pub(super) ingress_history_length: IntGauge,
     pub(super) msg_execution_duration: Histogram,
     pub(super) registered_canisters: IntGaugeVec,
+    pub(super) available_canister_ids: IntGauge,
     pub(super) consumed_cycles_since_replica_started: Gauge,
     pub(super) input_queue_messages: IntGaugeVec,
     pub(super) input_queues_size_bytes: IntGaugeVec,
@@ -50,10 +58,10 @@ pub(super) struct SchedulerMetrics {
     pub(super) round_subnet_queue: ScopedMetrics,
     pub(super) round_scheduling_duration: Histogram,
     pub(super) round_inner: ScopedMetrics,
+    pub(super) round_inner_heartbeat_overhead_duration: Histogram,
     pub(super) round_inner_iteration: ScopedMetrics,
     pub(super) round_inner_iteration_prep: Histogram,
     pub(super) round_inner_iteration_thread: ScopedMetrics,
-    pub(super) round_inner_iteration_thread_heartbeat: ScopedMetrics,
     pub(super) round_inner_iteration_thread_message: ScopedMetrics,
     pub(super) round_inner_iteration_fin: Histogram,
     pub(super) round_inner_iteration_fin_induct: Histogram,
@@ -61,12 +69,25 @@ pub(super) struct SchedulerMetrics {
     pub(super) round_finalization_stop_canisters: Histogram,
     pub(super) round_finalization_ingress: Histogram,
     pub(super) round_finalization_charge: Histogram,
-    pub(super) execution_round_failed_heartbeat_executions: IntCounter,
     pub(super) canister_heap_delta_debits: Histogram,
     pub(super) heap_delta_rate_limited_canisters_per_round: Histogram,
     pub(super) canisters_not_in_routing_table: IntGauge,
     pub(super) canister_install_code_debits: Histogram,
     pub(super) old_open_call_contexts: IntGaugeVec,
+    pub(super) canisters_with_old_open_call_contexts: IntGaugeVec,
+    pub(super) canister_invariants: IntCounter,
+    pub(super) scheduler_compute_allocation_invariant_broken: IntCounter,
+    pub(super) scheduler_cores_invariant_broken: IntCounter,
+    pub(super) scheduler_accumulated_priority_invariant: IntGauge,
+    pub(super) scheduler_accumulated_priority_deviation: Gauge,
+    pub(super) subnet_memory_usage_invariant: IntCounter,
+    pub(super) total_canister_balance: Gauge,
+    pub(super) canister_paused_execution: Histogram,
+    pub(super) canister_aborted_execution: Histogram,
+    pub(super) canister_paused_install_code: Histogram,
+    pub(super) canister_aborted_install_code: Histogram,
+    pub(super) inducted_messages: IntCounterVec,
+    pub(super) ecdsa_signature_agreements: IntGauge,
 }
 
 const LABEL_MESSAGE_KIND: &str = "kind";
@@ -162,6 +183,10 @@ impl SchedulerMetrics {
                 "Total number of canisters keyed by their current status.",
                 &["status"],
             ),
+            available_canister_ids: metrics_registry.int_gauge(
+                "replicated_state_available_canister_ids",
+                "Number of allocated canister IDs that can still be generated.",
+            ),
             /// Metric `consumed_cycles_since_replica_started` is not
             /// monotonically increasing. Cycles consumed are increasing the
             /// value of the metric while refunding cycles are decreasing it.
@@ -174,6 +199,10 @@ impl SchedulerMetrics {
             consumed_cycles_since_replica_started: metrics_registry.gauge(
                 "replicated_state_consumed_cycles_since_replica_started",
                 "Number of cycles consumed since replica started",
+            ),
+            ecdsa_signature_agreements: metrics_registry.int_gauge(
+                "replicated_state_ecdsa_signature_agreements_total",
+                "Total number of ECDSA signature agreements created",
             ),
             input_queue_messages: metrics_registry.int_gauge_vec(
                 "execution_input_queue_messages",
@@ -247,6 +276,11 @@ impl SchedulerMetrics {
                     "The number of instructions executed in an execution round",
                     metrics_registry,
                 ),
+                slices: slices_histogram(
+                    "execution_round_slices",
+                    "The number of slices executed in an execution round",
+                    metrics_registry,
+                ),
                 messages: messages_histogram(
                     "execution_round_messages",
                     "The number of messages executed in an execution round",
@@ -277,6 +311,12 @@ impl SchedulerMetrics {
                           queue processing in an execution round",
                     metrics_registry,
                 ),
+                slices: slices_histogram(
+                    "execution_round_consensus_queue_slices",
+                    "The number of slices executed during consensus \
+                          queue processing in an execution round",
+                    metrics_registry,
+                ),
                 messages: messages_histogram(
                     "execution_round_consensus_queue_messages",
                     "The number of messages executed during consensus \
@@ -294,6 +334,12 @@ impl SchedulerMetrics {
                 instructions: instructions_histogram(
                     "execution_round_subnet_queue_instructions",
                     "The number of instructions executed during subnet \
+                          queue processing in an execution round",
+                    metrics_registry,
+                ),
+                slices: slices_histogram(
+                    "execution_round_subnet_queue_slices",
+                    "The number of slices executed during subnet \
                           queue processing in an execution round",
                     metrics_registry,
                 ),
@@ -320,12 +366,22 @@ impl SchedulerMetrics {
                     "The number of instructions executed in an inner round",
                     metrics_registry,
                 ),
+                slices: slices_histogram(
+                    "execution_round_inner_slices",
+                    "The number of slices executed in an inner round",
+                    metrics_registry,
+                ),
                 messages: messages_histogram(
                     "execution_round_inner_messages",
                     "The number of messages executed in an inner round",
                     metrics_registry,
                 ),
             },
+            round_inner_heartbeat_overhead_duration: duration_histogram(
+                "execution_round_inner_heartbeat_overhead_duration_seconds",
+                "The duration of iterating canisters to prepare/remove heartbeat and global timer tasks",
+                metrics_registry,
+            ),
             round_inner_iteration: ScopedMetrics {
                 duration: duration_histogram(
                     "execution_round_inner_iteration_duration_seconds",
@@ -335,6 +391,11 @@ impl SchedulerMetrics {
                 instructions: instructions_histogram(
                     "execution_round_inner_iteration_instructions",
                     "The number of instructions executed in an iteration of an inner round",
+                    metrics_registry,
+                ),
+                slices: slices_histogram(
+                    "execution_round_inner_iteration_slices",
+                    "The number of messages executed in an iteration of an inner round",
                     metrics_registry,
                 ),
                 messages: messages_histogram(
@@ -361,30 +422,16 @@ impl SchedulerMetrics {
                           by an iteration of an inner round",
                     metrics_registry,
                 ),
-                messages: messages_histogram(
-                    "execution_round_inner_iteration_thread_messages",
+                slices: slices_histogram(
+                    "execution_round_inner_iteration_thread_slices",
                     "The number of messages executed in a thread spawned \
                           by an iteration of an inner round",
                     metrics_registry,
                 ),
-            },
-            round_inner_iteration_thread_heartbeat: ScopedMetrics {
-                duration: duration_histogram(
-                    "execution_round_inner_iteration_thread_heartbeat_duration_seconds",
-                    "The duration of executing a heartbeat in a thread \
-                          spawned by an iteration of an inner round",
-                    metrics_registry,
-                ),
-                instructions: instructions_histogram(
-                    "execution_round_inner_iteration_thread_heartbeat_instructions",
-                    "The number of instructions executed in a heartbeat \
-                          in a thread spawned by an iteration of an inner round",
-                    metrics_registry,
-                ),
                 messages: messages_histogram(
-                    "execution_round_inner_iteration_thread_heartbeat_messages",
-                    "The number of messages executed in a heartbeat in a \
-                          thread spawned by an iteration of an inner round",
+                    "execution_round_inner_iteration_thread_messages",
+                    "The number of messages executed in a thread spawned \
+                          by an iteration of an inner round",
                     metrics_registry,
                 ),
             },
@@ -399,6 +446,12 @@ impl SchedulerMetrics {
                     "execution_round_inner_iteration_thread_message_instructions",
                     "The number of instructions executed in a message \
                           in a thread spawned by an iteration of an inner round",
+                    metrics_registry,
+                ),
+                slices: slices_histogram(
+                    "execution_round_inner_iteration_thread_message_slices",
+                    "The number of slices executed in a message in a \
+                          thread spawned by an iteration of an inner round",
                     metrics_registry,
                 ),
                 messages: messages_histogram(
@@ -442,10 +495,6 @@ impl SchedulerMetrics {
                       round finalization in seconds.",
                 metrics_registry,
             ),
-            execution_round_failed_heartbeat_executions: metrics_registry.int_counter(
-                "execution_round_failed_heartbeat_executions",
-                "Total number of heartbeat executions that completed in error",
-            ),
             canister_heap_delta_debits: metrics_registry.histogram(
                 "scheduler_canister_heap_delta_debits",
                 "The heap delta debit of a canister at the end of the round, before \
@@ -473,6 +522,52 @@ impl SchedulerMetrics {
                 "scheduler_old_open_call_contexts",
                 "Number of call contexts that have been open for more than the given age.",
                 &["age"]
+            ),
+            canisters_with_old_open_call_contexts: metrics_registry.int_gauge_vec(
+                "scheduler_canisters_with_old_open_call_contexts",
+                "Number of canisters with call contexts that have been open for more than the given age.",
+                &["age"]
+            ),
+            canister_invariants: metrics_registry.error_counter(CANISTER_INVARIANT_BROKEN),
+            scheduler_compute_allocation_invariant_broken: metrics_registry.error_counter(SCHEDULER_COMPUTE_ALLOCATION_INVARIANT_BROKEN),
+            scheduler_cores_invariant_broken: metrics_registry.error_counter(SCHEDULER_CORES_INVARIANT_BROKEN),
+            scheduler_accumulated_priority_invariant: metrics_registry.int_gauge(
+                "scheduler_accumulated_priority_invariant",
+                "The sum of all accumulated priorities on the subnet."
+            ),
+            scheduler_accumulated_priority_deviation: metrics_registry.gauge(
+                "scheduler_accumulated_priority_deviation",
+                "The standard deviation of accumulated priorities on the subnet."
+            ),
+            subnet_memory_usage_invariant: metrics_registry.error_counter(SUBNET_MEMORY_USAGE_INVARIANT_BROKEN),
+            total_canister_balance: metrics_registry.gauge(
+                "scheduler_canister_balance_cycles_total",
+                "Total canister balance in Cycles.",
+            ),
+            canister_paused_execution: dts_pause_or_abort_histogram(
+                "scheduler_canister_paused_execution",
+                "Number of canisters that have a paused execution.",
+                metrics_registry,
+            ),
+            canister_aborted_execution: dts_pause_or_abort_histogram(
+                "scheduler_canister_aborted_execution",
+                "Number of canisters that have an aborted execution.",
+                metrics_registry,
+            ),
+            canister_paused_install_code: dts_pause_or_abort_histogram(
+                "scheduler_canister_paused_install_code",
+                "Number of canisters that have a paused install code.",
+                metrics_registry,
+            ),
+            canister_aborted_install_code: dts_pause_or_abort_histogram(
+                "scheduler_canister_aborted_install_code",
+                "Number of canisters that have an aborted install code.",
+                metrics_registry,
+            ),
+            inducted_messages: metrics_registry.int_counter_vec(
+                "scheduler_inducted_messages_total",
+                "Number of messages inducted, by destination.",
+                &["destination"],
             ),
         }
     }

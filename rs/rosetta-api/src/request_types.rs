@@ -1,22 +1,17 @@
-use crate::convert::principal_id_from_public_key_or_principal;
+use crate::models::amount::{signed_amount, tokens_to_amount};
+use crate::models::operation::{OperationIdentifier, OperationType};
+use crate::models::seconds::Seconds;
 use crate::{
-    convert::{
-        self, amount_, principal_id_from_public_key, signed_amount, to_model_account_identifier,
-    },
-    errors,
+    convert::{principal_id_from_public_key, to_model_account_identifier},
     errors::ApiError,
-    models::{self, Object, Operation, OperationIdentifier, OperationType},
-    time::Seconds,
+    models::{self, operation::Operation, Object},
     transaction_id::TransactionIdentifier,
 };
-use dfn_candid::CandidOne;
-use ic_nns_governance::pb::v1::manage_neuron::{self, configure, Command, Configure};
 use ic_types::PrincipalId;
-use ledger_canister::{AccountIdentifier, BlockHeight, Operation as LedgerOperation, Tokens};
-use on_wire::FromWire;
-use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use icp_ledger::{AccountIdentifier, BlockIndex, Operation as LedgerOperation, Tokens};
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::convert::{TryFrom, TryInto};
+use std::convert::TryFrom;
 
 // Since our blockchain doesn't have smart contracts all operations are always a
 // single value
@@ -30,12 +25,15 @@ pub const STAKE: &str = "STAKE";
 pub const START_DISSOLVE: &str = "START_DISSOLVE";
 pub const STOP_DISSOLVE: &str = "STOP_DISSOLVE";
 pub const SET_DISSOLVE_TIMESTAMP: &str = "SET_DISSOLVE_TIMESTAMP";
+pub const CHANGE_AUTO_STAKE_MATURITY: &str = "CHANGE_AUTO_STAKE_MATURITY";
 pub const DISBURSE: &str = "DISBURSE";
 pub const DISSOLVE_TIME_UTC_SECONDS: &str = "dissolve_time_utc_seconds";
 pub const ADD_HOT_KEY: &str = "ADD_HOT_KEY";
 pub const REMOVE_HOTKEY: &str = "REMOVE_HOTKEY";
 pub const SPAWN: &str = "SPAWN";
 pub const MERGE_MATURITY: &str = "MERGE_MATURITY";
+pub const REGISTER_VOTE: &str = "REGISTER_VOTE";
+pub const STAKE_MATURITY: &str = "STAKE_MATURITY";
 pub const NEURON_INFO: &str = "NEURON_INFO";
 pub const FOLLOW: &str = "FOLLOW";
 
@@ -54,6 +52,9 @@ pub enum RequestType {
     #[serde(rename = "SET_DISSOLVE_TIMESTAMP")]
     #[serde(alias = "SetDissolveTimestamp")]
     SetDissolveTimestamp { neuron_index: u64 },
+    #[serde(rename = "CHANGE_AUTO_STAKE_MATURITY")]
+    #[serde(alias = "ChangeAutoStakeMaturity")]
+    ChangeAutoStakeMaturity { neuron_index: u64 },
     #[serde(rename = "START_DISSOLVE")]
     #[serde(alias = "StartDissolve")]
     StartDissolve { neuron_index: u64 },
@@ -75,6 +76,12 @@ pub enum RequestType {
     #[serde(rename = "MERGE_MATURITY")]
     #[serde(alias = "MergeMaturity")]
     MergeMaturity { neuron_index: u64 },
+    #[serde(rename = "STAKE_MATURITY")]
+    #[serde(alias = "StakeMaturity")]
+    StakeMaturity { neuron_index: u64 },
+    #[serde(rename = "REGISTER_VOTE")]
+    #[serde(alias = "RegisterVote")]
+    RegisterVote { neuron_index: u64 },
     #[serde(rename = "NEURON_INFO")]
     #[serde(alias = "NeuronInfo")]
     NeuronInfo {
@@ -95,6 +102,7 @@ impl RequestType {
             RequestType::Send { .. } => TRANSACTION,
             RequestType::Stake { .. } => STAKE,
             RequestType::SetDissolveTimestamp { .. } => SET_DISSOLVE_TIMESTAMP,
+            RequestType::ChangeAutoStakeMaturity { .. } => CHANGE_AUTO_STAKE_MATURITY,
             RequestType::StartDissolve { .. } => START_DISSOLVE,
             RequestType::StopDissolve { .. } => STOP_DISSOLVE,
             RequestType::Disburse { .. } => DISBURSE,
@@ -102,6 +110,8 @@ impl RequestType {
             RequestType::RemoveHotKey { .. } => REMOVE_HOTKEY,
             RequestType::Spawn { .. } => SPAWN,
             RequestType::MergeMaturity { .. } => MERGE_MATURITY,
+            RequestType::RegisterVote { .. } => REGISTER_VOTE,
+            RequestType::StakeMaturity { .. } => STAKE_MATURITY,
             RequestType::NeuronInfo { .. } => NEURON_INFO,
             RequestType::Follow { .. } => FOLLOW,
         }
@@ -116,6 +126,7 @@ impl RequestType {
             self,
             RequestType::Stake { .. }
                 | RequestType::SetDissolveTimestamp { .. }
+                | RequestType::ChangeAutoStakeMaturity { .. }
                 | RequestType::StartDissolve { .. }
                 | RequestType::StopDissolve { .. }
                 | RequestType::Disburse { .. }
@@ -123,96 +134,11 @@ impl RequestType {
                 | RequestType::RemoveHotKey { .. }
                 | RequestType::Spawn { .. }
                 | RequestType::MergeMaturity { .. }
+                | RequestType::RegisterVote { .. }
+                | RequestType::StakeMaturity { .. }
                 | RequestType::NeuronInfo { .. }
                 | RequestType::Follow { .. }
         )
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
-pub struct TransactionOperationResults {
-    pub operations: Vec<Operation>,
-}
-
-impl TransactionOperationResults {
-    /// Parse a TransactionOperationResults from a Json object.
-    pub fn parse(json: Object) -> Result<Self, ApiError> {
-        serde_json::from_value(serde_json::Value::Object(json)).map_err(|e| {
-            ApiError::internal_error(format!(
-                "Could not parse TransactionOperationResults from Object: {}",
-                e
-            ))
-        })
-    }
-
-    /// Convert TransactionResults to TransactionOperationResults.
-    pub fn from_transaction_results(
-        tr: TransactionResults,
-        token_name: &str,
-    ) -> Result<Self, ApiError> {
-        let mut operations = Request::requests_to_operations(
-            tr.operations
-                .iter()
-                .map(|rr| rr._type.clone())
-                .collect::<Vec<_>>()
-                .as_slice(),
-            token_name,
-        )?;
-
-        let merge_metadata = |o: &mut Operation, rr: &RequestResult| {
-            let mut metadata = o.metadata.take().unwrap_or_default();
-            let rrmd = convert_to_request_result_metadata(rr);
-            let rrmd = Object::from(rrmd);
-            for (k, v) in rrmd {
-                metadata.insert(k, v);
-            }
-            // Add optional response data (may contains content from client).
-            if let Some(data) = rr.response.clone() {
-                for (k, v) in data.into_iter() {
-                    metadata.insert(k, v);
-                }
-            }
-            o.metadata = if metadata.is_empty() {
-                None
-            } else {
-                Some(metadata)
-            };
-            o.status = Some(rr.status.name().to_owned());
-        };
-
-        let mut op_idx = 0;
-        for rr in tr.operations.iter() {
-            match (rr, &mut operations[op_idx..]) {
-                (
-                    RequestResult {
-                        _type: Request::Transfer(LedgerOperation::Transfer { .. }),
-                        ..
-                    },
-                    [withdraw, deposit, fee, ..],
-                ) if withdraw._type == OperationType::Transaction
-                    && deposit._type == OperationType::Transaction
-                    && fee._type == OperationType::Fee =>
-                {
-                    merge_metadata(withdraw, rr);
-                    merge_metadata(deposit, rr);
-                    merge_metadata(fee, rr);
-                    op_idx += 3;
-                }
-                (rr, [o, ..]) => {
-                    merge_metadata(o, rr);
-                    op_idx += 1
-                }
-                _ => {
-                    return Err(ApiError::internal_error(format!(
-                        "Too few Operations, could not match requests with operations.\n{}\n\n{}",
-                        serde_json::to_string(&tr.operations).unwrap(),
-                        serde_json::to_string(&operations).unwrap()
-                    )))
-                }
-            };
-        }
-
-        Ok(TransactionOperationResults { operations })
     }
 }
 
@@ -225,94 +151,11 @@ impl From<RequestResultMetadata> for Object {
     }
 }
 
-impl From<TransactionOperationResults> for Object {
-    fn from(d: TransactionOperationResults) -> Self {
-        match serde_json::to_value(d) {
-            Ok(Value::Object(o)) => o,
-            _ => Object::default(),
-        }
-    }
-}
-
-impl From<&TransactionOperationResults> for Object {
-    fn from(d: &TransactionOperationResults) -> Self {
-        match serde_json::to_value(d) {
-            Ok(Value::Object(o)) => o,
-            _ => Object::default(),
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
-pub struct TransactionResults {
-    pub operations: Vec<RequestResult>,
-}
-
-impl TransactionResults {
-    pub fn retriable(&self) -> bool {
-        self.operations
-            .iter()
-            .filter_map(|r| r.status.failed())
-            .all(|e| e.retriable())
-    }
-
-    pub fn last_block_index(&self) -> Option<BlockHeight> {
-        self.operations.iter().rev().find_map(|r| r.block_index)
-    }
-
-    pub fn last_transaction_id(&self) -> Option<&TransactionIdentifier> {
-        self.operations
-            .iter()
-            .rev()
-            .find_map(|r| r.transaction_identifier.as_ref())
-    }
-
-    /// Get the last failed Request error.
-    /// There should only be one, since `construction_submit` stops
-    /// when it encountered an error.
-    pub fn error(&self) -> Option<&ApiError> {
-        self.operations.iter().rev().find_map(|r| r.status.failed())
-    }
-}
-
-impl From<&TransactionResults> for Object {
-    fn from(d: &TransactionResults) -> Self {
-        match serde_json::to_value(d) {
-            Ok(Value::Object(o)) => o,
-            _ => Object::default(),
-        }
-    }
-}
-
-impl TryFrom<Object> for TransactionResults {
-    type Error = ApiError;
-    fn try_from(o: Object) -> Result<Self, ApiError> {
-        serde_json::from_value(serde_json::Value::Object(o)).map_err(|e| {
-            ApiError::internal_error(format!(
-                "Could not parse TransactionResults from Object: {}",
-                e
-            ))
-        })
-    }
-}
-
-impl From<Vec<RequestResult>> for TransactionResults {
-    fn from(operations: Vec<RequestResult>) -> Self {
-        Self { operations }
-    }
-}
-
-impl From<TransactionResults> for Vec<RequestResult> {
-    fn from(r: TransactionResults) -> Self {
-        r.operations
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 pub struct RequestResultMetadata {
     #[serde(skip_serializing_if = "Option::is_none")]
     #[serde(default)]
-    pub block_index: Option<BlockHeight>,
+    pub block_index: Option<BlockIndex>,
     #[serde(skip_serializing_if = "Option::is_none")]
     #[serde(default)]
     pub neuron_id: Option<u64>,
@@ -334,35 +177,6 @@ impl TryFrom<Option<Object>> for RequestResultMetadata {
             ))
         })
     }
-}
-
-pub fn convert_to_request_result_metadata(rr: &RequestResult) -> RequestResultMetadata {
-    RequestResultMetadata {
-        block_index: rr.block_index,
-        neuron_id: rr.neuron_id,
-        transaction_identifier: rr.transaction_identifier.clone(),
-        response: rr.status.failed().map(errors::convert_to_error),
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
-pub struct RequestResult {
-    #[serde(rename = "type")]
-    pub _type: Request,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    #[serde(default)]
-    pub block_index: Option<BlockHeight>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    #[serde(default)]
-    pub neuron_id: Option<u64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    #[serde(default)]
-    pub transaction_identifier: Option<TransactionIdentifier>,
-    #[serde(flatten)]
-    pub status: Status,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    #[serde(default)]
-    pub response: Option<Object>,
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
@@ -403,470 +217,9 @@ impl Status {
     }
 }
 
-/// A `Request` is the deserialized representation of an `Operation`,
-/// sans the `operation_identifier`, and `FEE` Operations.
-/// Multiple `Request`s can be converted to `Operation`s via the
-/// `TransactionBuilder`.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
-#[serde(tag = "type")]
-pub enum Request {
-    /// Contains `Send`, `Mint`, and `Burn` operations.
-    /// Attempting to serialize or deserialize any Mint, or Burn will error.
-    #[serde(rename = "TRANSACTION")]
-    #[serde(with = "send")]
-    Transfer(LedgerOperation),
-    #[serde(rename = "STAKE")]
-    Stake(Stake),
-    #[serde(rename = "SET_DISSOLVE_TIMESTAMP")]
-    SetDissolveTimestamp(SetDissolveTimestamp),
-    #[serde(rename = "START_DISSOLVE")]
-    StartDissolve(StartDissolve),
-    #[serde(rename = "STOP_DISSOLVE")]
-    StopDissolve(StopDissolve),
-    #[serde(rename = "DISBURSE")]
-    Disburse(Disburse),
-    #[serde(rename = "ADD_HOT_KEY")]
-    AddHotKey(AddHotKey),
-    #[serde(rename = "REMOVE_HOTKEY")]
-    RemoveHotKey(RemoveHotKey),
-    #[serde(rename = "SPAWN")]
-    Spawn(Spawn),
-    #[serde(rename = "MERGE_MATURITY")]
-    MergeMaturity(MergeMaturity),
-    #[serde(rename = "NEURON_INFO")]
-    NeuronInfo(NeuronInfo),
-    #[serde(rename = "FOLLOW")]
-    Follow(Follow),
-}
-
-impl Request {
-    pub fn request_type(&self) -> Result<RequestType, ApiError> {
-        match self {
-            Request::Stake(Stake { neuron_index, .. }) => Ok(RequestType::Stake {
-                neuron_index: *neuron_index,
-            }),
-            Request::SetDissolveTimestamp(SetDissolveTimestamp { neuron_index, .. }) => {
-                Ok(RequestType::SetDissolveTimestamp {
-                    neuron_index: *neuron_index,
-                })
-            }
-            Request::StartDissolve(StartDissolve { neuron_index, .. }) => {
-                Ok(RequestType::StartDissolve {
-                    neuron_index: *neuron_index,
-                })
-            }
-            Request::StopDissolve(StopDissolve { neuron_index, .. }) => {
-                Ok(RequestType::StopDissolve {
-                    neuron_index: *neuron_index,
-                })
-            }
-            Request::Disburse(Disburse { neuron_index, .. }) => Ok(RequestType::Disburse {
-                neuron_index: *neuron_index,
-            }),
-            Request::AddHotKey(AddHotKey { neuron_index, .. }) => Ok(RequestType::AddHotKey {
-                neuron_index: *neuron_index,
-            }),
-            Request::RemoveHotKey(RemoveHotKey { neuron_index, .. }) => {
-                Ok(RequestType::RemoveHotKey {
-                    neuron_index: *neuron_index,
-                })
-            }
-            Request::Transfer(LedgerOperation::Transfer { .. }) => Ok(RequestType::Send),
-            Request::Transfer(LedgerOperation::Burn { .. }) => Err(ApiError::invalid_request(
-                "Burn operations are not supported through rosetta",
-            )),
-            Request::Transfer(LedgerOperation::Mint { .. }) => Err(ApiError::invalid_request(
-                "Mint operations are not supported through rosetta",
-            )),
-            Request::Spawn(Spawn { neuron_index, .. }) => Ok(RequestType::Spawn {
-                neuron_index: *neuron_index,
-            }),
-            Request::MergeMaturity(MergeMaturity { neuron_index, .. }) => {
-                Ok(RequestType::MergeMaturity {
-                    neuron_index: *neuron_index,
-                })
-            }
-            Request::NeuronInfo(NeuronInfo {
-                neuron_index,
-                controller,
-                ..
-            }) => Ok(RequestType::NeuronInfo {
-                neuron_index: *neuron_index,
-                controller: controller.map(|pid| PublicKeyOrPrincipal::Principal(pid)),
-            }),
-            Request::Follow(Follow {
-                neuron_index,
-                controller,
-                ..
-            }) => Ok(RequestType::Follow {
-                neuron_index: *neuron_index,
-                controller: controller.map(|pid| PublicKeyOrPrincipal::Principal(pid)),
-            }),
-        }
-    }
-
-    /// Builds a Transaction from a sequence of `Request`s.
-    /// This is a thin wrapper over the `TransactionBuilder`.
-    ///
-    /// TODO We should capture the concept of a Transaction in a type.
-    pub fn requests_to_operations(
-        requests: &[Request],
-        token_name: &str,
-    ) -> Result<Vec<Operation>, ApiError> {
-        let mut builder = TransactionBuilder::default();
-        for request in requests {
-            match request {
-                Request::Transfer(o) => builder.transfer(o, token_name)?,
-                Request::Stake(o) => builder.stake(o),
-                Request::SetDissolveTimestamp(o) => builder.set_dissolve_timestamp(o),
-                Request::StartDissolve(o) => builder.start_dissolve(o),
-                Request::StopDissolve(o) => builder.stop_dissolve(o),
-                Request::Disburse(o) => builder.disburse(o, token_name),
-                Request::AddHotKey(o) => builder.add_hot_key(o),
-                Request::RemoveHotKey(o) => builder.remove_hotkey(o),
-                Request::Spawn(o) => builder.spawn(o),
-                Request::MergeMaturity(o) => builder.merge_maturity(o),
-                Request::NeuronInfo(o) => builder.neuron_info(o),
-                Request::Follow(o) => builder.follow(o),
-            };
-        }
-        Ok(builder.build())
-    }
-
-    pub fn is_transfer(&self) -> bool {
-        matches!(self, Request::Transfer(_))
-    }
-
-    pub fn is_neuron_management(&self) -> bool {
-        matches!(
-            self,
-            Request::Stake(_)
-                | Request::SetDissolveTimestamp(_)
-                | Request::StartDissolve(_)
-                | Request::StopDissolve(_)
-                | Request::Disburse(_)
-                | Request::AddHotKey(_)
-                | Request::RemoveHotKey(_)
-                | Request::Spawn(_)
-                | Request::MergeMaturity(_)
-                | Request::NeuronInfo(_) // not neuron management but we need it signed.
-                | Request::Follow(_)
-        )
-    }
-}
-
-/// Sort of the inverse of `construction_payloads`.
-impl TryFrom<&models::Request> for Request {
-    type Error = ApiError;
-
-    fn try_from(req: &models::Request) -> Result<Self, Self::Error> {
-        let (request_type, calls) = req;
-        let payload: &models::EnvelopePair = calls
-            .first()
-            .ok_or_else(|| ApiError::invalid_request("No request payload provided."))?;
-
-        let pid =
-            PrincipalId::try_from(payload.update_content().sender.clone().0).map_err(|e| {
-                ApiError::internal_error(format!(
-                    "Could not parse envelope sender's public key: {}",
-                    e
-                ))
-            })?;
-
-        let account = AccountIdentifier::from(pid);
-
-        let manage_neuron = || {
-            {
-                CandidOne::<ic_nns_governance::pb::v1::ManageNeuron>::from_bytes(
-                    payload.update_content().arg.0.clone(),
-                )
-                .map_err(|e| {
-                    ApiError::invalid_request(format!("Could not parse manage_neuron: {}", e))
-                })
-            }
-            .map(|m| m.0.command)
-        };
-
-        match request_type {
-            RequestType::Send => {
-                let ledger_canister::SendArgs {
-                    to, amount, fee, ..
-                } = convert::from_arg(payload.update_content().arg.0.clone())?;
-                Ok(Request::Transfer(LedgerOperation::Transfer {
-                    from: account,
-                    to,
-                    amount,
-                    fee,
-                }))
-            }
-            RequestType::Stake { neuron_index } => Ok(Request::Stake(Stake {
-                account,
-                neuron_index: *neuron_index,
-            })),
-            RequestType::SetDissolveTimestamp { neuron_index } => {
-                let command = manage_neuron()?;
-                if let Some(Command::Configure(Configure {
-                    operation:
-                        Some(configure::Operation::SetDissolveTimestamp(
-                            manage_neuron::SetDissolveTimestamp {
-                                dissolve_timestamp_seconds,
-                                ..
-                            },
-                        )),
-                })) = command
-                {
-                    Ok(Request::SetDissolveTimestamp(SetDissolveTimestamp {
-                        account,
-                        neuron_index: *neuron_index,
-                        timestamp: Seconds(dissolve_timestamp_seconds),
-                    }))
-                } else {
-                    Err(ApiError::invalid_request(
-                        "Request is missing set dissolve timestamp operation.",
-                    ))
-                }
-            }
-            RequestType::StartDissolve { neuron_index } => {
-                Ok(Request::StartDissolve(StartDissolve {
-                    account,
-                    neuron_index: *neuron_index,
-                }))
-            }
-            RequestType::StopDissolve { neuron_index } => Ok(Request::StopDissolve(StopDissolve {
-                account,
-                neuron_index: *neuron_index,
-            })),
-            RequestType::Disburse { neuron_index } => {
-                let command = manage_neuron()?;
-                if let Some(Command::Disburse(manage_neuron::Disburse { to_account, amount })) =
-                    command
-                {
-                    let recipient = if let Some(a) = to_account {
-                        Some((&a).try_into().map_err(|e| {
-                            ApiError::invalid_request(format!(
-                                "Could not parse recipient account identifier: {}",
-                                e
-                            ))
-                        })?)
-                    } else {
-                        None
-                    };
-
-                    Ok(Request::Disburse(Disburse {
-                        account,
-                        amount: amount.map(|amount| Tokens::from_e8s(amount.e8s)),
-                        recipient,
-                        neuron_index: *neuron_index,
-                    }))
-                } else {
-                    Err(ApiError::invalid_request("Request is missing recipient"))
-                }
-            }
-            RequestType::AddHotKey { neuron_index } => {
-                if let Some(Command::Configure(Configure {
-                    operation:
-                        Some(configure::Operation::AddHotKey(manage_neuron::AddHotKey {
-                            new_hot_key: Some(pid),
-                            ..
-                        })),
-                })) = manage_neuron()?
-                {
-                    Ok(Request::AddHotKey(AddHotKey {
-                        account,
-                        neuron_index: *neuron_index,
-                        key: PublicKeyOrPrincipal::Principal(pid),
-                    }))
-                } else {
-                    Err(ApiError::invalid_request("Request is missing set hotkey."))
-                }
-            }
-            RequestType::RemoveHotKey { neuron_index } => {
-                if let Some(Command::Configure(Configure {
-                    operation:
-                        Some(configure::Operation::RemoveHotKey(manage_neuron::RemoveHotKey {
-                            hot_key_to_remove: Some(pid),
-                            ..
-                        })),
-                })) = manage_neuron()?
-                {
-                    Ok(Request::RemoveHotKey(RemoveHotKey {
-                        account,
-                        neuron_index: *neuron_index,
-                        key: PublicKeyOrPrincipal::Principal(pid),
-                    }))
-                } else {
-                    Err(ApiError::invalid_request(
-                        "Request is missing hotkey to remove.",
-                    ))
-                }
-            }
-            RequestType::Spawn { neuron_index } => {
-                if let Some(Command::Spawn(manage_neuron::Spawn {
-                    new_controller,
-                    nonce,
-                    percentage_to_spawn,
-                })) = manage_neuron()?
-                {
-                    if let Some(spawned_neuron_index) = nonce {
-                        Ok(Request::Spawn(Spawn {
-                            account,
-                            spawned_neuron_index,
-                            controller: new_controller,
-                            percentage_to_spawn,
-                            neuron_index: *neuron_index,
-                        }))
-                    } else {
-                        Err(ApiError::invalid_request(
-                            "Spawned neuron index is required.",
-                        ))
-                    }
-                } else {
-                    Err(ApiError::invalid_request("Invalid spawn request."))
-                }
-            }
-            RequestType::MergeMaturity { neuron_index } => {
-                if let Some(Command::MergeMaturity(manage_neuron::MergeMaturity {
-                    percentage_to_merge,
-                })) = manage_neuron()?
-                {
-                    Ok(Request::MergeMaturity(MergeMaturity {
-                        account,
-                        percentage_to_merge,
-                        neuron_index: *neuron_index,
-                    }))
-                } else {
-                    Err(ApiError::invalid_request("Invalid merge maturity request."))
-                }
-            }
-            RequestType::NeuronInfo {
-                neuron_index,
-                controller,
-                ..
-            } => {
-                match controller
-                    .clone()
-                    .map(|pkp| principal_id_from_public_key_or_principal(pkp))
-                {
-                    None => Ok(Request::NeuronInfo(NeuronInfo {
-                        account,
-                        controller: None,
-                        neuron_index: *neuron_index,
-                    })),
-                    Some(Ok(pid)) => Ok(Request::NeuronInfo(NeuronInfo {
-                        account,
-                        controller: Some(pid),
-                        neuron_index: *neuron_index,
-                    })),
-                    Some(Err(e)) => Err(e),
-                }
-            }
-            RequestType::Follow {
-                neuron_index,
-                controller,
-            } => {
-                if let Some(Command::Follow(manage_neuron::Follow { topic, followees })) =
-                    manage_neuron()?
-                {
-                    let ids = followees.iter().map(|n| n.id).collect();
-                    match controller
-                        .clone()
-                        .map(|pkp| principal_id_from_public_key_or_principal(pkp))
-                    {
-                        None => Ok(Request::Follow(Follow {
-                            account,
-                            topic,
-                            followees: ids,
-                            controller: None,
-                            neuron_index: *neuron_index,
-                        })),
-                        Some(Ok(pid)) => Ok(Request::Follow(Follow {
-                            account,
-                            topic,
-                            followees: ids,
-                            controller: Some(pid),
-                            neuron_index: *neuron_index,
-                        })),
-                        Some(Err(e)) => Err(e),
-                    }
-                } else {
-                    Err(ApiError::invalid_request("Invalid follow request."))
-                }
-            }
-        }
-    }
-}
-
-/// A helper for serializing `TransactionResults`
-mod send {
-    use super::*;
-
-    pub fn deserialize<'d, D: Deserializer<'d>>(d: D) -> Result<LedgerOperation, D::Error> {
-        Send::deserialize(d)
-            .map(LedgerOperation::from)
-            .map_err(D::Error::from)
-    }
-
-    pub fn serialize<S: Serializer>(t: &LedgerOperation, s: S) -> Result<S::Ok, S::Error> {
-        Send::try_from(t)
-            .map_err(serde::ser::Error::custom)
-            .and_then(|t| t.serialize(s))
-    }
-
-    #[derive(Copy, Clone, Deserialize, Serialize)]
-    struct Send {
-        from: AccountIdentifier,
-        to: AccountIdentifier,
-        amount: Tokens,
-        fee: Tokens,
-    }
-
-    impl TryFrom<&LedgerOperation> for Send {
-        type Error = String;
-
-        fn try_from(transfer: &LedgerOperation) -> Result<Self, String> {
-            match *transfer {
-                LedgerOperation::Transfer {
-                    from,
-                    to,
-                    amount,
-                    fee,
-                } => Ok(Send {
-                    from,
-                    to,
-                    amount,
-                    fee,
-                }),
-                LedgerOperation::Burn { .. } => {
-                    Err("Burn operations are not supported through rosetta".to_owned())
-                }
-                LedgerOperation::Mint { .. } => {
-                    Err("Mint operations are not supported through rosetta".to_owned())
-                }
-            }
-        }
-    }
-
-    impl From<Send> for LedgerOperation {
-        fn from(s: Send) -> Self {
-            let Send {
-                from,
-                to,
-                amount,
-                fee,
-            } = s;
-            LedgerOperation::Transfer {
-                from,
-                to,
-                amount,
-                fee,
-            }
-        }
-    }
-}
-
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 pub struct SetDissolveTimestamp {
-    pub account: ledger_canister::AccountIdentifier,
+    pub account: icp_ledger::AccountIdentifier,
     #[serde(default)]
     pub neuron_index: u64,
     /// The number of seconds since Unix epoch.
@@ -874,36 +227,44 @@ pub struct SetDissolveTimestamp {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+pub struct ChangeAutoStakeMaturity {
+    pub account: icp_ledger::AccountIdentifier,
+    #[serde(default)]
+    pub neuron_index: u64,
+    pub requested_setting_for_auto_stake_maturity: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 pub struct StartDissolve {
-    pub account: ledger_canister::AccountIdentifier,
+    pub account: icp_ledger::AccountIdentifier,
     pub neuron_index: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 pub struct StopDissolve {
-    pub account: ledger_canister::AccountIdentifier,
+    pub account: icp_ledger::AccountIdentifier,
     #[serde(default)]
     pub neuron_index: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 pub struct Stake {
-    pub account: ledger_canister::AccountIdentifier,
+    pub account: icp_ledger::AccountIdentifier,
     #[serde(default)]
     pub neuron_index: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 pub struct Disburse {
-    pub account: ledger_canister::AccountIdentifier,
+    pub account: icp_ledger::AccountIdentifier,
     pub amount: Option<Tokens>,
-    pub recipient: Option<ledger_canister::AccountIdentifier>,
+    pub recipient: Option<icp_ledger::AccountIdentifier>,
     pub neuron_index: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Deserialize, Serialize)]
 pub struct AddHotKey {
-    pub account: ledger_canister::AccountIdentifier,
+    pub account: icp_ledger::AccountIdentifier,
     #[serde(default)]
     pub neuron_index: u64,
     pub key: PublicKeyOrPrincipal,
@@ -911,7 +272,7 @@ pub struct AddHotKey {
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Deserialize, Serialize)]
 pub struct RemoveHotKey {
-    pub account: ledger_canister::AccountIdentifier,
+    pub account: icp_ledger::AccountIdentifier,
     #[serde(default)]
     pub neuron_index: u64,
     pub key: PublicKeyOrPrincipal,
@@ -919,7 +280,7 @@ pub struct RemoveHotKey {
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 pub struct Spawn {
-    pub account: ledger_canister::AccountIdentifier,
+    pub account: icp_ledger::AccountIdentifier,
     pub spawned_neuron_index: u64,
     pub controller: Option<PrincipalId>,
     pub percentage_to_spawn: Option<u32>,
@@ -929,15 +290,32 @@ pub struct Spawn {
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 pub struct MergeMaturity {
-    pub account: ledger_canister::AccountIdentifier,
+    pub account: icp_ledger::AccountIdentifier,
     pub percentage_to_merge: u32,
     #[serde(default)]
     pub neuron_index: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+pub struct RegisterVote {
+    pub account: icp_ledger::AccountIdentifier,
+    pub proposal: Option<u64>,
+    pub vote: i32,
+    #[serde(default)]
+    pub neuron_index: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+pub struct StakeMaturity {
+    pub account: icp_ledger::AccountIdentifier,
+    pub percentage_to_stake: Option<u32>,
+    #[serde(default)]
+    pub neuron_index: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 pub struct NeuronInfo {
-    pub account: ledger_canister::AccountIdentifier,
+    pub account: icp_ledger::AccountIdentifier,
     pub controller: Option<PrincipalId>,
     #[serde(default)]
     pub neuron_index: u64,
@@ -945,7 +323,7 @@ pub struct NeuronInfo {
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 pub struct Follow {
-    pub account: ledger_canister::AccountIdentifier,
+    pub account: icp_ledger::AccountIdentifier,
     pub topic: i32,
     pub followees: Vec<u64>,
     pub controller: Option<PrincipalId>,
@@ -955,6 +333,7 @@ pub struct Follow {
 
 #[derive(Debug, Clone, Eq, PartialOrd, Ord, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
+// Externally tagged by default.
 pub enum PublicKeyOrPrincipal {
     PublicKey(models::PublicKey),
     Principal(PrincipalId),
@@ -992,6 +371,35 @@ pub struct SetDissolveTimestampMetadata {
     pub timestamp: Seconds,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+pub struct ChangeAutoStakeMaturityMetadata {
+    #[serde(default)]
+    pub neuron_index: u64,
+    #[serde(rename = "set_auto_stake_maturity")]
+    pub requested_setting_for_auto_stake_maturity: bool,
+}
+
+impl From<ChangeAutoStakeMaturityMetadata> for Object {
+    fn from(m: ChangeAutoStakeMaturityMetadata) -> Self {
+        match serde_json::to_value(m) {
+            Ok(Value::Object(o)) => o,
+            _ => unreachable!(),
+        }
+    }
+}
+
+impl TryFrom<Option<Object>> for ChangeAutoStakeMaturityMetadata {
+    type Error = ApiError;
+    fn try_from(o: Option<Object>) -> Result<Self, Self::Error> {
+        serde_json::from_value(serde_json::Value::Object(o.unwrap_or_default())).map_err(|e| {
+            ApiError::internal_error(format!(
+                "Could not parse a `neuron_index` from metadata JSON object: {}",
+                e
+            ))
+        })
+    }
+}
+
 impl From<SetDissolveTimestampMetadata> for Object {
     fn from(m: SetDissolveTimestampMetadata) -> Self {
         match serde_json::to_value(m) {
@@ -1003,7 +411,6 @@ impl From<SetDissolveTimestampMetadata> for Object {
 
 impl TryFrom<Option<Object>> for SetDissolveTimestampMetadata {
     type Error = ApiError;
-
     fn try_from(o: Option<Object>) -> Result<Self, Self::Error> {
         serde_json::from_value(serde_json::Value::Object(o.unwrap_or_default())).map_err(|e| {
             ApiError::internal_error(format!(
@@ -1029,7 +436,6 @@ pub struct NeuronIdentifierMetadata {
 
 impl TryFrom<Option<Object>> for NeuronIdentifierMetadata {
     type Error = ApiError;
-
     fn try_from(o: Option<Object>) -> Result<Self, Self::Error> {
         serde_json::from_value(serde_json::Value::Object(o.unwrap_or_default())).map_err(|e| {
             ApiError::internal_error(format!(
@@ -1158,7 +564,7 @@ pub struct SpawnMetadata {
 
     #[serde(default)]
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub controller: Option<PrincipalId>,
+    pub controller: Option<PublicKeyOrPrincipal>,
 
     #[serde(default)]
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1191,6 +597,35 @@ impl From<SpawnMetadata> for Object {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Deserialize, Serialize)]
+pub struct RegisterVoteMetadata {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub proposal: Option<u64>,
+    pub vote: i32,
+    pub neuron_index: u64,
+}
+
+impl TryFrom<Option<Object>> for RegisterVoteMetadata {
+    type Error = ApiError;
+    fn try_from(o: Option<Object>) -> Result<Self, Self::Error> {
+        serde_json::from_value(serde_json::Value::Object(o.unwrap_or_default())).map_err(|e| {
+            ApiError::internal_error(format!(
+                "Could not parse REGISTER_VOTE operation metadata from metadata JSON object: {}",
+                e
+            ))
+        })
+    }
+}
+
+impl From<RegisterVoteMetadata> for Object {
+    fn from(m: RegisterVoteMetadata) -> Self {
+        match serde_json::to_value(m) {
+            Ok(Value::Object(o)) => o,
+            _ => unreachable!(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Deserialize, Serialize)]
 pub struct MergeMaturityMetadata {
     #[serde(default)]
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1201,11 +636,10 @@ pub struct MergeMaturityMetadata {
 
 impl TryFrom<Option<Object>> for MergeMaturityMetadata {
     type Error = ApiError;
-
     fn try_from(o: Option<Object>) -> Result<Self, Self::Error> {
         serde_json::from_value(serde_json::Value::Object(o.unwrap_or_default())).map_err(|e| {
             ApiError::internal_error(format!(
-                "Could not parse a `neuron_index` from metadata JSON object: {}",
+                "Could not parse MERGE_MATURITY operation metadata from metadata JSON object: {}",
                 e
             ))
         })
@@ -1220,12 +654,50 @@ impl From<MergeMaturityMetadata> for Object {
         }
     }
 }
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Deserialize, Serialize)]
+pub struct StakeMaturityMetadata {
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub percentage_to_stake: Option<u32>,
+    #[serde(default)]
+    pub neuron_index: u64,
+}
+
+impl TryFrom<Option<Object>> for StakeMaturityMetadata {
+    type Error = ApiError;
+    fn try_from(o: Option<Object>) -> Result<Self, Self::Error> {
+        serde_json::from_value(serde_json::Value::Object(o.unwrap_or_default())).map_err(|e| {
+            ApiError::internal_error(format!(
+                "Could not parse STAKE_MATURITY operation metadata from metadata JSON object: {}",
+                e
+            ))
+        })
+    }
+}
+
+impl From<StakeMaturityMetadata> for Object {
+    fn from(m: StakeMaturityMetadata) -> Self {
+        match serde_json::to_value(m) {
+            Ok(Value::Object(o)) => o,
+            _ => unreachable!(),
+        }
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Deserialize, Serialize)]
 pub struct NeuronInfoMetadata {
-    pub controller: Option<PrincipalId>,
+    pub controller: Option<PublicKeyOrPrincipal>,
     #[serde(default)]
     pub neuron_index: u64,
+}
+
+impl From<PublicKeyOrPrincipal> for Object {
+    fn from(p: PublicKeyOrPrincipal) -> Self {
+        match serde_json::to_value(p) {
+            Ok(Value::Object(o)) => o,
+            _ => unreachable!(),
+        }
+    }
 }
 
 impl TryFrom<Option<Object>> for NeuronInfoMetadata {
@@ -1233,11 +705,63 @@ impl TryFrom<Option<Object>> for NeuronInfoMetadata {
     fn try_from(o: Option<Object>) -> Result<Self, Self::Error> {
         serde_json::from_value(serde_json::Value::Object(o.unwrap_or_default())).map_err(|e| {
             ApiError::internal_error(format!(
-                "Could not parse a `neuron_index` from metadata JSON object: {}",
+                "Could not parse NEURON_INFO operation metadata from metadata JSON object: {}",
                 e
             ))
         })
     }
+}
+
+#[test]
+fn test_parse_neuron_info_metadata_public_key() {
+    let m1 = r#"
+            {
+                "controller": {
+                    "public_key": {
+                        "hex_bytes": "ba5242d02642aede88a5f9fe82482a9fd0b6dc25f38c729253116c6865384a9d",
+                        "curve_type": "edwards25519"
+                     }
+                },
+                "neuron_index": 123456
+            }
+        "#;
+    let m1: NeuronInfoMetadata = serde_json::from_str(m1).unwrap();
+    assert_eq!(
+        m1,
+        NeuronInfoMetadata {
+            neuron_index: 123456,
+            controller: Some(PublicKeyOrPrincipal::PublicKey(models::PublicKey::new(
+                "ba5242d02642aede88a5f9fe82482a9fd0b6dc25f38c729253116c6865384a9d"
+                    .parse()
+                    .unwrap(),
+                models::CurveType::Edwards25519
+            )))
+        }
+    );
+}
+
+#[test]
+fn test_parse_neuron_info_metadata_principal() {
+    use std::str::FromStr;
+    let m1 = r#"
+            {
+                "controller": {
+                    "principal": "4auul-2ca7l-khhsk-dcyds-qnj57-cc3ko-h3j6b-jcszz-nsjn4-ab2zb-oqe"
+                },
+                "neuron_index": 123456
+            }
+        "#;
+    let m1: NeuronInfoMetadata = serde_json::from_str(m1).unwrap();
+    let pid =
+        PrincipalId::from_str("4auul-2ca7l-khhsk-dcyds-qnj57-cc3ko-h3j6b-jcszz-nsjn4-ab2zb-oqe")
+            .expect("Invalid PrincipalId");
+    assert_eq!(
+        m1,
+        NeuronInfoMetadata {
+            neuron_index: 123456,
+            controller: Some(PublicKeyOrPrincipal::Principal(pid))
+        }
+    );
 }
 
 impl From<NeuronInfoMetadata> for Object {
@@ -1253,7 +777,7 @@ impl From<NeuronInfoMetadata> for Object {
 pub struct FollowMetadata {
     pub topic: i32,
     pub followees: Vec<u64>,
-    pub controller: Option<PrincipalId>,
+    pub controller: Option<PublicKeyOrPrincipal>,
     #[serde(default)]
     pub neuron_index: u64,
 }
@@ -1263,7 +787,7 @@ impl TryFrom<Option<Object>> for FollowMetadata {
     fn try_from(o: Option<Object>) -> Result<Self, Self::Error> {
         serde_json::from_value(serde_json::Value::Object(o.unwrap_or_default())).map_err(|e| {
             ApiError::internal_error(format!(
-                "Could not parse a `neuron_index` from metadata JSON object: {}",
+                "Could not parse a FOLLOW operation metadata from metadata JSON object: {}",
                 e
             ))
         })
@@ -1311,75 +835,51 @@ impl TransactionBuilder {
         operation: &LedgerOperation,
         token_name: &str,
     ) -> Result<(), ApiError> {
+        let mut push_op = |_type: OperationType, account: &AccountIdentifier, amount: i128| {
+            let operation_identifier = self.allocate_op_id();
+            self.ops.push(Operation {
+                operation_identifier,
+                _type,
+                status: None,
+                account: Some(to_model_account_identifier(account)),
+                amount: Some(signed_amount(amount, token_name)),
+                related_operations: None,
+                coin_change: None,
+                metadata: None,
+            });
+        };
+
         match operation {
             LedgerOperation::Burn { from, amount } => {
-                let operation_identifier = self.allocate_op_id();
-                self.ops.push(Operation {
-                    operation_identifier,
-                    _type: OperationType::Burn,
-                    status: None,
-                    account: Some(to_model_account_identifier(from)),
-                    amount: Some(signed_amount(-i128::from(amount.get_e8s()), token_name)),
-                    related_operations: None,
-                    coin_change: None,
-                    metadata: None,
-                });
+                push_op(OperationType::Burn, from, -i128::from(amount.get_e8s()));
             }
             LedgerOperation::Mint { to, amount } => {
-                let operation_identifier = self.allocate_op_id();
-                self.ops.push(Operation {
-                    operation_identifier,
-                    _type: OperationType::Mint,
-                    status: None,
-                    account: Some(to_model_account_identifier(to)),
-                    amount: Some(amount_(*amount, token_name)?),
-                    related_operations: None,
-                    coin_change: None,
-                    metadata: None,
-                });
+                push_op(OperationType::Mint, to, i128::from(amount.get_e8s()));
+            }
+            LedgerOperation::Approve {
+                from, spender, fee, ..
+            } => {
+                push_op(OperationType::Transaction, from, 0);
+                push_op(OperationType::Transaction, spender, 0);
+                push_op(OperationType::Fee, from, -i128::from(fee.get_e8s()));
             }
             LedgerOperation::Transfer {
                 from,
                 to,
                 amount,
                 fee,
+            }
+            | LedgerOperation::TransferFrom {
+                from,
+                to,
+                amount,
+                fee,
+                ..
             } => {
-                let from_account = Some(to_model_account_identifier(from));
                 let amount = i128::from(amount.get_e8s());
-
-                let operation_identifier = self.allocate_op_id();
-                self.ops.push(Operation {
-                    operation_identifier,
-                    _type: OperationType::Transaction,
-                    status: None,
-                    account: from_account.clone(),
-                    amount: Some(signed_amount(-amount, token_name)),
-                    related_operations: None,
-                    coin_change: None,
-                    metadata: None,
-                });
-                let operation_identifier = self.allocate_op_id();
-                self.ops.push(Operation {
-                    operation_identifier,
-                    _type: OperationType::Transaction,
-                    status: None,
-                    account: Some(to_model_account_identifier(to)),
-                    amount: Some(signed_amount(amount, token_name)),
-                    related_operations: None,
-                    coin_change: None,
-                    metadata: None,
-                });
-                let operation_identifier = self.allocate_op_id();
-                self.ops.push(Operation {
-                    operation_identifier,
-                    _type: OperationType::Fee,
-                    status: None,
-                    account: from_account,
-                    amount: Some(signed_amount(-(fee.get_e8s() as i128), token_name)),
-                    related_operations: None,
-                    coin_change: None,
-                    metadata: None,
-                });
+                push_op(OperationType::Transaction, from, -amount);
+                push_op(OperationType::Transaction, to, amount);
+                push_op(OperationType::Fee, from, -i128::from(fee.get_e8s()));
             }
         };
         Ok(())
@@ -1427,6 +927,35 @@ impl TransactionBuilder {
                 SetDissolveTimestampMetadata {
                     neuron_index: *neuron_index,
                     timestamp: *timestamp,
+                }
+                .into(),
+            ),
+        });
+    }
+
+    pub fn change_auto_stake_maturity(
+        &mut self,
+        setting_for_auto_stake_maturity: &ChangeAutoStakeMaturity,
+    ) {
+        let ChangeAutoStakeMaturity {
+            account,
+            neuron_index,
+            requested_setting_for_auto_stake_maturity,
+        } = setting_for_auto_stake_maturity;
+        let operation_identifier = self.allocate_op_id();
+        self.ops.push(Operation {
+            operation_identifier,
+            _type: OperationType::ChangeAutoStakeMaturity,
+            status: None,
+            account: Some(to_model_account_identifier(account)),
+            amount: None,
+            related_operations: None,
+            coin_change: None,
+            metadata: Some(
+                ChangeAutoStakeMaturityMetadata {
+                    neuron_index: *neuron_index,
+                    requested_setting_for_auto_stake_maturity:
+                        *requested_setting_for_auto_stake_maturity,
                 }
                 .into(),
             ),
@@ -1492,7 +1021,8 @@ impl TransactionBuilder {
             _type: OperationType::Disburse,
             status: None,
             account: Some(to_model_account_identifier(account)),
-            amount: amount.map(|a| amount_(a, token_name).expect("failed to convert amount")),
+            amount: amount
+                .map(|a| tokens_to_amount(a, token_name).expect("failed to convert amount")),
             related_operations: None,
             coin_change: None,
             metadata: Some(
@@ -1571,10 +1101,37 @@ impl TransactionBuilder {
             coin_change: None,
             metadata: Some(
                 SpawnMetadata {
-                    controller: *controller,
+                    controller: controller.map(PublicKeyOrPrincipal::Principal),
                     neuron_index: *neuron_index,
                     percentage_to_spawn: *percentage_to_spawn,
                     spawned_neuron_index: *spawned_neuron_index,
+                }
+                .into(),
+            ),
+        });
+    }
+
+    pub fn register_vote(&mut self, register_vote: &RegisterVote) {
+        let RegisterVote {
+            account,
+            proposal,
+            vote,
+            neuron_index,
+        } = register_vote;
+        let operation_identifier = self.allocate_op_id();
+        self.ops.push(Operation {
+            operation_identifier,
+            _type: OperationType::RegisterVote,
+            status: None,
+            account: Some(to_model_account_identifier(account)),
+            amount: None,
+            related_operations: None,
+            coin_change: None,
+            metadata: Some(
+                RegisterVoteMetadata {
+                    proposal: *proposal,
+                    vote: *vote,
+                    neuron_index: *neuron_index,
                 }
                 .into(),
             ),
@@ -1606,6 +1163,31 @@ impl TransactionBuilder {
         });
     }
 
+    pub fn stake_maturity(&mut self, stake: &StakeMaturity) {
+        let StakeMaturity {
+            account,
+            percentage_to_stake,
+            neuron_index,
+        } = stake;
+        let operation_identifier = self.allocate_op_id();
+        self.ops.push(Operation {
+            operation_identifier,
+            _type: OperationType::StakeMaturity,
+            status: None,
+            account: Some(to_model_account_identifier(account)),
+            amount: None,
+            related_operations: None,
+            coin_change: None,
+            metadata: Some(
+                StakeMaturityMetadata {
+                    percentage_to_stake: *percentage_to_stake,
+                    neuron_index: *neuron_index,
+                }
+                .into(),
+            ),
+        });
+    }
+
     pub fn neuron_info(&mut self, req: &NeuronInfo) {
         let NeuronInfo {
             account,
@@ -1623,7 +1205,7 @@ impl TransactionBuilder {
             coin_change: None,
             metadata: Some(
                 NeuronInfoMetadata {
-                    controller: *controller,
+                    controller: pkp_from_principal(controller),
                     neuron_index: *neuron_index,
                 }
                 .into(),
@@ -1652,11 +1234,16 @@ impl TransactionBuilder {
                 FollowMetadata {
                     topic: *topic,
                     followees: followees.clone(),
-                    controller: *controller,
+                    controller: pkp_from_principal(controller),
                     neuron_index: *neuron_index,
                 }
                 .into(),
             ),
         });
     }
+}
+
+/// Converts an optional PrincipalId to an optional PublicKeyOrPrincipal.
+fn pkp_from_principal(pid: &Option<PrincipalId>) -> Option<PublicKeyOrPrincipal> {
+    pid.as_ref().map(|p| PublicKeyOrPrincipal::Principal(*p))
 }

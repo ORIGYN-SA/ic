@@ -2,13 +2,15 @@
 //! Internet Computer.
 mod errors;
 
-pub use errors::{ParityWasmError, WasmEngineError, WasmInstrumentationError, WasmValidationError};
+pub use errors::{WasmEngineError, WasmError, WasmInstrumentationError, WasmValidationError};
 use ic_utils::byte_slice_fmt::truncate_and_format;
 use std::{
     fmt,
     path::{Path, PathBuf},
     sync::Arc,
 };
+
+const WASM_HASH_LENGTH: usize = 32;
 
 /// A newtype for
 /// [BinaryEncoded](https://github.com/WebAssembly/design/blob/master/BinaryEncoding.md)
@@ -42,7 +44,7 @@ pub struct CanisterModule {
     // The Wasm binary.
     module: ModuleStorage,
     // The Sha256 hash of the binary.
-    module_hash: [u8; 32],
+    module_hash: [u8; WASM_HASH_LENGTH],
 }
 
 impl CanisterModule {
@@ -55,9 +57,12 @@ impl CanisterModule {
         }
     }
 
-    pub fn new_from_file(path: PathBuf) -> std::io::Result<Self> {
+    pub fn new_from_file(path: PathBuf, module_hash: Option<WasmHash>) -> std::io::Result<Self> {
         let module = ModuleStorage::mmap_file(path)?;
-        let module_hash = ic_crypto_sha::Sha256::hash(module.as_slice());
+        // It should only be necessary to compute the hash here when
+        // loading checkpoints written by older replica versions
+        let module_hash =
+            module_hash.map_or_else(|| ic_crypto_sha::Sha256::hash(module.as_slice()), |h| h.0);
         Ok(Self {
             module,
             module_hash,
@@ -92,7 +97,7 @@ impl CanisterModule {
     }
 
     /// Returns the Sha256 hash of this Wasm module.
-    pub fn module_hash(&self) -> [u8; 32] {
+    pub fn module_hash(&self) -> [u8; WASM_HASH_LENGTH] {
         self.module_hash
     }
 }
@@ -117,6 +122,28 @@ impl Eq for CanisterModule {}
 impl std::hash::Hash for CanisterModule {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
         self.as_slice().hash(state)
+    }
+}
+
+/// The hash of an __uninstrumented__ canister wasm.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct WasmHash([u8; WASM_HASH_LENGTH]);
+
+impl WasmHash {
+    pub fn to_vec(&self) -> Vec<u8> {
+        self.0.to_vec()
+    }
+}
+
+impl From<&CanisterModule> for WasmHash {
+    fn from(item: &CanisterModule) -> Self {
+        Self(item.module_hash())
+    }
+}
+
+impl From<[u8; WASM_HASH_LENGTH]> for WasmHash {
+    fn from(item: [u8; WASM_HASH_LENGTH]) -> Self {
+        Self(item)
     }
 }
 

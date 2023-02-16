@@ -1,26 +1,61 @@
 //! Tests for multisignatures
 
 use crate::{
-    api, crypto as multi_crypto, test_utils as multi_test_utils, types as multi_types,
-    types::arbitrary,
+    api, crypto as multi_crypto, types as multi_types, types::arbitrary, types::CombinedSignature,
+    types::IndividualSignature, types::PublicKey, types::SecretKey,
 };
-use ic_crypto_internal_bls12381_common as bls;
-use ic_crypto_internal_test_vectors::unhex::hex_to_48_bytes;
+use ic_crypto_internal_bls12_381_type::G1Projective;
+
+fn check_single_point_signature_verifies(
+    secret_key: &SecretKey,
+    public_key: &PublicKey,
+    point: &G1Projective,
+) {
+    let signature = multi_crypto::sign_point(point, secret_key);
+    assert!(multi_crypto::verify_point(point, &signature, public_key));
+}
+
+fn check_individual_multi_signature_contribution_verifies(
+    secret_key: &SecretKey,
+    public_key: &PublicKey,
+    message: &[u8],
+) {
+    let signature = multi_crypto::sign_message(message, secret_key);
+    assert!(multi_crypto::verify_individual_message_signature(
+        message, &signature, public_key
+    ));
+}
+
+fn check_multi_signature_verifies(keys: &[(SecretKey, PublicKey)], message: &[u8]) {
+    let signatures: Vec<IndividualSignature> = keys
+        .iter()
+        .map(|(secret_key, _)| multi_crypto::sign_message(message, secret_key))
+        .collect();
+    let signature: CombinedSignature = multi_crypto::combine_signatures(&signatures);
+    let public_keys: Vec<PublicKey> = keys
+        .iter()
+        .map(|(_, public_key)| public_key)
+        .cloned()
+        .collect();
+    assert!(multi_crypto::verify_combined_message_signature(
+        message,
+        &signature,
+        &public_keys
+    ));
+}
 
 /// This checks that the output of operations is stable.
 mod stability {
     use super::*;
     use crate::types::PublicKeyBytes;
+    use rand::SeedableRng;
     use rand_chacha::ChaCha20Rng;
-    use rand_core::SeedableRng;
 
     #[test]
     fn message_to_g1() {
         assert_eq!(
-            bls::g1_to_bytes(&multi_crypto::hash_message_to_g1(b"abc"))[..],
-            hex_to_48_bytes(
-                "a13964470939e806ca5ca96b348ab13af3f06a7d9dc4e8a0cf20d8a81a6d8f5a692c67424228d45d749e7832d27cea79"
-            )[..]
+            hex::encode(multi_crypto::hash_message_to_g1(b"abc").serialize()),
+            "a13964470939e806ca5ca96b348ab13af3f06a7d9dc4e8a0cf20d8a81a6d8f5a692c67424228d45d749e7832d27cea79"
         );
     }
     #[test]
@@ -29,10 +64,8 @@ mod stability {
         let (_secret_key, public_key) = multi_crypto::keypair_from_rng(&mut csprng);
         let public_key_bytes = PublicKeyBytes::from(public_key);
         assert_eq!(
-            bls::g1_to_bytes(&multi_crypto::hash_public_key_to_g1(&public_key_bytes.0[..]))[..],
-            hex_to_48_bytes(
-                "8b6db127df1bdc6e0a78c7b1e9539d9c7720cf10f07c5f408d06ad8000538f556f546949c94329a0164fbdc5d8eb1d33"
-            )[..]
+            hex::encode(multi_crypto::hash_public_key_to_g1(&public_key_bytes.0[..]).serialize()),
+            "b02fd0d54faab7498924d7e230f84b00519ea7f3846cd30f82b149c1f172ad79ee68adb2ea2fc8a2d40ffdf3fd5df02a"
         );
     }
 }
@@ -40,11 +73,10 @@ mod stability {
 mod basic_functionality {
     use super::*;
     use crate::types::PublicKeyBytes;
-    use ic_crypto_internal_bls12381_common::g1_to_bytes;
     use proptest::prelude::*;
     use proptest::std_facade::HashSet;
+    use rand::SeedableRng;
     use rand_chacha::ChaCha20Rng;
-    use rand_core::SeedableRng;
 
     // Slow tests
     proptest! {
@@ -73,7 +105,7 @@ mod basic_functionality {
         let points: HashSet<_> = (0..number_of_messages as u32)
             .map(|number| {
                 let g1 = multi_crypto::hash_message_to_g1(&number.to_be_bytes()[..]);
-                let bytes = g1_to_bytes(&g1);
+                let bytes = g1.serialize();
                 // It suffices to prove that the first 32 bytes are distinct.  More requires a
                 // custom hash implementation.
                 let mut hashable = [0u8; 32];
@@ -94,7 +126,7 @@ mod basic_functionality {
                 let (_secret_key, public_key) = multi_crypto::keypair_from_rng(&mut csprng);
                 let public_key_bytes = PublicKeyBytes::from(public_key);
                 let g1 = multi_crypto::hash_public_key_to_g1(&public_key_bytes.0[..]);
-                let bytes = g1_to_bytes(&g1);
+                let bytes = g1.serialize();
                 // It suffices to prove that the first 32 bytes are distinct.  More requires a
                 // custom hash implementation.
                 let mut hashable = [0u8; 32];
@@ -109,7 +141,7 @@ mod basic_functionality {
 mod advanced_functionality {
     use super::*;
     use crate::types::{PopBytes, PublicKeyBytes};
-    use ic_crypto_internal_types::curves::bls12_381::G2;
+    use ic_crypto_internal_types::curves::bls12_381::G2Bytes;
     use proptest::prelude::*;
 
     #[test]
@@ -124,30 +156,28 @@ mod advanced_functionality {
     fn single_point_signature_verifies() {
         let (secret_key, public_key) = multi_crypto::keypair_from_seed([1, 2, 3, 4]);
         let point = multi_crypto::hash_message_to_g1(b"abba");
-        multi_test_utils::single_point_signature_verifies(secret_key, public_key, point);
+        check_single_point_signature_verifies(&secret_key, &public_key, &point);
     }
 
     #[test]
     fn individual_multi_signature_contribution_verifies() {
         let (secret_key, public_key) = multi_crypto::keypair_from_seed([1, 2, 3, 4]);
-        multi_test_utils::individual_multi_signature_contribution_verifies(
-            secret_key, public_key, b"abba",
-        );
+        check_individual_multi_signature_contribution_verifies(&secret_key, &public_key, b"abba");
     }
     #[test]
     fn pop_verifies() {
         let (secret_key, public_key) = multi_crypto::keypair_from_seed([1, 2, 3, 4]);
-        let pop = multi_crypto::create_pop(public_key, secret_key);
-        assert!(multi_crypto::verify_pop(pop, public_key));
+        let pop = multi_crypto::create_pop(&public_key, &secret_key);
+        assert!(multi_crypto::verify_pop(&pop, &public_key));
     }
 
     #[test]
     fn verify_pop_throws_error_on_public_key_bytes_with_unset_compressed_flag() {
         let (secret_key, public_key) = multi_crypto::keypair_from_seed([1, 2, 3, 4]);
-        let pop = multi_crypto::create_pop(public_key, secret_key);
+        let pop = multi_crypto::create_pop(&public_key, &secret_key);
         let pop_bytes = PopBytes::from(pop);
         let mut public_key_bytes = PublicKeyBytes::from(public_key);
-        public_key_bytes.0[G2::FLAG_BYTE_OFFSET] &= !G2::COMPRESSED_FLAG;
+        public_key_bytes.0[G2Bytes::FLAG_BYTE_OFFSET] &= !G2Bytes::COMPRESSED_FLAG;
         match api::verify_pop(pop_bytes, public_key_bytes) {
             Err(e) => assert!(e.to_string().contains("Point decoding failed")),
             Ok(_) => panic!("error should have been thrown"),
@@ -157,16 +187,16 @@ mod advanced_functionality {
     #[test]
     fn verify_pop_throws_error_on_public_key_bytes_not_on_curve() {
         let (secret_key, public_key) = multi_crypto::keypair_from_seed([1, 2, 3, 4]);
-        let pop = multi_crypto::create_pop(public_key, secret_key);
+        let pop = multi_crypto::create_pop(&public_key, &secret_key);
         let pop_bytes = PopBytes::from(pop);
         let mut public_key_bytes = PublicKeyBytes::from(public_key);
         // Zero out the bytes, set the compression flag.
         // This represents x = 0, which happens to have no solution
         // on the G2 curve.
-        for i in 0..G2::SIZE {
+        for i in 0..G2Bytes::SIZE {
             public_key_bytes.0[i] = 0;
         }
-        public_key_bytes.0[G2::FLAG_BYTE_OFFSET] |= G2::COMPRESSED_FLAG;
+        public_key_bytes.0[G2Bytes::FLAG_BYTE_OFFSET] |= G2Bytes::COMPRESSED_FLAG;
         match api::verify_pop(pop_bytes, public_key_bytes) {
             Err(e) => assert!(e.to_string().contains("Point decoding failed")),
             Ok(_) => panic!("error should have been thrown"),
@@ -176,15 +206,15 @@ mod advanced_functionality {
     #[test]
     fn verify_pop_throws_error_on_public_key_bytes_not_in_subgroup() {
         let (secret_key, public_key) = multi_crypto::keypair_from_seed([1, 2, 3, 4]);
-        let pop = multi_crypto::create_pop(public_key, secret_key);
+        let pop = multi_crypto::create_pop(&public_key, &secret_key);
         let pop_bytes = PopBytes::from(pop);
         let mut public_key_bytes = PublicKeyBytes::from(public_key);
         // By manual rejection sampling, we found an x-coordinate with a
         // solution, which is unlikely to have order r.
-        for i in 0..G2::SIZE {
+        for i in 0..G2Bytes::SIZE {
             public_key_bytes.0[i] = 0;
         }
-        public_key_bytes.0[G2::FLAG_BYTE_OFFSET] |= G2::COMPRESSED_FLAG;
+        public_key_bytes.0[G2Bytes::FLAG_BYTE_OFFSET] |= G2Bytes::COMPRESSED_FLAG;
         public_key_bytes.0[5] = 3;
         match api::verify_pop(pop_bytes, public_key_bytes) {
             Err(e) => assert!(e.to_string().contains("Point decoding failed")),
@@ -198,7 +228,7 @@ mod advanced_functionality {
             multi_crypto::keypair_from_seed([1, 2, 3, 4]),
             multi_crypto::keypair_from_seed([5, 6, 7, 8]),
         ];
-        multi_test_utils::multi_signature_verifies(&keys, b"abba");
+        check_multi_signature_verifies(&keys, b"abba");
     }
 
     // Slow tests
@@ -212,7 +242,7 @@ mod advanced_functionality {
           keys in proptest::collection::vec(arbitrary::key_pair(), 1..10),
           message in proptest::collection::vec(any::<u8>(), 0..100),
         ) {
-            multi_test_utils::multi_signature_verifies(&keys, &message);
+            check_multi_signature_verifies(&keys, &message);
         }
     }
 }

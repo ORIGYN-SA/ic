@@ -1,34 +1,42 @@
-use crate::wasmtime_embedder::{system_api_complexity, StoreData};
+use crate::wasmtime_embedder::{
+    system_api_complexity, StoreData, WASM_HEAP_BYTEMAP_MEMORY_NAME, WASM_HEAP_MEMORY_NAME,
+};
 
-use ic_config::flag_status::FlagStatus;
-use ic_interfaces::execution_environment::{HypervisorError, HypervisorResult, SystemApi};
-use ic_logger::{error, info, ReplicaLogger};
+use ic_config::{embedders::FeatureFlags, flag_status::FlagStatus};
+use ic_interfaces::execution_environment::{
+    ExecutionComplexity, HypervisorError, HypervisorResult, PerformanceCounterType,
+    StableGrowOutcome, SystemApi, TrapCode,
+};
+use ic_logger::{error, ReplicaLogger};
 use ic_registry_subnet_type::SubnetType;
-use ic_types::{CanisterId, Cycles, NumBytes, NumInstructions};
+use ic_sys::PAGE_SIZE;
+use ic_types::{CanisterId, Cycles, NumBytes, NumInstructions, NumPages, Time};
 
-use wasmtime::{AsContextMut, Caller, Global, Linker, Store, Trap, Val};
+use wasmtime::{AsContextMut, Caller, Global, Linker, Store, Val};
 
+use crate::InternalErrorCode;
 use std::convert::TryFrom;
 
 fn process_err<S: SystemApi>(
-    mut store: impl AsContextMut<Data = StoreData<S>>,
+    store: &mut impl AsContextMut<Data = StoreData<S>>,
     e: HypervisorError,
-) -> wasmtime::Trap {
-    let t = wasmtime::Trap::new(format! {"{}", e});
+) -> anyhow::Error {
+    let result = anyhow::Error::msg(format! {"{}", e});
     store
         .as_context_mut()
         .data_mut()
         .system_api
         .set_execution_error(e);
-    t
+    result
 }
 
 /// Gets the global variable that stores the number of instructions from `caller`.
+#[inline(always)]
 fn get_num_instructions_global<S: SystemApi>(
     caller: &mut Caller<'_, StoreData<S>>,
     log: &ReplicaLogger,
     canister_id: CanisterId,
-) -> Result<Global, Trap> {
+) -> Result<Global, anyhow::Error> {
     match caller.data().num_instructions_global {
         None => {
             error!(
@@ -44,14 +52,15 @@ fn get_num_instructions_global<S: SystemApi>(
     }
 }
 
+#[inline(always)]
 fn load_value<S: SystemApi>(
     global: &Global,
     mut caller: &mut Caller<'_, StoreData<S>>,
     log: &ReplicaLogger,
     canister_id: CanisterId,
-) -> Result<NumInstructions, Trap> {
+) -> Result<i64, anyhow::Error> {
     match global.get(&mut caller) {
-        Val::I64(instructions) => Ok(NumInstructions::from(instructions.max(0) as u64)),
+        Val::I64(instructions) => Ok(instructions),
         others => {
             error!(
                 log,
@@ -67,14 +76,15 @@ fn load_value<S: SystemApi>(
     }
 }
 
+#[inline(always)]
 fn store_value<S: SystemApi>(
     global: &Global,
-    num_instructions: NumInstructions,
+    num_instructions: i64,
     mut caller: &mut Caller<'_, StoreData<S>>,
     log: &ReplicaLogger,
     canister_id: CanisterId,
-) -> Result<(), Trap> {
-    if let Err(err) = global.set(&mut caller, Val::I64(num_instructions.get() as i64)) {
+) -> Result<(), anyhow::Error> {
+    if let Err(err) = global.set(&mut caller, Val::I64(num_instructions)) {
         error!(
             log,
             "[EXC-BUG] Canister {}: Setting instructions to {} failed with {}",
@@ -86,6 +96,38 @@ fn store_value<S: SystemApi>(
             caller,
             HypervisorError::InstructionLimitExceeded,
         ));
+    }
+    Ok(())
+}
+
+/// Updates heap bytemap marking which pages have been written to dst and size
+/// need to have valid values (need to pass checks performed by the function
+/// that actually writes to the heap)
+#[inline(never)]
+fn mark_writes_on_bytemap<S: SystemApi>(
+    caller: &mut Caller<'_, StoreData<S>>,
+    dst: usize,
+    size: usize,
+) -> Result<(), anyhow::Error> {
+    if size < 1 {
+        return Ok(());
+    }
+    let bitmap_mem = match caller.get_export(WASM_HEAP_BYTEMAP_MEMORY_NAME) {
+        Some(wasmtime::Extern::Memory(mem)) => mem,
+        _ => {
+            return Err(process_err(
+                caller,
+                HypervisorError::ContractViolation("Failed to access heap bitmap".to_string()),
+            ))
+        }
+    };
+
+    let bitmap = bitmap_mem.data_mut(caller);
+    let mut i = dst / PAGE_SIZE;
+    let end = (dst + size - 1) / PAGE_SIZE + 1;
+    while i < end {
+        bitmap[i] = 1;
+        i += 1;
     }
     Ok(())
 }
@@ -103,73 +145,238 @@ fn store_value<S: SystemApi>(
 /// not introduce new error types in these paths as these error paths should
 /// be extremely rare and we do not want to increase the complexity of the
 /// code to handle hypothetical bugs.
+//
+// Note: marked not for inlining as we don't want to spill this code into every system API call.
+#[inline(never)]
 fn charge_for_system_api_call<S: SystemApi>(
     log: &ReplicaLogger,
     canister_id: CanisterId,
     caller: &mut Caller<'_, StoreData<S>>,
-    system_api_charge: NumInstructions,
+    system_api_overhead: NumInstructions,
     num_bytes: u32,
-) -> Result<(), Trap> {
+    complexity: ExecutionComplexity,
+    dirty_page_cost: NumInstructions,
+    stable_memory_dirty_page_limit: NumPages,
+) -> Result<(), anyhow::Error> {
+    observe_execution_complexity(
+        log,
+        canister_id,
+        caller,
+        complexity,
+        stable_memory_dirty_page_limit,
+    )?;
+    let num_instructions_from_bytes = caller
+        .data()
+        .system_api
+        .get_num_instructions_from_bytes(NumBytes::from(num_bytes as u64));
+    let (num_instructions1, overflow1) = num_instructions_from_bytes
+        .get()
+        .overflowing_add(dirty_page_cost.get());
+    let (num_instructions, overflow2) =
+        num_instructions1.overflowing_add(system_api_overhead.get());
+    if overflow1 || overflow2 {
+        error!(
+            log,
+            "Canister {}: Overflow while calculating charge for System API Call: overhead: {}, num_bytes: {}, dirty_page_cost: {}",
+            canister_id,
+            system_api_overhead,
+            num_bytes,
+            dirty_page_cost,
+        );
+        return Err(process_err(
+            caller,
+            HypervisorError::ContractViolation(
+                "Overflow while calculating charge for a system call".to_string(),
+            ),
+        ));
+    }
+    charge_direct_fee(
+        log,
+        canister_id,
+        caller,
+        NumInstructions::from(num_instructions),
+    )
+}
+
+fn charge_direct_fee<S: SystemApi>(
+    log: &ReplicaLogger,
+    canister_id: CanisterId,
+    caller: &mut Caller<'_, StoreData<S>>,
+    num_instructions: NumInstructions,
+) -> Result<(), anyhow::Error> {
+    if num_instructions == NumInstructions::from(0) {
+        return Ok(());
+    }
+
     let num_instructions_global = get_num_instructions_global(caller, log, canister_id)?;
-    let current_instructions =
-        load_value(&num_instructions_global, caller, log, canister_id)?.get() as i64;
+    let mut instruction_counter = load_value(&num_instructions_global, caller, log, canister_id)?;
     // Assert the current instruction counter is sane
-    let system_api = &caller.data().system_api;
+    let system_api = &mut caller.data_mut().system_api;
     let instruction_limit = system_api.slice_instruction_limit().get() as i64;
-    if current_instructions > instruction_limit {
+    if instruction_counter > instruction_limit {
         error!(
             log,
             "[EXC-BUG] Canister {}: current instructions counter {} is greater than the limit {}",
             canister_id,
-            current_instructions,
+            instruction_counter,
             instruction_limit
         );
         // Continue execution
     }
-    let fee = system_api
-        .get_num_instructions_from_bytes(NumBytes::from(num_bytes as u64))
-        .get() as i64
-        + system_api_charge.get() as i64;
-    if current_instructions < fee {
-        info!(
-            log,
-            "Canister {}: ran out of instructions.  Current {}, fee {}",
-            canister_id,
-            current_instructions,
-            fee
-        );
-        return Err(process_err(
-            caller,
-            HypervisorError::InstructionLimitExceeded,
-        ));
+
+    // We are going to substract a potentially large fee from the instruction
+    // counter. To avoid underflows, we need to first ensure that the
+    // instruction counter is not negative.
+    if instruction_counter < 0 {
+        // Note we cannot use `map_err()` here because `caller` is needed later on in `store_value`.
+        instruction_counter = match system_api.out_of_instructions(instruction_counter) {
+            Ok(instruction_counter) => instruction_counter,
+            Err(err) => {
+                return Err(process_err(caller, err));
+            }
+        };
     }
-    let updated_instructions = NumInstructions::from((current_instructions - fee) as u64);
+
+    // Now we can subtract the fee and store the new instruction counter.
+    let fee = num_instructions.get() as i64;
+    instruction_counter -= fee;
     store_value(
         &num_instructions_global,
-        updated_instructions,
+        instruction_counter,
         caller,
         log,
         canister_id,
     )?;
+
+    // If the instruction counter became negative after subtracting the fee,
+    // then we need to call the out-of-instructins handler again and store the
+    // returned new counter value.
+    if instruction_counter < 0 {
+        let system_api = &mut caller.data_mut().system_api;
+        // Note we cannot use `map_err()` here because `caller` is needed later on in `store_value`.
+        instruction_counter = match system_api.out_of_instructions(instruction_counter) {
+            Ok(instruction_counter) => instruction_counter,
+            Err(err) => {
+                return Err(process_err(caller, err));
+            }
+        };
+        store_value(
+            &num_instructions_global,
+            instruction_counter,
+            caller,
+            log,
+            canister_id,
+        )?;
+    }
     Ok(())
+}
+
+/// Returns the number of new stable dirty pages and their cost for a potential
+/// write to stable memory.
+fn get_new_stable_dirty_pages<S: SystemApi>(
+    caller: &mut Caller<'_, StoreData<S>>,
+    offset: u64,
+    size: u64,
+) -> Result<(NumPages, NumInstructions), anyhow::Error> {
+    match caller
+        .data()
+        .system_api
+        .dirty_pages_from_stable_write(offset, size)
+    {
+        Err(e) => Err(process_err(caller, e)),
+        Ok(result) => Ok(result),
+    }
+}
+
+/// Observe execution complexity.
+fn observe_execution_complexity<S: SystemApi>(
+    log: &ReplicaLogger,
+    canister_id: CanisterId,
+    caller: &mut Caller<'_, StoreData<S>>,
+    complexity: ExecutionComplexity,
+    stable_memory_dirty_page_limit: NumPages,
+) -> Result<(), anyhow::Error> {
+    #[allow(non_upper_case_globals)]
+    const KiB: u64 = 1024;
+
+    let system_api = &mut caller.data_mut().system_api;
+    let total_complexity = system_api.execution_complexity() + &complexity;
+    match system_api.subnet_type() {
+        SubnetType::System => {}
+        SubnetType::Application | SubnetType::VerifiedApplication => {
+            let message_instruction_limit = system_api.message_instruction_limit();
+            if total_complexity.cpu_reached(message_instruction_limit) {
+                error!(
+                    log,
+                    "Canister {}: Error exceeding CPU complexity limit: (observed:{}, limit:{})",
+                    canister_id,
+                    total_complexity.cpu,
+                    message_instruction_limit,
+                );
+                return Err(process_err(
+                    caller,
+                    HypervisorError::ExecutionComplexityLimitExceeded,
+                ));
+            } else if total_complexity.stable_dirty_pages > stable_memory_dirty_page_limit {
+                let error = HypervisorError::MemoryAccessLimitExceeded(
+                format!("Exceeded the limit for the number of modified pages in the stable memory in a single message execution: limit: {} KB.",
+                    stable_memory_dirty_page_limit * (PAGE_SIZE as u64 / KiB),
+                ),
+            );
+                return Err(process_err(caller, error));
+            }
+            // Do not observe the execution complexity on the system subnets.
+            system_api.set_execution_complexity(total_complexity);
+        }
+    }
+    Ok(())
+}
+
+/// A helper to pass wasmtime counters to the System API
+fn ic0_performance_counter_helper<S: SystemApi>(
+    log: &ReplicaLogger,
+    canister_id: CanisterId,
+    caller: &mut Caller<'_, StoreData<S>>,
+    counter_type: u32,
+) -> Result<u64, anyhow::Error> {
+    match counter_type {
+        0 => {
+            let num_instructions_global = get_num_instructions_global(caller, log, canister_id)?;
+            let instruction_counter =
+                load_value(&num_instructions_global, caller, log, canister_id)?;
+            caller
+                .data()
+                .system_api
+                .ic0_performance_counter(PerformanceCounterType::Instructions(instruction_counter))
+                .map_err(|e| process_err(caller, e))
+        }
+        _ => Err(process_err(
+            caller,
+            HypervisorError::ContractViolation(format!(
+                "Error getting performance counter type {}",
+                counter_type
+            )),
+        )),
+    }
 }
 
 pub(crate) fn syscalls<S: SystemApi>(
     log: ReplicaLogger,
     canister_id: CanisterId,
     store: &Store<StoreData<S>>,
-    rate_limiting_of_debug_prints: FlagStatus,
+    feature_flags: FeatureFlags,
+    stable_memory_dirty_page_limit: NumPages,
 ) -> Linker<StoreData<S>> {
     fn with_system_api<S, T>(caller: &mut Caller<'_, StoreData<S>>, f: impl Fn(&mut S) -> T) -> T {
         f(&mut caller.as_context_mut().data_mut().system_api)
     }
 
     fn with_memory_and_system_api<S: SystemApi, T>(
-        mut caller: Caller<'_, StoreData<S>>,
+        mut caller: &mut Caller<'_, StoreData<S>>,
         f: impl Fn(&mut S, &mut [u8]) -> HypervisorResult<T>,
-    ) -> Result<T, wasmtime::Trap> {
+    ) -> Result<T, anyhow::Error> {
         let result = caller
-            .get_export("memory")
+            .get_export(WASM_HEAP_MEMORY_NAME)
             .ok_or_else(|| {
                 HypervisorError::ContractViolation(
                     "WebAssembly module must define memory".to_string(),
@@ -183,19 +390,10 @@ pub(crate) fn syscalls<S: SystemApi>(
                 })
             })
             .and_then(|mem| {
-                let mem = mem.data_mut(&mut caller);
-                let ptr = mem.as_mut_ptr();
-                let len = mem.len();
-                // SAFETY: The memory array is valid for the duration of our borrow of the
-                // `SystemApi` and the mutating the `SystemApi` cannot change the memory array
-                // so it's safe to mutate both at once.  If the memory and system_api were two
-                // fields of the `caller` struct then this would be allowed, but
-                // since we access them through opaque functions the
-                // compiler can't know that they are unrelated objects.
-                f(&mut caller.as_context_mut().data_mut().system_api, unsafe {
-                    std::slice::from_raw_parts_mut(ptr, len)
-                })
+                let (mem, store) = mem.data_and_store_mut(&mut caller);
+                f(&mut store.system_api, mem)
             });
+
         match result {
             Err(e) => Err(process_err(caller, e)),
             Ok(r) => Ok(r),
@@ -206,10 +404,26 @@ pub(crate) fn syscalls<S: SystemApi>(
 
     linker
         .func_wrap("ic0", "msg_caller_copy", {
-            move |caller: Caller<'_, StoreData<S>>, dst: i32, offset: i32, size: i32| {
-                with_memory_and_system_api(caller, |system_api, memory| {
+            let log = log.clone();
+            move |mut caller: Caller<'_, StoreData<S>>, dst: i32, offset: i32, size: i32| {
+                observe_execution_complexity(
+                    &log,
+                    canister_id,
+                    &mut caller,
+                    ExecutionComplexity {
+                        cpu: system_api_complexity::cpu::MSG_CALLER_COPY,
+                        ..Default::default()
+                    },
+                    stable_memory_dirty_page_limit,
+                )?;
+                with_memory_and_system_api(&mut caller, |system_api, memory| {
                     system_api.ic0_msg_caller_copy(dst as u32, offset as u32, size as u32, memory)
-                })
+                })?;
+                if feature_flags.write_barrier == FlagStatus::Enabled {
+                    mark_writes_on_bytemap(&mut caller, dst as u32 as usize, size as u32 as usize)
+                } else {
+                    Ok(())
+                }
             }
         })
         .unwrap();
@@ -218,10 +432,10 @@ pub(crate) fn syscalls<S: SystemApi>(
         .func_wrap("ic0", "msg_caller_size", {
             move |mut caller: Caller<'_, StoreData<S>>| {
                 with_system_api(&mut caller, |s| s.ic0_msg_caller_size())
-                    .map_err(|e| process_err(caller, e))
+                    .map_err(|e| process_err(&mut caller, e))
                     .and_then(|s| {
                         i32::try_from(s).map_err(|e| {
-                            wasmtime::Trap::new(format!("ic0::msg_caller_size failed: {}", e))
+                            anyhow::Error::msg(format!("ic0::msg_caller_size failed: {}", e))
                         })
                     })
             }
@@ -232,10 +446,10 @@ pub(crate) fn syscalls<S: SystemApi>(
         .func_wrap("ic0", "msg_arg_data_size", {
             move |mut caller: Caller<'_, StoreData<S>>| {
                 with_system_api(&mut caller, |s| s.ic0_msg_arg_data_size())
-                    .map_err(|e| process_err(caller, e))
+                    .map_err(|e| process_err(&mut caller, e))
                     .and_then(|s| {
                         i32::try_from(s).map_err(|e| {
-                            wasmtime::Trap::new(format!("ic0::msg_arg_data_size failed: {}", e))
+                            anyhow::Error::msg(format!("ic0::msg_arg_data_size failed: {}", e))
                         })
                     })
             }
@@ -250,12 +464,23 @@ pub(crate) fn syscalls<S: SystemApi>(
                     &log,
                     canister_id,
                     &mut caller,
-                    system_api_complexity::MSG_ARG_DATA_COPY,
+                    system_api_complexity::overhead::MSG_ARG_DATA_COPY,
                     size as u32,
+                    ExecutionComplexity {
+                        cpu: system_api_complexity::cpu::MSG_ARG_DATA_COPY,
+                        ..Default::default()
+                    },
+                    NumInstructions::from(0),
+                    stable_memory_dirty_page_limit,
                 )?;
-                with_memory_and_system_api(caller, |system_api, mem| {
+                with_memory_and_system_api(&mut caller, |system_api, mem| {
                     system_api.ic0_msg_arg_data_copy(dst as u32, offset as u32, size as u32, mem)
-                })
+                })?;
+                if feature_flags.write_barrier == FlagStatus::Enabled {
+                    mark_writes_on_bytemap(&mut caller, dst as u32 as usize, size as u32 as usize)
+                } else {
+                    Ok(())
+                }
             }
         })
         .unwrap();
@@ -264,10 +489,10 @@ pub(crate) fn syscalls<S: SystemApi>(
         .func_wrap("ic0", "msg_method_name_size", {
             move |mut caller: Caller<'_, StoreData<S>>| {
                 with_system_api(&mut caller, |s| s.ic0_msg_method_name_size())
-                    .map_err(|e| process_err(caller, e))
+                    .map_err(|e| process_err(&mut caller, e))
                     .and_then(|s| {
                         i32::try_from(s).map_err(|e| {
-                            wasmtime::Trap::new(format!("ic0::msg_metohd_name_size failed: {}", e))
+                            anyhow::Error::msg(format!("ic0::msg_metohd_name_size failed: {}", e))
                         })
                     })
             }
@@ -282,17 +507,28 @@ pub(crate) fn syscalls<S: SystemApi>(
                     &log,
                     canister_id,
                     &mut caller,
-                    system_api_complexity::MSG_METHOD_NAME_COPY,
+                    system_api_complexity::overhead::MSG_METHOD_NAME_COPY,
                     size as u32,
+                    ExecutionComplexity {
+                        cpu: system_api_complexity::cpu::MSG_METHOD_NAME_COPY,
+                        ..Default::default()
+                    },
+                    NumInstructions::from(0),
+                    stable_memory_dirty_page_limit,
                 )?;
-                with_memory_and_system_api(caller, |system_api, memory| {
+                with_memory_and_system_api(&mut caller, |system_api, memory| {
                     system_api.ic0_msg_method_name_copy(
                         dst as u32,
                         offset as u32,
                         size as u32,
                         memory,
                     )
-                })
+                })?;
+                if feature_flags.write_barrier == FlagStatus::Enabled {
+                    mark_writes_on_bytemap(&mut caller, dst as u32 as usize, size as u32 as usize)
+                } else {
+                    Ok(())
+                }
             }
         })
         .unwrap();
@@ -301,7 +537,7 @@ pub(crate) fn syscalls<S: SystemApi>(
         .func_wrap("ic0", "accept_message", {
             move |mut caller: Caller<'_, StoreData<S>>| {
                 with_system_api(&mut caller, |s| s.ic0_accept_message())
-                    .map_err(|e| process_err(caller, e))
+                    .map_err(|e| process_err(&mut caller, e))
             }
         })
         .unwrap();
@@ -314,10 +550,16 @@ pub(crate) fn syscalls<S: SystemApi>(
                     &log,
                     canister_id,
                     &mut caller,
-                    system_api_complexity::MSG_REPLY_DATA_APPEND,
+                    system_api_complexity::overhead::MSG_REPLY_DATA_APPEND,
                     size as u32,
+                    ExecutionComplexity {
+                        cpu: system_api_complexity::cpu::MSG_REPLY_DATA_APPEND,
+                        ..Default::default()
+                    },
+                    NumInstructions::from(0),
+                    stable_memory_dirty_page_limit,
                 )?;
-                with_memory_and_system_api(caller, |system_api, memory| {
+                with_memory_and_system_api(&mut caller, |system_api, memory| {
                     system_api.ic0_msg_reply_data_append(src as u32, size as u32, memory)
                 })
             }
@@ -328,7 +570,7 @@ pub(crate) fn syscalls<S: SystemApi>(
         .func_wrap("ic0", "msg_reply", {
             move |mut caller: Caller<'_, StoreData<S>>| {
                 with_system_api(&mut caller, |s| s.ic0_msg_reply())
-                    .map_err(|e| process_err(caller, e))
+                    .map_err(|e| process_err(&mut caller, e))
             }
         })
         .unwrap();
@@ -337,7 +579,7 @@ pub(crate) fn syscalls<S: SystemApi>(
         .func_wrap("ic0", "msg_reject_code", {
             move |mut caller: Caller<'_, StoreData<S>>| {
                 with_system_api(&mut caller, |s| s.ic0_msg_reject_code())
-                    .map_err(|e| process_err(caller, e))
+                    .map_err(|e| process_err(&mut caller, e))
             }
         })
         .unwrap();
@@ -350,10 +592,16 @@ pub(crate) fn syscalls<S: SystemApi>(
                     &log,
                     canister_id,
                     &mut caller,
-                    system_api_complexity::MSG_REJECT,
+                    system_api_complexity::overhead::MSG_REJECT,
                     size as u32,
+                    ExecutionComplexity {
+                        cpu: system_api_complexity::cpu::MSG_REJECT,
+                        ..Default::default()
+                    },
+                    NumInstructions::from(0),
+                    stable_memory_dirty_page_limit,
                 )?;
-                with_memory_and_system_api(caller, |system_api, memory| {
+                with_memory_and_system_api(&mut caller, |system_api, memory| {
                     system_api.ic0_msg_reject(src as u32, size as u32, memory)
                 })
             }
@@ -364,10 +612,10 @@ pub(crate) fn syscalls<S: SystemApi>(
         .func_wrap("ic0", "msg_reject_msg_size", {
             move |mut caller: Caller<'_, StoreData<S>>| {
                 with_system_api(&mut caller, |s| s.ic0_msg_reject_msg_size())
-                    .map_err(|e| process_err(caller, e))
+                    .map_err(|e| process_err(&mut caller, e))
                     .and_then(|s| {
                         i32::try_from(s).map_err(|e| {
-                            wasmtime::Trap::new(format!("ic0_msg_reject_msg_size failed: {}", e))
+                            anyhow::Error::msg(format!("ic0_msg_reject_msg_size failed: {}", e))
                         })
                     })
             }
@@ -382,17 +630,28 @@ pub(crate) fn syscalls<S: SystemApi>(
                     &log,
                     canister_id,
                     &mut caller,
-                    system_api_complexity::MSG_REJECT_MSG_COPY,
+                    system_api_complexity::overhead::MSG_REJECT_MSG_COPY,
                     size as u32,
+                    ExecutionComplexity {
+                        cpu: system_api_complexity::cpu::MSG_REJECT_MSG_COPY,
+                        ..Default::default()
+                    },
+                    NumInstructions::from(0),
+                    stable_memory_dirty_page_limit,
                 )?;
-                with_memory_and_system_api(caller, |system_api, memory| {
+                with_memory_and_system_api(&mut caller, |system_api, memory| {
                     system_api.ic0_msg_reject_msg_copy(
                         dst as u32,
                         offset as u32,
                         size as u32,
                         memory,
                     )
-                })
+                })?;
+                if feature_flags.write_barrier == FlagStatus::Enabled {
+                    mark_writes_on_bytemap(&mut caller, dst as u32 as usize, size as u32 as usize)
+                } else {
+                    Ok(())
+                }
             }
         })
         .unwrap();
@@ -401,10 +660,10 @@ pub(crate) fn syscalls<S: SystemApi>(
         .func_wrap("ic0", "canister_self_size", {
             move |mut caller: Caller<'_, StoreData<S>>| {
                 with_system_api(&mut caller, |s| s.ic0_canister_self_size())
-                    .map_err(|e| process_err(caller, e))
+                    .map_err(|e| process_err(&mut caller, e))
                     .and_then(|s| {
                         i32::try_from(s).map_err(|e| {
-                            wasmtime::Trap::new(format!("ic0_canister_self_size failed: {}", e))
+                            anyhow::Error::msg(format!("ic0_canister_self_size failed: {}", e))
                         })
                     })
             }
@@ -413,15 +672,31 @@ pub(crate) fn syscalls<S: SystemApi>(
 
     linker
         .func_wrap("ic0", "canister_self_copy", {
-            move |caller: Caller<'_, StoreData<S>>, dst: i32, offset: i32, size: i32| {
-                with_memory_and_system_api(caller, |system_api, memory| {
+            let log = log.clone();
+            move |mut caller: Caller<'_, StoreData<S>>, dst: i32, offset: i32, size: i32| {
+                observe_execution_complexity(
+                    &log,
+                    canister_id,
+                    &mut caller,
+                    ExecutionComplexity {
+                        cpu: system_api_complexity::cpu::CANISTER_SELF_COPY,
+                        ..Default::default()
+                    },
+                    stable_memory_dirty_page_limit,
+                )?;
+                with_memory_and_system_api(&mut caller, |system_api, memory| {
                     system_api.ic0_canister_self_copy(
                         dst as u32,
                         offset as u32,
                         size as u32,
                         memory,
                     )
-                })
+                })?;
+                if feature_flags.write_barrier == FlagStatus::Enabled {
+                    mark_writes_on_bytemap(&mut caller, dst as u32 as usize, size as u32 as usize)
+                } else {
+                    Ok(())
+                }
             }
         })
         .unwrap();
@@ -430,10 +705,10 @@ pub(crate) fn syscalls<S: SystemApi>(
         .func_wrap("ic0", "controller_size", {
             move |mut caller: Caller<'_, StoreData<S>>| {
                 with_system_api(&mut caller, |s| s.ic0_controller_size())
-                    .map_err(|e| process_err(caller, e))
+                    .map_err(|e| process_err(&mut caller, e))
                     .and_then(|s| {
                         i32::try_from(s).map_err(|e| {
-                            wasmtime::Trap::new(format!("ic0_controller_size failed: {}", e))
+                            anyhow::Error::msg(format!("ic0_controller_size failed: {}", e))
                         })
                     })
             }
@@ -442,10 +717,26 @@ pub(crate) fn syscalls<S: SystemApi>(
 
     linker
         .func_wrap("ic0", "controller_copy", {
-            move |caller: Caller<'_, StoreData<S>>, dst: i32, offset: i32, size: i32| {
-                with_memory_and_system_api(caller, |system_api, memory| {
+            let log = log.clone();
+            move |mut caller: Caller<'_, StoreData<S>>, dst: i32, offset: i32, size: i32| {
+                observe_execution_complexity(
+                    &log,
+                    canister_id,
+                    &mut caller,
+                    ExecutionComplexity {
+                        cpu: system_api_complexity::cpu::CONTROLLER_COPY,
+                        ..Default::default()
+                    },
+                    stable_memory_dirty_page_limit,
+                )?;
+                with_memory_and_system_api(&mut caller, |system_api, memory| {
                     system_api.ic0_controller_copy(dst as u32, offset as u32, size as u32, memory)
-                })
+                })?;
+                if feature_flags.write_barrier == FlagStatus::Enabled {
+                    mark_writes_on_bytemap(&mut caller, dst as u32 as usize, size as u32 as usize)
+                } else {
+                    Ok(())
+                }
             }
         })
         .unwrap();
@@ -458,12 +749,18 @@ pub(crate) fn syscalls<S: SystemApi>(
                     &log,
                     canister_id,
                     &mut caller,
-                    system_api_complexity::DEBUG_PRINT,
+                    system_api_complexity::overhead::DEBUG_PRINT,
                     length as u32,
+                    ExecutionComplexity {
+                        cpu: system_api_complexity::cpu::DEBUG_PRINT,
+                        ..Default::default()
+                    },
+                    NumInstructions::from(0),
+                    stable_memory_dirty_page_limit,
                 )?;
                 match (
                     caller.data().system_api.subnet_type(),
-                    rate_limiting_of_debug_prints,
+                    feature_flags.rate_limiting_of_debug_prints,
                 ) {
                     // Debug print is a no-op on non-system subnets with rate limiting.
                     (SubnetType::Application, FlagStatus::Enabled) => Ok(()),
@@ -471,7 +768,7 @@ pub(crate) fn syscalls<S: SystemApi>(
                     // If rate limiting is disabled or the subnet is a system subnet, then
                     // debug print produces output.
                     (_, FlagStatus::Disabled) | (SubnetType::System, FlagStatus::Enabled) => {
-                        with_memory_and_system_api(caller, |system_api, memory| {
+                        with_memory_and_system_api(&mut caller, |system_api, memory| {
                             system_api.ic0_debug_print(offset as u32, length as u32, memory)
                         })
                     }
@@ -488,10 +785,16 @@ pub(crate) fn syscalls<S: SystemApi>(
                     &log,
                     canister_id,
                     &mut caller,
-                    system_api_complexity::TRAP,
+                    system_api_complexity::overhead::TRAP,
                     length as u32,
+                    ExecutionComplexity {
+                        cpu: system_api_complexity::cpu::TRAP,
+                        ..Default::default()
+                    },
+                    NumInstructions::from(0),
+                    stable_memory_dirty_page_limit,
                 )?;
-                with_memory_and_system_api(caller, |system_api, memory| {
+                with_memory_and_system_api(&mut caller, |system_api, memory| {
                     system_api.ic0_trap(offset as u32, length as u32, memory)
                 })
             }
@@ -499,7 +802,7 @@ pub(crate) fn syscalls<S: SystemApi>(
         .unwrap();
 
     linker
-        .func_wrap("ic0", "call_simple", {
+        .func_wrap("ic0", "call_new", {
             let log = log.clone();
             move |mut caller: Caller<'_, StoreData<S>>,
                   callee_src: i32,
@@ -509,47 +812,18 @@ pub(crate) fn syscalls<S: SystemApi>(
                   reply_fun: i32,
                   reply_env: i32,
                   reject_fun: i32,
-                  reject_env: i32,
-                  src: i32,
-                  len: i32| {
-                charge_for_system_api_call(
+                  reject_env: i32| {
+                observe_execution_complexity(
                     &log,
                     canister_id,
                     &mut caller,
-                    system_api_complexity::CALL_SIMPLE,
-                    len as u32,
+                    ExecutionComplexity {
+                        cpu: system_api_complexity::cpu::CALL_NEW,
+                        ..Default::default()
+                    },
+                    stable_memory_dirty_page_limit,
                 )?;
-                with_memory_and_system_api(caller, |system_api, memory| {
-                    system_api.ic0_call_simple(
-                        callee_src as u32,
-                        callee_size as u32,
-                        name_src as u32,
-                        name_len as u32,
-                        reply_fun as u32,
-                        reply_env as u32,
-                        reject_fun as u32,
-                        reject_env as u32,
-                        src as u32,
-                        len as u32,
-                        memory,
-                    )
-                })
-            }
-        })
-        .unwrap();
-
-    linker
-        .func_wrap("ic0", "call_new", {
-            move |caller: Caller<'_, StoreData<S>>,
-                  callee_src: i32,
-                  callee_size: i32,
-                  name_src: i32,
-                  name_len: i32,
-                  reply_fun: i32,
-                  reply_env: i32,
-                  reject_fun: i32,
-                  reject_env: i32| {
-                with_memory_and_system_api(caller, |system_api, memory| {
+                with_memory_and_system_api(&mut caller, |system_api, memory| {
                     system_api.ic0_call_new(
                         callee_src as u32,
                         callee_size as u32,
@@ -574,10 +848,16 @@ pub(crate) fn syscalls<S: SystemApi>(
                     &log,
                     canister_id,
                     &mut caller,
-                    system_api_complexity::CALL_DATA_APPEND,
+                    system_api_complexity::overhead::CALL_DATA_APPEND,
                     size as u32,
+                    ExecutionComplexity {
+                        cpu: system_api_complexity::cpu::CALL_DATA_APPEND,
+                        ..Default::default()
+                    },
+                    NumInstructions::from(0),
+                    stable_memory_dirty_page_limit,
                 )?;
-                with_memory_and_system_api(caller, |system_api, memory| {
+                with_memory_and_system_api(&mut caller, |system_api, memory| {
                     system_api.ic0_call_data_append(src as u32, size as u32, memory)
                 })
             }
@@ -590,7 +870,7 @@ pub(crate) fn syscalls<S: SystemApi>(
                 with_system_api(&mut caller, |s| {
                     s.ic0_call_on_cleanup(fun as u32, env as u32)
                 })
-                .map_err(|e| process_err(caller, e))
+                .map_err(|e| process_err(&mut caller, e))
             }
         })
         .unwrap();
@@ -599,7 +879,7 @@ pub(crate) fn syscalls<S: SystemApi>(
         .func_wrap("ic0", "call_cycles_add", {
             move |mut caller: Caller<'_, StoreData<S>>, amount: i64| {
                 with_system_api(&mut caller, |s| s.ic0_call_cycles_add(amount as u64))
-                    .map_err(|e| process_err(caller, e))
+                    .map_err(|e| process_err(&mut caller, e))
             }
         })
         .unwrap();
@@ -613,16 +893,27 @@ pub(crate) fn syscalls<S: SystemApi>(
                         amount_low as u64,
                     ))
                 })
-                .map_err(|e| process_err(caller, e))
+                .map_err(|e| process_err(&mut caller, e))
             }
         })
         .unwrap();
 
     linker
         .func_wrap("ic0", "call_perform", {
+            let log = log.clone();
             move |mut caller: Caller<'_, StoreData<S>>| {
+                observe_execution_complexity(
+                    &log,
+                    canister_id,
+                    &mut caller,
+                    ExecutionComplexity {
+                        cpu: system_api_complexity::cpu::CALL_PERFORM,
+                        ..Default::default()
+                    },
+                    stable_memory_dirty_page_limit,
+                )?;
                 with_system_api(&mut caller, |s| s.ic0_call_perform())
-                    .map_err(|e| process_err(caller, e))
+                    .map_err(|e| process_err(&mut caller, e))
             }
         })
         .unwrap();
@@ -631,10 +922,10 @@ pub(crate) fn syscalls<S: SystemApi>(
         .func_wrap("ic0", "stable_size", {
             move |mut caller: Caller<'_, StoreData<S>>| {
                 with_system_api(&mut caller, |s| s.ic0_stable_size())
-                    .map_err(|e| process_err(caller, e))
+                    .map_err(|e| process_err(&mut caller, e))
                     .and_then(|s| {
                         i32::try_from(s).map_err(|e| {
-                            wasmtime::Trap::new(format!("ic0_stable_size failed: {}", e))
+                            anyhow::Error::msg(format!("ic0_stable_size failed: {}", e))
                         })
                     })
             }
@@ -643,9 +934,20 @@ pub(crate) fn syscalls<S: SystemApi>(
 
     linker
         .func_wrap("ic0", "stable_grow", {
+            let log = log.clone();
             move |mut caller: Caller<'_, StoreData<S>>, additional_pages: i32| {
+                observe_execution_complexity(
+                    &log,
+                    canister_id,
+                    &mut caller,
+                    ExecutionComplexity {
+                        cpu: system_api_complexity::cpu::STABLE_GROW,
+                        ..Default::default()
+                    },
+                    stable_memory_dirty_page_limit,
+                )?;
                 with_system_api(&mut caller, |s| s.ic0_stable_grow(additional_pages as u32))
-                    .map_err(|e| process_err(caller, e))
+                    .map_err(|e| process_err(&mut caller, e))
             }
         })
         .unwrap();
@@ -658,12 +960,23 @@ pub(crate) fn syscalls<S: SystemApi>(
                     &log,
                     canister_id,
                     &mut caller,
-                    system_api_complexity::STABLE_READ,
+                    system_api_complexity::overhead::STABLE_READ,
                     size as u32,
+                    ExecutionComplexity {
+                        cpu: system_api_complexity::cpu::STABLE_READ,
+                        ..Default::default()
+                    },
+                    NumInstructions::from(0),
+                    stable_memory_dirty_page_limit,
                 )?;
-                with_memory_and_system_api(caller, |system_api, memory| {
+                with_memory_and_system_api(&mut caller, |system_api, memory| {
                     system_api.ic0_stable_read(dst as u32, offset as u32, size as u32, memory)
-                })
+                })?;
+                if feature_flags.write_barrier == FlagStatus::Enabled {
+                    mark_writes_on_bytemap(&mut caller, dst as u32 as usize, size as u32 as usize)
+                } else {
+                    Ok(())
+                }
             }
         })
         .unwrap();
@@ -672,15 +985,26 @@ pub(crate) fn syscalls<S: SystemApi>(
         .func_wrap("ic0", "stable_write", {
             let log = log.clone();
             move |mut caller: Caller<'_, StoreData<S>>, offset: i32, src: i32, size: i32| {
+                let offset = offset as u32;
+                let src = src as u32;
+                let size = size as u32;
+                let (stable_dirty_pages, dirty_page_cost) =
+                    get_new_stable_dirty_pages(&mut caller, offset as u64, size as u64)?;
                 charge_for_system_api_call(
                     &log,
                     canister_id,
                     &mut caller,
-                    system_api_complexity::STABLE_WRITE,
-                    size as u32,
+                    system_api_complexity::overhead::STABLE_WRITE,
+                    size,
+                    ExecutionComplexity {
+                        cpu: system_api_complexity::cpu::STABLE_WRITE,
+                        stable_dirty_pages,
+                    },
+                    dirty_page_cost,
+                    stable_memory_dirty_page_limit,
                 )?;
-                with_memory_and_system_api(caller, |system_api, memory| {
-                    system_api.ic0_stable_write(offset as u32, src as u32, size as u32, memory)
+                with_memory_and_system_api(&mut caller, |system_api, memory| {
+                    system_api.ic0_stable_write(offset, src, size, memory)
                 })
             }
         })
@@ -690,10 +1014,10 @@ pub(crate) fn syscalls<S: SystemApi>(
         .func_wrap("ic0", "stable64_size", {
             move |mut caller: Caller<'_, StoreData<S>>| {
                 with_system_api(&mut caller, |s| s.ic0_stable64_size())
-                    .map_err(|e| process_err(caller, e))
+                    .map_err(|e| process_err(&mut caller, e))
                     .and_then(|s| {
                         i64::try_from(s).map_err(|e| {
-                            wasmtime::Trap::new(format!("ic0_stable64_size failed: {}", e))
+                            anyhow::Error::msg(format!("ic0_stable64_size failed: {}", e))
                         })
                     })
             }
@@ -702,11 +1026,22 @@ pub(crate) fn syscalls<S: SystemApi>(
 
     linker
         .func_wrap("ic0", "stable64_grow", {
+            let log = log.clone();
             move |mut caller: Caller<'_, StoreData<S>>, additional_pages: i64| {
+                observe_execution_complexity(
+                    &log,
+                    canister_id,
+                    &mut caller,
+                    ExecutionComplexity {
+                        cpu: system_api_complexity::cpu::STABLE64_GROW,
+                        ..Default::default()
+                    },
+                    stable_memory_dirty_page_limit,
+                )?;
                 with_system_api(&mut caller, |s| {
                     s.ic0_stable64_grow(additional_pages as u64)
                 })
-                .map_err(|e| process_err(caller, e))
+                .map_err(|e| process_err(&mut caller, e))
             }
         })
         .unwrap();
@@ -719,12 +1054,23 @@ pub(crate) fn syscalls<S: SystemApi>(
                     &log,
                     canister_id,
                     &mut caller,
-                    system_api_complexity::STABLE64_READ,
+                    system_api_complexity::overhead::STABLE64_READ,
                     size as u32,
+                    ExecutionComplexity {
+                        cpu: system_api_complexity::cpu::STABLE64_READ,
+                        ..Default::default()
+                    },
+                    NumInstructions::from(0),
+                    stable_memory_dirty_page_limit,
                 )?;
-                with_memory_and_system_api(caller, |system_api, memory| {
+                with_memory_and_system_api(&mut caller, |system_api, memory| {
                     system_api.ic0_stable64_read(dst as u64, offset as u64, size as u64, memory)
-                })
+                })?;
+                if feature_flags.write_barrier == FlagStatus::Enabled {
+                    mark_writes_on_bytemap(&mut caller, dst as u32 as usize, size as u32 as usize)
+                } else {
+                    Ok(())
+                }
             }
         })
         .unwrap();
@@ -733,15 +1079,26 @@ pub(crate) fn syscalls<S: SystemApi>(
         .func_wrap("ic0", "stable64_write", {
             let log = log.clone();
             move |mut caller: Caller<'_, StoreData<S>>, offset: i64, src: i64, size: i64| {
+                let offset = offset as u64;
+                let src = src as u64;
+                let size = size as u64;
+                let (stable_dirty_pages, dirty_page_cost) =
+                    get_new_stable_dirty_pages(&mut caller, offset, size)?;
                 charge_for_system_api_call(
                     &log,
                     canister_id,
                     &mut caller,
-                    system_api_complexity::STABLE64_WRITE,
+                    system_api_complexity::overhead::STABLE64_WRITE,
                     size as u32,
+                    ExecutionComplexity {
+                        cpu: system_api_complexity::cpu::STABLE64_WRITE,
+                        stable_dirty_pages,
+                    },
+                    dirty_page_cost,
+                    stable_memory_dirty_page_limit,
                 )?;
-                with_memory_and_system_api(caller, |system_api, memory| {
-                    system_api.ic0_stable64_write(offset as u64, src as u64, size as u64, memory)
+                with_memory_and_system_api(&mut caller, |system_api, memory| {
+                    system_api.ic0_stable64_write(offset, src, size, memory)
                 })
             }
         })
@@ -751,8 +1108,51 @@ pub(crate) fn syscalls<S: SystemApi>(
         .func_wrap("ic0", "time", {
             move |mut caller: Caller<'_, StoreData<S>>| {
                 with_system_api(&mut caller, |s| s.ic0_time())
-                    .map_err(|e| process_err(caller, e))
+                    .map_err(|e| process_err(&mut caller, e))
                     .map(|s| s.as_nanos_since_unix_epoch())
+            }
+        })
+        .unwrap();
+
+    linker
+        .func_wrap("ic0", "global_timer_set", {
+            move |mut caller: Caller<'_, StoreData<S>>, time: i64| {
+                with_system_api(&mut caller, |s| {
+                    s.ic0_global_timer_set(Time::from_nanos_since_unix_epoch(time as u64))
+                })
+                .map_err(|e| process_err(&mut caller, e))
+                .map(|s| s.as_nanos_since_unix_epoch())
+            }
+        })
+        .unwrap();
+
+    linker
+        .func_wrap("ic0", "performance_counter", {
+            let log = log.clone();
+            move |mut caller: Caller<'_, StoreData<S>>, counter_type: u32| {
+                charge_for_system_api_call(
+                    &log,
+                    canister_id,
+                    &mut caller,
+                    system_api_complexity::overhead::PERFORMANCE_COUNTER,
+                    0,
+                    ExecutionComplexity {
+                        cpu: system_api_complexity::cpu::PERFORMANCE_COUNTER,
+                        ..Default::default()
+                    },
+                    NumInstructions::from(0),
+                    stable_memory_dirty_page_limit,
+                )?;
+                ic0_performance_counter_helper(&log, canister_id, &mut caller, counter_type)
+            }
+        })
+        .unwrap();
+
+    linker
+        .func_wrap("ic0", "canister_version", {
+            move |mut caller: Caller<'_, StoreData<S>>| {
+                with_system_api(&mut caller, |s| s.ic0_canister_version())
+                    .map_err(|e| process_err(&mut caller, e))
             }
         })
         .unwrap();
@@ -761,10 +1161,10 @@ pub(crate) fn syscalls<S: SystemApi>(
         .func_wrap("ic0", "canister_cycle_balance", {
             move |mut caller: Caller<'_, StoreData<S>>| {
                 with_system_api(&mut caller, |s| s.ic0_canister_cycle_balance())
-                    .map_err(|e| process_err(caller, e))
+                    .map_err(|e| process_err(&mut caller, e))
                     .and_then(|s| {
                         i64::try_from(s).map_err(|e| {
-                            wasmtime::Trap::new(format!("ic0_canister_cycle_balance failed: {}", e))
+                            anyhow::Error::msg(format!("ic0_canister_cycle_balance failed: {}", e))
                         })
                     })
             }
@@ -773,10 +1173,26 @@ pub(crate) fn syscalls<S: SystemApi>(
 
     linker
         .func_wrap("ic0", "canister_cycle_balance128", {
-            move |caller: Caller<'_, StoreData<S>>, dst: u32| {
-                with_memory_and_system_api(caller, |system_api, memory| {
-                    system_api.ic0_canister_cycles_balance128(dst, memory)
-                })
+            let log = log.clone();
+            move |mut caller: Caller<'_, StoreData<S>>, dst: u32| {
+                observe_execution_complexity(
+                    &log,
+                    canister_id,
+                    &mut caller,
+                    ExecutionComplexity {
+                        cpu: system_api_complexity::cpu::CANISTER_CYCLES_BALANCE128,
+                        ..Default::default()
+                    },
+                    stable_memory_dirty_page_limit,
+                )?;
+                with_memory_and_system_api(&mut caller, |system_api, memory| {
+                    system_api.ic0_canister_cycle_balance128(dst, memory)
+                })?;
+                if feature_flags.write_barrier == FlagStatus::Enabled {
+                    mark_writes_on_bytemap(&mut caller, dst as usize, 16)
+                } else {
+                    Ok(())
+                }
             }
         })
         .unwrap();
@@ -785,10 +1201,10 @@ pub(crate) fn syscalls<S: SystemApi>(
         .func_wrap("ic0", "msg_cycles_available", {
             move |mut caller: Caller<'_, StoreData<S>>| {
                 with_system_api(&mut caller, |s| s.ic0_msg_cycles_available())
-                    .map_err(|e| process_err(caller, e))
+                    .map_err(|e| process_err(&mut caller, e))
                     .and_then(|s| {
                         i64::try_from(s).map_err(|e| {
-                            wasmtime::Trap::new(format!("ic0_msg_cycles_available failed: {}", e))
+                            anyhow::Error::msg(format!("ic0_msg_cycles_available failed: {}", e))
                         })
                     })
             }
@@ -797,10 +1213,26 @@ pub(crate) fn syscalls<S: SystemApi>(
 
     linker
         .func_wrap("ic0", "msg_cycles_available128", {
-            move |caller: Caller<'_, StoreData<S>>, dst: u32| {
-                with_memory_and_system_api(caller, |system_api, memory| {
+            let log = log.clone();
+            move |mut caller: Caller<'_, StoreData<S>>, dst: u32| {
+                observe_execution_complexity(
+                    &log,
+                    canister_id,
+                    &mut caller,
+                    ExecutionComplexity {
+                        cpu: system_api_complexity::cpu::MSG_CYCLES_AVAILABLE128,
+                        ..Default::default()
+                    },
+                    stable_memory_dirty_page_limit,
+                )?;
+                with_memory_and_system_api(&mut caller, |system_api, memory| {
                     system_api.ic0_msg_cycles_available128(dst, memory)
-                })
+                })?;
+                if feature_flags.write_barrier == FlagStatus::Enabled {
+                    mark_writes_on_bytemap(&mut caller, dst as usize, 16)
+                } else {
+                    Ok(())
+                }
             }
         })
         .unwrap();
@@ -809,10 +1241,10 @@ pub(crate) fn syscalls<S: SystemApi>(
         .func_wrap("ic0", "msg_cycles_refunded", {
             move |mut caller: Caller<'_, StoreData<S>>| {
                 with_system_api(&mut caller, |s| s.ic0_msg_cycles_refunded())
-                    .map_err(|e| process_err(caller, e))
+                    .map_err(|e| process_err(&mut caller, e))
                     .and_then(|s| {
                         i64::try_from(s).map_err(|e| {
-                            wasmtime::Trap::new(format!("ic0_msg_cycles_refunded failed: {}", e))
+                            anyhow::Error::msg(format!("ic0_msg_cycles_refunded failed: {}", e))
                         })
                     })
             }
@@ -821,10 +1253,26 @@ pub(crate) fn syscalls<S: SystemApi>(
 
     linker
         .func_wrap("ic0", "msg_cycles_refunded128", {
-            move |caller: Caller<'_, StoreData<S>>, dst: u32| {
-                with_memory_and_system_api(caller, |system_api, memory| {
+            let log = log.clone();
+            move |mut caller: Caller<'_, StoreData<S>>, dst: u32| {
+                observe_execution_complexity(
+                    &log,
+                    canister_id,
+                    &mut caller,
+                    ExecutionComplexity {
+                        cpu: system_api_complexity::cpu::MSG_CYCLES_REFUNDED128,
+                        ..Default::default()
+                    },
+                    stable_memory_dirty_page_limit,
+                )?;
+                with_memory_and_system_api(&mut caller, |system_api, memory| {
                     system_api.ic0_msg_cycles_refunded128(dst, memory)
-                })
+                })?;
+                if feature_flags.write_barrier == FlagStatus::Enabled {
+                    mark_writes_on_bytemap(&mut caller, dst as usize, 16)
+                } else {
+                    Ok(())
+                }
             }
         })
         .unwrap();
@@ -833,49 +1281,54 @@ pub(crate) fn syscalls<S: SystemApi>(
         .func_wrap("ic0", "msg_cycles_accept", {
             move |mut caller: Caller<'_, StoreData<S>>, amount: i64| {
                 with_system_api(&mut caller, |s| s.ic0_msg_cycles_accept(amount as u64))
-                    .map_err(|e| process_err(caller, e))
+                    .map_err(|e| process_err(&mut caller, e))
             }
         })
         .unwrap();
 
     linker
         .func_wrap("ic0", "msg_cycles_accept128", {
-            move |caller: Caller<'_, StoreData<S>>, amount_high: i64, amount_low: i64, dst: u32| {
-                with_memory_and_system_api(caller, |system_api, memory| {
+            let log = log.clone();
+            move |mut caller: Caller<'_, StoreData<S>>,
+                  amount_high: i64,
+                  amount_low: i64,
+                  dst: u32| {
+                observe_execution_complexity(
+                    &log,
+                    canister_id,
+                    &mut caller,
+                    ExecutionComplexity {
+                        cpu: system_api_complexity::cpu::MSG_CYCLES_ACCEPT128,
+                        ..Default::default()
+                    },
+                    stable_memory_dirty_page_limit,
+                )?;
+                with_memory_and_system_api(&mut caller, |system_api, memory| {
                     system_api.ic0_msg_cycles_accept128(
                         Cycles::from_parts(amount_high as u64, amount_low as u64),
                         dst,
                         memory,
                     )
-                })
+                })?;
+                if feature_flags.write_barrier == FlagStatus::Enabled {
+                    mark_writes_on_bytemap(&mut caller, dst as usize, 16)
+                } else {
+                    Ok(())
+                }
             }
         })
         .unwrap();
 
     linker
         .func_wrap("__", "out_of_instructions", {
+            let log = log.clone();
             move |mut caller: Caller<'_, StoreData<S>>| -> Result<(), _> {
-                let num_instructions_global =
-                    get_num_instructions_global(&mut caller, &log, canister_id)?;
-                let num_instructions_left =
-                    load_value(&num_instructions_global, &mut caller, &log, canister_id)?;
-                let result = with_system_api(&mut caller, |s| {
-                    s.out_of_instructions(num_instructions_left)
-                });
-
-                match result {
-                    Ok(updated_instructions) => {
-                        store_value(
-                            &num_instructions_global,
-                            updated_instructions,
-                            &mut caller,
-                            &log,
-                            canister_id,
-                        )?;
-                        Ok(())
-                    }
-                    Err(err) => Err(process_err(caller, err)),
-                }
+                let global = get_num_instructions_global(&mut caller, &log, canister_id)?;
+                let instruction_counter = load_value(&global, &mut caller, &log, canister_id)?;
+                let instruction_counter =
+                    with_system_api(&mut caller, |s| s.out_of_instructions(instruction_counter))
+                        .map_err(|e| process_err(&mut caller, e))?;
+                store_value(&global, instruction_counter, &mut caller, &log, canister_id)
             }
         })
         .unwrap();
@@ -886,9 +1339,44 @@ pub(crate) fn syscalls<S: SystemApi>(
                   native_memory_grow_res: i32,
                   additional_pages: i32| {
                 with_system_api(&mut caller, |s| {
-                    s.update_available_memory(native_memory_grow_res, additional_pages as u32)
+                    s.update_available_memory(
+                        native_memory_grow_res as i64,
+                        additional_pages as u32 as u64,
+                    )
                 })
-                .map_err(|e| process_err(caller, e))
+                .map(|()| native_memory_grow_res)
+                .map_err(|e| process_err(&mut caller, e))
+            }
+        })
+        .unwrap();
+
+    linker
+        .func_wrap("__", "try_grow_stable_memory", {
+            move |mut caller: Caller<'_, StoreData<S>>,
+                  current_size: i64,
+                  additional_pages: i64,
+                  stable_memory_api: i32| {
+                with_system_api(&mut caller, |s| {
+                    match s.try_grow_stable_memory(
+                        current_size as u64,
+                        additional_pages as u64,
+                        stable_memory_api
+                            .try_into()
+                            .map_err(|()| HypervisorError::Trapped(TrapCode::Other))?,
+                    )? {
+                        StableGrowOutcome::Success => Ok(current_size),
+                        StableGrowOutcome::Failure => Ok(-1),
+                    }
+                })
+                .map_err(|e| process_err(&mut caller, e))
+            }
+        })
+        .unwrap();
+
+    linker
+        .func_wrap("__", "deallocate_pages", {
+            move |mut caller: Caller<'_, StoreData<S>>, additional_pages: i64| {
+                with_system_api(&mut caller, |s| s.deallocate_pages(additional_pages as u64))
             }
         })
         .unwrap();
@@ -897,15 +1385,26 @@ pub(crate) fn syscalls<S: SystemApi>(
         .func_wrap("ic0", "canister_status", {
             move |mut caller: Caller<'_, StoreData<S>>| {
                 with_system_api(&mut caller, |s| s.ic0_canister_status())
-                    .map_err(|e| process_err(caller, e))
+                    .map_err(|e| process_err(&mut caller, e))
             }
         })
         .unwrap();
 
     linker
         .func_wrap("ic0", "certified_data_set", {
-            move |caller: Caller<'_, StoreData<S>>, src: u32, size: u32| {
-                with_memory_and_system_api(caller, |system_api, memory| {
+            let log = log.clone();
+            move |mut caller: Caller<'_, StoreData<S>>, src: u32, size: u32| {
+                observe_execution_complexity(
+                    &log,
+                    canister_id,
+                    &mut caller,
+                    ExecutionComplexity {
+                        cpu: system_api_complexity::cpu::CERTIFIED_DATA_SET,
+                        ..Default::default()
+                    },
+                    stable_memory_dirty_page_limit,
+                )?;
+                with_memory_and_system_api(&mut caller, |system_api, memory| {
                     system_api.ic0_certified_data_set(src, size, memory)
                 })
             }
@@ -916,7 +1415,7 @@ pub(crate) fn syscalls<S: SystemApi>(
         .func_wrap("ic0", "data_certificate_present", {
             move |mut caller: Caller<'_, StoreData<S>>| {
                 with_system_api(&mut caller, |s| s.ic0_data_certificate_present())
-                    .map_err(|e| process_err(caller, e))
+                    .map_err(|e| process_err(&mut caller, e))
             }
         })
         .unwrap();
@@ -925,17 +1424,32 @@ pub(crate) fn syscalls<S: SystemApi>(
         .func_wrap("ic0", "data_certificate_size", {
             move |mut caller: Caller<'_, StoreData<S>>| {
                 with_system_api(&mut caller, |s| s.ic0_data_certificate_size())
-                    .map_err(|e| process_err(caller, e))
+                    .map_err(|e| process_err(&mut caller, e))
             }
         })
         .unwrap();
 
     linker
         .func_wrap("ic0", "data_certificate_copy", {
-            move |caller: Caller<'_, StoreData<S>>, dst: u32, offset: u32, size: u32| {
-                with_memory_and_system_api(caller, |system_api, memory| {
+            move |mut caller: Caller<'_, StoreData<S>>, dst: u32, offset: u32, size: u32| {
+                observe_execution_complexity(
+                    &log,
+                    canister_id,
+                    &mut caller,
+                    ExecutionComplexity {
+                        cpu: system_api_complexity::cpu::DATA_CERTIFICATE_COPY,
+                        ..Default::default()
+                    },
+                    stable_memory_dirty_page_limit,
+                )?;
+                with_memory_and_system_api(&mut caller, |system_api, memory| {
                     system_api.ic0_data_certificate_copy(dst, offset, size, memory)
-                })
+                })?;
+                if feature_flags.write_barrier == FlagStatus::Enabled {
+                    mark_writes_on_bytemap(&mut caller, dst as usize, size as usize)
+                } else {
+                    Ok(())
+                }
             }
         })
         .unwrap();
@@ -944,12 +1458,42 @@ pub(crate) fn syscalls<S: SystemApi>(
         .func_wrap("ic0", "mint_cycles", {
             move |mut caller: Caller<'_, StoreData<S>>, amount: i64| {
                 with_system_api(&mut caller, |s| s.ic0_mint_cycles(amount as u64))
-                    .map_err(|e| process_err(caller, e))
+                    .map_err(|e| process_err(&mut caller, e))
                     .and_then(|s| {
                         i64::try_from(s).map_err(|e| {
-                            wasmtime::Trap::new(format!("ic0_mint_cycles failed: {}", e))
+                            anyhow::Error::msg(format!("ic0_mint_cycles failed: {}", e))
                         })
                     })
+            }
+        })
+        .unwrap();
+
+    linker
+        .func_wrap("__", "internal_trap", {
+            move |mut caller: Caller<'_, StoreData<S>>, err_code: i32| -> Result<(), _> {
+                let err = match InternalErrorCode::from_i32(err_code) {
+                    InternalErrorCode::HeapOutOfBounds => {
+                        HypervisorError::Trapped(TrapCode::HeapOutOfBounds)
+                    }
+                    InternalErrorCode::StableMemoryOutOfBounds => {
+                        HypervisorError::Trapped(TrapCode::StableMemoryOutOfBounds)
+                    }
+                    InternalErrorCode::StableMemoryTooBigFor32Bit => {
+                        HypervisorError::Trapped(TrapCode::StableMemoryTooBigFor32Bit)
+                    }
+                    InternalErrorCode::MemoryAccessLimitExceeded => {
+                        HypervisorError::MemoryAccessLimitExceeded(
+                            format!("Exceeded the limit for the number of modified pages in the stable memory in a single message execution: limit: {} KB.",
+                                    stable_memory_dirty_page_limit * (PAGE_SIZE as u64 / 1024),
+                            )
+                        )
+                    }
+                    InternalErrorCode::Unknown => HypervisorError::CalledTrap(format!(
+                        "Trapped with internal error code: {}",
+                        err_code
+                    )),
+                };
+                Err(process_err(&mut caller, err))
             }
         })
         .unwrap();

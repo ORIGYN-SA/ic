@@ -5,15 +5,18 @@
 mod ingress_handler;
 mod ingress_selector;
 
+#[cfg(all(test, feature = "proptest"))]
+mod proptests;
+
 use ic_cycles_account_manager::CyclesAccountManager;
 use ic_interfaces::{
     consensus_pool::ConsensusPoolCache,
     crypto::IngressSigVerifier,
     execution_environment::IngressHistoryReader,
     ingress_pool::{IngressPoolObject, IngressPoolSelect, SelectResult},
-    registry::RegistryClient,
 };
-use ic_interfaces_state_manager::StateManager;
+use ic_interfaces_registry::RegistryClient;
+use ic_interfaces_state_manager::StateReader;
 use ic_logger::{error, warn, ReplicaLogger};
 use ic_metrics::{buckets::decimal_buckets, MetricsRegistry};
 use ic_registry_client_helpers::subnet::{IngressMessageSettings, SubnetRegistry};
@@ -116,7 +119,7 @@ pub struct IngressManager {
 
     /// Remember last purge time to control purge frequency.
     pub(crate) last_purge_time: RwLock<Time>,
-    state_manager: Arc<dyn StateManager<State = ReplicatedState>>,
+    state_reader: Arc<dyn StateReader<State = ReplicatedState>>,
     cycles_account_manager: Arc<CyclesAccountManager>,
     malicious_flags: MaliciousFlags,
 }
@@ -133,7 +136,7 @@ impl IngressManager {
         metrics_registry: MetricsRegistry,
         subnet_id: SubnetId,
         log: ReplicaLogger,
-        state_manager: Arc<dyn StateManager<State = ReplicatedState>>,
+        state_reader: Arc<dyn StateReader<State = ReplicatedState>>,
         cycles_account_manager: Arc<CyclesAccountManager>,
         malicious_flags: MaliciousFlags,
     ) -> Self {
@@ -149,7 +152,7 @@ impl IngressManager {
             log,
             last_purge_time: RwLock::new(UNIX_EPOCH),
             messages_to_purge: RwLock::new(Vec::new()),
-            state_manager,
+            state_reader,
             cycles_account_manager,
             malicious_flags,
         }
@@ -207,8 +210,8 @@ pub(crate) mod tests {
             ChangeSet, IngressPool, MutableIngressPool, PoolSection, UnvalidatedIngressArtifact,
             ValidatedIngressArtifact,
         },
-        registry::RegistryClient,
     };
+    use ic_interfaces_state_manager_mocks::MockStateManager;
     use ic_metrics::MetricsRegistry;
     use ic_registry_client::client::RegistryClientImpl;
     use ic_registry_keys::make_subnet_record_key;
@@ -220,10 +223,9 @@ pub(crate) mod tests {
         cycles_account_manager::CyclesAccountManagerBuilder,
         history::MockIngressHistory,
         state::ReplicatedStateBuilder,
-        state_manager::MockStateManager,
         types::ids::{node_test_id, subnet_test_id},
-        with_test_replica_logger,
     };
+    use ic_test_utilities_logger::with_test_replica_logger;
     use ic_test_utilities_registry::test_subnet_record;
     use ic_types::{ingress::IngressStatus, Height, RegistryVersion, SubnetId};
     use std::sync::{Arc, RwLockWriteGuard};

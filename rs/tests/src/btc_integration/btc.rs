@@ -1,39 +1,86 @@
 /* tag::catalog[]
 Title:: Bitcoin integration test
+
+Goal:: Test whether we can successfully retrieve the BTC balance of an address on the IC.
+
+Runbook::
+. Setup:
+    . Bitcoind running in a docker container inside the Universal VM.
+    . App subnet with bitcoin feature enabled and setup to talk to bitcoind.
+. Create a BTC address
+. Mint some blocks giving BTC to the address created
+. Assert that a bitcoin_get_balance management call returns the expected value.
+
+Success::
+. The balance of the address matches the expected value.
+
 end::catalog[] */
 
-use std::io::Read;
-use std::net::IpAddr;
+use std::net::{IpAddr, SocketAddr};
+use std::sync::Arc;
 
-use crate::nns::NnsExt;
-use crate::util::{self /* runtime_from_url */};
-// use canister_test::Project;
-// use dfn_candid::candid;
-use crate::driver::pot_dsl::get_ic_handle_and_ctx;
+use crate::ckbtc::lib::install_bitcoin_canister;
 use crate::driver::test_env::TestEnv;
-use crate::driver::test_env_api::{DefaultIC, HasPublicApiUrl, IcNodeContainer, SshSession, ADMIN};
+use crate::driver::test_env_api::{
+    retry, retry_async, HasGroupSetup, HasPublicApiUrl, HasTopologySnapshot, IcNodeContainer,
+    SshSession, ADMIN, READY_WAIT_TIMEOUT, RETRY_BACKOFF,
+};
 use crate::driver::universal_vm::UniversalVms;
+use crate::util::runtime_from_url;
+use crate::util::{block_on, UniversalCanister};
 use crate::{
     driver::ic::{InternetComputer, Subnet},
     driver::universal_vm::UniversalVm,
 };
-use ic_registry_subnet_features::{BitcoinFeature, SubnetFeatures};
+use anyhow::bail;
+use bitcoincore_rpc::{Auth, Client, RpcApi};
+use candid::Decode;
 use ic_registry_subnet_type::SubnetType;
-use slog::{info, Logger};
+use ic_types::Height;
+use ic_universal_canister::{management, wasm};
+use slog::info;
+use std::{
+    fs::File,
+    io::{Read, Write},
+    path::Path,
+};
 
 const UNIVERSAL_VM_NAME: &str = "btc-node";
 
 pub fn config(env: TestEnv) {
+    env.ensure_group_setup_created();
+    let logger = env.logger();
+    // Regtest bitcoin node listens on 18444
+    // docker bitcoind image uses 8332 for the rpc server
+    // https://en.bitcoinwiki.org/wiki/Running_Bitcoind
     let activate_script = r#"#!/bin/sh
-docker volume create --name=bitcoind-data
-docker run -v bitcoind-data:/bitcoin/.bitcoin --name=bitcoind-node -d \
-  -p 8333:8333 \
-  -p 127.0.0.1:8332:8332 \
-  kylemanna/bitcoind
+cp /config/bitcoin.conf /tmp/bitcoin.conf
+docker run  --name=bitcoind-node -d \
+  -p 8332:8332 \
+  -p 18444:18444 \
+  -v /tmp:/bitcoin/.bitcoin \
+  registry.gitlab.com/dfinity-lab/open/public-docker-registry/kylemanna/bitcoind
 "#;
     let config_dir = env
         .single_activate_script_config_dir(UNIVERSAL_VM_NAME, activate_script)
         .unwrap();
+
+    let bitcoin_conf_path = config_dir.join("bitcoin.conf");
+    let mut bitcoin_conf = File::create(bitcoin_conf_path).unwrap();
+    bitcoin_conf.write_all(r#"
+    # Enable regtest mode. This is required to setup a private bitcoin network.
+    regtest=1
+    debug=1
+    whitelist=[::]/0
+    fallbackfee=0.0002
+
+    # Dummy credentials that are required by `bitcoin-cli`.
+    rpcuser=btc-dev-preview
+    rpcpassword=Wjh4u6SAjT4UMJKxPmoZ0AN2r9qbE-ksXQ5I2_-Hm4w=
+    rpcauth=btc-dev-preview:8555f1162d473af8e1f744aa056fd728$afaf9cb17b8cf0e8e65994d1195e4b3a4348963b08897b4084d210e5ee588bcb
+    "#
+    .as_bytes()).unwrap();
+    bitcoin_conf.sync_all().unwrap();
 
     UniversalVm::new(String::from(UNIVERSAL_VM_NAME))
         .with_config_dir(config_dir)
@@ -45,93 +92,130 @@ docker run -v bitcoind-data:/bitcoin/.bitcoin --name=bitcoind-node -d \
     let btc_node_ipv6 = universal_vm.ipv6;
 
     InternetComputer::new()
-        .with_bitcoind_addr(IpAddr::V6(btc_node_ipv6))
-        .add_subnet(Subnet::new(SubnetType::System).add_nodes(4))
+        .with_bitcoind_addr(SocketAddr::new(IpAddr::V6(btc_node_ipv6), 18444))
         .add_subnet(
-            Subnet::new(SubnetType::Application)
-                .with_features(SubnetFeatures {
-                    bitcoin_testnet_feature: Some(BitcoinFeature::Enabled),
-                    ..SubnetFeatures::default()
-                })
-                .add_nodes(4),
+            Subnet::new(SubnetType::System)
+                .with_dkg_interval_length(Height::from(10))
+                .add_nodes(1),
         )
-        .setup_and_start(&env)
+        .setup_and_start_with_ids(&env)
         .expect("failed to setup IC under test");
+
+    info!(logger, "Checking readiness of all nodes ...");
+    env.topology_snapshot().subnets().for_each(|subnet| {
+        subnet
+            .nodes()
+            .for_each(|node| node.await_status_is_healthy().unwrap())
+    });
+    info!(logger, "All nodes are ready");
 }
 
-pub fn test(env: TestEnv, logger: Logger) {
-    info!(&logger, "Checking readiness of all nodes...");
-    for subnet in env.topology_snapshot().subnets() {
-        for node in subnet.nodes() {
-            node.await_status_is_healthy().unwrap();
-        }
-    }
+fn get_bitcoind_log(env: &TestEnv) {
+    let f = || -> Result<(), anyhow::Error> {
+        let r = {
+            let universal_vm = env.get_deployed_universal_vm(UNIVERSAL_VM_NAME).unwrap();
+            let session = universal_vm.block_on_ssh_session(ADMIN).unwrap();
 
-    // SSH to universal-VM example:
-    info!(
-        logger,
-        "Executing the uname -a command on the universal VM via SSH..."
-    );
+            // Give log file user permission to copy it from the host.
+            universal_vm.block_on_bash_script_from_session(
+                &session,
+                "sudo chown -R $(id -u):$(id -g) /tmp/regtest/debug.log",
+            )?;
+
+            // Log file is mapped from docker container to tmp directory.
+            let (mut remote_file, _) = session.scp_recv(Path::new("/tmp/regtest/debug.log"))?;
+
+            let mut buf = String::new();
+            remote_file.read_to_string(&mut buf)?;
+            std::fs::write(env.base_path().join("bitcoind.log"), buf)
+        };
+        r.map_err(|e| e.into())
+    };
+
+    retry(env.logger(), READY_WAIT_TIMEOUT, RETRY_BACKOFF, f).expect("Failed to get bitcoind logs");
+}
+
+pub fn get_balance(env: TestEnv) {
+    let logger = env.logger();
+
     let deployed_universal_vm = env.get_deployed_universal_vm(UNIVERSAL_VM_NAME).unwrap();
-    let sess = deployed_universal_vm.block_on_ssh_session(ADMIN).unwrap();
-    let mut channel = sess.channel_session().unwrap();
-    channel.exec("uname -a").unwrap();
-    let mut s = String::new();
-    channel.read_to_string(&mut s).unwrap();
-    info!(logger, "{}", s);
-    channel.wait_close().unwrap();
-    info!(logger, "{}", channel.exit_status().unwrap());
 
-    // TODO: adapt the test below to use the env directly
-    // instead of using the deprecated IcHandle and Context.
-    let (handle, ctx) = get_ic_handle_and_ctx(env, logger.clone());
-
-    // Install NNS canisters
-    ctx.install_nns_canisters(&handle, true);
-    let rt = tokio::runtime::Runtime::new().expect("Could not create tokio runtime.");
-    let mut rng = ctx.rng.clone();
-
-    let app_endpoint = util::get_random_application_node_endpoint(&handle, &mut rng);
-    rt.block_on(app_endpoint.assert_ready(&ctx));
-    info!(&logger, "App endpoint reachable over http.");
-
-    /*
-    info!(&logger, "Building btc test canister wasm...");
-    let wasm = Project::cargo_bin_maybe_use_path_relative_to_rs(
-        "rust_canisters/btc",
-        "btc-test-canister",
-        &[],
+    let btc_rpc = Arc::new(
+        self::Client::new(
+            &format!(
+                "http://[{}]:8332",
+                deployed_universal_vm.get_vm().unwrap().ipv6
+            ),
+            Auth::UserPass(
+                "btc-dev-preview".to_string(),
+                "Wjh4u6SAjT4UMJKxPmoZ0AN2r9qbE-ksXQ5I2_-Hm4w=".to_string(),
+            ),
+        )
+        .unwrap(),
     );
 
-    info!(&logger, "Installing btc test canister...");
-    rt.block_on(async {
-        let crt = runtime_from_url(app_endpoint.clone().url);
-        let canister = wasm
-            .clone()
-            .install_(&crt, vec![])
-            .await
-            .unwrap_or_else(|_| panic!("Installation of the btc test canister failed.",));
+    // Create a wallet.
+    // Retry since the bitcoind VM might not be up yet.
+    let btc_rpc_c = btc_rpc.clone();
+    retry(
+        logger.clone(),
+        READY_WAIT_TIMEOUT,
+        RETRY_BACKOFF,
+        move || match btc_rpc_c.create_wallet("mywallet", None, None, None, None) {
+            Ok(_) => Ok(()),
+            Err(err) => {
+                bail!("Connecting to btc rpc failed {err}")
+            }
+        },
+    )
+    .unwrap();
 
-        let query_input = (); // ("BTC_address", ..);
-        let query_result1: i32 = canister
-            .query_("balance_query_call", candid, query_input)
-            .await
-            .unwrap_or_else(|_| panic!("Btc test canister query failed."));
+    // Generate an address.
+    let btc_address = btc_rpc.get_new_address(None, None).unwrap();
+    info!(&logger, "Created temporary btc address: {}", btc_address);
 
-        let amount = 3;
-        let update_input = ("BTC_address", amount);
-        let _update_result = canister
-            .query_("transfer_update_call", candid, update_input)
-            .await
-            .unwrap_or_else(|_| panic!("Btc test canister update failed."));
+    // Mint some blocks for the address we generated.
+    let block = btc_rpc.generate_to_address(101, &btc_address).unwrap();
+    info!(&logger, "Generated {} btc blocks.", block.len());
 
-        tokio::time::sleep(std::time::Duration::from_secs(100)).await;
-        let query_result2: i32 = canister
-            .query_("balance_query_call", candid, query_input)
-            .await
-            .unwrap_or_else(|_| panic!("Btc test canister query failed."));
+    // We have minted 101 blocks and each one gives 50 bitcoin to the target address,
+    // so in total the balance of the address without setting `any min_confirmations`
+    // should be 50 * 101 = 5050 bitcoin or 505000000000 satoshis.
+    let expected_balance_in_satoshis = 5050_0000_0000_u64;
+    let topology = env.topology_snapshot();
+    let node = topology.root_subnet().nodes().next().unwrap();
+    let agent = node.with_default_agent(|agent| async move { agent });
+    let res = block_on(async {
+        let runtime = runtime_from_url(node.get_public_url(), node.effective_canister_id());
+        install_bitcoin_canister(&runtime, &logger, &env).await;
+        let canister =
+            UniversalCanister::new_with_retries(&agent, node.effective_canister_id(), &logger)
+                .await;
+        retry_async(&logger, READY_WAIT_TIMEOUT, RETRY_BACKOFF, || async {
+            let res = canister
+                .update(wasm().call(management::bitcoin_get_balance(
+                    btc_address.to_string(),
+                    None,
+                )))
+                .await
+                .map(|res| Decode!(res.as_slice(), u64))
+                .unwrap()
+                .unwrap();
 
-        assert_eq!(query_result2 - query_result1, amount);
+            if res != expected_balance_in_satoshis {
+                bail!(
+                    "IC balance {:?} does not match bitcoind balance {}",
+                    res,
+                    expected_balance_in_satoshis
+                );
+            }
+
+            Ok(res)
+        })
+        .await
     });
-    */
+    // blocks
+    get_bitcoind_log(&env);
+    // We only exit retry loop successfully if we got the expected satoshi balance
+    res.expect("Failed to get btc balance");
 }

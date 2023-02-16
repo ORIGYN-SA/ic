@@ -1,23 +1,17 @@
 use serde::{Deserialize, Serialize};
 
-/// Represents an error that can happen when parsing a Wasm module using
-/// `parity_wasm`.
-///
-/// Note that ideally we would wrap a `parity_wasm::elements:Error` here but
-/// unfortunately it does not derive `Serialize` and `Deserialize` which is
-/// required by other types that this error gets embedded in. So, instead wrap
-/// only the error message.
+/// Represents an error that can happen when parsing or encoding a Wasm module
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
-pub struct ParityWasmError(String);
+pub struct WasmError(String);
 
-impl ParityWasmError {
-    /// Creates a new `ParityWasmError` out of an error message.
+impl WasmError {
+    /// Creates a new `WasmError` out of an error message.
     pub fn new(error_message: String) -> Self {
         Self(error_message)
     }
 }
 
-impl std::fmt::Display for ParityWasmError {
+impl std::fmt::Display for WasmError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}", self.0)
     }
@@ -26,8 +20,8 @@ impl std::fmt::Display for ParityWasmError {
 /// Different errors that be returned by `validate_wasm_binary`
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub enum WasmValidationError {
-    /// Failure in party_wasm when deserializing the wasm module.  
-    ParityDeserializeError(ParityWasmError),
+    /// Failure in deserialization of the wasm module.
+    WasmDeserializeError(WasmError),
     /// wasmtime::Module::validate() failed
     WasmtimeValidation(String),
     /// Failed to decode the canister module.
@@ -50,12 +44,24 @@ pub enum WasmValidationError {
     TooManyCustomSections { defined: usize, allowed: usize },
     /// Module defines an invalid index for a local function.
     InvalidFunctionIndex { index: usize, import_count: usize },
+    /// A function was too complex.
+    FunctionComplexityTooHigh {
+        index: usize,
+        complexity: usize,
+        allowed: usize,
+    },
+    /// A function was too large.
+    FunctionTooLarge {
+        index: usize,
+        size: usize,
+        allowed: usize,
+    },
 }
 
 impl std::fmt::Display for WasmValidationError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::ParityDeserializeError(err) => {
+            Self::WasmDeserializeError(err) => {
                 write!(f, "Failed to deserialize wasm module with {}", err)
             }
             Self::WasmtimeValidation(err) => {
@@ -102,6 +108,16 @@ impl std::fmt::Display for WasmValidationError {
                 "Function has index {} but should start from {}.",
                 index, import_count
             ),
+            Self::FunctionComplexityTooHigh{ index, complexity, allowed } => write!(
+                f,
+                "Wasm module contains a function at index {} with complexity {} which exceeds the maximum complexity allowed {}",
+                index, complexity, allowed
+            ),
+            Self::FunctionTooLarge{index, size, allowed} => write!(
+                f,
+                "Wasm module contains a function at index {} of size {} that exceeds the maximum allowed size of {}",
+                index, size, allowed,
+            ),
         }
     }
 }
@@ -109,10 +125,10 @@ impl std::fmt::Display for WasmValidationError {
 /// Different errors that can be returned by `instrument`
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub enum WasmInstrumentationError {
-    /// Failure in party_wasm when deserializing the wasm module
-    ParityDeserializeError(ParityWasmError),
-    /// Failure in party_wasm when serializing the wasm module
-    ParitySerializeError(ParityWasmError),
+    /// Failure in deserialization the wasm module
+    WasmDeserializeError(WasmError),
+    /// Failure in serialization the wasm module
+    WasmSerializeError(WasmError),
     /// Incorrect number of memory sections
     IncorrectNumberMemorySections {
         expected: usize,
@@ -128,10 +144,10 @@ pub enum WasmInstrumentationError {
 impl std::fmt::Display for WasmInstrumentationError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::ParityDeserializeError(err) => {
+            Self::WasmDeserializeError(err) => {
                 write!(f, "Failed to deserialize wasm module with {}", err)
             }
-            Self::ParitySerializeError(err) => {
+            Self::WasmSerializeError(err) => {
                 write!(f, "Failed to serialize wasm module with {}", err)
             }
             Self::IncorrectNumberMemorySections { expected, got } => write!(
@@ -155,9 +171,12 @@ impl std::fmt::Display for WasmInstrumentationError {
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub enum WasmEngineError {
     FailedToInitializeEngine,
-    FailedToInstantiateModule,
+    FailedToInstantiateModule(String),
     FailedToSetAsyncStack,
     FailedToSetWasmStack,
+    FailedToSerializeModule(String),
+    FailedToDeserializeModule(String),
+    FailedToApplySystemChanges(String),
 }
 
 impl std::fmt::Display for WasmEngineError {
@@ -166,14 +185,23 @@ impl std::fmt::Display for WasmEngineError {
             Self::FailedToInitializeEngine => {
                 write!(f, "Failed to initialize engine")
             }
-            Self::FailedToInstantiateModule => {
-                write!(f, "Failed to instantiate module")
+            Self::FailedToInstantiateModule(s) => {
+                write!(f, "Failed to instantiate module: {}", s)
             }
             Self::FailedToSetWasmStack => {
                 write!(f, "Failed to set Wasm stack")
             }
             Self::FailedToSetAsyncStack => {
                 write!(f, "Failed to set async stack")
+            }
+            Self::FailedToSerializeModule(s) => {
+                write!(f, "Failed to serialize module: {}", s)
+            }
+            Self::FailedToDeserializeModule(s) => {
+                write!(f, "Failed to deserialize module: {}", s)
+            }
+            Self::FailedToApplySystemChanges(s) => {
+                write!(f, "Failed to apply system changes: {}", s)
             }
         }
     }

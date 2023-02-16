@@ -68,32 +68,31 @@
 //!      PeerFlowQueueMap: A single flow being addressed by 1 thread.
 //! ```
 use crate::{
-    advert_utils::AdvertRequestBuilder,
-    gossip_protocol::{Gossip, GossipChunk, GossipChunkRequest, GossipMessage},
+    gossip_protocol::Gossip,
+    gossip_types::{GossipChunk, GossipChunkRequest, GossipMessage},
     metrics::FlowWorkerMetrics,
 };
-use async_trait::async_trait;
-use ic_interfaces::ingress_pool::IngressPoolThrottler;
-use ic_interfaces_p2p::IngressError;
-use ic_interfaces_transport::{
-    AsyncTransportEventHandler, FlowId, SendError, TransportError, TransportErrorCode,
-    TransportNotification, TransportPayload, TransportStateChange,
-};
-use ic_logger::{debug, info, replica_logger::ReplicaLogger, trace};
+use ic_interfaces_transport::{TransportEvent, TransportMessage};
+use ic_logger::{debug, error, replica_logger::ReplicaLogger, warn};
 use ic_metrics::MetricsRegistry;
-use ic_protobuf::{p2p::v1 as pb, proxy::ProtoProxy, registry::subnet::v1::GossipConfig};
-use ic_types::{artifact::AdvertClass, messages::SignedIngress, p2p::GossipAdvert, NodeId};
-use parking_lot::RwLock;
+use ic_protobuf::{p2p::v1 as pb, proxy::ProtoProxy};
+use ic_types::{
+    artifact::{ArtifactDestination, ArtifactFilter, ArtifactTag},
+    p2p::GossipAdvert,
+    NodeId,
+};
+use parking_lot::{Mutex, RwLock};
+use prometheus::IntCounterVec;
 use std::{
     cmp::max,
     collections::BTreeMap,
-    convert::{Infallible, TryInto},
+    convert::Infallible,
     fmt::Debug,
     future::Future,
     pin::Pin,
     sync::{
         atomic::{AtomicBool, Ordering::SeqCst},
-        Arc, Condvar, Mutex,
+        Arc, Condvar,
     },
     task::{Context, Poll},
     thread::JoinHandle,
@@ -116,9 +115,7 @@ type GossipArc = Arc<
             GossipAdvert = GossipAdvert,
             GossipChunkRequest = GossipChunkRequest,
             GossipChunk = GossipChunk,
-            NodeId = NodeId,
-            TransportNotification = TransportNotification,
-            Ingress = SignedIngress,
+            GossipRetransmissionRequest = ArtifactFilter,
         > + Send
         + Sync,
 >;
@@ -142,6 +139,7 @@ enum FlowType {
 }
 
 /// We have a single worker for all flows with the same flow type.
+#[derive(Clone)]
 struct FlowWorker {
     flow_type_name: &'static str,
     /// The flow type worker metrics.
@@ -151,9 +149,7 @@ struct FlowWorker {
     threadpool: Arc<Mutex<ThreadPool>>,
     /// The semaphore map used to make sure not a single peer can
     /// flood the this peer.
-    sem_map: Arc<RwLock<BTreeMap<NodeId, Arc<Semaphore>>>>,
-    /// The max number of inflight request for each peer.
-    max_inflight_requests: usize,
+    sem: Arc<Semaphore>,
 }
 
 impl FlowWorker {
@@ -171,8 +167,7 @@ impl FlowWorker {
             flow_type_name,
             metrics,
             threadpool: Arc::new(Mutex::new(threadpool)),
-            sem_map: Arc::new(RwLock::new(BTreeMap::new())),
-            max_inflight_requests,
+            sem: Arc::new(Semaphore::new(max(1, max_inflight_requests))),
         }
     }
 
@@ -190,8 +185,8 @@ impl FlowWorker {
             .with_label_values(&[self.flow_type_name])
             .start_timer();
 
-        let sem = self.insert_peer_semaphore_if_missing(node_id);
         // Acquiring a permit must always succeed because we never close the semaphore.
+        let sem = self.sem.clone();
         let permit = match sem.clone().try_acquire_owned() {
             Ok(permit) => permit,
             Err(_) => {
@@ -204,38 +199,24 @@ impl FlowWorker {
                     .expect("Acquiring a permit can't fail because we never close the semaphore.")
             }
         };
-        self.threadpool.lock().unwrap().execute(move || {
+        self.threadpool.lock().execute(move || {
             let _permit = permit;
             let _send_timer = send_timer;
             consume_message_fn(msg, node_id);
         });
     }
-
-    fn insert_peer_semaphore_if_missing(&self, node_id: NodeId) -> Arc<Semaphore> {
-        if let Some(sem) = self.sem_map.read().get(&node_id) {
-            return sem.clone();
-        }
-        let mut sem_map = self.sem_map.write();
-        match sem_map.entry(node_id) {
-            std::collections::btree_map::Entry::Vacant(e) => {
-                let sem = Arc::new(Semaphore::new(max(1, self.max_inflight_requests)));
-                e.insert(sem.clone());
-                sem
-            }
-            std::collections::btree_map::Entry::Occupied(e) => e.get().clone(),
-        }
-    }
 }
 
 /// The struct implements the async event handler traits for consumption by
 /// transport, ingress, artifact manager, and node addition/removal.
+#[derive(Clone)]
 pub(crate) struct AsyncTransportEventHandlerImpl {
     /// The replica node ID.
     node_id: NodeId,
     /// The logger.
     log: ReplicaLogger,
     /// The peer flows.
-    gossip: Arc<RwLock<Option<GossipArc>>>,
+    gossip: GossipArc,
 
     /// The current flows of received adverts.
     advert: FlowWorker,
@@ -251,35 +232,24 @@ pub(crate) struct AsyncTransportEventHandlerImpl {
 
 /// The maximum number of buffered adverts.
 pub(crate) const MAX_ADVERT_BUFFER: usize = 100_000;
-/// The maximum number of buffered *Transport* notification messages.
-pub(crate) const MAX_TRANSPORT_BUFFER: usize = 1000;
-/// The maximum number of buffered retransmission requests.
-pub(crate) const MAX_RETRANSMISSION_BUFFER: usize = 1000;
 
 /// The channel configuration, containing the maximum number of messages for
 /// each flow type.
-#[derive(Default)]
 pub(crate) struct ChannelConfig {
     /// The map from flow type to the maximum number of buffered messages.
     map: BTreeMap<FlowType, usize>,
 }
 
-/// A `GossipConfig` can be converted into a `ChannelConfig`.
-impl From<GossipConfig> for ChannelConfig {
-    /// The function converts a `GossipConfig` to a `ChannelConfig`.
-    fn from(gossip_config: GossipConfig) -> Self {
-        let max_outstanding_buffer = gossip_config
-            .max_artifact_streams_per_peer
-            .try_into()
-            .unwrap();
+impl Default for ChannelConfig {
+    fn default() -> Self {
         Self {
             map: FlowType::iter()
                 .map(|flow_type| match flow_type {
                     FlowType::Advert => (flow_type, MAX_ADVERT_BUFFER),
-                    FlowType::Request => (flow_type, max_outstanding_buffer),
-                    FlowType::Chunk => (flow_type, max_outstanding_buffer),
-                    FlowType::Retransmission => (flow_type, MAX_RETRANSMISSION_BUFFER),
-                    FlowType::Transport => (flow_type, MAX_TRANSPORT_BUFFER),
+                    FlowType::Request => (flow_type, 100),
+                    FlowType::Chunk => (flow_type, 100),
+                    FlowType::Retransmission => (flow_type, 1000),
+                    FlowType::Transport => (flow_type, 1000),
                 })
                 .collect(),
         }
@@ -292,12 +262,13 @@ impl AsyncTransportEventHandlerImpl {
         log: ReplicaLogger,
         metrics_registry: &MetricsRegistry,
         channel_config: ChannelConfig,
+        gossip: GossipArc,
     ) -> Self {
         let flow_worker_metrics = FlowWorkerMetrics::new(metrics_registry);
         Self {
             node_id,
             log,
-            gossip: Arc::new(RwLock::new(None)),
+            gossip,
 
             advert: FlowWorker::new(
                 FlowType::Advert.into(),
@@ -326,154 +297,100 @@ impl AsyncTransportEventHandlerImpl {
             ),
         }
     }
-
-    /// The method starts the event processing loop, dispatching events to the
-    /// *Gossip* component.
-    pub(crate) fn start(&self, gossip_arc: GossipArc) {
-        self.gossip.write().replace(gossip_arc);
-    }
 }
 
-#[async_trait]
-impl AsyncTransportEventHandler for AsyncTransportEventHandlerImpl {
-    /// The method sends the given message on the flow associated with the given
-    /// flow ID.
-    async fn send_message(&self, flow: FlowId, message: TransportPayload) -> Result<(), SendError> {
-        let gossip_message = <pb::GossipMessage as ProtoProxy<GossipMessage>>::proxy_decode(
-            &message.0,
-        )
-        .map_err(|e| {
-            trace!(self.log, "Deserialization failed {}", e);
-            SendError::DeserializationFailed
-        })?;
-
-        let c_gossip = self.gossip.read().as_ref().unwrap().clone();
-        match gossip_message {
-            GossipMessage::Advert(msg) => {
-                let consume_fn = move |item, peer_id| {
-                    c_gossip.on_advert(item, peer_id);
-                };
-                self.advert.execute(flow.peer_id, msg, consume_fn).await;
-            }
-            GossipMessage::ChunkRequest(msg) => {
-                let consume_fn = move |item, peer_id| {
-                    c_gossip.on_chunk_request(item, peer_id);
-                };
-                self.request.execute(flow.peer_id, msg, consume_fn).await;
-            }
-            GossipMessage::Chunk(msg) => {
-                let consume_fn = move |item, peer_id| {
-                    c_gossip.on_chunk(item, peer_id);
-                };
-                self.chunk.execute(flow.peer_id, msg, consume_fn).await;
-            }
-            GossipMessage::RetransmissionRequest(msg) => {
-                let consume_fn = move |item, peer_id| {
-                    c_gossip.on_retransmission_request(item, peer_id);
-                };
-                self.retransmission
-                    .execute(flow.peer_id, msg, consume_fn)
-                    .await;
-            }
-        };
-        Ok(())
-    }
-
-    /// The method changes the state of the P2P event handler.
-    async fn state_changed(&self, state_change: TransportStateChange) {
-        let c_gossip = self.gossip.read().as_ref().unwrap().clone();
-        let consume_fn = move |item, _peer_id| {
-            c_gossip.on_transport_state_change(item);
-        };
-        self.transport
-            .execute(self.node_id, state_change, consume_fn)
-            .await;
-    }
-
-    /// If there is a sender error, the method sends a transport error
-    /// notification message on the flow associated with the given flow ID.
-    async fn error(&self, flow: FlowId, error: TransportErrorCode) {
-        if let TransportErrorCode::SenderErrorIndicated = error {
-            let c_gossip = self.gossip.read().as_ref().unwrap().clone();
-            let consume_fn = move |item, _peer_id| {
-                c_gossip.on_transport_error(item);
-            };
-            self.transport
-                .execute(
-                    self.node_id,
-                    TransportError::TransportSendError(FlowId {
-                        peer_id: flow.peer_id,
-                        flow_tag: flow.flow_tag,
-                    }),
-                    consume_fn,
-                )
-                .await;
-        }
-    }
-}
-
-/// The ingress throttler is protected by a read-write lock for concurrent
-/// access.
-pub type IngressThrottler = Arc<std::sync::RwLock<dyn IngressPoolThrottler + Send + Sync>>;
-
-pub(crate) struct IngressEventHandler {
-    threadpool: ThreadPool,
-    /// The ingress throttler.
-    ingress_throttler: IngressThrottler,
-    /// The shared *Gossip* instance (using automatic reference counting).
-    gossip: GossipArc,
-    /// The node ID.
-    node_id: NodeId,
-}
-
-impl IngressEventHandler {
-    /// The function creates an `IngressEventHandler` instance.
-    pub(crate) fn new(
-        ingress_throttler: IngressThrottler,
-        gossip: GossipArc,
-        node_id: NodeId,
-    ) -> Self {
-        let threadpool = threadpool::Builder::new()
-            .num_threads(P2P_PER_FLOW_THREADS)
-            .thread_name("P2P_Ingress_Thread".into())
-            .build();
-
-        Self {
-            threadpool,
-            ingress_throttler,
-            gossip,
-            node_id,
-        }
-    }
-}
-
-/// `IngressEventHandler` implements the `IngressEventHandler` trait.
-impl Service<SignedIngress> for IngressEventHandler {
-    type Response = Result<(), IngressError>;
+impl Service<TransportEvent> for AsyncTransportEventHandlerImpl {
+    type Response = ();
     type Error = Infallible;
     #[allow(clippy::type_complexity)]
-    type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send>>;
+    type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send + Sync>>;
 
     fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
         Poll::Ready(Ok(()))
     }
 
-    /// The method is called when an ingress message is received.
-    fn call(&mut self, signed_ingress: SignedIngress) -> Self::Future {
-        let gossip = Arc::clone(&self.gossip);
-        let throttler = Arc::clone(&self.ingress_throttler);
-        let node_id = self.node_id;
-        let (tx, rx) = tokio::sync::oneshot::channel();
-        self.threadpool.execute(move || {
-            // We ingnore the error in case the receiver was dropped. This can happen when the
-            // client drops the future executing this code.
-            let _ = tx.send(if throttler.read().unwrap().exceeds_threshold() {
-                Err(IngressError::Overloaded)
-            } else {
-                gossip.on_user_ingress(signed_ingress, node_id)
-            });
-        });
-        Box::pin(async move { Ok(rx.await.expect("Ingress ingestion task MUST NOT panic.")) })
+    /// The method sends the given message on the flow associated with the given
+    /// flow ID.
+    fn call(&mut self, event: TransportEvent) -> Self::Future {
+        let c_gossip = self.gossip.clone();
+        match event {
+            TransportEvent::Message(raw) => {
+                let TransportMessage { payload, peer_id } = raw;
+                let gossip_message =
+                    match <pb::GossipMessage as ProtoProxy<GossipMessage>>::proxy_decode(&payload.0)
+                    {
+                        Ok(msg) => msg,
+                        Err(err) => {
+                            warn!(self.log, "Deserialization failed {}", err);
+                            return Box::pin(async { Ok(()) });
+                        }
+                    };
+                match gossip_message {
+                    GossipMessage::Advert(msg) => {
+                        let consume_fn = move |item, peer_id| {
+                            c_gossip.on_gossip_advert(item, peer_id);
+                        };
+                        let advert = self.advert.clone();
+                        Box::pin(async move {
+                            advert.execute(peer_id, msg, consume_fn).await;
+                            Ok(())
+                        })
+                    }
+                    GossipMessage::ChunkRequest(msg) => {
+                        let consume_fn = move |item, peer_id| {
+                            c_gossip.on_chunk_request(item, peer_id);
+                        };
+                        let request = self.request.clone();
+                        Box::pin(async move {
+                            request.execute(peer_id, msg, consume_fn).await;
+                            Ok(())
+                        })
+                    }
+                    GossipMessage::Chunk(msg) => {
+                        let consume_fn = move |item, peer_id| {
+                            c_gossip.on_gossip_chunk(item, peer_id);
+                        };
+                        let chunk = self.chunk.clone();
+                        Box::pin(async move {
+                            chunk.execute(peer_id, msg, consume_fn).await;
+                            Ok(())
+                        })
+                    }
+                    GossipMessage::RetransmissionRequest(msg) => {
+                        let consume_fn = move |item, peer_id| {
+                            c_gossip.on_gossip_retransmission_request(item, peer_id);
+                        };
+                        let retransmission = self.retransmission.clone();
+                        Box::pin(async move {
+                            retransmission.execute(peer_id, msg, consume_fn).await;
+                            Ok(())
+                        })
+                    }
+                }
+            }
+            TransportEvent::PeerUp(peer_id) => {
+                let consume_fn = move |item, _peer_id| {
+                    c_gossip.on_peer_up(item);
+                };
+                let node_id = self.node_id;
+                let transport = self.transport.clone();
+                Box::pin(async move {
+                    transport.execute(node_id, peer_id, consume_fn).await;
+                    Ok(())
+                })
+            }
+            TransportEvent::PeerDown(peer_id) => {
+                let consume_fn = move |item, _peer_id| {
+                    c_gossip.on_peer_down(item);
+                };
+                let node_id = self.node_id;
+                let transport = self.transport.clone();
+                Box::pin(async move {
+                    transport.execute(node_id, peer_id, consume_fn).await;
+                    Ok(())
+                })
+            }
+        }
     }
 }
 
@@ -503,7 +420,7 @@ impl P2PThreadJoiner {
                 let timer_duration = Duration::from_millis(P2P_TIMER_DURATION_MS);
                 while !killed_c.load(SeqCst) {
                     std::thread::sleep(timer_duration);
-                    gossip.on_timer();
+                    gossip.on_gossip_timer();
                 }
             })
             .unwrap();
@@ -524,44 +441,40 @@ impl Drop for P2PThreadJoiner {
 
 /// The struct is used by `Consensus` to broadcast adverts. After creation a mutable
 /// references must be pass to `setup_p2p` in order to activate broadcasting.
-/// The `broadcast_advert` call blocks until AdvertSubscriber is activated by
+/// The `broadcast_advert` call blocks until AdvertBroadcaster is activated by
 /// `setup_p2p`.
 #[derive(Clone)]
-pub struct AdvertSubscriber {
+pub struct AdvertBroadcaster {
     log: ReplicaLogger,
     threadpool: ThreadPool,
     /// The shared *Gossip* instance (using automatic reference counting).
     gossip: Arc<RwLock<Option<GossipArc>>>,
-    /// For advert send requests from artifact manager.
-    advert_builder: AdvertRequestBuilder,
     sem: Arc<Semaphore>,
-    started: Arc<(Mutex<bool>, Condvar)>,
+    started: Arc<(std::sync::Mutex<bool>, Condvar)>,
+    dropped_adverts: IntCounterVec,
 }
 
 #[allow(clippy::mutex_atomic)]
-impl AdvertSubscriber {
-    pub fn new(
-        log: ReplicaLogger,
-        metrics_registry: &MetricsRegistry,
-        gossip_config: GossipConfig,
-    ) -> Self {
+impl AdvertBroadcaster {
+    pub fn new(log: ReplicaLogger, metrics_registry: &MetricsRegistry) -> Self {
         let threadpool = threadpool::Builder::new()
             .num_threads(P2P_PER_FLOW_THREADS)
             .thread_name("P2P_Advert_Thread".into())
             .build();
 
+        let dropped_adverts = metrics_registry.int_counter_vec(
+            "p2p_dropped_adverts_by_sender_total",
+            "Total number of artifact advertisements dropped at the sender, grouped by artifact id.",
+            &["type"],
+        );
+
         Self {
-            log: log.clone(),
+            log,
             threadpool,
             gossip: Arc::new(RwLock::new(None)),
-
-            advert_builder: AdvertRequestBuilder::new(
-                gossip_config.advert_config,
-                metrics_registry,
-                log,
-            ),
             sem: Arc::new(Semaphore::new(MAX_ADVERT_BUFFER)),
-            started: Arc::new((Mutex::new(false), Condvar::new())),
+            started: Arc::new((std::sync::Mutex::new(false), Condvar::new())),
+            dropped_adverts,
         }
     }
 
@@ -569,51 +482,49 @@ impl AdvertSubscriber {
         self.gossip.write().replace(gossip_arc);
         let (lock, cvar) = &*self.started;
         *lock.lock().unwrap() = true;
-        cvar.notify_one();
+        cvar.notify_all();
     }
 
     /// The method broadcasts the given advert.
-    pub fn broadcast_advert(&self, advert: GossipAdvert, advert_class: AdvertClass) {
+    pub fn send(&self, advert: GossipAdvert, dst: ArtifactDestination) {
         let (lock, cvar) = &*self.started;
         let mut started = lock.lock().unwrap();
         while !*started {
             started = cvar.wait(started).unwrap();
         }
 
+        let artifact_id_label = ArtifactTag::from(&advert.artifact_id).into();
         // Translate the advert request to internal format
-        let advert_request = match self.advert_builder.build(advert, advert_class) {
-            Some(request) => request,
-            None => return,
-        };
+
         match self.sem.clone().try_acquire_owned() {
             Ok(permit) => {
                 let c_gossip = self.gossip.read().as_ref().unwrap().clone();
                 self.threadpool.execute(move || {
                     let _permit = permit;
-                    c_gossip.broadcast_advert(advert_request);
+                    c_gossip.broadcast_advert(advert, dst);
                 });
             }
             Err(TryAcquireError::Closed) => {
-                info!(self.log, "Send advert channel closed");
+                error!(self.log, "Send advert channel closed");
             }
-            _ => (),
+            _ => {
+                self.dropped_adverts
+                    .with_label_values(&[artifact_id_label])
+                    .inc();
+            }
         };
     }
 }
 
 #[cfg(test)]
-#[allow(dead_code)]
 pub mod tests {
     use super::*;
-    use crate::{
-        download_prioritization::test::make_gossip_advert,
-        gossip_protocol::{GossipAdvertSendRequest, GossipRetransmissionRequest},
-    };
+    use crate::download_prioritization::test::make_gossip_advert;
     use ic_interfaces::ingress_pool::IngressPoolThrottler;
-    use ic_interfaces_transport::FlowTag;
+    use ic_interfaces_transport::TransportPayload;
     use ic_metrics::MetricsRegistry;
     use ic_test_utilities::{p2p::p2p_test_setup_logger, types::ids::node_test_id};
-    use ic_types::artifact::AdvertClass;
+    use ic_types::artifact::ArtifactDestination;
     use tokio::time::{sleep, Duration};
 
     struct TestThrottle();
@@ -626,7 +537,7 @@ pub mod tests {
     type ItemCountCollector = Mutex<BTreeMap<NodeId, usize>>;
 
     /// The test *Gossip* struct.
-    struct TestGossip {
+    pub(crate) struct TestGossip {
         /// The node ID.
         node_id: NodeId,
         /// The advert processing delay.
@@ -637,8 +548,6 @@ pub mod tests {
         num_chunks: ItemCountCollector,
         /// The item count collector, counting the number of chunk requests.
         num_reqs: ItemCountCollector,
-        /// The item count collector, counting the number of ingress messages.
-        num_ingress: ItemCountCollector,
         /// The item count collector, counting the number of *Transport* state
         /// changes.
         num_changes: ItemCountCollector,
@@ -648,14 +557,13 @@ pub mod tests {
 
     impl TestGossip {
         /// The function creates a TestGossip instance.
-        fn new(advert_processing_delay: Duration, node_id: NodeId) -> Self {
+        pub(crate) fn new(advert_processing_delay: Duration, node_id: NodeId) -> Self {
             TestGossip {
                 node_id,
                 advert_processing_delay,
                 num_adverts: Default::default(),
                 num_chunks: Default::default(),
                 num_reqs: Default::default(),
-                num_ingress: Default::default(),
                 num_changes: Default::default(),
                 num_advert_bcasts: Default::default(),
             }
@@ -663,15 +571,15 @@ pub mod tests {
 
         /// The function performs an atomic increment-or-set operation.
         fn increment_or_set(map: &ItemCountCollector, peer_id: NodeId) {
-            let map_i = &mut map.lock().unwrap();
+            let map_i = &mut map.lock();
             map_i.entry(peer_id).and_modify(|e| *e += 1).or_insert(1);
         }
 
         /// The function returns the number of flows of the node with the given
         /// node ID.
         fn get_node_flow_count(map: &ItemCountCollector, node_id: NodeId) -> usize {
-            let map_i = &mut map.lock().unwrap();
-            *map_i.get(&node_id).or(Some(&0)).unwrap()
+            let map_i = &mut map.lock();
+            *map_i.get(&node_id).unwrap_or(&0)
         }
     }
 
@@ -680,12 +588,10 @@ pub mod tests {
         type GossipAdvert = GossipAdvert;
         type GossipChunkRequest = GossipChunkRequest;
         type GossipChunk = GossipChunk;
-        type NodeId = NodeId;
-        type TransportNotification = TransportNotification;
-        type Ingress = SignedIngress;
+        type GossipRetransmissionRequest = ArtifactFilter;
 
         /// The method is called when an advert is received.
-        fn on_advert(&self, _gossip_advert: Self::GossipAdvert, peer_id: Self::NodeId) {
+        fn on_gossip_advert(&self, _gossip_advert: Self::GossipAdvert, peer_id: NodeId) {
             std::thread::sleep(self.advert_processing_delay);
             TestGossip::increment_or_set(&self.num_adverts, peer_id);
         }
@@ -696,50 +602,33 @@ pub mod tests {
         }
 
         /// The method is called when a chunk is received.
-        fn on_chunk(&self, _gossip_artifact: Self::GossipChunk, peer_id: Self::NodeId) {
+        fn on_gossip_chunk(&self, _gossip_artifact: Self::GossipChunk, peer_id: NodeId) {
             TestGossip::increment_or_set(&self.num_chunks, peer_id);
         }
 
-        /// The method is called when a user ingress message is received.
-        fn on_user_ingress(
-            &self,
-            _ingress: Self::Ingress,
-            peer_id: Self::NodeId,
-        ) -> Result<(), IngressError> {
-            TestGossip::increment_or_set(&self.num_ingress, peer_id);
-            Ok(())
-        }
-
         /// The method broadcasts the given advert.
-        fn broadcast_advert(&self, _advert: GossipAdvertSendRequest) {
+        fn broadcast_advert(&self, _advert: Self::GossipAdvert, _dst: ArtifactDestination) {
             TestGossip::increment_or_set(&self.num_advert_bcasts, self.node_id);
         }
 
         /// The method is called when a re-transmission request is received.
-        fn on_retransmission_request(
+        fn on_gossip_retransmission_request(
             &self,
-            _gossip_request: GossipRetransmissionRequest,
+            _gossip_request: Self::GossipRetransmissionRequest,
             _node_id: NodeId,
         ) {
             unimplemented!()
         }
 
-        /// The method is called when a transport state change is received.
-        fn on_transport_state_change(&self, transport_state_change: TransportStateChange) {
-            let peer_id = match transport_state_change {
-                TransportStateChange::PeerFlowUp(x) => x,
-                TransportStateChange::PeerFlowDown(x) => x,
-            }
-            .peer_id;
+        fn on_peer_up(&self, peer_id: NodeId) {
             TestGossip::increment_or_set(&self.num_changes, peer_id);
         }
 
-        /// The method is called on a transport error.
-        fn on_transport_error(&self, _transport_error: TransportError) {
-            // Do nothing
+        fn on_peer_down(&self, peer_id: NodeId) {
+            TestGossip::increment_or_set(&self.num_changes, peer_id);
         }
 
-        fn on_timer(&self) {
+        fn on_gossip_timer(&self) {
             // Do nothing
         }
     }
@@ -748,8 +637,9 @@ pub mod tests {
     pub(crate) fn new_test_event_handler(
         advert_max_depth: usize,
         node_id: NodeId,
-    ) -> (AsyncTransportEventHandlerImpl, AdvertSubscriber) {
-        let mut channel_config = ChannelConfig::from(ic_types::p2p::build_default_gossip_config());
+        gossip: GossipArc,
+    ) -> (AsyncTransportEventHandlerImpl, AdvertBroadcaster) {
+        let mut channel_config = ChannelConfig::default();
         channel_config
             .map
             .insert(FlowType::Advert, advert_max_depth);
@@ -759,12 +649,12 @@ pub mod tests {
             p2p_test_setup_logger().root.clone().into(),
             &MetricsRegistry::new(),
             channel_config,
+            gossip,
         );
 
-        let advert_subscriber = AdvertSubscriber::new(
+        let advert_subscriber = AdvertBroadcaster::new(
             p2p_test_setup_logger().root.clone().into(),
             &MetricsRegistry::new(),
-            ic_types::p2p::build_default_gossip_config(),
         );
 
         (handler, advert_subscriber)
@@ -772,27 +662,28 @@ pub mod tests {
 
     /// The function sends the given number of messages to the peer with the
     /// given node ID.
-    async fn send_advert(count: usize, handler: &AsyncTransportEventHandlerImpl, peer_id: NodeId) {
+    async fn send_advert(
+        count: usize,
+        handler: &mut AsyncTransportEventHandlerImpl,
+        peer_id: NodeId,
+    ) {
         for i in 0..count {
             let message = GossipMessage::Advert(make_gossip_advert(i as u64));
             let message = TransportPayload(pb::GossipMessage::proxy_encode(message).unwrap());
             let _ = handler
-                .send_message(
-                    FlowId {
-                        peer_id,
-                        flow_tag: FlowTag::from(0),
-                    },
-                    message,
-                )
+                .call(TransportEvent::Message(TransportMessage {
+                    peer_id,
+                    payload: message,
+                }))
                 .await;
         }
     }
 
     /// The function broadcasts the given number of adverts.
-    async fn broadcast_advert(count: usize, handler: &AdvertSubscriber) {
+    async fn broadcast_advert(count: usize, handler: &AdvertBroadcaster) {
         for i in 0..count {
             let message = make_gossip_advert(i as u64);
-            handler.broadcast_advert(message, AdvertClass::Critical);
+            handler.send(message, ArtifactDestination::AllPeersInSubnet);
         }
     }
 
@@ -805,57 +696,49 @@ pub mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn event_handler_start_stop() {
         let node_test_id = node_test_id(0);
-        let handler = new_test_event_handler(MAX_ADVERT_BUFFER, node_test_id).0;
-        handler.start(Arc::new(TestGossip::new(
-            Duration::from_secs(0),
-            node_test_id,
-        )));
+        let gossip_arc = Arc::new(TestGossip::new(Duration::from_secs(0), node_test_id));
+        let _handler = new_test_event_handler(MAX_ADVERT_BUFFER, node_test_id, gossip_arc).0;
     }
 
     /// Test the dispatching of adverts to the event handler.
     #[tokio::test(flavor = "multi_thread")]
     async fn event_handler_advert_dispatch() {
         let node_test_id = node_test_id(0);
-        let handler = new_test_event_handler(MAX_ADVERT_BUFFER, node_test_id).0;
-        handler.start(Arc::new(TestGossip::new(
-            Duration::from_secs(0),
-            node_test_id,
-        )));
-        send_advert(100, &handler, node_test_id).await;
+        let gossip_arc = Arc::new(TestGossip::new(Duration::from_secs(0), node_test_id));
+        let mut handler = new_test_event_handler(MAX_ADVERT_BUFFER, node_test_id, gossip_arc).0;
+        send_advert(100, &mut handler, node_test_id).await;
     }
 
     /// Test slow/delayed consumption of events.
     #[tokio::test(flavor = "multi_thread")]
     async fn event_handler_slow_consumer() {
         let node_id = node_test_id(0);
-        let handler = new_test_event_handler(1, node_id).0;
-        handler.start(Arc::new(TestGossip::new(Duration::from_millis(3), node_id)));
+        let gossip_arc = Arc::new(TestGossip::new(Duration::from_millis(3), node_id));
+        let mut handler = new_test_event_handler(1, node_id, gossip_arc).0;
         // send adverts
-        send_advert(10, &handler, node_id).await;
+        send_advert(10, &mut handler, node_id).await;
     }
 
     /// Test the addition of nodes to the event handler.
     #[tokio::test(flavor = "multi_thread")]
-    async fn event_handler_add_remove_nodes() {
+    async fn event_handler_add_remove_peers() {
         let node_id = node_test_id(0);
-        let handler = Arc::new(new_test_event_handler(1, node_id).0);
-
-        handler.start(Arc::new(TestGossip::new(Duration::from_secs(0), node_id)));
-        send_advert(100, &handler, node_id).await;
+        let gossip_arc = Arc::new(TestGossip::new(Duration::from_secs(0), node_id));
+        let mut handler = new_test_event_handler(1, node_id, gossip_arc).0;
+        send_advert(100, &mut handler, node_id).await;
     }
 
     /// Test queuing up the maximum number of adverts.
     #[tokio::test(flavor = "multi_thread")]
     async fn event_handler_max_channel_capacity() {
         let node_id = node_test_id(0);
-        let (handler, subscriber) = new_test_event_handler(MAX_ADVERT_BUFFER, node_id);
-        let handler = Arc::new(handler);
         let node_test_id = node_test_id(0);
         let gossip_arc = Arc::new(TestGossip::new(Duration::from_secs(0), node_id));
-        handler.start(gossip_arc.clone());
+        let (mut handler, subscriber) =
+            new_test_event_handler(MAX_ADVERT_BUFFER, node_id, gossip_arc.clone());
         subscriber.start(gossip_arc.clone());
 
-        send_advert(MAX_ADVERT_BUFFER, &handler, node_test_id).await;
+        send_advert(MAX_ADVERT_BUFFER, &mut handler, node_test_id).await;
         loop {
             let num_adverts = TestGossip::get_node_flow_count(&gossip_arc.num_adverts, node_id);
             assert!(num_adverts <= MAX_ADVERT_BUFFER);

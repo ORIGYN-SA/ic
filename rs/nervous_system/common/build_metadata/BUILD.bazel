@@ -1,0 +1,10 @@
+load("@rules_rust//rust:defs.bzl", "rust_proc_macro")
+
+package(default_visibility = ["//visibility:public"])
+
+rust_proc_macro(
+    name = "build_metadata",
+    srcs = glob(["src/**"]),
+    crate_name = "ic_nervous_system_common_build_metadata",
+    version = "0.8.0",
+)

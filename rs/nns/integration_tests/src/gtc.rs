@@ -1,7 +1,10 @@
 use dfn_candid::{candid, candid_one};
 use dfn_protobuf::protobuf;
-use ed25519_dalek::Keypair;
-use ic_canister_client::Sender;
+use ic_canister_client_sender::Sender;
+use ic_nervous_system_common_test_keys::{
+    TEST_NEURON_1_OWNER_KEYPAIR, TEST_NEURON_1_OWNER_PRINCIPAL, TEST_NEURON_2_OWNER_KEYPAIR,
+    TEST_NEURON_2_OWNER_PRINCIPAL,
+};
 use ic_nns_common::pb::v1::NeuronId;
 use ic_nns_constants::GOVERNANCE_CANISTER_ID;
 use ic_nns_governance::pb::v1::{GovernanceError, Neuron, NeuronInfo};
@@ -10,15 +13,13 @@ use ic_nns_gtc::pb::v1::AccountState;
 use ic_nns_gtc::test_constants::{
     TestIdentity, TEST_IDENTITY_1, TEST_IDENTITY_2, TEST_IDENTITY_3, TEST_IDENTITY_4,
 };
-use ic_nns_test_keys::{
-    TEST_NEURON_1_OWNER_KEYPAIR, TEST_NEURON_1_OWNER_PRINCIPAL, TEST_NEURON_2_OWNER_KEYPAIR,
-    TEST_NEURON_2_OWNER_PRINCIPAL,
+use ic_nns_test_utils::{
+    common::NnsInitPayloadsBuilder,
+    itest_helpers::{local_test_on_nns_subnet, NnsCanisters},
 };
-use ic_nns_test_utils::itest_helpers::{
-    local_test_on_nns_subnet, NnsCanisters, NnsInitPayloadsBuilder,
-};
-use ledger_canister::{
-    AccountBalanceArgs, AccountIdentifier, Subaccount, Tokens, DEFAULT_TRANSFER_FEE,
+use icp_ledger::{
+    tokens_from_proto, AccountBalanceArgs, AccountIdentifier, Subaccount, Tokens,
+    DEFAULT_TRANSFER_FEE,
 };
 use std::collections::HashSet;
 use std::convert::TryFrom;
@@ -95,7 +96,7 @@ pub fn test_claim_neurons() {
         assert_neurons_can_be_donated(
             &nns_canisters,
             donate_account_recipient_neuron_id,
-            &*TEST_NEURON_1_OWNER_KEYPAIR,
+            &TEST_NEURON_1_OWNER_KEYPAIR,
             &TEST_IDENTITY_3,
         )
         .await;
@@ -110,7 +111,7 @@ pub fn test_claim_neurons() {
         assert_unclaimed_neurons_can_be_forwarded(
             &nns_canisters,
             forward_all_unclaimed_accounts_recipient_neuron_id,
-            &*TEST_NEURON_2_OWNER_KEYPAIR,
+            &TEST_NEURON_2_OWNER_KEYPAIR,
         )
         .await;
 
@@ -250,7 +251,7 @@ async fn assert_neurons_can_only_be_donated_by_account_owner(nns_canisters: &Nns
 async fn assert_unclaimed_neurons_can_be_forwarded(
     nns_canisters: &NnsCanisters<'_>,
     custodian_neuron_id: NeuronId,
-    custodian_key_pair: &Keypair,
+    custodian_key_pair: &ic_canister_client_sender::Ed25519KeyPair,
 ) {
     let gtc = &nns_canisters.genesis_token;
     let governance = &nns_canisters.governance;
@@ -277,7 +278,7 @@ async fn assert_unclaimed_neurons_can_be_forwarded(
     assert!(!account_before_forward.has_donated);
     assert!(!account_before_forward.has_forwarded);
 
-    // Calculate how much ICPT is expected to be forwarded to the custodian
+    // Calculate how much ICP is expected to be forwarded to the custodian
     // neuron.
     let expected_custodian_account_balance_increase: Tokens = Tokens::from_e8s(
         Tokens::from_tokens(account_before_forward.icpts as u64)
@@ -312,7 +313,8 @@ async fn assert_unclaimed_neurons_can_be_forwarded(
             },
             &Sender::from_keypair(custodian_key_pair),
         )
-        .await;
+        .await
+        .map(tokens_from_proto);
 
     let custodian_account_balance = account_balance_response.unwrap();
 
@@ -365,7 +367,8 @@ async fn assert_unclaimed_neurons_can_be_forwarded(
             },
             &Sender::from_keypair(custodian_key_pair),
         )
-        .await;
+        .await
+        .map(tokens_from_proto);
 
     let actual_custodian_account_balance_after_forward = account_balance_response.unwrap();
 
@@ -398,7 +401,7 @@ async fn assert_unclaimed_neurons_can_be_forwarded(
 async fn assert_neurons_can_be_donated(
     nns_canisters: &NnsCanisters<'_>,
     custodian_neuron_id: NeuronId,
-    custodian_key_pair: &'static Keypair,
+    custodian_key_pair: &ic_canister_client_sender::Ed25519KeyPair,
     test_identity: &'static TestIdentity,
 ) {
     let gtc = &nns_canisters.genesis_token;
@@ -426,7 +429,7 @@ async fn assert_neurons_can_be_donated(
     assert!(!account_before_donation.has_donated);
     assert!(!account_before_donation.has_forwarded);
 
-    // Calculate how much ICPT is expected to be donated to the custodian
+    // Calculate how much ICP is expected to be donated to the custodian
     // neuron.
     let expected_custodian_account_balance_increase: Tokens = Tokens::from_e8s(
         Tokens::from_tokens(account_before_donation.icpts as u64)
@@ -461,7 +464,8 @@ async fn assert_neurons_can_be_donated(
             },
             &Sender::from_keypair(custodian_key_pair),
         )
-        .await;
+        .await
+        .map(tokens_from_proto);
 
     let custodian_account_balance = account_balance_response.unwrap();
 
@@ -534,7 +538,8 @@ async fn assert_neurons_can_be_donated(
             },
             &Sender::from_keypair(custodian_key_pair),
         )
-        .await;
+        .await
+        .map(tokens_from_proto);
 
     let actual_custodian_account_balance_after_donation = account_balance_response.unwrap();
 

@@ -1,13 +1,15 @@
 use ic_interfaces_transport::{
-    AsyncTransportEventHandler, FlowId, FlowTag, Transport, TransportErrorCode, TransportPayload,
+    Transport, TransportChannelId, TransportError, TransportEvent, TransportEventHandler,
+    TransportMessage, TransportPayload,
 };
 use ic_logger::{info, ReplicaLogger};
-use ic_protobuf::registry::node::v1::NodeRecord;
 use ic_types::{NodeId, RegistryVersion};
-
+use parking_lot::Mutex;
 use std::collections::{BTreeMap, HashMap};
 use std::fmt::Debug;
-use std::sync::{Arc, Mutex, RwLock, Weak};
+use std::net::SocketAddr;
+use std::sync::{Arc, RwLock, Weak};
+use tower::Service;
 
 #[derive(Default)]
 struct Deferred {
@@ -21,7 +23,7 @@ pub struct ThreadPort {
     id: NodeId,
     // Access to full hub to route messages across threads
     hub_access: HubAccess,
-    client_map: RwLock<Option<ClientState>>,
+    event_handler: Mutex<Option<TransportEventHandler>>,
     log: ReplicaLogger,
     deferred: Mutex<HashMap<NodeId, Deferred>>,
     weak_self: RwLock<Weak<ThreadPort>>,
@@ -45,7 +47,7 @@ impl ThreadPort {
         let thread_port = Arc::new(Self {
             id,
             hub_access,
-            client_map: RwLock::new(None),
+            event_handler: Mutex::new(None),
             log,
             deferred: Default::default(),
             weak_self: RwLock::new(Weak::new()),
@@ -57,7 +59,7 @@ impl ThreadPort {
 
     fn replay_deferred(&self, node_id: NodeId) {
         let replay = {
-            let mut deferred_guard = self.deferred.lock().unwrap();
+            let mut deferred_guard = self.deferred.lock();
             let deferred_map = &mut *deferred_guard;
             let mut replay = Vec::new();
             let i = 0;
@@ -101,7 +103,7 @@ impl ThreadPort {
         src_node_id: NodeId,
         dest_node_id: NodeId,
         message: TransportPayload,
-    ) -> Result<(), TransportErrorCode> {
+    ) -> Result<(), TransportError> {
         // Dispatch  or defer send a message to a node.
         // Dispatch happens only if all 3 conditions are met
         //.
@@ -117,20 +119,17 @@ impl ThreadPort {
 
         // 1.
         let destination_node = {
-            let hub_access = self.hub_access.lock().unwrap();
+            let hub_access = self.hub_access.lock();
             // All node ports must be connected  to hub before test start.
             hub_access.ports[&dest_node_id].clone()
         };
 
         // 2.
-        let event_handler = {
-            let client_map = destination_node.client_map.write().unwrap();
-            client_map.as_ref().map(|s| s.event_handler.clone())
-        };
+        let event_handler = destination_node.event_handler.lock().clone();
 
         // 3.
-        let event_handler = {
-            let mut deferred = destination_node.deferred.lock().unwrap();
+        let mut event_handler = {
+            let mut deferred = destination_node.deferred.lock();
             let deferred = deferred.entry(src_node_id).or_default();
 
             // Stash
@@ -144,21 +143,14 @@ impl ThreadPort {
         };
 
         event_handler
-            .send_message(
-                FlowId {
-                    peer_id: src_node_id,
-                    flow_tag: FlowTag::from(0),
-                },
-                message,
-            )
+            .call(TransportEvent::Message(TransportMessage {
+                peer_id: src_node_id,
+                payload: message,
+            }))
             .await
             .expect("send message failed");
         Ok(())
     }
-}
-
-struct ClientState {
-    event_handler: Arc<dyn AsyncTransportEventHandler>,
 }
 
 #[derive(Debug, Default)]
@@ -177,39 +169,32 @@ impl Hub {
 }
 
 impl Transport for ThreadPort {
-    fn register_client(
-        &self,
-        event_handler: Arc<dyn AsyncTransportEventHandler>,
-    ) -> Result<(), TransportErrorCode> {
+    fn set_event_handler(&self, event_handler: TransportEventHandler) {
         info!(self.log, "Node{} -> Client Registered", self.id);
-        let mut client_map = self.client_map.write().unwrap();
-        client_map.replace(ClientState { event_handler });
-        Ok(())
+        *self.event_handler.lock() = Some(event_handler);
     }
 
-    fn start_connections(
+    fn start_connection(
         &self,
         node_id: &NodeId,
-        _record: &NodeRecord,
+        _peer_addr: SocketAddr,
         _registry_version: RegistryVersion,
-    ) -> Result<(), TransportErrorCode> {
+    ) {
         info!(
             self.log,
             "Node{} -> Connections to peer {} started", self.id, node_id
         );
         self.replay_deferred(*node_id);
-        Ok(())
     }
 
     /// Remove the peer from the set of valid neighbors, and tear down the
     /// queues and connections for the peer. Any messages in the Tx and Rx
     /// queues for the peer will be discarded.
-    fn stop_connections(&self, peer_id: &NodeId) -> Result<(), TransportErrorCode> {
+    fn stop_connection(&self, peer_id: &NodeId) {
         info!(
             self.log,
             "Node{} -> Connections to peer {} stopped", self.id, *peer_id
         );
-        Ok(())
     }
 
     /// Send the message to the specified peer. The message will be en-queued
@@ -217,9 +202,9 @@ impl Transport for ThreadPort {
     fn send(
         &self,
         peer_id: &NodeId,
-        _flow_tag: FlowTag,
+        _channel_id: TransportChannelId,
         message: TransportPayload,
-    ) -> Result<(), TransportErrorCode> {
+    ) -> Result<(), TransportError> {
         let peer_id = *peer_id;
         let id = self.id;
         let weak_self = self.weak_self.read().unwrap().clone();
@@ -230,6 +215,4 @@ impl Transport for ThreadPort {
     }
 
     fn clear_send_queues(&self, _peer_id: &NodeId) {}
-
-    fn clear_send_queue(&self, _peer_id: &NodeId, _flow_tag: FlowTag) {}
 }

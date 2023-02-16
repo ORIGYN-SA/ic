@@ -2,6 +2,7 @@ use crate::*;
 use ic_types::crypto::canister_threshold_sig::idkg::{IDkgTranscript, IDkgTranscriptOperation};
 use ic_types::NodeIndex;
 use serde::{Deserialize, Serialize};
+use std::cmp::Ordering;
 use std::collections::BTreeMap;
 use std::convert::TryFrom;
 
@@ -41,6 +42,26 @@ impl TryFrom<&IDkgTranscript> for IDkgTranscriptInternal {
     }
 }
 
+impl PartialOrd for IDkgTranscriptInternal {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for IDkgTranscriptInternal {
+    fn cmp(&self, other: &Self) -> Ordering {
+        let lhs = self
+            .combined_commitment
+            .commitment()
+            .stable_representation();
+        let rhs = other
+            .combined_commitment
+            .commitment()
+            .stable_representation();
+        lhs.cmp(&rhs)
+    }
+}
+
 /// Some type of commitment, specifying its combination strategy
 #[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq)]
 pub enum CombinedCommitment {
@@ -54,10 +75,6 @@ impl CombinedCommitment {
             Self::BySummation(c) => c,
             Self::ByInterpolation(c) => c,
         }
-    }
-
-    pub(crate) fn reconstruction_threshold(&self) -> usize {
-        self.commitment().len()
     }
 
     pub fn serialize(&self) -> ThresholdEcdsaResult<Vec<u8>> {
@@ -120,7 +137,7 @@ fn combine_commitments_via_interpolation(
     // First verify the dealings are of the expected type
     for dealing in verified_dealings.values() {
         if dealing.commitment.ctype() != commitment_type {
-            return Err(ThresholdEcdsaError::InconsistentCommitments);
+            return Err(ThresholdEcdsaError::UnexpectedCommitmentType);
         }
     }
 
@@ -138,7 +155,12 @@ fn combine_commitments_via_interpolation(
     for i in 0..reconstruction_threshold {
         let mut values = Vec::new();
         for commitment in &commitments {
-            values.push(commitment.points()[i]);
+            values.push(commitment.points()[i].clone());
+        }
+        for pt in values.iter_mut() {
+            if !pt.is_precopmuted() {
+                pt.precompute(EccPoint::DEFAULT_LUT_WINDOW_SIZE)?;
+            }
         }
         combined.push(coefficients.interpolate_point(&values)?);
     }
@@ -161,12 +183,12 @@ impl IDkgTranscriptInternal {
         // Check all dealings have correct length and are on the same curve
         for dealing in verified_dealings.values() {
             if dealing.commitment.points().len() != reconstruction_threshold {
-                return Err(ThresholdEcdsaError::InconsistentCommitments);
+                return Err(ThresholdEcdsaError::UnexpectedCommitmentType);
             }
 
             for point in dealing.commitment.points() {
                 if point.curve_type() != curve {
-                    return Err(ThresholdEcdsaError::InconsistentCommitments);
+                    return Err(ThresholdEcdsaError::UnexpectedCommitmentType);
                 }
             }
         }
@@ -179,7 +201,7 @@ impl IDkgTranscriptInternal {
 
                 for dealing in verified_dealings.values() {
                     if dealing.commitment.ctype() != PolynomialCommitmentType::Pedersen {
-                        return Err(ThresholdEcdsaError::InconsistentCommitments);
+                        return Err(ThresholdEcdsaError::UnexpectedCommitmentType);
                     }
 
                     let c = dealing.commitment.points();
@@ -194,7 +216,7 @@ impl IDkgTranscriptInternal {
             IDkgTranscriptOperationInternal::ReshareOfMasked(reshared_commitment) => {
                 // Verify that the old commitment is actually masked
                 if reshared_commitment.ctype() != PolynomialCommitmentType::Pedersen {
-                    return Err(ThresholdEcdsaError::InconsistentCommitments);
+                    return Err(ThresholdEcdsaError::UnexpectedCommitmentType);
                 }
                 // Check the number of dealings is not smaller than the number of coefficients
                 // of the opening of the `reshared_commitment`. This ensures that the
@@ -214,7 +236,7 @@ impl IDkgTranscriptInternal {
             IDkgTranscriptOperationInternal::ReshareOfUnmasked(reshared_commitment) => {
                 // Verify that the old commitment is Unmasked
                 if reshared_commitment.ctype() != PolynomialCommitmentType::Simple {
-                    return Err(ThresholdEcdsaError::InconsistentCommitments);
+                    return Err(ThresholdEcdsaError::UnexpectedCommitmentType);
                 }
                 // Check the number of dealings is not smaller than the number of coefficients
                 // of the opening of the `reshared_commitment`. This ensures that the
@@ -233,7 +255,7 @@ impl IDkgTranscriptInternal {
                 // Check the constant term of the combined commitment is
                 // consistent with the reshared commitment
                 if reshared_commitment.points()[0] != combined_commitment.commitment().points()[0] {
-                    return Err(ThresholdEcdsaError::InconsistentCommitments);
+                    return Err(ThresholdEcdsaError::InvalidCommitment);
                 }
 
                 combined_commitment
@@ -245,7 +267,7 @@ impl IDkgTranscriptInternal {
                 if left_commitment.ctype() != PolynomialCommitmentType::Simple
                     || right_commitment.ctype() != PolynomialCommitmentType::Pedersen
                 {
-                    return Err(ThresholdEcdsaError::InconsistentCommitments);
+                    return Err(ThresholdEcdsaError::UnexpectedCommitmentType);
                 }
                 // Check the number of dealings is not smaller than the number of coefficients
                 // in the polynomial obtained by multiplying the opening of `left_commitment`
@@ -274,6 +296,19 @@ impl IDkgTranscriptInternal {
     }
 }
 
+/// Reconstruct a secret share from a set of openings
+///
+/// # Arguments:
+/// * `dealing` for which we want to reconstruct the secret share.
+/// * `openings` provided to compute the secret shares.
+/// * `share_index` index of the receiver for which we are trying to recompute the secret share.
+///
+/// # Errors:
+/// * `InsufficientOpenings` if the provided openings are insufficient
+///   to reconstruct the share for the given share_index.
+/// * `InconsistentCommitment` if the openings resulted in a share that
+///   is not consistent with the dealing commitment.
+/// * Any other error if the share could not be recomputed.
 fn reconstruct_share_from_openings(
     dealing: &IDkgDealingInternal,
     openings: &BTreeMap<NodeIndex, CommitmentOpening>,
@@ -282,13 +317,16 @@ fn reconstruct_share_from_openings(
     let reconstruction_threshold = dealing.commitment.len();
 
     if openings.len() < reconstruction_threshold {
-        return Err(ThresholdEcdsaError::InsufficientOpenings);
+        return Err(ThresholdEcdsaError::InsufficientOpenings(
+            openings.len(),
+            reconstruction_threshold,
+        ));
     }
 
     let curve = dealing.commitment.curve_type();
     let index = EccScalar::from_node_index(curve, share_index);
 
-    match &dealing.commitment {
+    let opening = match &dealing.commitment {
         PolynomialCommitment::Simple(_) => {
             let mut x_values = Vec::with_capacity(openings.len());
             let mut values = Vec::with_capacity(openings.len());
@@ -296,19 +334,15 @@ fn reconstruct_share_from_openings(
             for (receiver_index, opening) in openings {
                 if let CommitmentOpening::Simple(value) = opening {
                     x_values.push(*receiver_index);
-                    values.push(*value);
+                    values.push(value.clone());
                 } else {
-                    return Err(ThresholdEcdsaError::InconsistentCommitments);
+                    return Err(ThresholdEcdsaError::UnexpectedCommitmentType);
                 }
             }
 
             let coefficients = LagrangeCoefficients::at_value(&index, &x_values)?;
             let combined_value = coefficients.interpolate_scalar(&values)?;
-            let combined_opening = CommitmentOpening::Simple(combined_value);
-
-            dealing
-                .commitment
-                .return_opening_if_consistent(share_index, &combined_opening)
+            CommitmentOpening::Simple(combined_value)
         }
         PolynomialCommitment::Pedersen(_) => {
             let mut x_values = Vec::with_capacity(openings.len());
@@ -318,23 +352,23 @@ fn reconstruct_share_from_openings(
             for (receiver_index, opening) in openings {
                 if let CommitmentOpening::Pedersen(value, mask) = opening {
                     x_values.push(*receiver_index);
-                    values.push(*value);
-                    masks.push(*mask);
+                    values.push(value.clone());
+                    masks.push(mask.clone());
                 } else {
-                    return Err(ThresholdEcdsaError::InconsistentCommitments);
+                    return Err(ThresholdEcdsaError::UnexpectedCommitmentType);
                 }
             }
 
             let coefficients = LagrangeCoefficients::at_value(&index, &x_values)?;
             let combined_value = coefficients.interpolate_scalar(&values)?;
             let combined_mask = coefficients.interpolate_scalar(&masks)?;
-            let combined_opening = CommitmentOpening::Pedersen(combined_value, combined_mask);
-
-            dealing
-                .commitment
-                .return_opening_if_consistent(share_index, &combined_opening)
+            CommitmentOpening::Pedersen(combined_value, combined_mask)
         }
-    }
+    };
+
+    dealing
+        .commitment
+        .return_opening_if_consistent(share_index, &opening)
 }
 
 impl CommitmentOpening {
@@ -348,11 +382,19 @@ impl CommitmentOpening {
     /// * The openings must have already been verified
     ///
     /// # Errors
+    /// * `ComplaintShouldBeIssued` if a ciphertext failed to decrypt, and
+    ///   we do not currently have any openings for that dealing.
     /// * `InsufficientOpenings` if we require openings for a corrupted dealing but
     ///   do not have sufficiently many openings for that dealing.
-    /// * `InconsistentCommitments` if the commitments are inconsistent. This
+    /// * `InvalidCommitment` if the commitments are inconsistent. This
     ///   indicates that there is a corrupted dealing for which we have no openings
     ///   at all.
+    /// * `InvalidCiphertext` if the ciphertext could not be decrypted, for example
+    ///   because the proof of possesion was invalid.
+    /// * `UnableToReconstruct` if we had sufficient openings but were unable to
+    ///   combine them into a share which was consistent with the commitment.
+    /// * `UnableToReconstruct`: internal error denoting that the received openings
+    ///   cannot be used to recompute a share.
     pub(crate) fn from_dealings_and_openings(
         verified_dealings: &BTreeMap<NodeIndex, IDkgDealingInternal>,
         provided_openings: &BTreeMap<NodeIndex, BTreeMap<NodeIndex, CommitmentOpening>>,
@@ -361,7 +403,7 @@ impl CommitmentOpening {
         receiver_index: NodeIndex,
         secret_key: &MEGaPrivateKey,
         public_key: &MEGaPublicKey,
-    ) -> ThresholdEcdsaResult<Self> {
+    ) -> Result<Self, IDkgComputeSecretSharesInternalError> {
         let curve = secret_key.curve_type();
         let mut openings = Vec::with_capacity(verified_dealings.len());
 
@@ -369,22 +411,55 @@ impl CommitmentOpening {
             // If provided_openings contains an entry for dealer_index,
             // reconstruct the share, otherwise attempt to decrypt the dealing
             let opening = if let Some(shares) = provided_openings.get(dealer_index) {
-                reconstruct_share_from_openings(dealing, shares, receiver_index)?
+                reconstruct_share_from_openings(dealing, shares, receiver_index).map_err(|e| {
+                    match e {
+                        ThresholdEcdsaError::InsufficientOpenings(have, req) => {
+                            IDkgComputeSecretSharesInternalError::InsufficientOpenings(have, req)
+                        }
+                        e => IDkgComputeSecretSharesInternalError::UnableToReconstruct(format!(
+                            "{:?}",
+                            e
+                        )),
+                    }
+                })?
             } else {
-                dealing.ciphertext.decrypt_and_check(
-                    &dealing.commitment,
-                    context_data,
-                    *dealer_index,
-                    receiver_index,
-                    secret_key,
-                    public_key,
-                )?
+                dealing
+                    .ciphertext
+                    .decrypt_and_check(
+                        &dealing.commitment,
+                        context_data,
+                        *dealer_index,
+                        receiver_index,
+                        secret_key,
+                        public_key,
+                    )
+                    .map_err(|e| match e {
+                        ThresholdEcdsaError::InvalidCommitment => {
+                            IDkgComputeSecretSharesInternalError::ComplaintShouldBeIssued
+                        }
+                        e => IDkgComputeSecretSharesInternalError::InvalidCiphertext(format!(
+                            "Ciphertext {}/{} failed to decrypt {:?}",
+                            dealer_index,
+                            verified_dealings.len(),
+                            e
+                        )),
+                    })?
             };
 
             openings.push((*dealer_index, opening));
         }
 
-        Self::combine_openings(&openings, transcript_commitment, receiver_index, curve)
+        Self::combine_openings(&openings, transcript_commitment, receiver_index, curve).map_err(
+            |e| match e {
+                ThresholdEcdsaError::InsufficientOpenings(have, req) => {
+                    IDkgComputeSecretSharesInternalError::InsufficientOpenings(have, req)
+                }
+                e => IDkgComputeSecretSharesInternalError::UnableToCombineOpenings(format!(
+                    "{:?}",
+                    e
+                )),
+            },
+        )
     }
 
     /// Creates a commitment opening using dealings and openings
@@ -396,8 +471,9 @@ impl CommitmentOpening {
     /// * The dealings must have already been verified
     ///
     /// # Errors
-    /// * `InconsistentCommitments` if the commitments are inconsistent. This
-    ///   indicates we should issue a complaint and collect openings.
+    /// * `ComplaintShouldBeIssued` if upon decrypting a ciphertext,
+    ///   the embedded secret was invalid with the dealing commitment.
+    ///   In this case a complaint must be issued.
     pub(crate) fn from_dealings(
         verified_dealings: &BTreeMap<NodeIndex, IDkgDealingInternal>,
         transcript_commitment: &CombinedCommitment,
@@ -405,25 +481,48 @@ impl CommitmentOpening {
         receiver_index: NodeIndex,
         secret_key: &MEGaPrivateKey,
         public_key: &MEGaPublicKey,
-    ) -> ThresholdEcdsaResult<Self> {
+    ) -> Result<Self, IDkgComputeSecretSharesInternalError> {
         let curve = secret_key.curve_type();
         let mut openings = Vec::with_capacity(verified_dealings.len());
 
         for (dealer_index, dealing) in verified_dealings {
             // Decrypt each dealing and check consistency with the commitment in the dealing
-            let opening = dealing.ciphertext.decrypt_and_check(
-                &dealing.commitment,
-                context_data,
-                *dealer_index,
-                receiver_index,
-                secret_key,
-                public_key,
-            )?;
+            let opening = dealing
+                .ciphertext
+                .decrypt_and_check(
+                    &dealing.commitment,
+                    context_data,
+                    *dealer_index,
+                    receiver_index,
+                    secret_key,
+                    public_key,
+                )
+                .map_err(|e| match e {
+                    ThresholdEcdsaError::InvalidCommitment => {
+                        IDkgComputeSecretSharesInternalError::ComplaintShouldBeIssued
+                    }
+                    e => IDkgComputeSecretSharesInternalError::InvalidCiphertext(format!(
+                        "Ciphertext {}/{} failed to decrypt {:?}",
+                        dealer_index,
+                        verified_dealings.len(),
+                        e
+                    )),
+                })?;
 
             openings.push((*dealer_index, opening));
         }
 
-        Self::combine_openings(&openings, transcript_commitment, receiver_index, curve)
+        Self::combine_openings(&openings, transcript_commitment, receiver_index, curve).map_err(
+            |e| match e {
+                ThresholdEcdsaError::InsufficientOpenings(have, req) => {
+                    IDkgComputeSecretSharesInternalError::InsufficientOpenings(have, req)
+                }
+                e => IDkgComputeSecretSharesInternalError::UnableToCombineOpenings(format!(
+                    "{:?}",
+                    e
+                )),
+            },
+        )
     }
 
     fn combine_openings(
@@ -432,10 +531,6 @@ impl CommitmentOpening {
         receiver_index: NodeIndex,
         curve: EccCurveType,
     ) -> ThresholdEcdsaResult<Self> {
-        if openings.len() < transcript_commitment.reconstruction_threshold() {
-            return Err(ThresholdEcdsaError::InsufficientOpenings);
-        }
-
         // Recombine the openings according to the type of combined polynomial
         match transcript_commitment {
             CombinedCommitment::BySummation(commitment) => {
@@ -448,7 +543,7 @@ impl CommitmentOpening {
                         combined_value = combined_value.add(value)?;
                         combined_mask = combined_mask.add(mask)?;
                     } else {
-                        return Err(ThresholdEcdsaError::InconsistentCommitments);
+                        return Err(ThresholdEcdsaError::UnexpectedCommitmentType);
                     }
                 }
 
@@ -458,57 +553,51 @@ impl CommitmentOpening {
                 commitment.return_opening_if_consistent(receiver_index, &combined_opening)
             }
 
-            CombinedCommitment::ByInterpolation(PolynomialCommitment::Pedersen(commitment)) => {
-                let mut x_values = Vec::with_capacity(openings.len());
-                let mut values = Vec::with_capacity(openings.len());
-                let mut masks = Vec::with_capacity(openings.len());
+            CombinedCommitment::ByInterpolation(commitment) => {
+                let opening = match commitment {
+                    PolynomialCommitment::Simple(_) => {
+                        let mut x_values = Vec::with_capacity(openings.len());
+                        let mut values = Vec::with_capacity(openings.len());
 
-                for (dealer_index, opening) in openings {
-                    if let Self::Pedersen(value, mask) = opening {
-                        x_values.push(*dealer_index);
-                        values.push(*value);
-                        masks.push(*mask);
-                    } else {
-                        return Err(ThresholdEcdsaError::InconsistentCommitments);
+                        for (dealer_index, opening) in openings {
+                            if let Self::Simple(value) = opening {
+                                x_values.push(*dealer_index);
+                                values.push(value.clone());
+                            } else {
+                                return Err(ThresholdEcdsaError::UnexpectedCommitmentType);
+                            }
+                        }
+
+                        // Recombine secret by interpolation
+                        let coefficients = LagrangeCoefficients::at_zero(curve, &x_values)?;
+                        let combined_value = coefficients.interpolate_scalar(&values)?;
+                        Self::Simple(combined_value)
                     }
-                }
+                    PolynomialCommitment::Pedersen(_) => {
+                        let mut x_values = Vec::with_capacity(openings.len());
+                        let mut values = Vec::with_capacity(openings.len());
+                        let mut masks = Vec::with_capacity(openings.len());
 
-                // Recombine secret by interpolation
-                let coefficients = LagrangeCoefficients::at_zero(curve, &x_values)?;
-                let combined_value = coefficients.interpolate_scalar(&values)?;
-                let combined_mask = coefficients.interpolate_scalar(&masks)?;
+                        for (dealer_index, opening) in openings {
+                            if let Self::Pedersen(value, mask) = opening {
+                                x_values.push(*dealer_index);
+                                values.push(value.clone());
+                                masks.push(mask.clone());
+                            } else {
+                                return Err(ThresholdEcdsaError::UnexpectedCommitmentType);
+                            }
+                        }
+
+                        // Recombine secret by interpolation
+                        let coefficients = LagrangeCoefficients::at_zero(curve, &x_values)?;
+                        let combined_value = coefficients.interpolate_scalar(&values)?;
+                        let combined_mask = coefficients.interpolate_scalar(&masks)?;
+                        Self::Pedersen(combined_value, combined_mask)
+                    }
+                };
 
                 // Check reconstructed opening matches the commitment
-                if commitment.check_opening(receiver_index, &combined_value, &combined_mask)? {
-                    Ok(Self::Pedersen(combined_value, combined_mask))
-                } else {
-                    Err(ThresholdEcdsaError::InconsistentCommitments)
-                }
-            }
-
-            CombinedCommitment::ByInterpolation(PolynomialCommitment::Simple(commitment)) => {
-                let mut x_values = Vec::with_capacity(openings.len());
-                let mut values = Vec::with_capacity(openings.len());
-
-                for (dealer_index, opening) in openings {
-                    if let Self::Simple(value) = opening {
-                        x_values.push(*dealer_index);
-                        values.push(*value);
-                    } else {
-                        return Err(ThresholdEcdsaError::InconsistentCommitments);
-                    }
-                }
-
-                // Recombine secret by interpolation
-                let coefficients = LagrangeCoefficients::at_zero(curve, &x_values)?;
-                let combined_value = coefficients.interpolate_scalar(&values)?;
-
-                // Check reconstructed opening matches the commitment
-                if commitment.check_opening(receiver_index, &combined_value)? {
-                    Ok(Self::Simple(combined_value))
-                } else {
-                    Err(ThresholdEcdsaError::InconsistentCommitments)
-                }
+                commitment.return_opening_if_consistent(receiver_index, &opening)
             }
         }
     }

@@ -4,17 +4,17 @@ mod canister_threshold;
 mod keygen;
 mod sign;
 mod threshold;
-mod tls_stub;
+mod tls;
 
 pub use canister_threshold::{
     CspCreateMEGaKeyError, CspIDkgProtocol, CspThresholdEcdsaSigVerifier, CspThresholdEcdsaSigner,
 };
-pub use keygen::{CspKeyGenerator, CspSecretKeyStoreChecker, NodePublicKeyData};
-pub use sign::CspSigner;
+pub use keygen::{
+    CspKeyGenerator, CspPublicAndSecretKeyStoreChecker, CspSecretKeyStoreChecker,
+    DkgDealingEncryptionKeyIdRetrievalError, NodePublicKeyData, NodePublicKeyDataError,
+};
+pub use sign::{CspSigVerifier, CspSigner};
 pub use threshold::{
-    threshold_sign_error::CspThresholdSignError, DistributedKeyGenerationCspClient, NiDkgCspClient,
-    ThresholdSignatureCspClient,
+    threshold_sign_error::CspThresholdSignError, NiDkgCspClient, ThresholdSignatureCspClient,
 };
-pub use tls_stub::{
-    tls_errors, CspTlsClientHandshake, CspTlsHandshakeSignerProvider, CspTlsServerHandshake,
-};
+pub use tls::CspTlsHandshakeSignerProvider;

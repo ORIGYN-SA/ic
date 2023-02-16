@@ -1,10 +1,11 @@
 //! This defines the RPC service methods offered by the sandbox process
 //! (used by the controller) as well as the expected replies.
 
-use std::collections::BTreeSet;
+use std::{sync::Arc, time::Duration};
 
 use crate::fdenum::EnumerateInnerFileDescriptors;
 use crate::protocol::structs;
+use ic_embedders::{CompilationResult, SerializedModule, SerializedModuleBytes};
 use ic_interfaces::execution_environment::HypervisorResult;
 use ic_replicated_state::{
     page_map::{
@@ -13,14 +14,14 @@ use ic_replicated_state::{
     },
     Global, NumWasmPages,
 };
-use ic_types::{methods::WasmMethod, CanisterId};
+use ic_types::CanisterId;
+use ic_utils;
 use serde::{Deserialize, Serialize};
 
 use super::{
     id::{ExecId, MemoryId, WasmId},
     structs::{MemoryModifications, SandboxExecInput},
 };
-use ic_replicated_state::canister_state::execution_state::WasmMetadata;
 
 /// Instruct sandbox process to terminate: Sandbox process should take
 /// all necessary steps for graceful termination (sync all files etc.)
@@ -56,7 +57,26 @@ pub struct OpenWasmRequest {
 
 /// Reply to an `OpenWasmRequest`.
 #[derive(Debug, Serialize, Deserialize, Clone)]
-pub struct OpenWasmReply(pub HypervisorResult<()>);
+pub struct OpenWasmReply(pub HypervisorResult<(CompilationResult, SerializedModule)>);
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct OpenWasmSerializedRequest {
+    /// Id used to later refer to this canister runner. Must be unique
+    /// per sandbox instance.
+    pub wasm_id: WasmId,
+
+    /// The serialization of a previously compiled `wasmtime::Module`.
+    /// This types in just an `Arc` reference to a vector of bytes and the only
+    /// reason it is `Arc` is so that we can cheaply create the
+    /// `OpenWasmSerializedRequest` before sending it to the sandbox.
+    #[serde(serialize_with = "ic_utils::serde_arc::serialize_arc")]
+    #[serde(deserialize_with = "ic_utils::serde_arc::deserialize_arc")]
+    pub serialized_module: Arc<SerializedModuleBytes>,
+}
+
+/// Reply to an `OpenWasmRequest`.
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct OpenWasmSerializedReply(pub HypervisorResult<()>);
 
 /// Request to close the indicated wasm object.
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -122,10 +142,7 @@ impl EnumerateInnerFileDescriptors for MappingSerialization {
 // canister-sandbox.
 impl EnumerateInnerFileDescriptors for PageAllocatorSerialization {
     fn enumerate_fds<'a>(&'a mut self, fds: &mut Vec<&'a mut std::os::unix::io::RawFd>) {
-        match self {
-            PageAllocatorSerialization::Mmap(fd) => fds.push(&mut fd.fd),
-            PageAllocatorSerialization::Heap => {}
-        }
+        fds.push(&mut self.fd.fd);
     }
 }
 
@@ -183,9 +200,35 @@ pub struct StartExecutionRequest {
     pub exec_input: SandboxExecInput,
 }
 
-/// Reply to an `OpenExecutionRequest`.
+/// Reply to an `StartExecutionRequest`.
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct StartExecutionReply {
+    pub success: bool,
+}
+
+/// Resume execution.
+#[derive(Serialize, Deserialize, Clone)]
+pub struct ResumeExecutionRequest {
+    /// Id of the previously paused execution.
+    pub exec_id: ExecId,
+}
+
+/// Reply to an `ResumeExecutionRequest`.
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct ResumeExecutionReply {
+    pub success: bool,
+}
+
+/// Abort execution.
+#[derive(Serialize, Deserialize, Clone)]
+pub struct AbortExecutionRequest {
+    /// Id of the previously paused execution.
+    pub exec_id: ExecId,
+}
+
+/// Reply to an `AbortExecutionRequest`.
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct AbortExecutionReply {
     pub success: bool,
 }
 
@@ -197,11 +240,13 @@ pub struct CreateExecutionStateRequest {
     pub wasm_page_map: PageMapSerialization,
     pub next_wasm_memory_id: MemoryId,
     pub canister_id: CanisterId,
+    pub stable_memory_page_map: PageMapSerialization,
 }
 
 impl EnumerateInnerFileDescriptors for CreateExecutionStateRequest {
     fn enumerate_fds<'a>(&'a mut self, fds: &mut Vec<&'a mut std::os::unix::io::RawFd>) {
         self.wasm_page_map.enumerate_fds(fds);
+        self.stable_memory_page_map.enumerate_fds(fds);
     }
 }
 
@@ -209,12 +254,48 @@ impl EnumerateInnerFileDescriptors for CreateExecutionStateRequest {
 pub struct CreateExecutionStateSuccessReply {
     pub wasm_memory_modifications: MemoryModifications,
     pub exported_globals: Vec<Global>,
-    pub exported_functions: BTreeSet<WasmMethod>,
-    pub wasm_metadata: WasmMetadata,
+    pub compilation_result: CompilationResult,
+    pub serialized_module: SerializedModule,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct CreateExecutionStateReply(pub HypervisorResult<CreateExecutionStateSuccessReply>);
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct CreateExecutionStateSerializedRequest {
+    pub wasm_id: WasmId,
+    /// The serialization of a previously compiled `wasmtime::Module`.
+    /// This types in just an `Arc` reference to a vector of bytes and the only
+    /// reason it is `Arc` is so that we can cheaply create the
+    /// `CreateExecutionStateSerializedRequest` before sending it to the sandbox.
+    #[serde(serialize_with = "ic_utils::serde_arc::serialize_arc")]
+    #[serde(deserialize_with = "ic_utils::serde_arc::deserialize_arc")]
+    pub serialized_module: Arc<SerializedModule>,
+    pub wasm_page_map: PageMapSerialization,
+    pub next_wasm_memory_id: MemoryId,
+    pub canister_id: CanisterId,
+    pub stable_memory_page_map: PageMapSerialization,
+}
+
+impl EnumerateInnerFileDescriptors for CreateExecutionStateSerializedRequest {
+    fn enumerate_fds<'a>(&'a mut self, fds: &mut Vec<&'a mut std::os::unix::io::RawFd>) {
+        self.wasm_page_map.enumerate_fds(fds);
+        self.stable_memory_page_map.enumerate_fds(fds);
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct CreateExecutionStateSerializedSuccessReply {
+    pub wasm_memory_modifications: MemoryModifications,
+    pub exported_globals: Vec<Global>,
+    pub deserialization_time: Duration,
+    pub total_sandbox_time: Duration,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct CreateExecutionStateSerializedReply(
+    pub HypervisorResult<CreateExecutionStateSerializedSuccessReply>,
+);
 
 /// All possible requests to a sandboxed process.
 #[allow(clippy::large_enum_variant)]
@@ -222,11 +303,15 @@ pub struct CreateExecutionStateReply(pub HypervisorResult<CreateExecutionStateSu
 pub enum Request {
     Terminate(TerminateRequest),
     OpenWasm(OpenWasmRequest),
+    OpenWasmSerialized(OpenWasmSerializedRequest),
     CloseWasm(CloseWasmRequest),
     OpenMemory(OpenMemoryRequest),
     CloseMemory(CloseMemoryRequest),
     StartExecution(StartExecutionRequest),
+    ResumeExecution(ResumeExecutionRequest),
+    AbortExecution(AbortExecutionRequest),
     CreateExecutionState(CreateExecutionStateRequest),
+    CreateExecutionStateSerialized(CreateExecutionStateSerializedRequest),
 }
 
 impl EnumerateInnerFileDescriptors for Request {
@@ -234,11 +319,15 @@ impl EnumerateInnerFileDescriptors for Request {
         match self {
             Request::OpenMemory(request) => request.enumerate_fds(fds),
             Request::CreateExecutionState(request) => request.enumerate_fds(fds),
+            Request::CreateExecutionStateSerialized(request) => request.enumerate_fds(fds),
             Request::Terminate(_)
             | Request::OpenWasm(_)
+            | Request::OpenWasmSerialized(_)
             | Request::CloseWasm(_)
             | Request::CloseMemory(_)
-            | Request::StartExecution(_) => {}
+            | Request::StartExecution(_)
+            | Request::ResumeExecution(_)
+            | Request::AbortExecution(_) => {}
         }
     }
 }
@@ -249,11 +338,15 @@ impl EnumerateInnerFileDescriptors for Request {
 pub enum Reply {
     Terminate(TerminateReply),
     OpenWasm(OpenWasmReply),
+    OpenWasmSerialized(OpenWasmSerializedReply),
     CloseWasm(CloseWasmReply),
     OpenMemory(OpenMemoryReply),
     CloseMemory(CloseMemoryReply),
     StartExecution(StartExecutionReply),
+    ResumeExecution(ResumeExecutionReply),
+    AbortExecution(AbortExecutionReply),
     CreateExecutionState(CreateExecutionStateReply),
+    CreateExecutionStateSerialized(CreateExecutionStateSerializedReply),
 }
 
 impl EnumerateInnerFileDescriptors for Reply {

@@ -1,18 +1,16 @@
 //! Module for managing the canisters in test.
 
 use ic_canister_client::{Agent, HttpClient, Sender as AgentSender};
-use ic_types::{
-    ic00::{
-        CanisterIdRecord, InstallCodeArgs, Payload, ProvisionalCreateCanisterWithCyclesArgs, IC_00,
-    },
-    messages::CanisterInstallMode,
-    CanisterId,
+use ic_ic00_types::{
+    CanisterIdRecord, CanisterInstallMode, InstallCodeArgs, Payload,
+    ProvisionalCreateCanisterWithCyclesArgs, IC_00,
 };
+use ic_types::CanisterId;
 use std::{fs::File, io::Read, path::Path, time::Duration};
 use url::Url;
 
 const REQUESTED_MEMORY_ALLOCATION: Option<u64> = None; // Best effort memory allocation
-const COUNTER_CANISTER_WAT: &[u8] = include_bytes!("counter.wat");
+const COUNTER_CANISTER_WAT: &str = include_str!("counter.wat");
 /// Creates/installs the canister across the given replicas
 pub(crate) async fn setup_canister(
     http_client: HttpClient,
@@ -72,9 +70,10 @@ pub(crate) async fn create_canister(
     debug!("Create canister with agent: {:?}", agent);
     let creation_result = agent
         .execute_update(
+            &IC_00, // TODO(RUN-496): replace with a proper effective canister id
             &IC_00,
-            ic_types::ic00::Method::ProvisionalCreateCanisterWithCycles,
-            ProvisionalCreateCanisterWithCyclesArgs::new(Some(u64::MAX as u128)).encode(),
+            ic_ic00_types::Method::ProvisionalCreateCanisterWithCycles,
+            ProvisionalCreateCanisterWithCyclesArgs::new(Some(u64::MAX as u128), None).encode(),
             vec![],
         )
         .await?;
@@ -115,7 +114,7 @@ pub(crate) async fn install_canister(
     let bytes = if let Some(wasm_file_path) = wasm_file_path {
         // Buffer to store bytes of the canister code
         let mut bytes_buffer = Vec::new();
-        let mut f = File::open(&wasm_file_path).map_err(|err| {
+        let mut f = File::open(wasm_file_path).map_err(|err| {
             format!(
                 "Failed to open canister file: {:?} - try running from the rs directory. {}",
                 wasm_file_path, err
@@ -130,12 +129,12 @@ pub(crate) async fn install_canister(
         })?;
 
         if wasm_file_path.extension() == Some(std::ffi::OsStr::new("wat")) {
-            wabt::wat2wasm(bytes_buffer).unwrap()
+            wat::parse_bytes(&bytes_buffer).unwrap().to_vec()
         } else {
             bytes_buffer
         }
     } else {
-        wabt::wat2wasm(COUNTER_CANISTER_WAT).unwrap()
+        wat::parse_str(COUNTER_CANISTER_WAT).unwrap()
     };
 
     let install_args = InstallCodeArgs::new(

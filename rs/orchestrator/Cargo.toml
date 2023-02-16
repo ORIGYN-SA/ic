@@ -1,31 +1,38 @@
 [package]
 name = "orchestrator"
 version = "0.8.0"
-edition = "2018"
+edition = "2021"
 
 [dependencies]
-candid = "0.7.4"
+async-trait = "0.1.41"
+candid = "0.8.1"
+clap = { version = "3.1.6", features = ["derive"] }
 exec = "0.3.1"
 hex = "0.4.2"
 http = "0.2.1"
 ic-async-utils = { path = "../async_utils" }
 ic-canister-client = { path = "../canister_client" }
+ic-canister-client-sender = { path = "../canister_client/sender" }
 ic-config = { path = "../config" }
-ic-consensus-message = { path = "../consensus/message" }
 ic-consensus = { path = "../consensus" }
 ic-crypto = { path = "../crypto" }
+ic-crypto-node-key-generation = { path = "../crypto/node_key_generation" }
 ic-crypto-tls-interfaces = { path = "../crypto/tls_interfaces" }
+ic-crypto-utils-basic-sig = { path = "../crypto/utils/basic_sig" }
 ic-crypto-utils-threshold-sig = { path = "../crypto/utils/threshold_sig" }
 ic-crypto-sha = { path = "../crypto/sha" }
+ic-dashboard = { path = "./dashboard" }
 ic-http-utils = { path = "../http_utils" }
+ic-image-upgrader = { path = "./image_upgrader" }
 ic-interfaces = { path = "../interfaces" }
+ic-interfaces-registry = { path = "../interfaces/registry" }
 ic-logger = { path = "../monitoring/logger" }
 ic-metrics = { path = "../monitoring/metrics" }
-ic-metrics-exporter = { path = "../monitoring/metrics_exporter" }
+ic-http-endpoints-metrics = { path = "../http_endpoints/metrics" }
 ic-nns-constants = { path = "../nns/constants" }
 ic-protobuf = { path = "../protobuf" }
 ic-registry-client-helpers = { path = "../registry/helpers" }
-ic-registry-common = { path = "../registry/common" }
+ic-registry-local-store = { path = "../registry/local_store" }
 ic-registry-proto-data-provider = { path = "../registry/proto_data_provider" }
 ic-registry-keys = { path = "../registry/keys" }
 ic-registry-replicator = { path = "./registry_replicator" }
@@ -35,15 +42,16 @@ ic-types = { path = "../types/types" }
 ic-utils = { path = "../utils" }
 nix = "0.23.0"
 prometheus = { version = "0.12.0", features = [ "process" ] }
-rand = "0.7.3"
-prost = "0.9.0"
+rand = "0.8"
+prost = "0.11.0"
 registry-canister = { path = "../registry/canister" }
 serde = { version = "1.0.99", features = [ "derive" ] }
 serde_cbor = "0.11.1"
 signal-hook = "0.1"
-slog = { version = "2.5.2", features = ["nested-values", "max_level_trace", "release_max_level_debug"] }
+slog = { version = "2.5.2", features = ["nested-values", "release_max_level_debug"] }
 slog-async = { version = "2.5", features = ["nested-values"] }
-structopt = "0.3"
+strum = "0.23.0"
+strum_macros = "0.23.0"
 tar = "0.4.38"
 tempfile = "3.1.0"
 tokio = { version = "1.15.0", features = ["full"] }
@@ -52,5 +60,5 @@ url = "2.1.1"
 [dev-dependencies]
 assert_cmd = "0.12"
 ic-registry-client-fake = { path = "../registry/fake" }
-ic-test-utilities = { path = "../test_utilities" }
+ic-test-utilities-logger = { path = "../test_utilities/logger" }
 wait-timeout = "0.2.0"

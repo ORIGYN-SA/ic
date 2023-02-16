@@ -267,14 +267,11 @@ fn prune_witness_impl(
         LabeledTree::Leaf(v) => {
             match witness {
                 // LabeledTree <-> Witness mismatch.
-                Witness::Fork { .. } | Witness::Node { .. } => {
+                Witness::Fork { .. } | Witness::Node { .. } | Witness::Pruned { .. } => {
                     Err(TreeHashError::InconsistentPartialTree {
                         offending_path: curr_path.to_owned(),
                     })
                 }
-
-                // Nothing to do here.
-                Witness::Pruned { .. } => Ok(witness.to_owned()),
 
                 // Provided 'Leaf`, prune it.
                 Witness::Known() => Ok(Witness::Pruned {
@@ -356,7 +353,7 @@ pub fn recompute_digest(
         Witness::Pruned { digest } => Ok(digest),
         Witness::Fork { .. } | Witness::Node { .. } | Witness::Known() => {
             Err(TreeHashError::InconsistentPartialTree {
-                offending_path: path_to_first_known(&pruned).unwrap_or_else(Vec::new),
+                offending_path: path_to_first_known(&pruned).unwrap_or_default(),
             })
         }
     }
@@ -443,7 +440,7 @@ fn find_missing_label(
     map: &FlatMap<Label, LabeledTree<Digest>>,
 ) -> Option<Label> {
     for label in needed_labels {
-        if map.get(label) == None {
+        if map.get(label).is_none() {
             return Some(label.to_owned());
         }
     }
@@ -620,7 +617,6 @@ fn witness_for_subtree<Builder: WitnessBuilder>(
 
 impl WitnessGeneratorImpl {
     fn witness_impl<Builder: WitnessBuilder, T: std::convert::AsRef<[u8]> + Debug>(
-        &self,
         partial_tree: &LabeledTree<T>,
         orig_tree: &LabeledTree<Digest>,
         hash_tree: &HashTree,
@@ -661,7 +657,7 @@ impl WitnessGeneratorImpl {
                     let mut sub_witnesses = FlatMap::new();
                     for label in children.keys() {
                         curr_path.push(label.to_owned());
-                        let sub_witness = self.witness_impl::<Builder, _>(
+                        let sub_witness = Self::witness_impl::<Builder, _>(
                             children.get(label).expect("Could not get label"),
                             orig_children.get(label).expect("Could not get label"),
                             find_subtree_node(label, hash_tree),
@@ -897,7 +893,7 @@ impl WitnessGenerator for WitnessGeneratorImpl {
 
     fn witness(&self, partial_tree: &LabeledTree<Vec<u8>>) -> Result<Witness, TreeHashError> {
         let mut path = Vec::new();
-        self.witness_impl::<Witness, _>(partial_tree, &self.orig_tree, &self.hash_tree, &mut path)
+        Self::witness_impl::<Witness, _>(partial_tree, &self.orig_tree, &self.hash_tree, &mut path)
     }
 
     fn mixed_hash_tree(
@@ -905,7 +901,7 @@ impl WitnessGenerator for WitnessGeneratorImpl {
         partial_tree: &LabeledTree<Vec<u8>>,
     ) -> Result<MixedHashTree, TreeHashError> {
         let mut path = Vec::new();
-        self.witness_impl::<MixedHashTree, _>(
+        Self::witness_impl::<MixedHashTree, _>(
             partial_tree,
             &self.orig_tree,
             &self.hash_tree,

@@ -24,6 +24,8 @@ const MAX_CANISTER_TO_CANISTER_RATE: usize = 30;
 
 const DEFAULT_TARGETED_LATENCY_SECONDS: u64 = 20;
 
+pub const DEFAULT_DELETE_CANISTER_RETRIES: u64 = 8;
+
 /// Testcase 4.3 implementation: installs `xnet-test-canister` onto the first
 /// `subnets` subnets of `ic`; calls `start()` on each; sleeps for `runtime`;
 /// calls `stop()` on each; and finally retrieves and validates the metrics
@@ -43,7 +45,10 @@ pub async fn test_impl(
     wallet_canisters: Option<Vec<String>>,
     cycles_per_subnet: Option<u64>,
     skip_cleanup: bool,
+    delete_canister_retries: Option<u64>,
     all_to_one: bool,
+    canisters_per_subnet: Option<u64>,
+    canister_to_subnet_rate: Option<u64>,
 ) {
     if let Some(subnets) = subnets {
         assert!(
@@ -79,11 +84,7 @@ pub async fn test_impl(
     }
 
     // Load the xnet-test-canister.
-    let wasm = Project::cargo_bin_maybe_use_path_relative_to_rs(
-        "rust_canisters/xnet_test",
-        "xnet-test-canister",
-        &[],
-    );
+    let wasm = Project::cargo_bin_maybe_from_env("xnet-test-canister", &[]);
 
     // Map subnets to wallet canisters (if provided) and retain those subnets with
     // wallet canisters only.
@@ -114,17 +115,66 @@ pub async fn test_impl(
         .collect();
     let subnets = node_apis.len();
 
-    let rate = rate.unwrap_or(DEFAULT_RATE);
-    // Subnet-to-subnet request rate: ceil(rate / (subnets -1)).
-    let subnet_to_subnet_rate = (rate as usize - 1) / (subnets - 1) + 1;
-    // Minimum number of subnet-to-subnet queues needed to stay under
-    // `MAX_CANISTER_TO_CANISTER_RATE`.
-    let subnet_to_subnet_queues = (subnet_to_subnet_rate - 1) / MAX_CANISTER_TO_CANISTER_RATE + 1;
-    // Minimum number of canisters required to send `subnet_to_subnet_rate` requests
-    // per round.
-    let canisters_per_subnet = (subnet_to_subnet_queues as f64).sqrt().ceil() as usize;
-    // A canister's outbound request rate to a given subnet.
-    let canister_to_subnet_rate = (subnet_to_subnet_rate - 1) / canisters_per_subnet + 1;
+    let (canisters_per_subnet, canister_to_subnet_rate, subnet_to_subnet_rate) = match (
+        canisters_per_subnet,
+        canister_to_subnet_rate,
+    ) {
+        (Some(_), None) | (None, Some(_)) => {
+            panic!(
+                "`--canisters_per_subnet` and `--canister_to_subnet_rate` must be specified together."
+            );
+        }
+        (Some(canisters_per_subnet), Some(canister_to_subnet_rate)) => {
+            // Using overwrites for `rate` to directly specify the number of canisters per subnet,
+            // the canister to subnet rate. The subnet to subnet rate is the product of the former.
+            assert!(
+                canisters_per_subnet > 0,
+                "Number of canisters per subnet must be non-zero. Test was invoked with '--canisters_per_subnet {}`.",
+                canisters_per_subnet,
+            );
+            assert!(
+                canister_to_subnet_rate > 0,
+                "Canisters to subnet rate must be non-zero. Test was invoked with '--canister_to_subnet_rate {}`.",
+                canister_to_subnet_rate,
+            );
+            if rate.is_some() {
+                println!("Warning: rate will be ignored when `canister_per_subnet` and `canister_to_subnet_rate` are specified.");
+            }
+            (
+                canisters_per_subnet as usize,
+                canister_to_subnet_rate as usize,
+                (canisters_per_subnet * canister_to_subnet_rate) as usize,
+            )
+        }
+        (None, None) => {
+            // Using `rate` to automatically compute the number of canisters per subnet, the
+            // canister to subnet rate and the subnet to subnet rate.
+            if let Some(rate) = rate {
+                assert!(
+                    rate > 0,
+                    "Message rate must be non-zero. Test was invoked with `--rate {}`",
+                    rate
+                );
+            }
+            let rate = rate.unwrap_or(DEFAULT_RATE);
+            // Subnet-to-subnet request rate: ceil(rate / (subnets - 1)).
+            let subnet_to_subnet_rate = (rate as usize - 1) / (subnets - 1) + 1;
+            // Minimum number of subnet-to-subnet queues needed to stay under
+            // `MAX_CANISTER_TO_CANISTER_RATE`.
+            let subnet_to_subnet_queues =
+                (subnet_to_subnet_rate - 1) / MAX_CANISTER_TO_CANISTER_RATE + 1;
+            // Minimum number of canisters required to send `subnet_to_subnet_rate` requests
+            // per round.
+            let canisters_per_subnet = (subnet_to_subnet_queues as f64).sqrt().ceil() as usize;
+            // A canister's outbound request rate to a given subnet.
+            let canister_to_subnet_rate = (subnet_to_subnet_rate - 1) / canisters_per_subnet + 1;
+            (
+                canisters_per_subnet,
+                canister_to_subnet_rate,
+                subnet_to_subnet_rate,
+            )
+        }
+    };
 
     let cycles_per_canister = cycles_per_subnet
         .map(|cycles| cycles / canisters_per_subnet as u64)
@@ -238,7 +288,11 @@ pub async fn test_impl(
 
     if !skip_cleanup {
         println!("👉 Cleaning up");
-        cleanup(locate_canisters(&canisters, &wallet_canisters, ic)).await;
+        cleanup(
+            locate_canisters(&canisters, &wallet_canisters, ic),
+            delete_canister_retries.unwrap_or(DEFAULT_DELETE_CANISTER_RETRIES),
+        )
+        .await;
     }
 
     let mut aggregated_metrics: Vec<Metrics> = Vec::with_capacity(subnets);

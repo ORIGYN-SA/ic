@@ -1,15 +1,11 @@
 //! Helper functionality for transport.
 
 use crate::metrics::SendQueueMetrics;
-use crate::types::{DequeuedMessage, QueueSize, SendQueue, SendQueueReader};
-use ic_base_types::NodeId;
-use ic_interfaces_transport::{FlowTag, TransportErrorCode, TransportPayload};
-use ic_protobuf::registry::node::v1::NodeRecord;
-
+use crate::types::{SendQueue, SendQueueReader};
 use async_trait::async_trait;
-use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, RwLock};
+use ic_base_types::NodeId;
+use ic_interfaces_transport::{TransportChannelId, TransportPayload};
+use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc::{channel, error::TrySendError, Receiver, Sender};
 use tokio::time::Duration;
 use tokio::time::{timeout_at, Instant};
@@ -32,8 +28,8 @@ use tokio::time::{timeout_at, Instant};
 //   to take ownership of the updated end. Since update() is an infrequent
 //   operation, take() should have minimal contention
 
-pub(crate) type SendEnd = Sender<(Instant, TransportPayload)>;
-pub(crate) type ReceiveEnd = Receiver<(Instant, TransportPayload)>;
+type SendEnd = Sender<(Instant, TransportPayload)>;
+type ReceiveEnd = Receiver<(Instant, TransportPayload)>;
 
 // Since there is no try_recv(), this is the max duration after the first
 // dequeue to batch for
@@ -86,21 +82,18 @@ impl ReceiveEndContainer {
 
 /// Transport client -> scheduler adapter.
 pub(crate) struct SendQueueImpl {
-    /// Flow label, string for use as the value for a metric label
-    flow_label: String,
+    /// Peer label, string for use as the value for a metric label
+    peer_label: String,
 
-    /// Flow Tag, string for use as the value for a metric label
-    flow_tag: String,
+    /// Channel id string for use as the value for a metric label
+    channel_id: String,
 
     /// Size of queue
-    queue_size: QueueSize,
+    queue_size: usize,
 
-    /// A lock is needed around the send/receive end tuples, as they
-    /// need to be updated in sync.
-    channel_ends: RwLock<(SendEnd, Arc<ReceiveEndContainer>)>,
-
-    /// Error flag
-    error: Arc<AtomicBool>,
+    // Both the send and receive ends should be updated together.
+    send_end: SendEnd,
+    receive_end: Arc<ReceiveEndContainer>,
 
     /// Metrics
     metrics: SendQueueMetrics,
@@ -110,19 +103,19 @@ pub(crate) struct SendQueueImpl {
 impl SendQueueImpl {
     /// Initializes and returns a send queue
     pub(crate) fn new(
-        flow_label: String,
-        flow_tag: &FlowTag,
-        queue_size: QueueSize,
+        peer_label: String,
+        channel_id: TransportChannelId,
+        queue_size: usize,
         metrics: SendQueueMetrics,
     ) -> Self {
-        let (send_end, receive_end) = channel(queue_size.get());
+        let (send_end, receive_end) = channel(queue_size);
         let receieve_end_wrapper = ReceiveEndContainer::new(receive_end);
         Self {
-            flow_label,
-            flow_tag: flow_tag.to_string(),
-            error: Arc::new(AtomicBool::new(false)),
+            peer_label,
+            channel_id: channel_id.to_string(),
             queue_size,
-            channel_ends: RwLock::new((send_end, Arc::new(receieve_end_wrapper))),
+            send_end,
+            receive_end: Arc::new(receieve_end_wrapper),
             metrics,
         }
     }
@@ -130,20 +123,18 @@ impl SendQueueImpl {
 
 #[async_trait]
 impl SendQueue for SendQueueImpl {
-    fn get_reader(&self) -> Box<dyn SendQueueReader + Send + Sync> {
-        let (send_end, receive_end) = channel(self.queue_size.get());
-        let mut channel_ends = self.channel_ends.write().unwrap();
-        if channel_ends.1.try_update(receive_end).is_ok() {
+    fn get_reader(&mut self) -> Box<dyn SendQueueReader + Send + Sync> {
+        let (send_end, receive_end) = channel(self.queue_size);
+        if self.receive_end.try_update(receive_end).is_ok() {
             // Receive end was updated, so update send end as well.
-            channel_ends.0 = send_end;
+            self.send_end = send_end;
         }
 
         let reader = SendQueueReaderImpl {
-            flow_label: self.flow_label.clone(),
-            flow_tag: self.flow_tag.clone(),
-            receive_end_container: channel_ends.1.clone(),
+            peer_label: self.peer_label.clone(),
+            channel_id: self.channel_id.clone(),
+            receive_end_container: self.receive_end.clone(),
             cur_receive_end: None,
-            error: self.error.clone(),
             metrics: self.metrics.clone(),
         };
         Box::new(reader)
@@ -152,56 +143,49 @@ impl SendQueue for SendQueueImpl {
     fn enqueue(&self, message: TransportPayload) -> Option<TransportPayload> {
         self.metrics
             .add_count
-            .with_label_values(&[&self.flow_label, &self.flow_tag])
+            .with_label_values(&[&self.peer_label, &self.channel_id])
             .inc();
         self.metrics
             .add_bytes
-            .with_label_values(&[&self.flow_label, &self.flow_tag])
+            .with_label_values(&[&self.peer_label, &self.channel_id])
             .inc_by(message.0.len() as u64);
 
-        let channel_ends = self.channel_ends.read().unwrap();
-        match channel_ends.0.try_send((Instant::now(), message)) {
+        match self.send_end.try_send((Instant::now(), message)) {
             Ok(_) => None,
             Err(TrySendError::Full((_, unsent))) => {
-                self.error.store(true, Ordering::Release);
                 self.metrics
                     .queue_full
-                    .with_label_values(&[&self.flow_label, &self.flow_tag])
+                    .with_label_values(&[&self.peer_label, &self.channel_id])
                     .inc();
                 Some(unsent)
             }
             Err(TrySendError::Closed((_, unsent))) => {
-                self.error.store(true, Ordering::Release);
                 self.metrics
                     .no_receiver
-                    .with_label_values(&[&self.flow_label, &self.flow_tag])
+                    .with_label_values(&[&self.peer_label, &self.channel_id])
                     .inc();
                 Some(unsent)
             }
         }
     }
 
-    fn clear(&self) {
-        let (send_end, receive_end) = channel(self.queue_size.get());
-        {
-            let mut channel_ends = self.channel_ends.write().unwrap();
-            channel_ends.0 = send_end;
-            channel_ends.1.update(receive_end);
-        }
+    fn clear(&mut self) {
+        let (send_end, receive_end) = channel(self.queue_size);
+        self.send_end = send_end;
+        self.receive_end.update(receive_end);
         self.metrics
             .queue_clear
-            .with_label_values(&[&self.flow_label, &self.flow_tag])
+            .with_label_values(&[&self.peer_label, &self.channel_id])
             .inc();
     }
 }
 
 /// Send queue implementation
 struct SendQueueReaderImpl {
-    flow_label: String,
-    flow_tag: String,
+    peer_label: String,
+    channel_id: String,
     receive_end_container: Arc<ReceiveEndContainer>,
     cur_receive_end: Option<ReceiveEnd>,
-    error: Arc<AtomicBool>,
     metrics: SendQueueMetrics,
 }
 
@@ -213,35 +197,28 @@ impl SendQueueReaderImpl {
         timeout: Duration,
     ) -> Option<(Instant, TransportPayload)> {
         let wait_for_entries = async move { receive_end.recv().await };
-        let ret = timeout_at(Instant::now() + timeout, wait_for_entries).await;
-        if ret.is_err() {
+        match timeout_at(Instant::now() + timeout, wait_for_entries).await {
             // Return None on timeout.
-            return None;
-        }
-
-        // Return None on sender disconnect as well.
-        ret.unwrap()
-    }
-
-    /// Updates the receive ends
-    fn update_cached_receive_end(&mut self) {
-        if let Some(receive_end) = self.receive_end_container.take() {
-            self.cur_receive_end = Some(receive_end);
-            self.metrics
-                .receive_end_updates
-                .with_label_values(&[&self.flow_label, &self.flow_tag])
-                .inc();
+            Err(_) => None,
+            // Return None on sender disconnect as well.
+            Ok(res) => res,
         }
     }
 }
 
 #[async_trait]
 impl SendQueueReader for SendQueueReaderImpl {
-    async fn dequeue(&mut self, bytes_limit: usize, timeout: Duration) -> Vec<DequeuedMessage> {
+    async fn dequeue(&mut self, bytes_limit: usize, timeout: Duration) -> Vec<TransportPayload> {
         // The channel end is looked up outside the loop. Any updates
         // to the receive end will be seen only in the next dequeue()
         // call.
-        self.update_cached_receive_end();
+        if let Some(receive_end) = self.receive_end_container.take() {
+            self.cur_receive_end = Some(receive_end);
+            self.metrics
+                .receive_end_updates
+                .with_label_values(&[&self.peer_label, &self.channel_id])
+                .inc();
+        }
         let cur_receive_end = self.cur_receive_end.as_mut().unwrap();
 
         let mut result = Vec::new();
@@ -254,22 +231,12 @@ impl SendQueueReader for SendQueueReaderImpl {
         {
             self.metrics
                 .queue_time_msec
-                .with_label_values(&[&self.flow_label, &self.flow_tag])
+                .with_label_values(&[&self.peer_label, &self.channel_id])
                 .observe(enqueue_time.elapsed().as_millis() as f64);
             removed += 1;
             removed_bytes += payload.0.len();
 
-            let sender_error = if removed == 1 {
-                // Return bool present in error and set error to false.
-                self.error.fetch_and(false, Ordering::Acquire)
-            } else {
-                false
-            };
-            let msg = DequeuedMessage {
-                payload,
-                sender_error,
-            };
-            result.push(msg);
+            result.push(payload);
 
             if removed_bytes >= bytes_limit {
                 break;
@@ -296,121 +263,19 @@ impl SendQueueReader for SendQueueReaderImpl {
 
         self.metrics
             .remove_count
-            .with_label_values(&[&self.flow_label, &self.flow_tag])
+            .with_label_values(&[&self.peer_label, &self.channel_id])
             .inc_by(removed as u64);
         self.metrics
             .remove_bytes
-            .with_label_values(&[&self.flow_label, &self.flow_tag])
+            .with_label_values(&[&self.peer_label, &self.channel_id])
             .inc_by(removed_bytes as u64);
         result
     }
 }
 
-/// Returns a map of flow_tag -> peer_ip for that flow.
-pub(crate) fn get_flow_ips(
-    node_record: &NodeRecord,
-) -> Result<HashMap<FlowTag, String>, TransportErrorCode> {
-    let mut ret = HashMap::new();
-    for flow_endpoint in &node_record.p2p_flow_endpoints {
-        let flow_tag = FlowTag::from(flow_endpoint.flow_tag);
-        if ret.contains_key(&flow_tag) {
-            return Err(TransportErrorCode::NodeRecordDuplicateFlowTag);
-        }
-
-        match &flow_endpoint.endpoint {
-            Some(connection_endpoint) => ret.insert(flow_tag, connection_endpoint.ip_addr.clone()),
-            None => return Err(TransportErrorCode::NodeRecordMissingConnectionEndpoint),
-        };
-    }
-
-    Ok(ret)
-}
-
 /// Builds the flow label to use for metrics, from the IP address and the NodeId
-pub(crate) fn get_flow_label(node_ip: &str, node_id: &NodeId) -> String {
+pub(crate) fn get_peer_label(node_ip: &str, node_id: &NodeId) -> String {
     // 35: Includes the first 6 groups of 5 chars each + the 5 separators
     let prefix = node_id.to_string().chars().take(35).collect::<String>();
-    return format!("{}_{}", node_ip, prefix);
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use ic_protobuf::registry::node::v1::{
-        connection_endpoint::Protocol, ConnectionEndpoint, FlowEndpoint,
-    };
-
-    #[test]
-    fn test_get_flow_ips() {
-        let mut node_record: NodeRecord = Default::default();
-
-        let ip_map = get_flow_ips(&node_record).unwrap();
-        assert_eq!(ip_map.len(), 0);
-
-        node_record.p2p_flow_endpoints.push(FlowEndpoint {
-            flow_tag: 1000,
-            endpoint: Some(ConnectionEndpoint {
-                ip_addr: "10.0.0.1".to_string(),
-                port: 100,
-                protocol: Protocol::P2p1Tls13 as i32,
-            }),
-        });
-        node_record.p2p_flow_endpoints.push(FlowEndpoint {
-            flow_tag: 2000,
-            endpoint: Some(ConnectionEndpoint {
-                ip_addr: "20.0.0.1".to_string(),
-                port: 200,
-                protocol: Protocol::P2p1Tls13 as i32,
-            }),
-        });
-
-        let ip_map = get_flow_ips(&node_record).unwrap();
-        assert_eq!(ip_map.len(), 2);
-        assert_eq!(
-            *ip_map.get(&FlowTag::from(1000)).unwrap(),
-            "10.0.0.1".to_string()
-        );
-        assert_eq!(
-            *ip_map.get(&FlowTag::from(2000)).unwrap(),
-            "20.0.0.1".to_string()
-        );
-    }
-
-    #[test]
-    fn test_get_flow_ips_duplicate_flow_tags() {
-        let mut node_record: NodeRecord = Default::default();
-        node_record.p2p_flow_endpoints.push(FlowEndpoint {
-            flow_tag: 1000,
-            endpoint: Some(ConnectionEndpoint {
-                ip_addr: "10.0.0.1".to_string(),
-                port: 100,
-                protocol: Protocol::P2p1Tls13 as i32,
-            }),
-        });
-        node_record.p2p_flow_endpoints.push(FlowEndpoint {
-            flow_tag: 1000,
-            endpoint: Some(ConnectionEndpoint {
-                ip_addr: "20.0.0.1".to_string(),
-                port: 200,
-                protocol: Protocol::P2p1Tls13 as i32,
-            }),
-        });
-        assert_eq!(
-            get_flow_ips(&node_record),
-            Err(TransportErrorCode::NodeRecordDuplicateFlowTag)
-        );
-    }
-
-    #[test]
-    fn test_get_flow_ips_missing_endpoint() {
-        let mut node_record: NodeRecord = Default::default();
-        node_record.p2p_flow_endpoints.push(FlowEndpoint {
-            flow_tag: 1000,
-            ..Default::default()
-        });
-        assert_eq!(
-            get_flow_ips(&node_record),
-            Err(TransportErrorCode::NodeRecordMissingConnectionEndpoint)
-        );
-    }
+    format!("{}_{}", node_ip, prefix)
 }

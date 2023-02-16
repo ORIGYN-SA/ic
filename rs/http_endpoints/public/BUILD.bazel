@@ -1,0 +1,117 @@
+load("@rules_rust//rust:defs.bzl", "rust_library", "rust_test")
+load("@rules_rust//cargo:cargo_build_script.bzl", "cargo_build_script")
+load("//bazel:defs.bzl", "rust_test_suite_with_extra_srcs")
+
+package(default_visibility = ["//rs/replica:__subpackages__"])
+
+DEPENDENCIES = [
+    "//rs/async_utils",
+    "//rs/certification",
+    "//rs/config",
+    "//rs/crypto/tls_interfaces",
+    "//rs/crypto/tree_hash",
+    "//rs/crypto/utils/threshold_sig_der",
+    "//rs/interfaces",
+    "//rs/interfaces/p2p",
+    "//rs/interfaces/registry",
+    "//rs/interfaces/state_manager",
+    "//rs/monitoring/logger",
+    "//rs/monitoring/metrics",
+    "//rs/monitoring/pprof",
+    "//rs/registry/helpers",
+    "//rs/registry/provisional_whitelist",
+    "//rs/registry/subnet_type",
+    "//rs/replicated_state",
+    "//rs/types/error_types",
+    "//rs/types/types",
+    "//rs/validator",
+    "@crate_index//:askama",
+    "@crate_index//:byte-unit",
+    "@crate_index//:crossbeam",
+    "@crate_index//:futures",
+    "@crate_index//:futures-util",
+    "@crate_index//:hex",
+    "@crate_index//:http",
+    "@crate_index//:hyper",
+    "@crate_index//:hyper-tls",
+    "@crate_index//:native-tls",
+    "@crate_index//:prometheus",
+    "@crate_index//:prost",
+    "@crate_index//:rand_0_8_4",
+    "@crate_index//:serde",
+    "@crate_index//:serde_cbor",
+    "@crate_index//:slog",
+    "@crate_index//:strum",
+    "@crate_index//:tempfile",
+    "@crate_index//:threadpool",
+    "@crate_index//:tokio",
+    "@crate_index//:tokio-io-timeout",
+    "@crate_index//:tower",
+    "@crate_index//:url",
+]
+
+MACRO_DEPENDENCIES = []
+
+BUILD_DEPENDENCIES = []
+
+DEV_DEPENDENCIES = [
+    "//rs/crypto/tls_interfaces/mocks",
+    "//rs/interfaces/registry/mocks",
+    "//rs/interfaces/state_manager/mocks",
+    "//rs/protobuf",
+    "//rs/registry/keys",
+    "//rs/registry/routing_table",
+    "//rs/test_utilities",
+    "@crate_index//:bytes",
+    "@crate_index//:ic-agent",
+    "@crate_index//:maplit",
+    "@crate_index//:pretty_assertions",
+    "@crate_index//:proptest",
+    "@crate_index//:tower-test",
+]
+
+MACRO_DEV_DEPENDENCIES = []
+
+ALIASES = {}
+
+cargo_build_script(
+    name = "build_script",
+    srcs = ["build.rs"],
+    aliases = ALIASES,
+    data = ["templates/dashboard.html"],  # build script data (e.g. template files) goes here
+    deps = BUILD_DEPENDENCIES,
+)
+
+rust_library(
+    name = "public",
+    srcs = glob(["src/**"]),
+    aliases = ALIASES,
+    crate_features = select({
+        "//bazel:malicious_code_enabled": ["malicious_code"],
+        "//conditions:default": [],
+    }),
+    crate_name = "ic_http_endpoints_public",
+    proc_macro_deps = MACRO_DEPENDENCIES,
+    version = "0.8.0",
+    deps = DEPENDENCIES + [":build_script"],
+)
+
+rust_test(
+    name = "public_test",
+    aliases = ALIASES,
+    crate = ":public",
+    proc_macro_deps = MACRO_DEPENDENCIES + MACRO_DEV_DEPENDENCIES,
+    deps = DEPENDENCIES + DEV_DEPENDENCIES + [":build_script"],
+)
+
+rust_test_suite_with_extra_srcs(
+    name = "public_integration_tests",
+    size = "small",
+    srcs = glob(
+        ["tests/**"],
+        exclude = ["tests/common/**"],
+    ),
+    extra_srcs = glob(["tests/common/**"]),
+    proc_macro_deps = MACRO_DEPENDENCIES + MACRO_DEV_DEPENDENCIES,
+    deps = [":public"] + DEPENDENCIES + DEV_DEPENDENCIES,
+)

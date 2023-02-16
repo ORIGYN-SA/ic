@@ -13,7 +13,7 @@ use std::path::PathBuf;
 /// Computes the manifest (chunk hashes, file hashes and root hash) of the
 /// checkpoint rooted at `path`.
 pub fn do_compute_manifest(path: PathBuf) -> Result<(), String> {
-    let cp_layout = CheckpointLayout::<ReadOnly>::new(path, Height::new(0))
+    let cp_layout = CheckpointLayout::<ReadOnly>::new_untracked(path, Height::new(0))
         .map_err(|e| format!("Failed to create checkpoint layout: {}", e))?;
 
     let metadata = cp_layout.system_metadata().deserialize().map_err(|e| {
@@ -32,7 +32,7 @@ pub fn do_compute_manifest(path: PathBuf) -> Result<(), String> {
         &manifest_metrics,
         &no_op_logger(),
         metadata.state_sync_version,
-        cp_layout.raw_path(),
+        &cp_layout,
         DEFAULT_CHUNK_SIZE,
         None,
     )

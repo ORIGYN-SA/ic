@@ -1,0 +1,110 @@
+load("@rules_rust//rust:defs.bzl", "rust_library", "rust_test", "rust_test_suite")
+
+package(default_visibility = ["//visibility:public"])
+
+DEPENDENCIES = [
+    "//rs/async_utils",
+    "//rs/bitcoin/service",
+    "//rs/bitcoin/types/internal",
+    "//rs/bitcoin/types/public",
+    "//rs/canister_client/sender",
+    "//rs/config",
+    "//rs/crypto",
+    "//rs/execution_environment",
+    "//rs/interfaces",
+    "//rs/interfaces/p2p",
+    "//rs/interfaces/registry",
+    "//rs/interfaces/state_manager",
+    "//rs/monitoring/logger",
+    "//rs/monitoring/metrics",
+    "//rs/prep",
+    "//rs/protobuf",
+    "//rs/registry/fake",
+    "//rs/registry/helpers",
+    "//rs/registry/keys",
+    "//rs/registry/proto_data_provider",
+    "//rs/registry/provisional_whitelist",
+    "//rs/registry/subnet_type",
+    "//rs/replica:replica_lib",
+    "//rs/replicated_state",
+    "//rs/state_machine_tests",
+    "//rs/state_manager",
+    "//rs/test_utilities",
+    "//rs/test_utilities/logger",
+    "//rs/types/base_types",
+    "//rs/types/error_types",
+    "//rs/types/ic00_types",
+    "//rs/types/types",
+    "//rs/utils",
+    "@crate_index//:futures",
+    "@crate_index//:prometheus",
+    "@crate_index//:prost",
+    "@crate_index//:rand_0_8_4",
+    "@crate_index//:slog",
+    "@crate_index//:slog-scope",
+    "@crate_index//:tempfile",
+    "@crate_index//:tokio",
+    "@crate_index//:tonic",
+    "@crate_index//:tower",
+    "@crate_index//:wat",
+]
+
+MACRO_DEPENDENCIES = []
+
+DEV_DEPENDENCIES = [
+    "//rs/crypto/sha",
+    "//rs/rust_canisters/canister_test",
+    "//rs/sys",
+    "@crate_index//:assert_matches",
+    "@crate_index//:candid",
+    "@crate_index//:maplit",
+    "@crate_index//:predicates",
+]
+
+MACRO_DEV_DEPENDENCIES = []
+
+DEV_DATA = [
+    # Keep sorted.
+    ":replica_tests",
+    "//rs/canister_sandbox",
+    "//rs/canister_sandbox/sandbox_launcher",
+]
+
+ALIASES = {}
+
+DEV_ENV = {
+    # Keep sorted.
+    "LAUNCHER_BINARY": "$(rootpath //rs/canister_sandbox/sandbox_launcher)",
+    "SANDBOX_BINARY": "$(rootpath //rs/canister_sandbox)",
+}
+
+rust_library(
+    name = "replica_tests",
+    srcs = glob(["src/**/*.rs"]),
+    aliases = ALIASES,
+    crate_name = "ic_replica_tests",
+    edition = "2021",
+    proc_macro_deps = MACRO_DEPENDENCIES,
+    deps = DEPENDENCIES,
+)
+
+rust_test(
+    name = "replica_tests_test",
+    aliases = ALIASES,
+    crate = ":replica_tests",
+    edition = "2021",
+    proc_macro_deps = MACRO_DEPENDENCIES + MACRO_DEV_DEPENDENCIES,
+    deps = DEPENDENCIES + DEV_DEPENDENCIES,
+)
+
+rust_test_suite(
+    name = "replica_tests_integration_tests",
+    timeout = "long",
+    srcs = glob(["tests/**/*.rs"]),
+    aliases = ALIASES,
+    data = DEV_DATA,
+    edition = "2021",
+    env = DEV_ENV,
+    proc_macro_deps = MACRO_DEPENDENCIES + MACRO_DEV_DEPENDENCIES,
+    deps = [":replica_tests"] + DEPENDENCIES + DEV_DEPENDENCIES,
+)

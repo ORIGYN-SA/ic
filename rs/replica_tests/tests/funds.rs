@@ -1,10 +1,8 @@
+use ic_ic00_types::{CanisterIdRecord, EmptyBlob, Method, Payload, IC_00};
 use ic_replica_tests as utils;
 use ic_test_utilities::assert_utils::assert_balance_equals;
 use ic_test_utilities::universal_canister::{call_args, wasm};
-use ic_types::{
-    ic00::{CanisterIdRecord, EmptyBlob, Method, Payload, IC_00},
-    Cycles,
-};
+use ic_types::Cycles;
 
 const BALANCE_EPSILON: Cycles = Cycles::new(2_000_000u128);
 const CANISTER_CREATION_FEE: Cycles = Cycles::new(1_000_000_000_000);
@@ -82,7 +80,7 @@ fn can_deposit_cycles_via_the_management_canister() {
         let canister_id = test.create_universal_canister_with_args(vec![], num_cycles);
 
         // Create another canister with some cycles and ICP tokens.
-        let cycles_for_new_canister = CANISTER_CREATION_FEE + Cycles::from(100_000_000);
+        let cycles_for_new_canister = CANISTER_CREATION_FEE + Cycles::new(100_000_000);
         let new_canister_id_payload = test
             .ingress(
                 canister_id,
@@ -90,7 +88,7 @@ fn can_deposit_cycles_via_the_management_canister() {
                 wasm().call_with_cycles(
                     IC_00,
                     Method::CreateCanister,
-                    call_args().other_side(EmptyBlob::encode()),
+                    call_args().other_side(EmptyBlob.encode()),
                     cycles_for_new_canister.into_parts(),
                 ),
             )
@@ -107,7 +105,7 @@ fn can_deposit_cycles_via_the_management_canister() {
             test.canister_state(&new_canister_id).system_state.balance();
 
         // Deposit cycles to the new canister.
-        let cycles_to_deposit = Cycles::from(200_000_000);
+        let cycles_to_deposit = Cycles::new(200_000_000);
         test.ingress(
             canister_id,
             "update",

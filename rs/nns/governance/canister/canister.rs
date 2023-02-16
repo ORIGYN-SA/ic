@@ -9,64 +9,52 @@
 // annotated with `#[candid_method(query/update)]` to be able to generate the
 // did definition of the method.
 
-use ic_nns_governance::{
-    governance::TimeWarp,
-    pb::v1::{manage_neuron::NeuronIdOrSubaccount, RewardNodeProviders},
-};
-use rand::rngs::StdRng;
-use rand_core::{RngCore, SeedableRng};
 use std::boxed::Box;
 use std::time::SystemTime;
 
-use prost::Message;
-
+use async_trait::async_trait;
 use candid::candid_method;
 use dfn_candid::{candid, candid_one};
 use dfn_core::{
-    api::{arg_data, call_with_callbacks, caller, now},
+    api::{arg_data, call_with_callbacks, caller, now, reject_message},
     over, over_async, println,
 };
 use dfn_protobuf::protobuf;
+use prost::Message;
+use rand::{RngCore, SeedableRng};
+use rand_chacha::ChaCha20Rng;
 
-use ic_base_types::PrincipalId;
-use ic_nervous_system_common::MethodAuthzChange;
+use ic_base_types::{CanisterId, PrincipalId};
+use ic_nervous_system_common::{
+    ledger::IcpLedgerCanister,
+    stable_mem_utils::{BufferedStableMemReader, BufferedStableMemWriter},
+    MethodAuthzChange,
+};
 use ic_nns_common::{
-    access_control::{check_caller_is_ledger, check_caller_is_root},
+    access_control::{check_caller_is_gtc, check_caller_is_ledger, check_caller_is_root},
     pb::v1::{CanisterAuthzInfo, NeuronId as NeuronIdProto, ProposalId as ProposalIdProto},
     types::{NeuronId, ProposalId},
 };
-
-// Makes expose_build_metadata! available.
-#[macro_use]
-extern crate ic_nervous_system_common;
-
-use ic_nns_constants::LEDGER_CANISTER_ID;
-use ic_nns_governance::pb::v1::{
-    ListNodeProvidersResponse, NodeProvider, RewardEvent, UpdateNodeProvider,
-};
-use ic_nns_governance::stable_mem_utils::{BufferedStableMemReader, BufferedStableMemWriter};
+use ic_nns_constants::{CYCLES_MINTING_CANISTER_ID, LEDGER_CANISTER_ID};
+use ic_nns_governance::pb::v1::governance::GovernanceCachedMetrics;
 use ic_nns_governance::{
-    governance::{Environment, Governance},
+    governance::{Environment, Governance, HeapGrowthPotential, TimeWarp, CMC},
     pb::v1::{
         claim_or_refresh_neuron_from_account_response::Result as ClaimOrRefreshNeuronFromAccountResponseResult,
         governance_error::ErrorType,
         manage_neuron::{
             claim_or_refresh::{By, MemoAndController},
-            ClaimOrRefresh, Command, RegisterVote,
+            ClaimOrRefresh, Command, NeuronIdOrSubaccount, RegisterVote,
         },
         manage_neuron_response, ClaimOrRefreshNeuronFromAccount,
         ClaimOrRefreshNeuronFromAccountResponse, ExecuteNnsFunction, Governance as GovernanceProto,
         GovernanceError, ListKnownNeuronsResponse, ListNeurons, ListNeuronsResponse,
-        ListProposalInfo, ListProposalInfoResponse, ManageNeuron, ManageNeuronResponse, Neuron,
-        NeuronInfo, NnsFunction, Proposal, ProposalInfo, Vote,
+        ListNodeProvidersResponse, ListProposalInfo, ListProposalInfoResponse, ManageNeuron,
+        ManageNeuronResponse, MostRecentMonthlyNodeProviderRewards, NetworkEconomics, Neuron,
+        NeuronInfo, NnsFunction, NodeProvider, Proposal, ProposalInfo, RewardEvent,
+        RewardNodeProviders, SettleCommunityFundParticipation, UpdateNodeProvider, Vote,
     },
 };
-
-use dfn_core::api::reject_message;
-use ic_nervous_system_common::ledger::LedgerCanister;
-use ic_nns_common::access_control::check_caller_is_gtc;
-use ic_nns_governance::governance::HeapGrowthPotential;
-use ledger_canister::metrics_encoder;
 
 /// Size of the buffer for stable memory reads and writes.
 ///
@@ -102,7 +90,7 @@ fn governance_mut() -> &'static mut Governance {
 }
 
 struct CanisterEnv {
-    rng: StdRng,
+    rng: ChaCha20Rng,
     time_warp: TimeWarp,
 }
 
@@ -126,7 +114,7 @@ impl CanisterEnv {
                 let mut seed = [0u8; 32];
                 seed[..16].copy_from_slice(&now_nanos.to_be_bytes());
                 seed[16..32].copy_from_slice(&now_nanos.to_be_bytes());
-                StdRng::from_seed(seed)
+                ChaCha20Rng::from_seed(seed)
             },
 
             time_warp: TimeWarp { delta_s: 0 },
@@ -134,6 +122,38 @@ impl CanisterEnv {
     }
 }
 
+struct CMCCanister {
+    canister_id: CanisterId,
+}
+
+impl CMCCanister {
+    fn new() -> Self {
+        CMCCanister {
+            canister_id: CYCLES_MINTING_CANISTER_ID,
+        }
+    }
+}
+
+#[async_trait]
+impl CMC for CMCCanister {
+    /// Returns the maturity_modulation from the CMC in basis points.
+    async fn neuron_maturity_modulation(&mut self) -> Result<i32, String> {
+        let result: Result<Result<i32, String>, (Option<i32>, String)> =
+            dfn_core::api::call_with_cleanup(
+                self.canister_id,
+                "neuron_maturity_modulation",
+                candid_one,
+                (),
+            )
+            .await;
+        match result {
+            Ok(result) => result,
+            Err(error) => Err(error.1),
+        }
+    }
+}
+
+#[async_trait]
 impl Environment for CanisterEnv {
     fn now(&self) -> u64 {
         self.time_warp.apply(
@@ -208,6 +228,15 @@ impl Environment for CanisterEnv {
         }
     }
 
+    async fn call_canister_method(
+        &mut self,
+        target: CanisterId,
+        method_name: &str,
+        request: Vec<u8>,
+    ) -> Result<Vec<u8>, (Option<i32>, String)> {
+        dfn_core::api::call(target, method_name, on_wire::bytes, request).await
+    }
+
     #[cfg(target_arch = "wasm32")]
     fn heap_growth_potential(&self) -> HeapGrowthPotential {
         if core::arch::wasm32::memory_size(0)
@@ -265,7 +294,8 @@ fn canister_init_(init_payload: GovernanceProto) {
         GOVERNANCE = Some(Governance::new(
             init_payload,
             Box::new(CanisterEnv::new()),
-            Box::new(LedgerCanister::new(LEDGER_CANISTER_ID)),
+            Box::new(IcpLedgerCanister::new(LEDGER_CANISTER_ID)),
+            Box::new(CMCCanister::new()),
         ));
     }
     governance()
@@ -425,7 +455,7 @@ async fn claim_or_refresh_neuron_from_account_(
     }
 }
 
-expose_build_metadata! {}
+ic_nervous_system_common_build_metadata::define_get_build_metadata_candid_method! {}
 
 #[export_name = "canister_update claim_gtc_neurons"]
 fn claim_gtc_neurons() {
@@ -579,6 +609,17 @@ fn list_neurons_(req: ListNeurons) -> ListNeuronsResponse {
     governance().list_neurons_by_principal(&req, &caller())
 }
 
+#[export_name = "canister_query get_metrics"]
+fn get_metrics() {
+    println!("{}get_metrics", LOG_PREFIX);
+    over(candid, |()| get_metrics_())
+}
+
+#[candid_method(query, rename = "get_metrics")]
+fn get_metrics_() -> Result<GovernanceCachedMetrics, GovernanceError> {
+    governance().get_metrics()
+}
+
 #[export_name = "canister_update get_monthly_node_provider_rewards"]
 fn get_monthly_node_provider_rewards() {
     println!("{}get_monthly_node_provider_rewards", LOG_PREFIX);
@@ -664,6 +705,24 @@ fn get_neuron_ids_() -> Vec<NeuronId> {
         .collect()
 }
 
+#[export_name = "canister_query get_network_economics_parameters"]
+fn get_network_economics_parameters() {
+    println!("{}get_network_economics_parameters", LOG_PREFIX);
+    over(candid, |()| -> NetworkEconomics {
+        get_network_economics_parameters_()
+    })
+}
+
+#[candid_method(query, rename = "get_network_economics_parameters")]
+fn get_network_economics_parameters_() -> NetworkEconomics {
+    governance()
+        .proto
+        .economics
+        .as_ref()
+        .expect("Governance must have network economics.")
+        .clone()
+}
+
 #[export_name = "canister_heartbeat"]
 fn canister_heartbeat() {
     let future = governance_mut().run_periodic_tasks();
@@ -709,6 +768,21 @@ fn update_node_provider_(req: UpdateNodeProvider) -> Result<(), GovernanceError>
     governance_mut().update_node_provider(&caller(), req)
 }
 
+#[export_name = "canister_update settle_community_fund_participation"]
+fn settle_community_fund_participation() {
+    println!("{}settle_community_fund_participation", LOG_PREFIX);
+    over_async(candid_one, settle_community_fund_participation_)
+}
+
+#[candid_method(update, rename = "settle_community_fund_participation")]
+async fn settle_community_fund_participation_(
+    request: SettleCommunityFundParticipation,
+) -> Result<(), GovernanceError> {
+    governance_mut()
+        .settle_community_fund_participation(caller(), &request)
+        .await
+}
+
 /// Return the NodeProvider record where NodeProvider.id == caller(), if such a
 /// NodeProvider record exists.
 #[export_name = "canister_query get_node_provider_by_caller"]
@@ -734,14 +808,38 @@ fn list_node_providers_() -> ListNodeProvidersResponse {
     ListNodeProvidersResponse { node_providers }
 }
 
+#[export_name = "canister_query get_most_recent_monthly_node_provider_rewards"]
+fn get_most_recent_monthly_node_provider_rewards() {
+    over(
+        candid,
+        |()| -> Option<MostRecentMonthlyNodeProviderRewards> {
+            get_most_recent_monthly_node_provider_rewards_()
+        },
+    )
+}
+
+#[candid_method(query, rename = "get_most_recent_monthly_node_provider_rewards")]
+fn get_most_recent_monthly_node_provider_rewards_() -> Option<MostRecentMonthlyNodeProviderRewards>
+{
+    governance()
+        .proto
+        .most_recent_monthly_node_provider_rewards
+        .clone()
+}
+
 /// Encodes
-fn encode_metrics(w: &mut metrics_encoder::MetricsEncoder<Vec<u8>>) -> std::io::Result<()> {
+fn encode_metrics(w: &mut ic_metrics_encoder::MetricsEncoder<Vec<u8>>) -> std::io::Result<()> {
     let governance = governance();
 
     w.encode_gauge(
         "governance_stable_memory_size_bytes",
-        (dfn_core::api::stable_memory_size_in_pages() * 65536) as f64,
+        ic_nervous_system_common::stable_memory_size_bytes() as f64,
         "Size of the stable memory allocated by this canister measured in bytes.",
+    )?;
+    w.encode_gauge(
+        "governance_total_memory_size_bytes",
+        ic_nervous_system_common::total_memory_size_bytes() as f64,
+        "Size of the total memory allocated by this canister measured in bytes.",
     )?;
     w.encode_gauge(
         "governance_proposals_total",
@@ -782,6 +880,16 @@ fn encode_metrics(w: &mut metrics_encoder::MetricsEncoder<Vec<u8>>) -> std::io::
         "governance_last_rewards_event_e8s",
         governance.latest_reward_event().distributed_e8s_equivalent as f64,
         "Total number of e8s distributed in the latest reward event.",
+    )?;
+    w.encode_gauge(
+        "governance_total_locked_e8s",
+        governance
+            .proto
+            .metrics
+            .as_ref()
+            .map(|m| m.total_locked_e8s)
+            .unwrap_or(0) as f64,
+        "Total number of e8s locked in non-dissolved neurons..",
     )?;
 
     let total_voting_power = match governance.proto.proposals.iter().next_back() {
@@ -892,6 +1000,12 @@ fn encode_metrics(w: &mut metrics_encoder::MetricsEncoder<Vec<u8>>) -> std::io::
             metrics.community_fund_total_staked_e8s as f64,
             "The amount of Neurons' stake committed to the Internet Computer's community fund",
         )?;
+
+        w.encode_gauge(
+            "governance_community_fund_total_maturity_e8s_equivalent",
+            metrics.community_fund_total_maturity_e8s_equivalent as f64,
+            "The amount of Neurons' maturity committed to the Internet Computer's community fund",
+        )?;
     }
 
     Ok(())
@@ -899,7 +1013,7 @@ fn encode_metrics(w: &mut metrics_encoder::MetricsEncoder<Vec<u8>>) -> std::io::
 
 #[export_name = "canister_query http_request"]
 fn http_request() {
-    ledger_canister::http_request::serve_metrics(encode_metrics);
+    dfn_http_metrics::serve_metrics(encode_metrics);
 }
 
 // This makes this Candid service self-describing, so that for example Candid
@@ -937,17 +1051,21 @@ fn main() {}
 
 #[test]
 fn check_governance_candid_file() {
-    let governance_did =
-        String::from_utf8(std::fs::read("canister/governance.did").unwrap()).unwrap();
+    let did_path = std::path::PathBuf::from(
+        std::env::var_os("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR env var undefined"),
+    )
+    .join("canister/governance.did");
+    let did_contents = String::from_utf8(std::fs::read(did_path).unwrap()).unwrap();
 
     // See comments in main above
     candid::export_service!();
     let expected = __export_service();
 
-    if governance_did != expected {
+    if did_contents != expected {
         panic!(
             "Generated candid definition does not match canister/governance.did. \
-            Run `cargo run --bin governance-canister > canister/governance.did` in \
+            Run `bazel run :generate_did > canister/governance.did` (no nix and/or direnv) or \
+            `cargo run --bin governance-canister > canister/governance.did` in \
             rs/nns/governance to update canister/governance.did."
         )
     }

@@ -2,7 +2,7 @@ use crate::framework::file_tree_artifact_mgr::ArtifactChunkingTestImpl;
 use ic_config::subnet_config::SubnetConfigs;
 use ic_cycles_account_manager::CyclesAccountManager;
 use ic_execution_environment::IngressHistoryReaderImpl;
-use ic_interfaces::registry::RegistryClient;
+use ic_interfaces_registry::RegistryClient;
 use ic_interfaces_transport::Transport;
 use ic_logger::{debug, info, ReplicaLogger};
 use ic_metrics::MetricsRegistry;
@@ -16,7 +16,6 @@ use ic_test_utilities::{
     crypto::fake_tls_handshake::FakeTlsHandshake,
     crypto::CryptoReturningOk,
     message_routing::FakeMessageRouting,
-    metrics::fetch_int_gauge,
     p2p::*,
     port_allocation::allocate_ports,
     self_validating_payload_builder::FakeSelfValidatingPayloadBuilder,
@@ -25,8 +24,10 @@ use ic_test_utilities::{
     types::ids::{node_test_id, subnet_test_id},
     xnet_payload_builder::FakeXNetPayloadBuilder,
 };
+use ic_test_utilities_metrics::fetch_int_gauge;
 use ic_types::{consensus::catchup::CUPWithOriginalProtobuf, replica_config::ReplicaConfig};
-use std::sync::{Arc, Mutex};
+use parking_lot::Mutex;
+use std::sync::Arc;
 use std::time::Duration;
 use tempfile::Builder;
 
@@ -109,6 +110,7 @@ fn execute_test(
             Some(transport),
             Arc::new(FakeTlsHandshake::new()),
             Arc::clone(&state_manager) as Arc<_>,
+            Arc::clone(&state_manager) as Arc<_>,
             no_state_sync_client,
             xnet_payload_builder as Arc<_>,
             self_validating_payload_builder as Arc<_>,
@@ -122,6 +124,7 @@ fn execute_test(
             &artifact_pools,
             cycles_account_manager,
             None,
+            Box::new(ic_https_outcalls_adapter_client::BrokenCanisterHttpClient {}),
             0,
         );
 
@@ -235,7 +238,7 @@ fn execute_test_chunking_pool(
         let fake_crypto = CryptoReturningOk::default();
         let fake_crypto = Arc::new(fake_crypto);
         let node_pool_dir = test_synchronizer.get_test_group_directory();
-        let state_sync_client = Arc::new(ArtifactChunkingTestImpl::new(node_pool_dir, node_id));
+        let state_sync_client = Box::new(ArtifactChunkingTestImpl::new(node_pool_dir, node_id));
         let state_sync_client =
             P2PStateSyncClient::TestChunkingPool(state_sync_client.clone(), state_sync_client);
         let subnet_config = SubnetConfigs::default().own_subnet_config(SubnetType::System);
@@ -269,6 +272,7 @@ fn execute_test_chunking_pool(
             Some(transport),
             Arc::new(FakeTlsHandshake::new()),
             Arc::clone(&state_manager) as Arc<_>,
+            Arc::clone(&state_manager) as Arc<_>,
             state_sync_client,
             xnet_payload_builder,
             self_validating_payload_builder,
@@ -282,6 +286,7 @@ fn execute_test_chunking_pool(
             &artifact_pools,
             cycles_account_manager,
             None,
+            Box::new(ic_https_outcalls_adapter_client::BrokenCanisterHttpClient {}),
             0,
         );
         let mut p2p_test_context = P2PTestContext::new(
@@ -359,7 +364,6 @@ pub fn spawn_replicas_as_threads(
         );
         hub_access
             .lock()
-            .unwrap()
             .insert(node_test_id(instance_id as u64), thread_port);
     }
 
@@ -371,7 +375,7 @@ pub fn spawn_replicas_as_threads(
         let test = test;
         let test = Box::new(test);
         let replica_log = log.clone();
-        let transport_hub = hub_access.lock().unwrap();
+        let transport_hub = hub_access.lock();
         let tp = transport_hub.get(&node_test_id(i as u64)).clone();
         let replica_registry = Arc::clone(&registry_client) as Arc<dyn RegistryClient>;
         let replica_config = ReplicaConfig {

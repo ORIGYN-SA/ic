@@ -8,7 +8,6 @@ use crate::{
     metrics::{LABEL_POOL_TYPE, POOL_TYPE_UNVALIDATED, POOL_TYPE_VALIDATED},
 };
 use ic_config::artifact_pool::{ArtifactPoolConfig, PersistentPoolBackend};
-use ic_consensus_message::ConsensusMessageHashable;
 use ic_interfaces::{
     consensus_pool::{
         ChangeAction, ChangeSet, ConsensusBlockCache, ConsensusBlockChain, ConsensusPool,
@@ -787,6 +786,8 @@ pub fn build_consensus_block_chain(
 
 #[cfg(test)]
 mod tests {
+    use crate::backup::{BackupAge, PurgingError};
+
     use super::*;
     use ic_interfaces::artifact_pool::UnvalidatedArtifact;
     use ic_logger::replica_logger::no_op_logger;
@@ -809,7 +810,7 @@ mod tests {
         RegistryVersion,
     };
     use prost::Message;
-    use std::{convert::TryFrom, fs, io::Read, time::Instant};
+    use std::{collections::HashMap, convert::TryFrom, fs, io::Read, path::Path, sync::RwLock};
 
     #[test]
     fn test_timestamp() {
@@ -925,7 +926,7 @@ mod tests {
                 Block::new(
                     CryptoHashOf::from(CryptoHash(Vec::new())),
                     Payload::new(
-                        ic_crypto::crypto_hash,
+                        ic_types::crypto::crypto_hash,
                         (ic_types::consensus::dkg::Summary::fake(), None).into(),
                     ),
                     Height::from(4),
@@ -942,7 +943,7 @@ mod tests {
             let genesis_cup = make_genesis(ic_types::consensus::dkg::Summary::fake());
             let mut cup = genesis_cup.clone();
             cup.content.random_beacon = hashed::Hashed::new(
-                ic_crypto::crypto_hash,
+                ic_types::crypto::crypto_hash,
                 RandomBeacon::fake(RandomBeaconContent::new(
                     Height::from(4),
                     CryptoHashOf::from(CryptoHash(Vec::new())),
@@ -1015,7 +1016,7 @@ mod tests {
             let notarization_path = path.join("2").join(format!(
                 "notarization_{}_{}.bin",
                 bytes_to_hex_str(&notarization.content.block),
-                bytes_to_hex_str(&ic_crypto::crypto_hash(&notarization)),
+                bytes_to_hex_str(&ic_types::crypto::crypto_hash(&notarization)),
             ));
             assert!(
                 path.join("2").join("random_tape.bin").exists(),
@@ -1054,7 +1055,7 @@ mod tests {
             let finalization_path = path.join("3").join(format!(
                 "finalization_{}_{}.bin",
                 bytes_to_hex_str(&finalization.content.block),
-                bytes_to_hex_str(&ic_crypto::crypto_hash(&finalization)),
+                bytes_to_hex_str(&ic_types::crypto::crypto_hash(&finalization)),
             ));
             assert!(
                 finalization_path.exists(),
@@ -1080,7 +1081,7 @@ mod tests {
             let proposal_path = path.join("4").join(format!(
                 "block_proposal_{}_{}.bin",
                 bytes_to_hex_str(proposal.content.get_hash()),
-                bytes_to_hex_str(&ic_crypto::crypto_hash(&proposal)),
+                bytes_to_hex_str(&ic_types::crypto::crypto_hash(&proposal)),
             ));
             assert!(
                 path.join("4").join("catch_up_package.bin").exists(),
@@ -1142,8 +1143,27 @@ mod tests {
     }
 
     #[test]
-    #[ignore]
     fn test_backup_purging() {
+        struct FakeAge {
+            // Mapping names of directories containing artifacts to their emulated age.
+            map: Arc<RwLock<HashMap<String, Duration>>>,
+        }
+
+        impl BackupAge for FakeAge {
+            fn get_elapsed_time(&self, path: &Path) -> Result<Duration, PurgingError> {
+                // Fake age of an artifact is determined through map look up. Panics on non-existant keys.
+                let name = path
+                    .file_name()
+                    .map(|os| os.to_os_string().into_string().unwrap())
+                    .unwrap();
+                let m = self.map.read().unwrap();
+                let age = m
+                    .get(&name)
+                    .unwrap_or_else(|| panic!("No age entry found for key path: {:?}", path));
+                Ok(*age)
+            }
+        }
+
         ic_test_utilities::artifact_pool_config::with_test_pool_config(|pool_config| {
             let time_source = FastForwardTimeSource::new();
             let backup_dir = tempfile::Builder::new().tempdir().unwrap();
@@ -1157,14 +1177,26 @@ mod tests {
                 no_op_logger(),
             );
 
-            // NOTE: Unfortunately, this test can not trivially be made walltime
-            // independend. We are tracking the time this test takes, to provide some
-            // context, should the test fail.
-            let test_start_time = Instant::now();
-            let mut next_wakeup_time = test_start_time;
+            let map: Arc<RwLock<HashMap<String, Duration>>> = Default::default();
+
+            // Insert a list of directory names into the fake age map.
+            let insert_dirs = |v: &[&str]| {
+                let mut m = map.write().unwrap();
+                for h in v {
+                    m.insert(h.to_string(), Duration::ZERO);
+                }
+            };
+
+            // Increase the age of all artifacts currently stored in the map by the given duration
+            let add_age = |d: Duration| {
+                let mut m = map.write().unwrap();
+                m.iter_mut().for_each(|(_, age)| {
+                    *age += d;
+                })
+            };
 
             let purging_interval = Duration::from_millis(3000);
-            pool.backup = Some(Backup::new(
+            pool.backup = Some(Backup::new_with_age_func(
                 &pool,
                 backup_dir.path().into(),
                 backup_dir.path().join(format!("{:?}", subnet_id)),
@@ -1173,6 +1205,7 @@ mod tests {
                 purging_interval,
                 MetricsRegistry::new(),
                 no_op_logger(),
+                Box::new(FakeAge { map: map.clone() }),
             ));
 
             let random_beacon = RandomBeacon::fake(RandomBeaconContent::new(
@@ -1188,7 +1221,7 @@ mod tests {
                 Block::new(
                     CryptoHashOf::from(CryptoHash(Vec::new())),
                     Payload::new(
-                        ic_crypto::crypto_hash,
+                        ic_types::crypto::crypto_hash,
                         (ic_types::consensus::dkg::Summary::fake(), None).into(),
                     ),
                     Height::from(4),
@@ -1214,15 +1247,16 @@ mod tests {
 
             let group_path = &path.join("0");
             // We expect 3 folders for heights 0 to 2.
-            assert_eq!(fs::read_dir(&group_path).unwrap().count(), 3);
+            assert_eq!(fs::read_dir(group_path).unwrap().count(), 3);
+            insert_dirs(&[&subnet_id.to_string(), "0", "1", "2"]);
 
             // Let's sleep so that the previous heights are close to being purged.
+            // Instead of actually sleeping, we simply increase the emulated age of artifacts.
             let sleep_time = purging_interval / 10 * 8;
-            next_wakeup_time += sleep_time;
-            sleep_until(next_wakeup_time, test_start_time);
             time_source
                 .set_time(time_source.get_relative_time() + sleep_time)
                 .unwrap();
+            add_age(sleep_time);
 
             // Now add new artifacts
             let changeset = vec![notarization.into_message(), proposal.into_message()]
@@ -1235,16 +1269,16 @@ mod tests {
             pool.backup.as_ref().unwrap().sync_backup();
 
             // We expect 5 folders for heights 0 to 4.
-            assert_eq!(fs::read_dir(&group_path).unwrap().count(), 5);
+            assert_eq!(fs::read_dir(group_path).unwrap().count(), 5);
+            insert_dirs(&["3", "4"]);
 
             // We sleep just enough so that purging is overdue and the oldest artifacts are
             // approximately 1 purging interval old.
             let sleep_time = purging_interval / 10 * 3;
-            next_wakeup_time += sleep_time;
-            sleep_until(next_wakeup_time, test_start_time);
             time_source
                 .set_time(time_source.get_relative_time() + sleep_time)
                 .unwrap();
+            add_age(sleep_time);
 
             // Trigger the purging.
             pool.apply_changes(time_source.as_ref(), Vec::new());
@@ -1252,17 +1286,15 @@ mod tests {
             pool.backup.as_ref().unwrap().sync_purging();
 
             // We expect only 2 folders to survive the purging: 3, 4
-            assert_eq!(fs::read_dir(&group_path).unwrap().count(), 2);
+            assert_eq!(fs::read_dir(group_path).unwrap().count(), 2);
             assert!(group_path.join("3").exists());
             assert!(group_path.join("4").exists());
 
             let sleep_time = purging_interval + purging_interval / 10 * 3;
-            next_wakeup_time += sleep_time;
-            sleep_until(next_wakeup_time, test_start_time);
-
             time_source
                 .set_time(time_source.get_relative_time() + sleep_time)
                 .unwrap();
+            add_age(sleep_time);
 
             // Trigger the purging.
             pool.apply_changes(time_source.as_ref(), Vec::new());
@@ -1272,14 +1304,13 @@ mod tests {
             // We deleted all artifacts, but the group folder was updated by this and needs
             // to age now.
             assert!(group_path.exists());
-            assert_eq!(fs::read_dir(&group_path).unwrap().count(), 0);
+            assert_eq!(fs::read_dir(group_path).unwrap().count(), 0);
 
             let sleep_time = purging_interval + purging_interval / 10 * 3;
-            next_wakeup_time += sleep_time;
-            sleep_until(next_wakeup_time, test_start_time);
             time_source
                 .set_time(time_source.get_relative_time() + sleep_time)
                 .unwrap();
+            add_age(sleep_time);
 
             // Trigger the purging.
             pool.apply_changes(time_source.as_ref(), Vec::new());
@@ -1293,11 +1324,10 @@ mod tests {
 
             // We wait more and make sure the subnet folder is purged.
             let sleep_time = purging_interval + purging_interval / 10 * 3;
-            next_wakeup_time += sleep_time;
-            sleep_until(next_wakeup_time, test_start_time);
             time_source
                 .set_time(time_source.get_relative_time() + sleep_time)
                 .unwrap();
+            add_age(sleep_time);
 
             // Trigger the purging.
             pool.apply_changes(time_source.as_ref(), Vec::new());
@@ -1375,22 +1405,6 @@ mod tests {
                 vec![6],
             );
         })
-    }
-
-    fn sleep_until(time: Instant, test_start_time: Instant) {
-        let now = Instant::now();
-
-        if now < time {
-            let sleep_time = time.duration_since(now);
-            std::thread::sleep(sleep_time);
-        }
-
-        let now = Instant::now();
-        println!(
-            "Runtime: {:?} ms, expected: {:?} ms",
-            now.duration_since(test_start_time).as_millis(),
-            time.duration_since(test_start_time).as_millis()
-        );
     }
 
     // Verifies the iterator output, starting from the given block

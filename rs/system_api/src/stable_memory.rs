@@ -5,7 +5,7 @@ use ic_interfaces::execution_environment::{
     TrapCode::{HeapOutOfBounds, StableMemoryOutOfBounds, StableMemoryTooBigFor32Bit},
 };
 use ic_replicated_state::{canister_state::WASM_PAGE_SIZE_IN_BYTES, page_map, NumWasmPages};
-use ic_types::MAX_STABLE_MEMORY_IN_BYTES;
+use ic_types::{NumPages, MAX_STABLE_MEMORY_IN_BYTES};
 
 const MAX_64_BIT_STABLE_MEMORY_IN_PAGES: usize =
     (MAX_STABLE_MEMORY_IN_BYTES / WASM_PAGE_SIZE_IN_BYTES as u64) as usize;
@@ -70,7 +70,7 @@ impl StableMemory {
     ) -> HypervisorResult<()> {
         let (dst, offset, size) = (dst as usize, offset as usize, size as usize);
 
-        if offset + size > (self.stable_size()? as usize * WASM_PAGE_SIZE_IN_BYTES as usize) {
+        if offset + size > (self.stable_size()? as usize * WASM_PAGE_SIZE_IN_BYTES) {
             return Err(HypervisorError::Trapped(StableMemoryOutOfBounds));
         }
 
@@ -83,6 +83,7 @@ impl StableMemory {
     }
 
     /// Writes from heap to stable memory.
+    /// Returns the number of **new** dirty pages created by the write.
     pub(super) fn stable_write(
         &mut self,
         offset: u32,
@@ -92,7 +93,7 @@ impl StableMemory {
     ) -> HypervisorResult<()> {
         let (src, offset, size) = (src as usize, offset as usize, size as usize);
 
-        if offset + size > (self.stable_size()? as usize * WASM_PAGE_SIZE_IN_BYTES as usize) {
+        if offset + size > (self.stable_size()? as usize * WASM_PAGE_SIZE_IN_BYTES) {
             return Err(HypervisorError::Trapped(StableMemoryOutOfBounds));
         }
 
@@ -161,6 +162,7 @@ impl StableMemory {
     /// Writes from heap to stable memory.
     ///
     /// Supports bigger stable memory indexed by 64 bit pointers.
+    /// Returns the number of **new** dirty pages created by the write.
     pub(super) fn stable64_write(
         &mut self,
         offset: u64,
@@ -190,5 +192,15 @@ impl StableMemory {
         self.stable_memory_buffer
             .write(&heap[src..heap_end], offset);
         Ok(())
+    }
+
+    /// Calculates the number of new dirty pages that a given write would
+    /// create.
+    ///
+    /// No guarantee is made that such a write would succeed though (e.g. it
+    /// could exceed the current stable memory size).
+    pub(super) fn dirty_pages_from_write(&self, offset: u64, size: u64) -> NumPages {
+        self.stable_memory_buffer
+            .dirty_pages_from_write(offset, size)
     }
 }

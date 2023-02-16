@@ -1,4 +1,5 @@
 use ic_crypto_internal_threshold_sig_ecdsa::*;
+use ic_crypto_test_utils_reproducible_rng::reproducible_rng;
 use rand::Rng;
 use std::collections::BTreeMap;
 
@@ -7,12 +8,12 @@ fn should_complaint_system_work() -> ThresholdEcdsaResult<()> {
     let curve = EccCurveType::K256;
     let associated_data = b"assoc_data_test";
 
-    let mut rng = rand::thread_rng();
+    let mut rng = reproducible_rng();
 
-    let sk0 = MEGaPrivateKey::generate(curve, &mut rng)?;
+    let sk0 = MEGaPrivateKey::generate(curve, &mut rng);
     let pk0 = sk0.public_key()?;
 
-    let sk1 = MEGaPrivateKey::generate(curve, &mut rng)?;
+    let sk1 = MEGaPrivateKey::generate(curve, &mut rng);
     let pk1 = sk1.public_key()?;
 
     let dealer_index = 0;
@@ -23,7 +24,7 @@ fn should_complaint_system_work() -> ThresholdEcdsaResult<()> {
         curve,
         Seed::from_rng(&mut rng),
         threshold,
-        &[pk0, pk1],
+        &[pk0.clone(), pk1.clone()],
         dealer_index,
         associated_data,
     )?;
@@ -34,7 +35,7 @@ fn should_complaint_system_work() -> ThresholdEcdsaResult<()> {
 
     dealings.insert(
         dealer_index,
-        test_utils::corrupt_dealing(&dealing, &[corruption_target], &mut rng)?,
+        test_utils::corrupt_dealing(&dealing, &[corruption_target], Seed::from_rng(&mut rng))?,
     );
 
     let complaints = generate_complaints(
@@ -63,38 +64,81 @@ fn should_complaint_system_work() -> ThresholdEcdsaResult<()> {
             )
             .unwrap();
 
+        // the complaint is invalid if we corrupt its ZK proof
+        {
+            let corrupted_complaint = test_utils::corrupt_complaint_zk_proof(complaint)?;
+            assert_eq!(
+                corrupted_complaint
+                    .verify(
+                        dealing,
+                        dealer_index,
+                        corruption_target,
+                        &pk0,
+                        associated_data,
+                    )
+                    .unwrap_err(),
+                ThresholdEcdsaError::InvalidProof
+            );
+        }
+
+        // the complaint is invalid if we corrupt its shared secret
+        {
+            let corrupted_complaint = test_utils::corrupt_complaint_shared_secret(complaint)?;
+            assert_eq!(
+                corrupted_complaint
+                    .verify(
+                        dealing,
+                        dealer_index,
+                        corruption_target,
+                        &pk0,
+                        associated_data,
+                    )
+                    .unwrap_err(),
+                ThresholdEcdsaError::InvalidProof
+            );
+        }
+
         // the complaint is invalid if we change the AD:
-        assert!(complaint
-            .verify(
-                dealing,
-                dealer_index,
-                corruption_target,
-                &pk0,
-                &rng.gen::<[u8; 32]>(),
-            )
-            .is_err());
+        assert_eq!(
+            complaint
+                .verify(
+                    dealing,
+                    dealer_index,
+                    corruption_target,
+                    &pk0,
+                    &rng.gen::<[u8; 32]>(),
+                )
+                .unwrap_err(),
+            ThresholdEcdsaError::InvalidProof
+        );
 
         // the complaint is invalid if we change the complainer public key:
-        assert!(complaint
-            .verify(
-                dealing,
-                dealer_index,
-                corruption_target,
-                &pk1,
-                associated_data,
-            )
-            .is_err());
+        assert_eq!(
+            complaint
+                .verify(
+                    dealing,
+                    dealer_index,
+                    corruption_target,
+                    &pk1,
+                    associated_data,
+                )
+                .unwrap_err(),
+            ThresholdEcdsaError::InvalidProof
+        );
 
         // the complaint is invalid if we change the dealer ID
-        assert!(complaint
-            .verify(
-                dealings.get(&dealer_index).unwrap(),
-                dealer_index + 1,
-                corruption_target,
-                &pk0,
-                associated_data,
-            )
-            .is_err());
+        assert_eq!(
+            complaint
+                .verify(
+                    dealings.get(&dealer_index).unwrap(),
+                    dealer_index + 1,
+                    corruption_target,
+                    &pk0,
+                    associated_data,
+                )
+                .unwrap_err(),
+            ThresholdEcdsaError::InvalidProof
+        );
 
         let opener_index = 1;
 
@@ -109,6 +153,13 @@ fn should_complaint_system_work() -> ThresholdEcdsaResult<()> {
         .expect("Unable to open dealing");
 
         assert!(verify_dealing_opening(dealing, opener_index, &opening).is_ok());
+
+        let corrupted_opening = test_utils::corrupt_opening(&opening)?;
+
+        assert_eq!(
+            verify_dealing_opening(dealing, opener_index, &corrupted_opening).unwrap_err(),
+            ThresholdVerifyOpeningInternalError::InvalidOpening
+        );
     }
 
     // a complaint against a dealing with modified ephemeral key will not verify
@@ -121,7 +172,7 @@ fn should_complaint_system_work() -> ThresholdEcdsaResult<()> {
         curve,
         Seed::from_rng(&mut rng),
         threshold,
-        &[pk0, pk1],
+        &[pk0.clone(), pk1],
         dealer_index,
         associated_data,
     )?;
@@ -155,9 +206,9 @@ fn should_complaint_verification_reject_spurious_complaints() -> ThresholdEcdsaR
     let curve = EccCurveType::K256;
     let associated_data = b"assoc_data_test";
 
-    let mut rng = rand::thread_rng();
+    let mut rng = reproducible_rng();
 
-    let sk = MEGaPrivateKey::generate(curve, &mut rng)?;
+    let sk = MEGaPrivateKey::generate(curve, &mut rng);
     let pk = sk.public_key()?;
 
     let dealer_index = 0;
@@ -169,7 +220,7 @@ fn should_complaint_verification_reject_spurious_complaints() -> ThresholdEcdsaR
         curve,
         Seed::from_rng(&mut rng),
         threshold,
-        &[pk],
+        &[pk.clone()],
         dealer_index,
         associated_data,
     )?;
@@ -184,9 +235,12 @@ fn should_complaint_verification_reject_spurious_complaints() -> ThresholdEcdsaR
         associated_data,
     )?;
 
-    assert!(complaint
-        .verify(&dealing, dealer_index, 0, &pk, associated_data)
-        .is_err());
+    assert_eq!(
+        complaint
+            .verify(&dealing, dealer_index, 0, &pk, associated_data)
+            .unwrap_err(),
+        ThresholdEcdsaError::InvalidComplaint
+    );
 
     Ok(())
 }

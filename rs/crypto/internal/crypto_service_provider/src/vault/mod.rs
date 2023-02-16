@@ -1,8 +1,8 @@
-use crate::api::CspThresholdSignError;
+use crate::key_id::KeyIdInstantiationError;
+use crate::secret_key_store::panic_due_to_duplicated_key_id;
 use crate::vault::api::{
     CspBasicSignatureError, CspBasicSignatureKeygenError, CspMultiSignatureError,
-    CspMultiSignatureKeygenError, CspThresholdSignatureKeygenError, CspTlsKeygenError,
-    CspTlsSignError,
+    CspMultiSignatureKeygenError, CspSecretKeyStoreContainsError,
 };
 use ic_types::crypto::CryptoError;
 
@@ -10,77 +10,16 @@ pub mod api;
 pub mod local_csp_vault;
 pub mod remote_csp_vault;
 #[cfg(test)]
-mod test_utils;
-
-impl From<tarpc::client::RpcError> for CspThresholdSignError {
-    fn from(e: tarpc::client::RpcError) -> Self {
-        CspThresholdSignError::InternalError {
-            internal_error: e.to_string(),
-        }
-    }
-}
-
-impl From<tarpc::client::RpcError> for CspThresholdSignatureKeygenError {
-    fn from(e: tarpc::client::RpcError) -> Self {
-        CspThresholdSignatureKeygenError::InternalError {
-            internal_error: e.to_string(),
-        }
-    }
-}
-
-impl From<tarpc::client::RpcError> for CspMultiSignatureError {
-    fn from(e: tarpc::client::RpcError) -> Self {
-        CspMultiSignatureError::InternalError {
-            internal_error: e.to_string(),
-        }
-    }
-}
-
-impl From<tarpc::client::RpcError> for CspMultiSignatureKeygenError {
-    fn from(e: tarpc::client::RpcError) -> Self {
-        CspMultiSignatureKeygenError::InternalError {
-            internal_error: e.to_string(),
-        }
-    }
-}
-
-impl From<tarpc::client::RpcError> for CspBasicSignatureError {
-    fn from(e: tarpc::client::RpcError) -> Self {
-        CspBasicSignatureError::InternalError {
-            internal_error: e.to_string(),
-        }
-    }
-}
-
-impl From<tarpc::client::RpcError> for CspBasicSignatureKeygenError {
-    fn from(e: tarpc::client::RpcError) -> Self {
-        CspBasicSignatureKeygenError::InternalError {
-            internal_error: e.to_string(),
-        }
-    }
-}
-
-impl From<tarpc::client::RpcError> for CspTlsKeygenError {
-    fn from(e: tarpc::client::RpcError) -> Self {
-        CspTlsKeygenError::InternalError {
-            internal_error: e.to_string(),
-        }
-    }
-}
-
-impl From<tarpc::client::RpcError> for CspTlsSignError {
-    fn from(e: tarpc::client::RpcError) -> Self {
-        CspTlsSignError::InternalError {
-            internal_error: e.to_string(),
-        }
-    }
-}
+pub mod test_utils;
 
 impl From<CspBasicSignatureError> for CryptoError {
     fn from(e: CspBasicSignatureError) -> CryptoError {
         match e {
             CspBasicSignatureError::SecretKeyNotFound { algorithm, key_id } => {
-                CryptoError::SecretKeyNotFound { algorithm, key_id }
+                CryptoError::SecretKeyNotFound {
+                    algorithm,
+                    key_id: key_id.to_string(),
+                }
             }
             CspBasicSignatureError::UnsupportedAlgorithm { algorithm } => {
                 CryptoError::AlgorithmNotSupported {
@@ -88,11 +27,14 @@ impl From<CspBasicSignatureError> for CryptoError {
                     reason: "Unsupported algorithm".to_string(),
                 }
             }
-            CspBasicSignatureError::WrongSecretKeyType { algorithm } => {
-                CryptoError::InvalidArgument {
-                    message: format!("Wrong secret key type: {:?}", algorithm),
-                }
-            }
+            CspBasicSignatureError::WrongSecretKeyType {
+                algorithm,
+                secret_key_variant,
+            } => CryptoError::InvalidArgument {
+                message: format!(
+                    "Wrong secret key type: {secret_key_variant} incompatible with {algorithm:?}"
+                ),
+            },
             CspBasicSignatureError::MalformedSecretKey { algorithm } => {
                 CryptoError::MalformedSecretKey {
                     algorithm,
@@ -112,16 +54,14 @@ impl From<CspBasicSignatureError> for CryptoError {
 impl From<CspBasicSignatureKeygenError> for CryptoError {
     fn from(e: CspBasicSignatureKeygenError) -> CryptoError {
         match e {
-            CspBasicSignatureKeygenError::UnsupportedAlgorithm { algorithm } => {
-                CryptoError::AlgorithmNotSupported {
-                    algorithm,
-                    reason: "Unsupported algorithm".to_string(),
-                }
-            }
             CspBasicSignatureKeygenError::InternalError { internal_error } => {
-                CryptoError::InvalidArgument {
-                    message: format!("Internal error: {}", internal_error),
-                }
+                CryptoError::InternalError { internal_error }
+            }
+            CspBasicSignatureKeygenError::DuplicateKeyId { key_id } => {
+                panic_due_to_duplicated_key_id(key_id)
+            }
+            CspBasicSignatureKeygenError::TransientInternalError { internal_error } => {
+                CryptoError::TransientInternalError { internal_error }
             }
         }
     }
@@ -131,7 +71,10 @@ impl From<CspMultiSignatureError> for CryptoError {
     fn from(e: CspMultiSignatureError) -> CryptoError {
         match e {
             CspMultiSignatureError::SecretKeyNotFound { algorithm, key_id } => {
-                CryptoError::SecretKeyNotFound { algorithm, key_id }
+                CryptoError::SecretKeyNotFound {
+                    algorithm,
+                    key_id: key_id.to_string(),
+                }
             }
             CspMultiSignatureError::UnsupportedAlgorithm { algorithm } => {
                 CryptoError::AlgorithmNotSupported {
@@ -139,11 +82,14 @@ impl From<CspMultiSignatureError> for CryptoError {
                     reason: "Unsupported algorithm".to_string(),
                 }
             }
-            CspMultiSignatureError::WrongSecretKeyType { algorithm } => {
-                CryptoError::InvalidArgument {
-                    message: format!("Wrong secret key type: {:?}", algorithm),
-                }
-            }
+            CspMultiSignatureError::WrongSecretKeyType {
+                algorithm,
+                secret_key_variant,
+            } => CryptoError::InvalidArgument {
+                message: format!(
+                    "Wrong secret key type: expected {algorithm:?} but found {secret_key_variant}"
+                ),
+            },
             CspMultiSignatureError::InternalError { internal_error } => {
                 CryptoError::InvalidArgument {
                     message: internal_error,
@@ -156,12 +102,6 @@ impl From<CspMultiSignatureError> for CryptoError {
 impl From<CspMultiSignatureKeygenError> for CryptoError {
     fn from(e: CspMultiSignatureKeygenError) -> CryptoError {
         match e {
-            CspMultiSignatureKeygenError::UnsupportedAlgorithm { algorithm } => {
-                CryptoError::AlgorithmNotSupported {
-                    algorithm,
-                    reason: "Unsupported algorithm".to_string(),
-                }
-            }
             CspMultiSignatureKeygenError::MalformedPublicKey {
                 algorithm,
                 key_bytes,
@@ -176,6 +116,38 @@ impl From<CspMultiSignatureKeygenError> for CryptoError {
                     message: internal_error,
                 }
             }
+            CspMultiSignatureKeygenError::DuplicateKeyId { key_id } => {
+                panic_due_to_duplicated_key_id(key_id)
+            }
+            CspMultiSignatureKeygenError::TransientInternalError { internal_error } => {
+                CryptoError::TransientInternalError { internal_error }
+            }
+        }
+    }
+}
+
+impl From<CspSecretKeyStoreContainsError> for CryptoError {
+    fn from(e: CspSecretKeyStoreContainsError) -> Self {
+        match e {
+            CspSecretKeyStoreContainsError::InternalError { internal_error } => {
+                CryptoError::InternalError { internal_error }
+            }
+        }
+    }
+}
+
+impl From<KeyIdInstantiationError> for CspBasicSignatureKeygenError {
+    fn from(error: KeyIdInstantiationError) -> Self {
+        CspBasicSignatureKeygenError::InternalError {
+            internal_error: format!("Cannot instantiate KeyId: {:?}", error),
+        }
+    }
+}
+
+impl From<KeyIdInstantiationError> for CspMultiSignatureKeygenError {
+    fn from(error: KeyIdInstantiationError) -> Self {
+        CspMultiSignatureKeygenError::InternalError {
+            internal_error: format!("Cannot instantiate KeyId: {:?}", error),
         }
     }
 }

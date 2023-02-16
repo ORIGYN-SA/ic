@@ -1,36 +1,31 @@
-use clap::{App, Arg};
+use clap::Parser;
 use ic_config::{Config, ConfigSource};
+use ic_crypto_internal_logmon::metrics::CryptoMetrics;
 use ic_logger::{info, new_replica_logger_from_config};
+use ic_metrics::MetricsRegistry;
 use std::os::unix::io::FromRawFd;
 use std::path::PathBuf;
 
 const IC_CRYPTO_CSP_SOCKET_NAME: &str = "ic-crypto-csp.socket";
 
+#[derive(Parser)]
+#[clap(
+    name = "Remote CspVault server",
+    version = "0.1",
+    author = "Internet Computer Developers",
+    about = "NOTE: This binary is intended to be started as socket-activated \
+               systemd service with a single socket named ic-crypto-csp.socket"
+)]
+struct Opts {
+    /// Sets the replica configuration file
+    #[clap(long = "replica-config-file", parse(from_os_str))]
+    config: PathBuf,
+}
+
 #[tokio::main]
 async fn main() {
-    let flags = App::new("Remote CspVault server")
-        .version("0.1")
-        .author("Internet Computer Developers")
-        .about(
-            format!(
-                "NOTE: This binary is intended to be started as socket-activated \
-                systemd service with a single socket named {}",
-                IC_CRYPTO_CSP_SOCKET_NAME
-            )
-            .as_str(),
-        )
-        .arg(
-            Arg::with_name("replica-config-file")
-                .long("replica-config-file")
-                .value_name("STRING")
-                .help("The path to the replica config file (ic.json5)")
-                .required(true)
-                .takes_value(true),
-        )
-        .get_matches();
-
-    let replica_config_file_flag = flags.value_of("replica-config-file").unwrap();
-    let ic_config = get_ic_config(PathBuf::from(replica_config_file_flag));
+    let opts = Opts::parse();
+    let ic_config = get_ic_config(opts.config);
 
     let sks_dir = ic_config.crypto.crypto_root.as_path();
 
@@ -49,7 +44,21 @@ async fn main() {
         )
     );
 
-    ic_crypto_internal_csp::run_csp_vault_server(sks_dir, systemd_socket_listener, logger).await;
+    // We abort the whole program with a core dump if a single thread panics.
+    // This way we can capture all the context if a critical error happens.
+    abort_on_panic();
+    let metrics = CryptoMetrics::new(Some(&MetricsRegistry::global()));
+    ic_crypto_internal_csp::run_csp_vault_server(sks_dir, systemd_socket_listener, logger, metrics)
+        .await;
+}
+
+/// Aborts the whole program with a core dump if a single thread panics.
+pub fn abort_on_panic() {
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |panic_info| {
+        default_hook(panic_info);
+        std::process::abort();
+    }));
 }
 
 fn get_ic_config(replica_config_file: PathBuf) -> Config {

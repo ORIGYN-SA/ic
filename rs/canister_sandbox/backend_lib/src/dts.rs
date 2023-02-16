@@ -1,4 +1,7 @@
-use ic_interfaces::execution_environment::{HypervisorError, OutOfInstructionsHandler};
+use ic_embedders::wasm_executor::SliceExecutionOutput;
+use ic_interfaces::execution_environment::{
+    ExecutionComplexity, HypervisorError, HypervisorResult, OutOfInstructionsHandler,
+};
 use ic_types::NumInstructions;
 use std::sync::{Arc, Condvar, Mutex};
 
@@ -15,30 +18,108 @@ enum ExecutionStatus {
 // All the state necessary to implement deterministic time slicing.
 struct State {
     execution_status: ExecutionStatus,
+
     // The instruction limit for all slices combined.
-    total_instruction_limit: NumInstructions,
-    // The instruction limit for the next execution slice.
-    // Initially it is given as input and stays constant for
-    // all slices except maybe the last one, which may have
-    // a smaller limit to ensure that the total limit is not
-    // exceeded.
-    slice_instruction_limit: NumInstructions,
+    total_instruction_limit: i64,
+
+    // The maximum value of the slice instruction limit.
+    max_slice_instruction_limit: i64,
+
+    // The instruction limit for the next slice. Typically it is the same as
+    // `max_slice_instruction_limit`, but may be lower for the last slice
+    // and if the previous slice went over its limit.
+    slice_instruction_limit: i64,
+
     // The number of instructions that have been executed so far.
     // Invariant: it does not exceed `total_instruction_limit`.
-    instructions_executed: NumInstructions,
+    instructions_executed: i64,
+
+    // The execution complexity accumulated at the beginning of the round.
+    execution_complexity: ExecutionComplexity,
 }
 
 impl State {
-    fn new(
-        total_instruction_limit: NumInstructions,
-        slice_instruction_limit: NumInstructions,
-    ) -> Self {
-        Self {
+    fn new(total_instruction_limit: i64, max_slice_instruction_limit: i64) -> Self {
+        let max_slice_instruction_limit = max_slice_instruction_limit.min(total_instruction_limit);
+        let result = Self {
             execution_status: ExecutionStatus::Running,
             total_instruction_limit,
-            slice_instruction_limit,
-            instructions_executed: NumInstructions::from(0),
+            max_slice_instruction_limit,
+            slice_instruction_limit: max_slice_instruction_limit,
+            instructions_executed: 0,
+            execution_complexity: ExecutionComplexity::default(),
+        };
+        result.check_invariants();
+        result
+    }
+
+    fn check_invariants(&self) {
+        if self.total_instructions_left() < 0 {
+            assert_eq!(self.slice_instruction_limit, 0);
+        } else {
+            assert!(
+                self.slice_instruction_limit <= self.total_instructions_left(),
+                "slice instructions limit {} exceeds instructions left {} ",
+                self.slice_instruction_limit,
+                self.total_instructions_left()
+            );
         }
+        // Note that `self.instructions_executed` may exceed either of the
+        // limits because Wasm execution does a best-effort detection of
+        // out-of-instruction condition.
+        assert!(self.instructions_executed >= 0);
+    }
+
+    /// Returns true if the current slice is sufficient to reach the total
+    /// instruction limit.
+    fn is_last_slice(&self) -> bool {
+        self.slice_instruction_limit >= self.total_instructions_left()
+    }
+
+    /// Computes the limit for the next slice taking into account
+    /// the instructions remaining in the total limit and
+    /// the instructions carried over from the current slice.
+    fn next_slice_instruction_limit(&mut self, instruction_counter: i64) -> i64 {
+        let newly_executed = self.newly_executed(instruction_counter);
+        let carry_over = (newly_executed - self.slice_instruction_limit).max(0);
+        (self.max_slice_instruction_limit - carry_over)
+            .min(self.total_instructions_left())
+            .max(0)
+    }
+
+    /// Returns the number of instructions executed in the current slice.
+    fn newly_executed(&self, instruction_counter: i64) -> i64 {
+        // Normally the instruction counter does not exceed the instruction
+        // limit. However, we cannot trust the instruction counter because it is
+        // coming from Wasm execution, so we use saturating operations here to avoid
+        // over-/underflows and invalid state.
+        self.slice_instruction_limit
+            .saturating_sub(instruction_counter)
+            .max(0)
+    }
+
+    /// Returns the newly observed execution complexity in the current slice.
+    fn newly_observed_complexity(
+        &self,
+        execution_complexity: &ExecutionComplexity,
+    ) -> ExecutionComplexity {
+        execution_complexity - &self.execution_complexity
+    }
+
+    /// Updates the state to prepare for the next slice.
+    fn update(&mut self, instruction_counter: i64, execution_complexity: ExecutionComplexity) {
+        self.instructions_executed = self
+            .instructions_executed
+            .saturating_add(self.newly_executed(instruction_counter));
+        self.slice_instruction_limit = self.next_slice_instruction_limit(instruction_counter);
+        self.execution_complexity = execution_complexity;
+        self.check_invariants();
+    }
+
+    /// The number of instructions remaining from the total limit.
+    fn total_instructions_left(&self) -> i64 {
+        // Both numbers are non-negative, so this cannot underflow.
+        self.total_instruction_limit - self.instructions_executed
     }
 }
 
@@ -57,10 +138,7 @@ struct DeterministicTimeSlicing {
 }
 
 impl DeterministicTimeSlicing {
-    fn new(
-        total_instruction_limit: NumInstructions,
-        slice_instruction_limit: NumInstructions,
-    ) -> Self {
+    fn new(total_instruction_limit: i64, slice_instruction_limit: i64) -> Self {
         let state = State::new(total_instruction_limit, slice_instruction_limit);
         Self {
             state: Arc::new(Mutex::new(state)),
@@ -86,35 +164,46 @@ impl DeterministicTimeSlicing {
         self.resumed_or_aborted.notify_one();
     }
 
-    // Given the number of instructions left in the current slice, the function:
-    // - either transitions to `Paused` after increasing `instruction_executed`
-    //   and setting the limit for the next slice.
+    // Given the current Wasm instruction counter the function either:
+    // - transitions to `Paused` if it is possible to continue the execution in
+    //   the next slice.
     // - or returns the `InstructionLimitExceeded` error.
-    fn try_pause(&self, instructions_left: NumInstructions) -> Result<(), HypervisorError> {
+    fn try_pause(
+        &self,
+        instruction_counter: i64,
+        execution_complexity: ExecutionComplexity,
+    ) -> Result<SliceExecutionOutput, HypervisorError> {
         let mut state = self.state.lock().unwrap();
         assert_eq!(state.execution_status, ExecutionStatus::Running);
-        let instructions_left = instructions_left.min(state.slice_instruction_limit);
-        let instructions_executed = state.slice_instruction_limit - instructions_left;
-        if instructions_executed.get() == 0 {
-            // No progress in executing instructions. Return an early error.
+        if state.is_last_slice() {
             return Err(HypervisorError::InstructionLimitExceeded);
         }
-        if state.instructions_executed + instructions_executed >= state.total_instruction_limit {
-            // Exceeded the total limit.
-            return Err(HypervisorError::InstructionLimitExceeded);
+
+        let newly_executed = state.newly_executed(instruction_counter);
+        let newly_observed_complexity = state.newly_observed_complexity(&execution_complexity);
+        if state.next_slice_instruction_limit(instruction_counter) == 0 {
+            // If the next slice doesn't have any instructions left, then
+            // execution will fail anyway, so we can return the error now.
+            return Err(HypervisorError::SliceOverrun {
+                instructions: NumInstructions::from(newly_executed as u64),
+                limit: NumInstructions::from(state.max_slice_instruction_limit as u64),
+            });
         }
-        state.instructions_executed += instructions_executed;
-        state.slice_instruction_limit = state
-            .slice_instruction_limit
-            .min(state.total_instruction_limit - state.instructions_executed);
+
+        // At this pont we know that the next slice will be able to run, so we
+        // can commit the state changes and pause now.
+        state.update(instruction_counter, execution_complexity);
         state.execution_status = ExecutionStatus::Paused;
-        Ok(())
+        Ok(SliceExecutionOutput {
+            executed_instructions: NumInstructions::from(newly_executed as u64),
+            execution_complexity: newly_observed_complexity,
+        })
     }
 
     // Sleeps while the current execution state is `Paused`.
     // Returns the instruction limit for the next slice if execution was resumed.
     // Otherwise, returns an error that indicates that execution was aborted.
-    fn wait_for_resume_or_abort(&self) -> Result<NumInstructions, HypervisorError> {
+    fn wait_for_resume_or_abort(&self) -> Result<i64, HypervisorError> {
         let state = self.state.lock().unwrap();
         let state = self
             .resumed_or_aborted
@@ -122,20 +211,13 @@ impl DeterministicTimeSlicing {
                 state.execution_status == ExecutionStatus::Paused
             })
             .unwrap();
-        assert!(
-            state.instructions_executed + state.slice_instruction_limit
-                <= state.total_instruction_limit
-        );
         match state.execution_status {
             ExecutionStatus::Paused => {
                 // This is really unreachable.
                 unreachable!("Unexpected paused status after waiting for a condition variable")
             }
             ExecutionStatus::Running => Ok(state.slice_instruction_limit),
-            ExecutionStatus::Aborted => {
-                // TODO(EXC-864): Implement aborting of execution by return a new "abort" error here.
-                unimplemented!()
-            }
+            ExecutionStatus::Aborted => Err(HypervisorError::Aborted),
         }
     }
 }
@@ -158,7 +240,7 @@ impl PausedExecution {
 
 // This callback is provided by the user of `DeterministicTimeSlicingHandler` to
 // send `PausedExecution` to the thread that controls pausing and aborting.
-pub type PauseCallback = dyn Fn(PausedExecution) + 'static;
+pub type PauseCallback = dyn Fn(SliceExecutionOutput, PausedExecution) + 'static;
 
 /// An implementation of `OutOfInstructionsHandler` that support
 /// deterministic time slicing. As input it expects:
@@ -173,12 +255,12 @@ pub struct DeterministicTimeSlicingHandler {
 
 impl DeterministicTimeSlicingHandler {
     pub fn new<F>(
-        total_instruction_limit: NumInstructions,
-        slice_instruction_limit: NumInstructions,
+        total_instruction_limit: i64,
+        slice_instruction_limit: i64,
         pause_callback: F,
     ) -> Self
     where
-        F: Fn(PausedExecution) + 'static,
+        F: Fn(SliceExecutionOutput, PausedExecution) + 'static,
     {
         Self {
             dts: DeterministicTimeSlicing::new(total_instruction_limit, slice_instruction_limit),
@@ -190,12 +272,16 @@ impl DeterministicTimeSlicingHandler {
 impl OutOfInstructionsHandler for DeterministicTimeSlicingHandler {
     fn out_of_instructions(
         &self,
-        instructions_left: NumInstructions,
-    ) -> HypervisorResult<NumInstructions> {
-        self.dts.try_pause(instructions_left)?;
-        (self.pause_callback)(PausedExecution {
+        instruction_counter: i64,
+        execution_complexity: ExecutionComplexity,
+    ) -> HypervisorResult<i64> {
+        let slice = self
+            .dts
+            .try_pause(instruction_counter, execution_complexity)?;
+        let paused = PausedExecution {
             dts: self.dts.clone(),
-        });
+        };
+        (self.pause_callback)(slice, paused);
         self.dts.wait_for_resume_or_abort()
     }
 }

@@ -1,10 +1,9 @@
 //! The module contains implementations of the artifact client trait.
 
-use crate::artifact::*;
 use crate::processors::ArtifactProcessorManager;
 use ic_constants::{MAX_INGRESS_TTL, PERMITTED_DRIFT_AT_ARTIFACT_MANAGER};
 use ic_interfaces::{
-    artifact_manager::{AdvertMismatchError, ArtifactAcceptance, ArtifactClient, OnArtifactError},
+    artifact_manager::{AdvertMismatchError, ArtifactClient, OnArtifactError},
     artifact_pool::{ArtifactPoolError, ReplicaVersionMismatch, UnvalidatedArtifact},
     canister_http::*,
     certification::{CertificationPool, CertifierGossip},
@@ -16,13 +15,14 @@ use ic_interfaces::{
         CanisterHttpGossipPool, CertificationGossipPool, ConsensusGossipPool, DkgGossipPool,
         EcdsaGossipPool, IngressGossipPool,
     },
-    ingress_pool::IngressPool,
+    ingress_pool::{IngressPool, IngressPoolThrottler},
     time_source::TimeSource,
 };
 use ic_logger::{debug, ReplicaLogger};
 use ic_types::{
     artifact,
     artifact::*,
+    artifact_kind::*,
     canister_http::*,
     chunkable::*,
     consensus::{
@@ -30,8 +30,10 @@ use ic_types::{
         HasVersion,
     },
     malicious_flags::MaliciousFlags,
-    messages::{SignedIngress, SignedRequestBytes},
-    p2p, NodeId, ReplicaVersion,
+    messages::SignedIngress,
+    p2p,
+    single_chunked::*,
+    NodeId, ReplicaVersion,
 };
 use std::convert::{TryFrom, TryInto};
 use std::sync::{Arc, RwLock};
@@ -93,7 +95,7 @@ pub(crate) trait ArtifactManagerBackend: Send + Sync {
 /// Implementation struct for `ArtifactManagerBackend`.
 pub(crate) struct ArtifactManagerBackendImpl<Artifact: ArtifactKind + 'static> {
     /// Reference to the artifact client.
-    pub client: Arc<dyn ArtifactClient<Artifact>>,
+    pub client: Box<dyn ArtifactClient<Artifact>>,
     /// The artifact processor front end.
     pub processor: ArtifactProcessorManager<Artifact>,
 }
@@ -101,8 +103,10 @@ pub(crate) struct ArtifactManagerBackendImpl<Artifact: ArtifactKind + 'static> {
 /// Trait implementation for `ArtifactManagerBackend`.
 impl<Artifact: ArtifactKind> ArtifactManagerBackend for ArtifactManagerBackendImpl<Artifact>
 where
-    Artifact::SerializeAs: TryFrom<artifact::Artifact, Error = artifact::Artifact>,
-    Artifact::Message: ChunkableArtifact + Send + 'static,
+    Artifact::Message: ChunkableArtifact
+        + Send
+        + 'static
+        + TryFrom<artifact::Artifact, Error = artifact::Artifact>,
     Advert<Artifact>:
         Into<p2p::GossipAdvert> + TryFrom<p2p::GossipAdvert, Error = p2p::GossipAdvert> + Eq,
     for<'a> &'a Artifact::Id: TryFrom<&'a artifact::ArtifactId, Error = &'a artifact::ArtifactId>,
@@ -121,28 +125,21 @@ where
         peer_id: NodeId,
     ) -> Result<(), OnArtifactError<artifact::Artifact>> {
         match (artifact.try_into(), advert.try_into()) {
-            (Ok(msg), Ok(advert)) => {
-                let result = self
-                    .client
-                    .as_ref()
-                    .check_artifact_acceptance(msg, &peer_id)?;
-                match result {
-                    ArtifactAcceptance::Processed => (),
-                    ArtifactAcceptance::AcceptedForProcessing(message) => {
-                        Artifact::check_advert(&message, &advert).map_err(|expected| {
-                            AdvertMismatchError {
-                                received: advert.into(),
-                                expected: expected.into(),
-                            }
-                        })?;
-                        // this sends to an unbounded channel, which is what we want here
-                        self.processor.on_artifact(UnvalidatedArtifact {
-                            message,
-                            peer_id,
-                            timestamp: time_source.get_relative_time(),
-                        })
+            (Ok(message), Ok(advert)) => {
+                Artifact::check_advert(&message, &advert).map_err(|expected| {
+                    AdvertMismatchError {
+                        received: advert.into(),
+                        expected: expected.into(),
                     }
-                };
+                })?;
+                self.client.check_artifact_acceptance(&message, &peer_id)?;
+                // this sends to an unbounded channel, which is what we want here
+                self.processor.on_artifact(UnvalidatedArtifact {
+                    message,
+                    peer_id,
+                    timestamp: time_source.get_relative_time(),
+                });
+
                 Ok(())
             }
             (Err(artifact), _) => Err(OnArtifactError::NotProcessed(Box::new(artifact))),
@@ -276,11 +273,11 @@ impl<Pool: ConsensusPool + ConsensusGossipPool + Send + Sync> ArtifactClient<Con
     /// `ArtifactAcceptance` enum.
     fn check_artifact_acceptance(
         &self,
-        msg: ConsensusMessage,
+        msg: &ConsensusMessage,
         _peer_id: &NodeId,
-    ) -> Result<ArtifactAcceptance<ConsensusMessage>, ArtifactPoolError> {
-        check_protocol_version(&msg)?;
-        Ok(ArtifactAcceptance::AcceptedForProcessing(msg))
+    ) -> Result<(), ArtifactPoolError> {
+        check_protocol_version(msg)?;
+        Ok(())
     }
 
     /// The method returns `true` if and only if the *Consensus* pool contains
@@ -362,8 +359,8 @@ impl<Pool> IngressClient<Pool> {
     }
 }
 
-impl<Pool: IngressPool + IngressGossipPool + Send + Sync> ArtifactClient<IngressArtifact>
-    for IngressClient<Pool>
+impl<Pool: IngressPool + IngressGossipPool + IngressPoolThrottler + Send + Sync + 'static>
+    ArtifactClient<IngressArtifact> for IngressClient<Pool>
 {
     /// The method checks whether the given signed ingress bytes constitutes a
     /// valid singed ingress message.
@@ -373,17 +370,13 @@ impl<Pool: IngressPool + IngressGossipPool + Send + Sync> ArtifactClient<Ingress
     /// neither in the past nor too far in the future.
     fn check_artifact_acceptance(
         &self,
-        bytes: SignedRequestBytes,
+        msg: &SignedIngress,
         peer_id: &NodeId,
-    ) -> Result<ArtifactAcceptance<SignedIngress>, ArtifactPoolError> {
-        let msg: SignedIngress = bytes
-            .try_into()
-            .map_err(|err| ArtifactPoolError::ArtifactRejected(Box::new(err)))?;
-
+    ) -> Result<(), ArtifactPoolError> {
         #[cfg(feature = "malicious_code")]
         {
             if self.malicious_flags.maliciously_disable_ingress_validation {
-                return Ok(ArtifactAcceptance::AcceptedForProcessing(msg));
+                return Ok(());
             }
         }
 
@@ -412,8 +405,8 @@ impl<Pool: IngressPool + IngressGossipPool + Send + Sync> ArtifactClient<Ingress
             self.ingress_pool
                 .read()
                 .unwrap()
-                .check_quota(&msg, peer_id)?;
-            Ok(ArtifactAcceptance::AcceptedForProcessing(msg))
+                .check_quota(msg, peer_id)?;
+            Ok(())
         }
     }
 
@@ -432,28 +425,26 @@ impl<Pool: IngressPool + IngressGossipPool + Send + Sync> ArtifactClient<Ingress
             .get_validated_by_identifier(msg_id)
     }
 
-    /// The method returns the ingress message filter.
-    fn get_filter(&self) -> IngressMessageFilter {
-        Default::default()
-    }
-
-    /// The method returns all adverts for validated ingress messages.
-    fn get_all_validated_by_filter(
-        &self,
-        _filter: &IngressMessageFilter,
-    ) -> Vec<Advert<IngressArtifact>> {
-        // TODO: Send adverts of ingress messages which are generated on this node (not
-        // relayed from other node). P2P-381
-        Vec::new()
-    }
-
     /// The method returns the priority function.
     fn get_priority_function(
         &self,
     ) -> Option<PriorityFn<IngressMessageId, IngressMessageAttribute>> {
         let start = self.time_source.get_relative_time();
         let range = start..=start + MAX_INGRESS_TTL;
+        let pool = self.ingress_pool.clone();
         Some(Box::new(move |ingress_id, _| {
+            // EXPLANATION: Because ingress messages are included in blocks, consensus
+            // does not rely on ingress gossip for correctness. Ingress gossip exists to
+            // reduce latency in cases where replicas don't have enough ingress messages
+            // to fill their block. Once a replica's pool is full, ingress gossip just
+            // causes redundant traffic between replicas, and is thus not needed.
+            if pool
+                .read()
+                .expect("couldn't acquire readers lock on ingress pool")
+                .exceeds_threshold()
+            {
+                return Priority::Drop;
+            }
             if range.contains(&ingress_id.expiry()) {
                 Priority::Later
             } else {
@@ -501,10 +492,10 @@ impl<PoolCertification: CertificationPool + CertificationGossipPool + Send + Syn
     /// The method always accepts the given `CertificationMessage`.
     fn check_artifact_acceptance(
         &self,
-        msg: CertificationMessage,
+        _msg: &CertificationMessage,
         _peer_id: &NodeId,
-    ) -> Result<ArtifactAcceptance<CertificationMessage>, ArtifactPoolError> {
-        Ok(ArtifactAcceptance::AcceptedForProcessing(msg))
+    ) -> Result<(), ArtifactPoolError> {
+        Ok(())
     }
 
     /// The method checks if the certification pool contains a certification
@@ -588,11 +579,11 @@ impl<Pool: DkgPool + DkgGossipPool + Send + Sync> ArtifactClient<DkgArtifact> fo
     /// `ArtifactAcceptance` enum.
     fn check_artifact_acceptance(
         &self,
-        msg: DkgMessage,
+        msg: &DkgMessage,
         _peer_id: &NodeId,
-    ) -> Result<ArtifactAcceptance<DkgMessage>, ArtifactPoolError> {
-        check_protocol_version(&msg)?;
-        Ok(ArtifactAcceptance::AcceptedForProcessing(msg))
+    ) -> Result<(), ArtifactPoolError> {
+        check_protocol_version(msg)?;
+        Ok(())
     }
 
     /// The method checks if the DKG pool contains a DKG message with the given
@@ -642,10 +633,10 @@ impl<Pool: EcdsaPool + EcdsaGossipPool + Send + Sync> ArtifactClient<EcdsaArtifa
 {
     fn check_artifact_acceptance(
         &self,
-        msg: EcdsaMessage,
+        _msg: &EcdsaMessage,
         _peer_id: &NodeId,
-    ) -> Result<ArtifactAcceptance<EcdsaMessage>, ArtifactPoolError> {
-        Ok(ArtifactAcceptance::AcceptedForProcessing(msg))
+    ) -> Result<(), ArtifactPoolError> {
+        Ok(())
     }
 
     fn has_artifact(&self, msg_id: &EcdsaMessageId) -> bool {
@@ -672,7 +663,7 @@ impl<Pool: EcdsaPool + EcdsaGossipPool + Send + Sync> ArtifactClient<EcdsaArtifa
 /// The CanisterHttp Client
 pub struct CanisterHttpClient<Pool> {
     pool: Arc<RwLock<Pool>>,
-    _gossip: Arc<dyn CanisterHttpGossip + Send + Sync>,
+    gossip: Arc<dyn CanisterHttpGossip + Send + Sync>,
 }
 
 impl<Pool: CanisterHttpPool + CanisterHttpGossipPool + Send + Sync> CanisterHttpClient<Pool> {
@@ -682,20 +673,20 @@ impl<Pool: CanisterHttpPool + CanisterHttpGossipPool + Send + Sync> CanisterHttp
     ) -> Self {
         Self {
             pool,
-            _gossip: Arc::new(gossip),
+            gossip: Arc::new(gossip),
         }
     }
 }
 
-impl<Pool: CanisterHttpGossipPool + CanisterHttpGossip + Send + Sync>
+impl<Pool: CanisterHttpPool + CanisterHttpGossipPool + Send + Sync>
     ArtifactClient<CanisterHttpArtifact> for CanisterHttpClient<Pool>
 {
     fn check_artifact_acceptance(
         &self,
-        msg: CanisterHttpResponseShare,
+        _msg: &CanisterHttpResponseShare,
         _peer_id: &NodeId,
-    ) -> Result<ArtifactAcceptance<CanisterHttpResponseShare>, ArtifactPoolError> {
-        Ok(ArtifactAcceptance::AcceptedForProcessing(msg))
+    ) -> Result<(), ArtifactPoolError> {
+        Ok(())
     }
 
     fn has_artifact(&self, msg_id: &CanisterHttpResponseId) -> bool {
@@ -712,11 +703,11 @@ impl<Pool: CanisterHttpGossipPool + CanisterHttpGossip + Send + Sync>
             .get_validated_by_identifier(msg_id)
     }
 
-    fn get_priority_function(&self) -> Option<PriorityFn<CanisterHttpResponseId, ()>> {
-        // TODO: This priority function makes it so that we will unconditionally
-        // drop all incoming messages. We need to implement a proper priority
-        // function for the canister http feature to work at all.
-        Some(Box::new(|_, _| Priority::Drop))
+    fn get_priority_function(
+        &self,
+    ) -> Option<PriorityFn<CanisterHttpResponseId, CanisterHttpResponseAttribute>> {
+        let pool = &*self.pool.read().unwrap();
+        Some(self.gossip.get_priority_function(pool))
     }
 
     fn get_chunk_tracker(&self, _id: &CanisterHttpResponseId) -> Box<dyn Chunkable + Send + Sync> {

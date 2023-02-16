@@ -29,16 +29,7 @@ impl TlsHandshake for FakeTlsHandshake {
         _tcp_stream: TcpStream,
         _allowed_clients: AllowedClients,
         _registry_version: RegistryVersion,
-    ) -> Result<(TlsStream, AuthenticatedPeer), TlsServerHandshakeError> {
-        unimplemented!()
-    }
-
-    async fn perform_tls_server_handshake_with_rustls(
-        &self,
-        _tcp_stream: TcpStream,
-        _allowed_clients: AllowedClients,
-        _registry_version: RegistryVersion,
-    ) -> Result<(TlsStream, AuthenticatedPeer), TlsServerHandshakeError> {
+    ) -> Result<(Box<dyn TlsStream>, AuthenticatedPeer), TlsServerHandshakeError> {
         unimplemented!()
     }
 
@@ -46,15 +37,7 @@ impl TlsHandshake for FakeTlsHandshake {
         &self,
         _tcp_stream: TcpStream,
         _registry_version: RegistryVersion,
-    ) -> Result<TlsStream, TlsServerHandshakeError> {
-        unimplemented!()
-    }
-
-    async fn perform_tls_server_handshake_without_client_auth_with_rustls(
-        &self,
-        _tcp_stream: TcpStream,
-        _registry_version: RegistryVersion,
-    ) -> Result<TlsStream, TlsServerHandshakeError> {
+    ) -> Result<Box<dyn TlsStream>, TlsServerHandshakeError> {
         unimplemented!()
     }
 
@@ -63,16 +46,7 @@ impl TlsHandshake for FakeTlsHandshake {
         _tcp_stream: TcpStream,
         _server: NodeId,
         _registry_version: RegistryVersion,
-    ) -> Result<TlsStream, TlsClientHandshakeError> {
-        unimplemented!()
-    }
-
-    async fn perform_tls_client_handshake_with_rustls(
-        &self,
-        _tcp_stream: TcpStream,
-        _server: NodeId,
-        _registry_version: RegistryVersion,
-    ) -> Result<TlsStream, TlsClientHandshakeError> {
+    ) -> Result<Box<dyn TlsStream>, TlsClientHandshakeError> {
         unimplemented!()
     }
 }

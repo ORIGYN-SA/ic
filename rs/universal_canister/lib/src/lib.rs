@@ -8,58 +8,16 @@
 pub mod management;
 
 use hex_literal::hex;
+use universal_canister::Ops;
 
 /// The binary of the universal canister as compiled from
 /// `rs/universal_canister/impl`.
 ///
 /// For steps on how to produce it, please see the README in
 /// `rs/universal_canister`.
-pub const UNIVERSAL_CANISTER_WASM: &[u8] = include_bytes!("universal_canister.wasm");
+pub const UNIVERSAL_CANISTER_WASM: &[u8] = include_bytes!("universal-canister.wasm");
 pub const UNIVERSAL_CANISTER_WASM_SHA256: [u8; 32] =
-    hex!("6243c3af6d8dd11b9aec8a1744f1e435ec200f6f880637a6c000fe2d251811f4");
-
-/// Operands used in encoding UC payloads.
-enum Ops {
-    Noop = 0,
-    PushInt = 2,
-    PushBytes = 3,
-    ReplyDataAppend = 4,
-    Reply = 5,
-    Self_ = 6,
-    Reject = 7,
-    Caller = 8,
-    RejectMessage = 10,
-    RejectCode = 11,
-    IntToBlob = 12,
-    MessagePayload = 13,
-    StableSize = 15,
-    StableGrow = 16,
-    StableRead = 17,
-    StableWrite = 18,
-    DebugPrint = 19,
-    Trap = 20,
-    SetGlobal = 21,
-    GetGlobal = 22,
-    SetPreUpgrade = 24,
-    AcceptCycles = 30,
-    PushInt64 = 31,
-    CallNew = 32,
-    CallDataAppend = 33,
-    CallPerform = 35,
-    SetHeartbeat = 40,
-    AcceptMessage = 41,
-    SetInspectMessage = 42,
-    TrapIfEq = 43,
-    CallOnCleanup = 44,
-    StableFill = 45,
-    StableSize64 = 46,
-    StableGrow64 = 47,
-    StableRead64 = 48,
-    StableWrite64 = 49,
-    Int64ToBlob = 50,
-    AcceptCycles128 = 54,
-    CallCyclesAdd128 = 55,
-}
+    hex!("6ffdd097110933e62c9eb2d223adde7fbcb7072a7e27af8e3a1053f6a144cc20");
 
 /// A succinct shortcut for creating a `PayloadBuilder`, which is used to encode
 /// instructions to be executed by the UC.
@@ -197,11 +155,18 @@ impl PayloadBuilder {
         self
     }
 
-    pub fn stable64_write(mut self, offset: u64, data: u64, length: u64) -> Self {
+    pub fn stable64_write(mut self, offset: u64, data: &[u8]) -> Self {
+        self = self.push_int64(offset);
+        self = self.push_bytes(data);
+        self.0.push(Ops::StableWrite64 as u8);
+        self
+    }
+
+    pub fn stable64_fill(mut self, offset: u64, data: u64, length: u64) -> Self {
         self = self.push_int64(offset);
         self = self.push_int64(data);
         self = self.push_int64(length);
-        self.0.push(Ops::StableWrite64 as u8);
+        self.0.push(Ops::StableFill64 as u8);
         self
     }
 
@@ -216,6 +181,23 @@ impl PayloadBuilder {
     pub fn set_heartbeat<P: AsRef<[u8]>>(mut self, payload: P) -> Self {
         self = self.push_bytes(payload.as_ref());
         self.0.push(Ops::SetHeartbeat as u8);
+        self
+    }
+
+    pub fn set_global_timer_method<P: AsRef<[u8]>>(mut self, payload: P) -> Self {
+        self = self.push_bytes(payload.as_ref());
+        self.0.push(Ops::SetGlobalTimerMethod as u8);
+        self
+    }
+
+    pub fn api_global_timer_set(mut self, timestamp: u64) -> Self {
+        self = self.push_int64(timestamp);
+        self.0.push(Ops::ApiGlobalTimerSet as u8);
+        self
+    }
+
+    pub fn canister_version(mut self) -> Self {
+        self.0.push(Ops::CanisterVersion as u8);
         self
     }
 
@@ -234,6 +216,11 @@ impl PayloadBuilder {
     /// A query from a UC to another UC.
     pub fn inter_query<P: AsRef<[u8]>>(self, callee: P, call_args: CallArgs) -> Self {
         self.call_simple(callee, "query", call_args)
+    }
+
+    /// A composite query from a UC to another UC.
+    pub fn composite_query<P: AsRef<[u8]>>(self, callee: P, call_args: CallArgs) -> Self {
+        self.call_simple(callee, "composite_query", call_args)
     }
 
     /// An update from a UC to another UC.
@@ -339,6 +326,18 @@ impl PayloadBuilder {
         self
     }
 
+    /// Increases heap-allocated global u64 counter.
+    pub fn inc_global_counter(mut self) -> Self {
+        self.0.push(Ops::IncGlobalCounter as u8);
+        self
+    }
+
+    /// Gets the heap-allocated global u64 counter.
+    pub fn get_global_counter(mut self) -> Self {
+        self.0.push(Ops::GetGlobalCounter as u8);
+        self
+    }
+
     pub fn debug_print(mut self, msg: &[u8]) -> Self {
         self = self.push_bytes(msg);
         self.0.push(Ops::DebugPrint as u8);
@@ -385,6 +384,58 @@ impl PayloadBuilder {
         let call = call.into();
         let call_args = call.get_call_args();
         self = self.call_with_cycles(call.callee, call.method, call_args, call.cycles);
+        self
+    }
+
+    /// Pushes the size of the argument data onto the stack.
+    pub fn msg_arg_data_size(mut self) -> Self {
+        self.0.push(Ops::MsgArgDataSize as u8);
+        self
+    }
+
+    /// Pushes a blob of the given size filled with the argument data bytes starting
+    /// from the given offset.
+    pub fn msg_arg_data_copy(mut self, offset: u32, size: u32) -> Self {
+        self = self.push_int(offset);
+        self = self.push_int(size);
+        self.0.push(Ops::MsgArgDataCopy as u8);
+        self
+    }
+
+    /// Pushes the size of the caller data onto the stack.
+    pub fn msg_caller_size(mut self) -> Self {
+        self.0.push(Ops::MsgCallerSize as u8);
+        self
+    }
+
+    /// Pushes a blob of the given size filled with the caller data bytes starting
+    /// from the given offset.
+    pub fn msg_caller_copy(mut self, offset: u32, size: u32) -> Self {
+        self = self.push_int(offset);
+        self = self.push_int(size);
+        self.0.push(Ops::MsgCallerCopy as u8);
+        self
+    }
+
+    /// Pushes the size of the reject message onto the stack.
+    pub fn msg_reject_msg_size(mut self) -> Self {
+        self.0.push(Ops::MsgRejectMsgSize as u8);
+        self
+    }
+
+    /// Pushes a blob of the given size filled with the reject message bytes starting
+    /// from the given offset.
+    pub fn msg_reject_msg_copy(mut self, offset: u32, size: u32) -> Self {
+        self = self.push_int(offset);
+        self = self.push_int(size);
+        self.0.push(Ops::MsgRejectMsgCopy as u8);
+        self
+    }
+
+    /// Loops until the instruction counter is at least the specified amount.
+    pub fn instruction_counter_is_at_least(mut self, amount: u64) -> Self {
+        self = self.push_int64(amount);
+        self.0.push(Ops::InstructionCounterIsAtLeast as u8);
         self
     }
 
@@ -485,7 +536,7 @@ impl From<PayloadBuilder> for Vec<u8> {
     }
 }
 
-/// Arguments to be passed into `call_simple` or `call_with_funds`.
+/// Arguments to be passed into `call_new`.
 #[derive(Clone)]
 pub struct CallArgs {
     pub on_reply: Vec<u8>,
@@ -572,5 +623,10 @@ mod test {
             UNIVERSAL_CANISTER_WASM_SHA256,
             ic_crypto_sha::Sha256::hash(UNIVERSAL_CANISTER_WASM)
         );
+    }
+
+    #[test]
+    fn try_from_macro_works() {
+        assert_eq!(Ops::GetGlobalCounter, Ops::try_from(65).unwrap());
     }
 }

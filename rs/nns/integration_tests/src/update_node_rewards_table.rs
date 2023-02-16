@@ -1,15 +1,16 @@
 use dfn_candid::candid;
-use ic_canister_client::Sender;
+use ic_canister_client_sender::Sender;
+use ic_nervous_system_common_test_keys::{
+    TEST_NEURON_1_OWNER_KEYPAIR, TEST_NEURON_2_OWNER_KEYPAIR,
+};
 use ic_nns_common::types::{NeuronId, ProposalId};
 use ic_nns_governance::pb::v1::{ManageNeuronResponse, NnsFunction, ProposalStatus, Vote};
-use ic_nns_test_keys::{TEST_NEURON_1_OWNER_KEYPAIR, TEST_NEURON_2_OWNER_KEYPAIR};
-use ic_nns_test_utils::governance::submit_external_update_proposal;
-use ic_nns_test_utils::ids::TEST_NEURON_2_ID;
-use ic_nns_test_utils::registry::get_value;
 use ic_nns_test_utils::{
-    governance::{get_pending_proposals, wait_for_final_state},
-    ids::TEST_NEURON_1_ID,
-    itest_helpers::{local_test_on_nns_subnet, NnsCanisters, NnsInitPayloadsBuilder},
+    common::NnsInitPayloadsBuilder,
+    governance::{get_pending_proposals, submit_external_update_proposal, wait_for_final_state},
+    ids::{TEST_NEURON_1_ID, TEST_NEURON_2_ID},
+    itest_helpers::{local_test_on_nns_subnet, NnsCanisters},
+    registry::get_value_or_panic,
 };
 use ic_protobuf::registry::node_rewards::v2::{
     NodeRewardRate, NodeRewardRates, NodeRewardsTable, UpdateNodeRewardsTableProposalPayload,
@@ -81,7 +82,7 @@ fn test_submit_update_node_rewards_table_proposal() {
         let pending_proposals = get_pending_proposals(&nns_canisters.governance).await;
         assert_eq!(pending_proposals, vec![]);
 
-        let table = get_value::<NodeRewardsTable>(
+        let table = get_value_or_panic::<NodeRewardsTable>(
             &nns_canisters.registry,
             NODE_REWARDS_TABLE_KEY.as_bytes(),
         )

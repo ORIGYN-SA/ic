@@ -9,11 +9,15 @@ use async_trait::async_trait;
 use candid::Encode;
 use comparable::Comparable;
 use futures::future::FutureExt;
-use ic_base_types::PrincipalId;
+use ic_base_types::{CanisterId, PrincipalId};
 use ic_crypto_sha::Sha256;
-use ic_nervous_system_common::{ledger::Ledger, NervousSystemError};
+use ic_nervous_system_common::{ledger::IcpLedger, NervousSystemError};
+use ic_nervous_system_common_test_keys::{
+    TEST_NEURON_1_OWNER_PRINCIPAL, TEST_NEURON_2_OWNER_PRINCIPAL,
+};
 use ic_nns_common::pb::v1::{NeuronId, ProposalId};
 use ic_nns_common::types::UpdateIcpXdrConversionRatePayload;
+use ic_nns_constants::LEDGER_CANISTER_ID;
 use ic_nns_governance::{
     governance::{
         governance_minting_account, neuron_subaccount, subaccount_from_slice, Environment,
@@ -58,11 +62,10 @@ use ic_nns_governance::{
         RewardEvent, RewardNodeProvider, SetDefaultFollowees, Tally, Topic, Vote,
     },
 };
-use ic_nns_test_keys::{TEST_NEURON_1_OWNER_PRINCIPAL, TEST_NEURON_2_OWNER_PRINCIPAL};
-use ledger_canister::{AccountIdentifier, Memo, Tokens};
+use icp_ledger::{AccountIdentifier, Memo, Tokens};
 use maplit::hashmap;
-use rand::rngs::StdRng;
-use rand_core::{RngCore, SeedableRng};
+use rand::{RngCore, SeedableRng};
+use rand_chacha::ChaCha20Rng;
 use registry_canister::mutations::do_add_node_operator::AddNodeOperatorPayload;
 use std::collections::hash_map::Entry;
 use std::collections::BTreeMap;
@@ -76,7 +79,7 @@ use std::sync::Arc;
 use std::sync::Mutex;
 
 use ic_nns_governance::governance::{
-    HeapGrowthPotential, MAX_DISSOLVE_DELAY_SECONDS, MAX_NEURON_AGE_FOR_AGE_BONUS,
+    HeapGrowthPotential, CMC, MAX_DISSOLVE_DELAY_SECONDS, MAX_NEURON_AGE_FOR_AGE_BONUS,
     MAX_NUMBER_OF_PROPOSALS_WITH_BALLOTS, ONE_YEAR_SECONDS,
 };
 use ic_nns_governance::pb::v1::governance::GovernanceCachedMetrics;
@@ -87,7 +90,7 @@ use ic_nns_governance::pb::v1::proposal::Action;
 use ic_nns_governance::pb::v1::ProposalRewardStatus::{AcceptVotes, ReadyToSettle};
 use ic_nns_governance::pb::v1::ProposalStatus::Rejected;
 use ic_nns_governance::pb::v1::{ManageNeuronResponse, ProposalRewardStatus, RewardNodeProviders};
-use ledger_canister::Subaccount;
+use icp_ledger::Subaccount;
 
 const DEFAULT_TEST_START_TIMESTAMP_SECONDS: u64 = 999_111_000_u64;
 
@@ -116,18 +119,17 @@ pub fn prorated_neuron_age(
 }
 
 /// The LedgerFixture allows for independent testing of Ledger functionality.
-#[derive(Default)]
+#[derive(Default, Clone)]
 pub struct LedgerFixture {
     accounts: LedgerMap,
 }
 
 impl LedgerFixture {
     pub fn get_supply(&self) -> Tokens {
-        Tokens::from_e8s(self.accounts.iter().map(|(_, y)| y).sum())
+        Tokens::from_e8s(self.accounts.values().sum())
     }
 }
 
-#[derive(Default)]
 pub struct LedgerBuilder {
     ledger_fixture: LedgerFixture,
 }
@@ -166,6 +168,18 @@ impl LedgerBuilder {
     }
 }
 
+impl Default for LedgerBuilder {
+    fn default() -> Self {
+        let mut ledger_builder = LedgerBuilder {
+            ledger_fixture: LedgerFixture::default(),
+        };
+
+        // Always insert the minting_account.
+        ledger_builder.add_account(LedgerBuilder::minting_account(), 0);
+        ledger_builder
+    }
+}
+
 /// The NeuronBuilder is used for creating neurons on behalf of the governance
 /// canister. The principal id and subaccount identifier are both derived from
 /// the neuron id, which is provided by the caller.
@@ -177,6 +191,7 @@ pub struct NeuronBuilder {
     age_timestamp: Option<u64>,
     created_seconds: Option<u64>,
     maturity: u64,
+    staked_maturity: u64,
     neuron_fees: u64,
     dissolve_state: Option<neuron::DissolveState>,
     followees: HashMap<i32, neuron::Followees>,
@@ -200,6 +215,7 @@ impl From<Neuron> for NeuronBuilder {
             },
             created_seconds: Some(neuron.created_timestamp_seconds),
             maturity: neuron.maturity_e8s_equivalent,
+            staked_maturity: neuron.staked_maturity_e8s_equivalent.unwrap_or(0),
             neuron_fees: neuron.neuron_fees_e8s,
             dissolve_state: neuron.dissolve_state,
             followees: neuron.followees,
@@ -221,6 +237,7 @@ impl NeuronBuilder {
             age_timestamp: None,
             created_seconds: None,
             maturity: 0,
+            staked_maturity: 0,
             neuron_fees: 0,
             dissolve_state: None,
             followees: HashMap::new(),
@@ -240,6 +257,7 @@ impl NeuronBuilder {
             age_timestamp: None,
             created_seconds: None,
             maturity: 0,
+            staked_maturity: 0,
             neuron_fees: 0,
             dissolve_state: None,
             followees: HashMap::new(),
@@ -275,6 +293,10 @@ impl NeuronBuilder {
         self
     }
 
+    pub fn set_staked_maturity(mut self, staked_maturity: u64) -> Self {
+        self.staked_maturity = staked_maturity;
+        self
+    }
     pub fn set_creation_timestamp(mut self, secs: u64) -> Self {
         self.created_seconds = Some(secs);
         self
@@ -325,13 +347,20 @@ impl NeuronBuilder {
     }
 
     pub fn create(self, now: u64, ledger: &mut LedgerBuilder) -> Neuron {
-        let subaccount = Self::subaccount(self.owner, self.ident);
-        if !self.do_not_create_subaccount {
-            ledger.add_account(neuron_subaccount(subaccount), self.stake);
-        }
+        let subaccount = match self.do_not_create_subaccount {
+            false => {
+                let subaccount = Self::subaccount(self.owner, self.ident);
+                ledger.add_account(neuron_subaccount(subaccount), self.stake);
+                subaccount.to_vec()
+            }
+            true => {
+                vec![]
+            }
+        };
+
         Neuron {
             id: Some(NeuronId { id: self.ident }),
-            account: subaccount.to_vec(),
+            account: subaccount,
             controller: self.owner,
             hot_keys: self.hot_keys,
             cached_neuron_stake_e8s: self.stake,
@@ -345,6 +374,11 @@ impl NeuronBuilder {
                 },
             },
             maturity_e8s_equivalent: self.maturity,
+            staked_maturity_e8s_equivalent: if self.staked_maturity == 0 {
+                None
+            } else {
+                Some(self.staked_maturity)
+            },
             dissolve_state: self.dissolve_state,
             kyc_verified: self.kyc_verified,
             not_for_profit: self.not_for_profit,
@@ -375,7 +409,7 @@ impl NeuronBuilder {
 
 pub struct NNSFixtureState {
     now: u64,
-    rng: StdRng,
+    rng: ChaCha20Rng,
     ledger: LedgerFixture,
 }
 
@@ -393,7 +427,7 @@ impl NNSFixture {
 }
 
 #[async_trait]
-impl Ledger for NNSFixture {
+impl IcpLedger for NNSFixture {
     async fn transfer_funds(
         &self,
         amount_e8s: u64,
@@ -402,6 +436,9 @@ impl Ledger for NNSFixture {
         to_account: AccountIdentifier,
         _: u64,
     ) -> Result<u64, NervousSystemError> {
+        // Minting operations (sending ICP from Gov main account) should just create ICP.
+        let is_minting_operation = from_subaccount.is_none();
+
         let from_account = from_subaccount.map_or(governance_minting_account(), neuron_subaccount);
         println!(
             "Issuing ledger transfer from account {} (subaccount {}) to account {} amount {} fee {}",
@@ -409,23 +446,21 @@ impl Ledger for NNSFixture {
         );
         let accounts = &mut self.nns_state.try_lock().unwrap().ledger.accounts;
 
-        let _to_e8s = accounts
-            .get(&to_account)
-            .ok_or_else(|| NervousSystemError::new_with_message("Target account doesn't exist"))?;
         let from_e8s = accounts
             .get_mut(&from_account)
             .ok_or_else(|| NervousSystemError::new_with_message("Source account doesn't exist"))?;
 
         let requested_e8s = amount_e8s + fee_e8s;
 
-        if *from_e8s < requested_e8s {
-            return Err(NervousSystemError::new_with_message(format!(
-                "Insufficient funds. Available {} requested {}",
-                *from_e8s, requested_e8s
-            )));
+        if !is_minting_operation {
+            if *from_e8s < requested_e8s {
+                return Err(NervousSystemError::new_with_message(format!(
+                    "Insufficient funds. Available {} requested {}",
+                    *from_e8s, requested_e8s
+                )));
+            }
+            *from_e8s -= requested_e8s;
         }
-
-        *from_e8s -= requested_e8s;
 
         *accounts.entry(to_account).or_default() += amount_e8s;
 
@@ -444,8 +479,13 @@ impl Ledger for NNSFixture {
         let account_e8s = accounts.get(&account).unwrap_or(&0);
         Ok(Tokens::from_e8s(*account_e8s))
     }
+
+    fn canister_id(&self) -> CanisterId {
+        LEDGER_CANISTER_ID
+    }
 }
 
+#[async_trait]
 impl Environment for NNSFixture {
     fn now(&self) -> u64 {
         self.nns_state.try_lock().unwrap().now
@@ -476,13 +516,29 @@ impl Environment for NNSFixture {
     fn heap_growth_potential(&self) -> HeapGrowthPotential {
         HeapGrowthPotential::NoIssue
     }
+
+    async fn call_canister_method(
+        &mut self,
+        _target: CanisterId,
+        _method_name: &str,
+        _request: Vec<u8>,
+    ) -> Result<Vec<u8>, (Option<i32>, String)> {
+        unimplemented!();
+    }
+}
+
+#[async_trait]
+impl CMC for NNSFixture {
+    async fn neuron_maturity_modulation(&mut self) -> Result<i32, String> {
+        Ok(100)
+    }
 }
 
 /// The NNSState is used to capture all of the salient details of the NNS
 /// environment, so that we can compute the "delta", or what changed between
 /// actions.
-#[derive(Clone, Default)]
-#[cfg_attr(feature = "test", derive(comparable::Comparable), compare_default)]
+#[derive(Clone, Default, comparable::Comparable)]
+#[compare_default]
 pub struct NNSState {
     now: u64,
     accounts: LedgerMap,
@@ -539,19 +595,17 @@ impl ProposalNeuronBehavior {
                 })
             }
         };
-        let pid = nns
-            .governance
-            .make_proposal(
-                &NeuronId { id: self.proposer },
-                &principal(self.proposer),
-                &Proposal {
-                    title: Some("A Reasonable Title".to_string()),
-                    summary,
-                    action: Some(action),
-                    ..Default::default()
-                },
-            )
-            .unwrap();
+        let pid = tokio_test::block_on(nns.governance.make_proposal(
+            &NeuronId { id: self.proposer },
+            &principal(self.proposer),
+            &Proposal {
+                title: Some("A Reasonable Title".to_string()),
+                summary,
+                action: Some(action),
+                ..Default::default()
+            },
+        ))
+        .unwrap();
         // Vote
         for (voter, vote) in &self.votes {
             nns.register_vote_assert_success(
@@ -715,18 +769,17 @@ impl NNS {
         action: proposal::Action,
     ) -> ProposalId {
         // Submit proposal
-        self.governance
-            .make_proposal(
-                &NeuronId { id: prop.proposer },
-                &principal(prop.proposer),
-                &Proposal {
-                    title: Some("A Reasonable Title".to_string()),
-                    summary,
-                    action: Some(action),
-                    ..Default::default()
-                },
-            )
-            .unwrap()
+        tokio_test::block_on(self.governance.make_proposal(
+            &NeuronId { id: prop.proposer },
+            &principal(prop.proposer),
+            &Proposal {
+                title: Some("A Reasonable Title".to_string()),
+                summary,
+                action: Some(action),
+                ..Default::default()
+            },
+        ))
+        .unwrap()
     }
 
     pub fn propose_and_vote(
@@ -807,7 +860,7 @@ impl NNS {
 }
 
 #[async_trait]
-impl Ledger for NNS {
+impl IcpLedger for NNS {
     async fn transfer_funds(
         &self,
         amount_e8s: u64,
@@ -831,8 +884,13 @@ impl Ledger for NNS {
     ) -> Result<Tokens, NervousSystemError> {
         self.fixture.account_balance(account).await
     }
+
+    fn canister_id(&self) -> CanisterId {
+        self.fixture.canister_id()
+    }
 }
 
+#[async_trait]
 impl Environment for NNS {
     fn now(&self) -> u64 {
         self.fixture.now()
@@ -857,9 +915,18 @@ impl Environment for NNS {
     fn heap_growth_potential(&self) -> HeapGrowthPotential {
         self.fixture.heap_growth_potential()
     }
+
+    async fn call_canister_method(
+        &mut self,
+        _target: CanisterId,
+        _method_name: &str,
+        _request: Vec<u8>,
+    ) -> Result<Vec<u8>, (Option<i32>, String)> {
+        unimplemented!();
+    }
 }
 
-pub type LedgerTransform = Box<dyn FnOnce(Box<dyn Ledger>) -> Box<dyn Ledger>>;
+pub type LedgerTransform = Box<dyn FnOnce(Box<dyn IcpLedger>) -> Box<dyn IcpLedger>>;
 /// The NNSBuilder permits the declarative construction of an NNS fixture. All
 /// of the methods concern setting or querying what this initial state will
 /// be. Therefore, `get_account_balance` on a builder object will only tell
@@ -896,16 +963,17 @@ impl NNSBuilder {
     pub fn create(self) -> NNS {
         let fixture = NNSFixture::new(NNSFixtureState {
             now: self.start_time,
-            rng: StdRng::seed_from_u64(9539),
+            rng: ChaCha20Rng::seed_from_u64(9539),
             ledger: self.ledger_builder.create(),
         });
-        let mut ledger: Box<dyn Ledger> = Box::new(fixture.clone());
+        let cmc: Box<dyn CMC> = Box::new(fixture.clone());
+        let mut ledger: Box<dyn IcpLedger> = Box::new(fixture.clone());
         for t in self.ledger_transforms {
             ledger = t(ledger);
         }
         let mut nns = NNS {
             fixture: fixture.clone(),
-            governance: Governance::new(self.governance, Box::new(fixture), ledger),
+            governance: Governance::new(self.governance, Box::new(fixture), ledger, cmc),
             initial_state: None,
         };
         nns.capture_state();
@@ -982,6 +1050,13 @@ impl NNSBuilder {
     /// chained; they are applied in the order in which they were added.
     pub fn add_ledger_transform(mut self, transform: LedgerTransform) -> Self {
         self.ledger_transforms.push(transform);
+        self
+    }
+
+    pub fn add_proposal(mut self, proposal_data: ProposalData) -> Self {
+        self.governance
+            .proposals
+            .insert(proposal_data.id.unwrap().id, proposal_data);
         self
     }
 }

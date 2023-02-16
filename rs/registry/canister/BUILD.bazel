@@ -1,0 +1,187 @@
+load("@rules_rust//rust:defs.bzl", "rust_library", "rust_test")
+load("@rules_rust//cargo:cargo_build_script.bzl", "cargo_build_script")
+load("//bazel:prost.bzl", "generated_files_check")
+load("//bazel:canisters.bzl", "rust_canister")
+load("//bazel:defs.bzl", "rust_test_suite_with_extra_srcs")
+
+package(default_visibility = ["//visibility:public"])
+
+filegroup(
+    name = "protos",
+    srcs = glob(["proto/**"]),
+)
+
+DEPENDENCIES = [
+    "//rs/crypto/node_key_validation",
+    "//rs/crypto/sha",
+    "//rs/crypto/utils/basic_sig",
+    "//rs/nervous_system/common",
+    "//rs/nns/cmc",
+    "//rs/nns/common",
+    "//rs/nns/constants",
+    "//rs/protobuf",
+    "//rs/registry/keys",
+    "//rs/registry/routing_table",
+    "//rs/registry/subnet_features",
+    "//rs/registry/subnet_type",
+    "//rs/registry/transport",
+    "//rs/rust_canisters/dfn_candid",
+    "//rs/rust_canisters/dfn_core",
+    "//rs/rust_canisters/dfn_http_metrics",
+    "//rs/rust_canisters/on_wire",
+    "//rs/types/base_types",
+    "//rs/types/ic00_types",
+    "//rs/types/types",
+    "@crate_index//:build-info",
+    "@crate_index//:candid",
+    "@crate_index//:futures",
+    "@crate_index//:ic-certified-map",
+    "@crate_index//:ic-metrics-encoder",
+    "@crate_index//:ipnet",
+    "@crate_index//:leb128",
+    "@crate_index//:prost",
+    "@crate_index//:serde",
+    "@crate_index//:serde_cbor",
+    "@crate_index//:url",
+]
+
+DEV_DEPENDENCIES = [
+    "@crate_index//:assert_matches",
+    "@crate_index//:itertools",
+    "@crate_index//:lazy_static",
+    "@crate_index//:maplit",
+    "@crate_index//:rand_0_8_4",
+    "@crate_index//:rand_distr_0_4",
+    "@crate_index//:tempfile",
+    "@crate_index//:tokio",
+    "//rs/rust_canisters/canister_test",
+    "//rs/canister_client/sender",
+    "//rs/config",
+    "//rs/crypto/node_key_generation",
+    "//rs/crypto/tree_hash",
+    "//rs/interfaces/registry",
+    "//rs/nervous_system/common/test_keys",
+    "//rs/nns/test_utils",
+    "//rs/replica_tests",
+    "//rs/registry/fake",
+    "//rs/registry/nns_data_provider",
+    "//rs/registry/proto_data_provider",
+    "//rs/test_utilities",
+    "//rs/test_utilities/compare_dirs",
+]
+
+MACRO_DEPENDENCIES = [
+    "//rs/nervous_system/common/build_metadata",
+]
+
+DEV_MACRO_DEPENDENCIES = [
+    "//rs/nns/test_utils_macros",
+]
+
+BUILD_DEPENDENCIES = [
+    "@crate_index//:build-info-build",
+]
+
+ALIASES = {}
+
+cargo_build_script(
+    name = "build_script",
+    srcs = ["build.rs"],
+    aliases = ALIASES,
+    data = [],  # build script data (e.g. template files) goes here
+    version = "0.8.0",
+    deps = BUILD_DEPENDENCIES,
+)
+
+rust_library(
+    name = "canister",
+    srcs = glob([
+        "src/**",
+        "gen/**",
+    ]),
+    aliases = ALIASES,
+    crate_name = "registry_canister",
+    proc_macro_deps = MACRO_DEPENDENCIES,
+    version = "0.8.0",
+    deps = DEPENDENCIES + [":build_script"],
+)
+
+rust_canister(
+    name = "registry-canister",
+    srcs = ["canister/canister.rs"],
+    aliases = ALIASES,
+    compile_data = ["canister/registry.did"],
+    proc_macro_deps = MACRO_DEPENDENCIES,
+    service_file = ":canister/registry.did",
+    deps = DEPENDENCIES + [":canister"] + [":build_script"],
+)
+
+rust_test(
+    name = "registry_canister_canister_test",
+    srcs = glob(["canister/*.rs"]),
+    crate_root = "canister/canister.rs",
+    data = [
+        "canister/registry.did",
+        ":registry-canister",
+        "//rs/canister_sandbox",
+        "//rs/canister_sandbox/sandbox_launcher",
+        "//rs/nns/cmc:cycles-minting-canister",
+    ],
+    env = {
+        "CARGO_MANIFEST_DIR": "rs/registry/canister",
+    },
+    proc_macro_deps = MACRO_DEPENDENCIES + DEV_MACRO_DEPENDENCIES,
+    deps = DEV_DEPENDENCIES + DEPENDENCIES + [":canister"] + [":build_script"],
+)
+
+rust_test(
+    name = "registry_canister_test",
+    crate = ":canister",
+    proc_macro_deps = DEV_MACRO_DEPENDENCIES,
+    deps = DEPENDENCIES + DEV_DEPENDENCIES,
+)
+
+rust_test_suite_with_extra_srcs(
+    name = "registry_canister_integration_test",
+    srcs = glob(
+        ["tests/*.rs"],
+        exclude = [
+            "tests/mod.rs",
+            "tests/check_generated_files.rs",
+        ],
+    ),
+    data = [
+        ":registry-canister",
+        "//rs/canister_sandbox",
+        "//rs/canister_sandbox/sandbox_launcher",
+        "//rs/nns/cmc:cycles-minting-canister",
+    ],
+    env = {
+        "CARGO_MANIFEST_DIR": "rs/registry/canister",
+        "CYCLES_MINTING_CANISTER_WASM_PATH": "$(rootpath //rs/nns/cmc:cycles-minting-canister)",
+        "REGISTRY_CANISTER_WASM_PATH": "$(rootpath :registry-canister)",
+        "LAUNCHER_BINARY": "$(rootpath //rs/canister_sandbox/sandbox_launcher)",
+        "SANDBOX_BINARY": "$(rootpath //rs/canister_sandbox)",
+    },
+    extra_srcs = glob(["tests/common/*.rs"]),
+    proc_macro_deps = DEV_MACRO_DEPENDENCIES,
+    deps = DEPENDENCIES + DEV_DEPENDENCIES + [":canister"],
+)
+
+generated_files_check(
+    name = "check_generated_files",
+    srcs = ["tests/check_generated_files.rs"],
+    data = [
+        ":protos",
+        "//rs/types/base_types:protos",
+        "//rs/registry/transport:protos",
+        "//rs/protobuf:protos",
+        "//rs/nns/common:protos",
+    ] + glob(["gen/**"]),
+    manifest_dir = "rs/registry/canister",
+    deps = [
+        "//rs/registry/canister/protobuf_generator:lib",
+        "//rs/test_utilities/compare_dirs",
+        "@crate_index//:tempfile",
+    ],
+)

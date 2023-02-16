@@ -1,6 +1,7 @@
 pub mod fixtures;
 
-use crate::types::conversions::key_id_from_csp_pub_coeffs;
+use crate::key_id::KeyId;
+use crate::keygen::utils::dkg_dealing_encryption_pk_to_proto;
 use crate::types::CspPublicCoefficients;
 use crate::vault::api::CspVault;
 use crate::vault::test_utils;
@@ -8,14 +9,21 @@ use crate::vault::test_utils::ni_dkg::fixtures::{
     random_algorithm_id, MockDkgConfig, MockNetwork, MockNode, StateWithConfig, StateWithDealings,
     StateWithTranscript, StateWithVerifiedDealings,
 };
+use assert_matches::assert_matches;
+use ic_crypto_internal_seed::Seed;
+use ic_crypto_internal_threshold_sig_bls12381::api::dkg_errors::InternalError;
+use ic_crypto_internal_threshold_sig_bls12381::api::ni_dkg_errors::CspDkgCreateFsKeyError;
 use ic_crypto_internal_threshold_sig_bls12381::api::ni_dkg_errors::CspDkgCreateReshareDealingError;
 use ic_crypto_internal_types::sign::threshold_sig::ni_dkg as internal_types;
 use ic_crypto_internal_types::sign::threshold_sig::ni_dkg::ni_dkg_groth20_bls12_381::PublicCoefficientsBytes;
-use ic_crypto_internal_types::sign::threshold_sig::ni_dkg::CspFsEncryptionPublicKey;
-use ic_types::crypto::{AlgorithmId, KeyId};
-use ic_types::{NodeIndex, NumberOfNodes, Randomness};
+use ic_crypto_internal_types::sign::threshold_sig::ni_dkg::{
+    CspFsEncryptionPop, CspFsEncryptionPublicKey,
+};
+use ic_types::crypto::AlgorithmId;
+use ic_types::{NodeIndex, NumberOfNodes};
+use ic_types_test_utils::ids::NODE_42;
 use rand::prelude::IteratorRandom;
-use rand::{Rng, SeedableRng};
+use rand::SeedableRng;
 use rand_chacha::ChaCha20Rng;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
@@ -25,7 +33,7 @@ pub fn test_ni_dkg_should_work_with_all_players_acting_correctly(
     seed: [u8; 32],
     network_size: usize,
     num_reshares: i32,
-    csp_vault_factory: fn() -> Arc<dyn CspVault>,
+    csp_vault_factory: impl Fn() -> Arc<dyn CspVault>,
 ) {
     let mut rng = ChaCha20Rng::from_seed(seed);
     let network = MockNetwork::random(&mut rng, network_size, csp_vault_factory);
@@ -56,7 +64,7 @@ fn state_with_transcript(config: &MockDkgConfig, network: MockNetwork) -> StateW
     };
     let state = StateWithDealings::from_state_with_config(state).expect("Dealing failed");
     let state = StateWithVerifiedDealings::from_state_with_dealings(state);
-    let mut state = StateWithTranscript::from_state_with_verified_dealings(state);
+    let state = StateWithTranscript::from_state_with_verified_dealings(state);
     state.load_keys();
     state
 }
@@ -80,7 +88,7 @@ fn threshold_signatures_should_work(
     };
     let public_coefficients = CspPublicCoefficients::Bls12_381(public_coefficients);
     let signatories: Vec<(Arc<dyn CspVault>, KeyId)> = {
-        let key_id = key_id_from_csp_pub_coeffs(&public_coefficients);
+        let key_id = KeyId::from(&public_coefficients);
         config
             .receivers
             .get()
@@ -94,7 +102,7 @@ fn threshold_signatures_should_work(
             })
             .collect()
     };
-    let seed = Randomness::from(rng.gen::<[u8; 32]>());
+    let seed = Seed::from_rng(rng);
     let message = b"Tinker tailor soldier spy";
     test_utils::threshold_sig::test_threshold_signatures(
         &public_coefficients,
@@ -126,7 +134,7 @@ fn threshold_signatures_should_work(
 /// The forward-secure encryption key should not have been erased, as it SHOULD
 /// have a different scope.  The presence of this key can be demonstrated by
 /// successfully reloading the transcript.
-pub fn test_retention(csp_vault_factory: fn() -> Arc<dyn CspVault>) {
+pub fn test_retention(csp_vault_factory: impl Fn() -> Arc<dyn CspVault>) {
     let seed = [69u8; 32];
     let network_size = 4;
     let mut rng = ChaCha20Rng::from_seed(seed);
@@ -155,7 +163,7 @@ pub fn test_retention(csp_vault_factory: fn() -> Arc<dyn CspVault>) {
         let node: &mut MockNode = get_one_node(&mut state);
 
         // Verify that the key is there:
-        let key_id = key_id_from_csp_pub_coeffs(&internal_public_coefficients);
+        let key_id = KeyId::from(&internal_public_coefficients);
         node.csp_vault
             .threshold_sign(
                 AlgorithmId::ThresBls12_381,
@@ -167,10 +175,11 @@ pub fn test_retention(csp_vault_factory: fn() -> Arc<dyn CspVault>) {
         // Call retain, keeping the threshold key:
         let active_key_ids: BTreeSet<KeyId> = vec![internal_public_coefficients.clone()]
             .iter()
-            .map(key_id_from_csp_pub_coeffs)
+            .map(KeyId::from)
             .collect();
         node.csp_vault
-            .retain_threshold_keys_if_present(active_key_ids);
+            .retain_threshold_keys_if_present(active_key_ids)
+            .expect("Retaining threshold keys failed");
 
         // The key should still be there:
         node.csp_vault
@@ -192,10 +201,11 @@ pub fn test_retention(csp_vault_factory: fn() -> Arc<dyn CspVault>) {
         );
         let active_key_ids = vec![different_public_coefficients]
             .iter()
-            .map(key_id_from_csp_pub_coeffs)
+            .map(KeyId::from)
             .collect();
         node.csp_vault
-            .retain_threshold_keys_if_present(active_key_ids);
+            .retain_threshold_keys_if_present(active_key_ids)
+            .expect("Retaining threshold keys failed");
 
         // The key should be unavailable
         node.csp_vault
@@ -219,7 +229,7 @@ pub fn test_retention(csp_vault_factory: fn() -> Arc<dyn CspVault>) {
         let node = get_one_node(&mut state);
 
         // Verify that the threshold key has been reloaded:
-        let key_id = key_id_from_csp_pub_coeffs(&internal_public_coefficients);
+        let key_id = KeyId::from(&internal_public_coefficients);
         node.csp_vault
             .threshold_sign(
                 AlgorithmId::ThresBls12_381,
@@ -235,12 +245,12 @@ pub fn test_create_dealing_should_detect_errors(
     seed: [u8; 32],
     network_size: usize,
     _num_reshares: i32,
-    csp_vault_factory: fn() -> Arc<dyn CspVault>,
+    csp_vault_factory: impl Fn() -> Arc<dyn CspVault>,
 ) {
     let mut rng = ChaCha20Rng::from_seed(seed);
     let network = MockNetwork::random(&mut rng, network_size, csp_vault_factory);
     let config = MockDkgConfig::from_network(&mut rng, &network, None);
-    let mut state = StateWithConfig { network, config };
+    let state = StateWithConfig { network, config };
     // Dealing errors:
     state.deal_with_incorrect_algorithm_id_should_fail(&mut rng);
     state.deal_with_incorrect_threshold_should_fail(&mut rng);
@@ -261,7 +271,7 @@ impl StateWithConfig {
     /// # Side effects
     /// Some randomness is consumed from rng.  The state is completely
     /// unchanged.
-    pub fn deal_with_incorrect_algorithm_id_should_fail(&mut self, rng: &mut ChaCha20Rng) {
+    pub fn deal_with_incorrect_algorithm_id_should_fail(&self, rng: &mut ChaCha20Rng) {
         // Note: We assume that any change in algorithm id makes this invalid.  At
         // present this is true, however if we introduce a new algorithm that uses the
         // same type of forward secure encryption key, this would have to change.
@@ -282,7 +292,7 @@ impl StateWithConfig {
         let dealer_node = self
             .network
             .nodes_by_node_id
-            .get_mut(&dealer_id)
+            .get(&dealer_id)
             .expect("Could not find dealer in nodes");
 
         let dealing = dealer_node.create_dealing(
@@ -318,7 +328,7 @@ impl StateWithConfig {
     ///
     /// # Side effects
     /// None, other than consuming randomness.
-    pub fn deal_with_incorrect_threshold_should_fail(&mut self, rng: &mut ChaCha20Rng) {
+    pub fn deal_with_incorrect_threshold_should_fail(&self, rng: &mut ChaCha20Rng) {
         let (_dealer_index, dealer_id) = self
             .config
             .dealers
@@ -329,7 +339,7 @@ impl StateWithConfig {
         let dealer_node = self
             .network
             .nodes_by_node_id
-            .get_mut(&dealer_id)
+            .get(&dealer_id)
             .expect("Could not find dealer in nodes");
 
         let num_receivers = self.config.receivers.count().get();
@@ -360,7 +370,7 @@ impl StateWithConfig {
     ///
     /// # Side effects
     /// None, other than consuming randomness.
-    pub fn deal_with_incorrect_receiver_ids_should_fail(&mut self, rng: &mut ChaCha20Rng) {
+    pub fn deal_with_incorrect_receiver_ids_should_fail(&self, rng: &mut ChaCha20Rng) {
         let (_dealer_index, dealer_id) = self
             .config
             .dealers
@@ -371,7 +381,7 @@ impl StateWithConfig {
         let dealer_node = self
             .network
             .nodes_by_node_id
-            .get_mut(&dealer_id)
+            .get(&dealer_id)
             .expect("Could not find dealer in nodes");
 
         // Choose another set of indices, leaving at least one gap in `[0..=n-1]`.
@@ -417,4 +427,60 @@ impl StateWithConfig {
         let values = map.iter().map(|(_, value)| (*value).clone());
         incorrect_indices.into_iter().zip(values).collect()
     }
+}
+
+pub fn should_generate_dealing_encryption_key_pair_and_store_keys(csp_vault: Arc<dyn CspVault>) {
+    let (public_key, pop) = csp_vault
+        .gen_dealing_encryption_key_pair(NODE_42)
+        .expect("failed creating key pair");
+
+    assert_matches!(public_key, CspFsEncryptionPublicKey::Groth20_Bls12_381(_));
+    assert_matches!(pop, CspFsEncryptionPop::Groth20WithPop_Bls12_381(_));
+    assert!(csp_vault.sks_contains(&KeyId::from(&public_key)).is_ok());
+    assert_eq!(
+        csp_vault
+            .current_node_public_keys()
+            .expect("missing public keys")
+            .dkg_dealing_encryption_public_key
+            .expect("missing ni-dkg dealing encryption key"),
+        dkg_dealing_encryption_pk_to_proto(public_key, pop)
+    );
+}
+
+// The given `csp_vault` is expected to return an AlreadySet error on set_once_ni_dkg_dealing_encryption_pubkey
+pub fn should_fail_with_internal_error_if_ni_dkg_dealing_encryption_key_already_set(
+    csp_vault: Arc<dyn CspVault>,
+) {
+    let result = csp_vault.gen_dealing_encryption_key_pair(NODE_42);
+
+    assert_matches!(result,
+        Err(CspDkgCreateFsKeyError::InternalError(InternalError{internal_error}))
+        if internal_error.contains("ni-dkg dealing encryption public key already set")
+    );
+}
+
+pub fn should_fail_with_internal_error_if_dkg_dealing_encryption_key_generated_more_than_once(
+    csp_vault: Arc<dyn CspVault>,
+) {
+    let node = NODE_42;
+    assert!(csp_vault.gen_dealing_encryption_key_pair(node).is_ok());
+
+    let result = csp_vault.gen_dealing_encryption_key_pair(node);
+
+    assert_matches!(result,
+        Err(CspDkgCreateFsKeyError::InternalError(InternalError{internal_error}))
+        if internal_error.contains("ni-dkg dealing encryption public key already set")
+    );
+}
+
+// The given `csp_vault` is expected to return an IO error on set_once_ni_dkg_dealing_encryption_pubkey
+pub fn should_fail_with_transient_internal_error_if_dkg_dealing_encryption_key_persistence_fails(
+    csp_vault: Arc<dyn CspVault>,
+) {
+    let result = csp_vault.gen_dealing_encryption_key_pair(NODE_42);
+
+    assert_matches!(result,
+        Err(CspDkgCreateFsKeyError::TransientInternalError(internal_error))
+        if internal_error.contains("error persisting ni-dkg dealing encryption public key")
+    );
 }

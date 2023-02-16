@@ -9,11 +9,15 @@
 //! pretending it's a library with several modules inside, `cargo test` is
 //! supposed to run all tests in parallel, because they are all in the same
 //! crate.
+
 #[cfg(test)]
 mod ledger;
 
 #[cfg(test)]
 mod nervous_system_parameters;
+
+#[cfg(test)]
+mod nervous_system_functions;
 
 #[cfg(test)]
 mod neuron;
@@ -25,4 +29,13 @@ mod proposals;
 mod root;
 
 #[cfg(test)]
+mod swap;
+
+#[cfg(test)]
 mod upgrade_canister;
+
+#[cfg(test)]
+mod governance;
+
+#[cfg(test)]
+mod sns_treasury;

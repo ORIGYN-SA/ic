@@ -1,12 +1,14 @@
+#![allow(clippy::unwrap_used)]
 use crate::api::CspSigner;
-use crate::keygen::tls_cert_hash_as_key_id;
-use crate::secret_key_store::test_utils::TempSecretKeyStore;
+use crate::key_id::KeyId;
 use crate::types::CspPublicKey;
+use crate::vault::api::CspTlsKeygenError;
 use crate::vault::api::{CspTlsSignError, CspVault};
-use crate::{CryptoServiceProvider, Csp};
+use crate::Csp;
+use assert_matches::assert_matches;
 use ic_crypto_internal_basic_sig_ed25519::types as ed25519_types;
 use ic_crypto_tls_interfaces::TlsPublicKeyCert;
-use ic_types::crypto::{AlgorithmId, KeyId};
+use ic_types::crypto::AlgorithmId;
 use ic_types_test_utils::ids::node_test_id;
 use openssl::asn1::Asn1Time;
 use openssl::bn::BigNum;
@@ -19,18 +21,39 @@ use std::sync::Arc;
 
 pub const NODE_1: u64 = 4241;
 pub const FIXED_SEED: u64 = 42;
-pub const NOT_AFTER: &str = "25670102030405Z";
+pub const NOT_AFTER: &str = "99991231235959Z";
 
-pub fn should_insert_secret_key_into_key_store(csp_vault: Arc<dyn CspVault>) {
-    let (key_id, cert) = csp_vault
+pub fn should_generate_tls_key_pair_and_store_certificate(csp_vault: Arc<dyn CspVault>) {
+    let cert = csp_vault
         .gen_tls_key_pair(node_test_id(NODE_1), NOT_AFTER)
         .expect("Generation of TLS keys failed.");
-    assert_eq!(key_id, tls_cert_hash_as_key_id(&cert));
-    assert!(csp_vault.sks_contains(&key_id));
+    let key_id = KeyId::try_from(&cert).unwrap();
+
+    assert!(csp_vault.sks_contains(&key_id).expect("SKS call failed"));
+    assert_eq!(
+        csp_vault
+            .current_node_public_keys()
+            .expect("missing public keys")
+            .tls_certificate
+            .expect("missing tls certificate"),
+        cert.to_proto()
+    );
+}
+
+pub fn should_fail_if_secret_key_insertion_yields_duplicate_error(
+    csp_vault: Arc<dyn CspVault>,
+    duplicated_key_id: &KeyId,
+) {
+    let result = csp_vault.gen_tls_key_pair(node_test_id(NODE_1), NOT_AFTER);
+
+    assert_matches!(
+        result,
+        Err(CspTlsKeygenError::DuplicateKeyId { key_id }) if key_id ==  *duplicated_key_id
+    );
 }
 
 pub fn should_return_der_encoded_self_signed_certificate(csp_vault: Arc<dyn CspVault>) {
-    let (_key_id, cert) = csp_vault
+    let cert = csp_vault
         .gen_tls_key_pair(node_test_id(NODE_1), NOT_AFTER)
         .expect("Generation of TLS keys failed.");
 
@@ -43,7 +66,7 @@ pub fn should_return_der_encoded_self_signed_certificate(csp_vault: Arc<dyn CspV
 }
 
 pub fn should_set_cert_subject_cn_as_node_id(csp_vault: Arc<dyn CspVault>) {
-    let (_key_id, cert) = csp_vault
+    let cert = csp_vault
         .gen_tls_key_pair(node_test_id(NODE_1), NOT_AFTER)
         .expect("Generation of TLS keys failed.");
 
@@ -57,7 +80,7 @@ pub fn should_set_cert_subject_cn_as_node_id(csp_vault: Arc<dyn CspVault>) {
 }
 
 pub fn should_use_stable_node_id_string_representation_as_subject_cn(csp_vault: Arc<dyn CspVault>) {
-    let (_key_id, cert) = csp_vault
+    let cert = csp_vault
         .gen_tls_key_pair(node_test_id(NODE_1), NOT_AFTER)
         .expect("Generation of TLS keys failed.");
 
@@ -68,7 +91,7 @@ pub fn should_use_stable_node_id_string_representation_as_subject_cn(csp_vault: 
 }
 
 pub fn should_set_cert_issuer_cn_as_node_id(csp_vault: Arc<dyn CspVault>) {
-    let (_key_id, cert) = csp_vault
+    let cert = csp_vault
         .gen_tls_key_pair(node_test_id(NODE_1), NOT_AFTER)
         .expect("Generation of TLS keys failed.");
 
@@ -83,7 +106,7 @@ pub fn should_set_cert_issuer_cn_as_node_id(csp_vault: Arc<dyn CspVault>) {
 }
 
 pub fn should_not_set_cert_subject_alt_name(csp_vault: Arc<dyn CspVault>) {
-    let (_key_id, cert) = csp_vault
+    let cert = csp_vault
         .gen_tls_key_pair(node_test_id(NODE_1), NOT_AFTER)
         .expect("Generation of TLS keys failed.");
 
@@ -92,7 +115,7 @@ pub fn should_not_set_cert_subject_alt_name(csp_vault: Arc<dyn CspVault>) {
 }
 
 pub fn should_set_random_cert_serial_number(csp_vault: Arc<dyn CspVault>) {
-    let (_key_id, cert) = csp_vault
+    let cert = csp_vault
         .gen_tls_key_pair(node_test_id(NODE_1), NOT_AFTER)
         .expect("Generation of TLS keys failed.");
 
@@ -107,11 +130,13 @@ pub fn should_set_random_cert_serial_number(csp_vault: Arc<dyn CspVault>) {
     assert_eq!(expected_serial, cert_serial);
 }
 
-pub fn should_set_different_serial_numbers_for_multiple_certs(csp_vault: Arc<dyn CspVault>) {
+pub fn should_set_different_serial_numbers_for_multiple_certs(
+    csp_vault_factory: &dyn Fn() -> Arc<dyn CspVault>,
+) {
     const SAMPLE_SIZE: usize = 20;
     let mut serial_samples = BTreeSet::new();
     for _i in 0..SAMPLE_SIZE {
-        let (_key_id, cert) = csp_vault
+        let cert = csp_vault_factory()
             .gen_tls_key_pair(node_test_id(NODE_1), NOT_AFTER)
             .expect("Generation of TLS keys failed.");
         serial_samples.insert(serial_number(&cert));
@@ -120,7 +145,7 @@ pub fn should_set_different_serial_numbers_for_multiple_certs(csp_vault: Arc<dyn
 }
 
 pub fn should_set_cert_not_after_correctly(csp_vault: Arc<dyn CspVault>) {
-    let (_key_id, cert) = csp_vault
+    let cert = csp_vault
         .gen_tls_key_pair(node_test_id(NODE_1), NOT_AFTER)
         .expect("Generation of TLS keys failed.");
     assert!(
@@ -133,7 +158,7 @@ fn cn_entries(x509_cert: &X509) -> X509NameEntries {
     x509_cert.subject_name().entries_by_nid(Nid::COMMONNAME)
 }
 
-pub fn csprng_seeded_with(seed: u64) -> impl CryptoRng + Rng + Clone {
+pub fn csprng_seeded_with(seed: u64) -> impl CryptoRng + Rng {
     ChaCha20Rng::seed_from_u64(seed)
 }
 
@@ -145,22 +170,30 @@ fn serial_number(cert: &TlsPublicKeyCert) -> BigNum {
 }
 
 pub fn should_sign_with_valid_key(csp_vault: Arc<dyn CspVault>) {
-    let (key_id, _public_key_cert) = csp_vault
+    let public_key_cert = csp_vault
         .gen_tls_key_pair(node_test_id(NODE_1), NOT_AFTER)
         .expect("Generation of TLS keys failed.");
 
-    assert!(csp_vault.tls_sign(&random_message(), &key_id).is_ok());
+    assert!(csp_vault
+        .tls_sign(
+            &random_message(),
+            &KeyId::try_from(&public_key_cert).expect("Cannot instantiate KeyId")
+        )
+        .is_ok());
 }
 
 pub fn should_sign_verifiably(csp_vault: Arc<dyn CspVault>) {
-    let verifier = verifier();
-    let (key_id, public_key_cert) = csp_vault
+    let verifier = Csp::builder().build();
+    let public_key_cert = csp_vault
         .gen_tls_key_pair(node_test_id(NODE_1), NOT_AFTER)
         .expect("Generation of TLS keys failed.");
     let msg = random_message();
 
     let sig = csp_vault
-        .tls_sign(&msg, &key_id)
+        .tls_sign(
+            &msg,
+            &KeyId::try_from(&public_key_cert).expect("cannot instantiate KeyId"),
+        )
         .expect("failed to generate signature");
 
     let csp_pub_key = ed25519_csp_pubkey_from_tls_pubkey_cert(&public_key_cert);
@@ -170,12 +203,12 @@ pub fn should_sign_verifiably(csp_vault: Arc<dyn CspVault>) {
 }
 
 pub fn should_fail_to_sign_if_secret_key_not_found(csp_vault: Arc<dyn CspVault>) {
-    let non_existent_key_id = KeyId(b"non-existent-key-id-000000000000".to_owned());
+    let non_existent_key_id = KeyId::from(b"non-existent-key-id-000000000000".to_owned());
 
     let result = csp_vault.tls_sign(b"message", &non_existent_key_id);
 
     assert_eq!(
-        result.unwrap_err(),
+        result.expect_err("Unexpected success."),
         CspTlsSignError::SecretKeyNotFound {
             key_id: non_existent_key_id
         }
@@ -183,17 +216,18 @@ pub fn should_fail_to_sign_if_secret_key_not_found(csp_vault: Arc<dyn CspVault>)
 }
 
 pub fn should_fail_to_sign_if_secret_key_in_store_has_wrong_type(csp_vault: Arc<dyn CspVault>) {
-    let (key_id, _wrong_csp_pub_key) = csp_vault
-        .gen_key_pair(AlgorithmId::Ed25519)
+    let wrong_csp_pub_key = csp_vault
+        .gen_node_signing_key_pair()
         .expect("failed to generate keys");
     let msg = random_message();
 
-    let result = csp_vault.tls_sign(&msg, &key_id);
+    let result = csp_vault.tls_sign(&msg, &KeyId::try_from(&wrong_csp_pub_key).unwrap());
 
     assert_eq!(
-        result.unwrap_err(),
+        result.expect_err("Unexpected success."),
         CspTlsSignError::WrongSecretKeyType {
-            algorithm: AlgorithmId::Ed25519
+            algorithm: AlgorithmId::Tls,
+            secret_key_variant: "Ed25519".to_string()
         }
     );
 }
@@ -202,10 +236,10 @@ pub fn should_fail_to_sign_if_secret_key_in_store_has_invalid_encoding(
     key_id: KeyId,
     csp_vault: Arc<dyn CspVault>,
 ) {
-    assert!(csp_vault.sks_contains(&key_id));
+    assert!(csp_vault.sks_contains(&key_id).expect("SKS call failed"));
     let result = csp_vault.tls_sign(&random_message(), &key_id);
     assert_eq!(
-        result.unwrap_err(),
+        result.expect_err("Unexpected success."),
         CspTlsSignError::MalformedSecretKey {
             error: "Failed to convert TLS secret key DER from key store to OpenSSL private key"
                 .to_string()
@@ -219,7 +253,7 @@ pub fn should_fail_to_sign_if_secret_key_in_store_has_invalid_length(
 ) {
     let result = csp_vault.tls_sign(&random_message(), &key_id);
     assert_eq!(
-        result.unwrap_err(),
+        result.expect_err("Unexpected success."),
         CspTlsSignError::MalformedSecretKey {
             error: "Invalid length of raw OpenSSL private key: expected 32 bytes, but got 57"
                 .to_string()
@@ -227,13 +261,7 @@ pub fn should_fail_to_sign_if_secret_key_in_store_has_invalid_length(
     );
 }
 
-fn verifier() -> impl CryptoServiceProvider {
-    let dummy_key_store = TempSecretKeyStore::new();
-    let csprng = ChaCha20Rng::from_seed(thread_rng().gen::<[u8; 32]>());
-    Csp::of(csprng, dummy_key_store)
-}
-
-fn ed25519_csp_pubkey_from_tls_pubkey_cert(public_key_cert: &TlsPublicKeyCert) -> CspPublicKey {
+pub fn ed25519_csp_pubkey_from_tls_pubkey_cert(public_key_cert: &TlsPublicKeyCert) -> CspPublicKey {
     let pubkey_bytes = public_key_cert
         .as_x509()
         .public_key()
@@ -252,6 +280,50 @@ fn ed25519_csp_pubkey_from_tls_pubkey_cert(public_key_cert: &TlsPublicKeyCert) -
 
 fn random_message() -> Vec<u8> {
     let mut rng = thread_rng();
-    let msg_len: usize = rng.gen_range(0, 1024);
+    let msg_len: usize = rng.gen_range(0..1024);
     (0..msg_len).map(|_| rng.gen::<u8>()).collect()
+}
+
+// The given `csp_vault` is expected to return an AlreadySet error on set_once_tls_certificate
+pub fn should_fail_with_internal_error_if_tls_certificate_already_set(
+    csp_vault: Arc<dyn CspVault>,
+) {
+    // with the same and a different node id
+    for node_id in [NODE_1, NODE_1 + 1] {
+        let result = csp_vault.gen_tls_key_pair(node_test_id(node_id), NOT_AFTER);
+
+        assert_matches!(result,
+            Err(CspTlsKeygenError::InternalError { internal_error })
+            if internal_error.contains("TLS certificate already set")
+        );
+    }
+}
+
+pub fn should_fail_with_internal_error_if_tls_certificate_generated_more_than_once(
+    csp_vault: Arc<dyn CspVault>,
+) {
+    assert!(csp_vault
+        .gen_tls_key_pair(node_test_id(NODE_1), NOT_AFTER)
+        .is_ok());
+
+    for node_id in [NODE_1, NODE_1 + 1, NODE_1 + 2] {
+        let result = csp_vault.gen_tls_key_pair(node_test_id(node_id), NOT_AFTER);
+
+        assert_matches!(result,
+            Err(CspTlsKeygenError::InternalError { internal_error })
+            if internal_error.contains("TLS certificate already set")
+        );
+    }
+}
+
+// The given `csp_vault` is expected to return an IO error on set_once_node_signing_pubkey
+pub fn should_fail_with_transient_internal_error_if_tls_keygen_persistance_fails(
+    csp_vault: Arc<dyn CspVault>,
+) {
+    let result = csp_vault.gen_tls_key_pair(node_test_id(NODE_1), NOT_AFTER);
+
+    assert_matches!(result,
+        Err(CspTlsKeygenError::TransientInternalError { internal_error })
+        if internal_error.contains("IO error")
+    );
 }

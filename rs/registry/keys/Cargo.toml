@@ -1,11 +1,14 @@
 [package]
 name = "ic-registry-keys"
 version = "0.8.0"
-edition = "2018"
+edition = "2021"
 
 [dependencies]
+candid = "0.8.1"
 ic-base-types = { path = "../../types/base_types" }
+ic-ic00-types = { path = "../../types/ic00_types" }
 ic-types = { path = "../../types/types" }
+serde = { version = "1.0", features = ["derive"] }
 
 [dev-dependencies]
-rand = "0.7.3"
+rand = "0.8"

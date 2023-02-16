@@ -5,11 +5,11 @@ use ic_protobuf::registry::{
     subnet::v1::{GossipConfig as GossipConfigProto, SubnetRecord as SubnetRecordProto},
 };
 use ic_registry_provisional_whitelist::ProvisionalWhitelist;
-use ic_registry_subnet_features::SubnetFeatures;
+use ic_registry_subnet_features::{EcdsaConfig, SubnetFeatures};
 use ic_registry_subnet_type::SubnetType;
 use ic_types::{NodeId, PrincipalId};
 use serde::Serialize;
-use std::convert::{From, TryFrom};
+use std::convert::{From, TryFrom, TryInto};
 
 /// All or part of the registry
 #[derive(Default, Serialize)]
@@ -54,7 +54,7 @@ pub(crate) struct SubnetRecord {
     pub max_ingress_messages_per_block: u64,
     pub max_block_payload_size: u64,
     pub unit_delay_millis: u64,
-    pub initial_notary_delay_mills: u64,
+    pub initial_notary_delay_millis: u64,
     pub replica_version_id: String,
     pub dkg_interval_length: u64,
     pub gossip_config: Option<GossipConfigProto>,
@@ -67,6 +67,7 @@ pub(crate) struct SubnetRecord {
     pub max_number_of_canisters: u64,
     pub ssh_readonly_access: Vec<String>,
     pub ssh_backup_access: Vec<String>,
+    pub ecdsa_config: Option<EcdsaConfig>,
 }
 
 impl From<&SubnetRecordProto> for SubnetRecord {
@@ -90,7 +91,7 @@ impl From<&SubnetRecordProto> for SubnetRecord {
             max_ingress_messages_per_block: value.max_ingress_messages_per_block,
             max_block_payload_size: value.max_block_payload_size,
             unit_delay_millis: value.unit_delay_millis,
-            initial_notary_delay_mills: value.initial_notary_delay_millis,
+            initial_notary_delay_millis: value.initial_notary_delay_millis,
             replica_version_id: value.replica_version_id.clone(),
             dkg_interval_length: value.dkg_interval_length,
             gossip_config: value.gossip_config.clone(),
@@ -103,6 +104,10 @@ impl From<&SubnetRecordProto> for SubnetRecord {
             max_number_of_canisters: value.max_number_of_canisters,
             ssh_readonly_access: value.ssh_readonly_access.clone(),
             ssh_backup_access: value.ssh_backup_access.clone(),
+            ecdsa_config: value
+                .ecdsa_config
+                .as_ref()
+                .map(|c| c.clone().try_into().unwrap()),
         }
     }
 }

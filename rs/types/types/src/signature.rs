@@ -1,16 +1,24 @@
 use crate::{crypto::threshold_sig::ni_dkg::NiDkgId, crypto::*, NodeId};
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 
 /// BasicSignature captures basic signature on a value and the identity of the
 /// replica that signed it
-#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize, Ord, PartialOrd)]
 pub struct BasicSignature<T> {
     pub signature: BasicSigOf<T>,
     pub signer: NodeId,
 }
 
-/// BasicSigned<T> captures a value of type T and a BasicSignature on it
+/// `BasicSigned<T>` captures a value of type T and a BasicSignature on it
 pub type BasicSigned<T> = Signed<T, BasicSignature<T>>;
+
+/// BasicSignatureBatch captures a collection of basic signatures on the same value and
+/// the identities of the replicas that signed it.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize, Ord, PartialOrd)]
+pub struct BasicSignatureBatch<T> {
+    pub signatures_map: BTreeMap<NodeId, BasicSigOf<T>>,
+}
 
 /// ThresholdSignature captures a threshold signature on a value and the
 /// DKG id of the threshold key material used to sign

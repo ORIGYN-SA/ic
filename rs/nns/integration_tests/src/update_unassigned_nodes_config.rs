@@ -1,18 +1,20 @@
-use ic_canister_client::Sender;
+use ic_canister_client_sender::Sender;
+use ic_nervous_system_common_test_keys::TEST_NEURON_1_OWNER_KEYPAIR;
 use ic_nns_common::{
     registry::MAX_NUM_SSH_KEYS,
     types::{NeuronId, ProposalId},
 };
 use ic_nns_governance::pb::v1::{NnsFunction, ProposalStatus};
-use ic_nns_test_keys::TEST_NEURON_1_OWNER_KEYPAIR;
-use ic_nns_test_utils::registry::get_value;
 use ic_nns_test_utils::{
+    common::NnsInitPayloadsBuilder,
     governance::{get_pending_proposals, submit_external_update_proposal, wait_for_final_state},
     ids::TEST_NEURON_1_ID,
-    itest_helpers::{local_test_on_nns_subnet, NnsCanisters, NnsInitPayloadsBuilder},
+    itest_helpers::{local_test_on_nns_subnet, NnsCanisters},
+    registry::get_value_or_panic,
 };
 use ic_protobuf::registry::unassigned_nodes_config::v1::UnassignedNodesConfigRecord;
 use ic_registry_keys::make_unassigned_nodes_config_record_key;
+use ic_types::ReplicaVersion;
 use registry_canister::mutations::do_update_unassigned_nodes_config::UpdateUnassignedNodesConfigPayload;
 
 #[test]
@@ -27,7 +29,7 @@ fn test_submit_update_unassigned_nodes_config_proposal() {
         let ssh_keys = Some(vec!["key0".to_string(), "key1".to_string()]);
         // A registry invariant guards against exceeding the max number of keys.
         let ssh_keys_invalid = Some(vec!["key_invalid".to_string(); MAX_NUM_SSH_KEYS + 1]);
-        let replica_version = Some("version_42".to_string());
+        let replica_version = Some(ReplicaVersion::default().into());
 
         let payload = UpdateUnassignedNodesConfigPayload {
             ssh_readonly_access: ssh_keys.clone(),
@@ -57,7 +59,7 @@ fn test_submit_update_unassigned_nodes_config_proposal() {
         let pending_proposals = get_pending_proposals(&nns_canisters.governance).await;
         assert_eq!(pending_proposals, vec![]);
 
-        let unassigned_nodes_config = get_value::<UnassignedNodesConfigRecord>(
+        let unassigned_nodes_config = get_value_or_panic::<UnassignedNodesConfigRecord>(
             &nns_canisters.registry,
             make_unassigned_nodes_config_record_key().as_bytes(),
         )
@@ -124,7 +126,7 @@ fn test_submit_update_unassigned_nodes_config_proposal() {
         let pending_proposals = get_pending_proposals(&nns_canisters.governance).await;
         assert_eq!(pending_proposals, vec![]);
 
-        let unassigned_nodes_config = get_value::<UnassignedNodesConfigRecord>(
+        let unassigned_nodes_config = get_value_or_panic::<UnassignedNodesConfigRecord>(
             &nns_canisters.registry,
             make_unassigned_nodes_config_record_key().as_bytes(),
         )

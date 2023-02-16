@@ -1,7 +1,6 @@
 //! Threshold signature implementation for the CSP
 use crate::api::{CspThresholdSignError, ThresholdSignatureCspClient};
-use crate::secret_key_store::SecretKeyStore;
-use crate::types::conversions::key_id_from_csp_pub_coeffs;
+use crate::key_id::KeyId;
 use crate::types::{CspPublicCoefficients, CspSignature, ThresBls12_381_Signature};
 use crate::Csp;
 use ic_crypto_internal_threshold_sig_bls12381 as clib;
@@ -9,11 +8,10 @@ use ic_crypto_internal_threshold_sig_bls12381::types::public_coefficients::conve
 use ic_crypto_internal_types::sign::threshold_sig::public_coefficients::bls12_381::PublicCoefficientsBytes;
 use ic_crypto_internal_types::sign::threshold_sig::public_key::bls12_381::PublicKeyBytes;
 use ic_crypto_internal_types::sign::threshold_sig::public_key::CspThresholdSigPublicKey;
-#[cfg(test)]
-use ic_types::crypto::KeyId;
 use ic_types::crypto::{AlgorithmId, CryptoError, CryptoResult};
 use ic_types::NodeIndex;
-use rand::{CryptoRng, Rng};
+
+use ic_crypto_internal_logmon::metrics::{MetricsDomain, MetricsResult};
 use std::convert::TryFrom;
 
 pub mod ni_dkg;
@@ -21,22 +19,16 @@ pub mod ni_dkg;
 #[cfg(test)]
 mod tests;
 
-impl<R: Rng + CryptoRng + Send + Sync, S: SecretKeyStore, C: SecretKeyStore>
-    ThresholdSignatureCspClient for Csp<R, S, C>
-{
-    /// See the trait for documentation.
-    ///
-    /// Warning: The secret key store has no transactions, so in the event of
-    /// failure it is possible that some but not all keys are written.
+impl ThresholdSignatureCspClient for Csp {
     #[cfg(test)]
     fn threshold_keygen(
-        &mut self,
+        &self,
         algorithm_id: AlgorithmId,
         threshold: ic_types::NumberOfNodes,
-        signatory_eligibilty: &[bool],
-    ) -> CryptoResult<(CspPublicCoefficients, Vec<Option<KeyId>>)> {
+        receivers: ic_types::NumberOfNodes,
+    ) -> CryptoResult<(CspPublicCoefficients, Vec<KeyId>)> {
         self.csp_vault
-            .threshold_keygen_for_test(algorithm_id, threshold, signatory_eligibilty)
+            .threshold_keygen_for_test(algorithm_id, threshold, receivers)
             .map_err(CryptoError::from)
     }
 
@@ -46,8 +38,17 @@ impl<R: Rng + CryptoRng + Send + Sync, S: SecretKeyStore, C: SecretKeyStore>
         message: &[u8],
         public_coefficients: CspPublicCoefficients,
     ) -> Result<CspSignature, CspThresholdSignError> {
-        let key_id = key_id_from_csp_pub_coeffs(&public_coefficients);
-        self.csp_vault.threshold_sign(algorithm_id, message, key_id)
+        let key_id = KeyId::from(&public_coefficients);
+        let message_len = message.len();
+        let result = self.csp_vault.threshold_sign(algorithm_id, message, key_id);
+        self.metrics.observe_parameter_size(
+            MetricsDomain::MultiSignature,
+            "sign_multi",
+            "message",
+            message_len,
+            MetricsResult::from(&result),
+        );
+        result
     }
 
     fn threshold_combine_signatures(

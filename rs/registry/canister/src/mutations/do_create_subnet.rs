@@ -2,10 +2,7 @@ use std::{collections::HashSet, convert::TryFrom};
 
 use crate::{
     common::LOG_PREFIX,
-    mutations::{
-        common::{decode_registry_value, encode_or_panic},
-        dkg::{SetupInitialDKGArgs, SetupInitialDKGResponse},
-    },
+    mutations::common::{decode_registry_value, encode_or_panic},
     registry::Registry,
 };
 
@@ -15,17 +12,19 @@ use dfn_core::api::{call, CanisterId};
 use dfn_core::println;
 use serde::Serialize;
 
-use ic_base_types::{NodeId, PrincipalId, SubnetId};
+use ic_base_types::{NodeId, PrincipalId, RegistryVersion, SubnetId};
+use ic_ic00_types::{EcdsaKeyId, SetupInitialDKGArgs, SetupInitialDKGResponse};
+use ic_protobuf::registry::subnet::v1::EcdsaConfig;
 use ic_protobuf::registry::{
     node::v1::NodeRecord,
-    subnet::v1::{CatchUpPackageContents, GossipAdvertConfig, GossipConfig, SubnetRecord},
+    subnet::v1::{CatchUpPackageContents, GossipConfig, SubnetRecord},
 };
 use ic_registry_keys::make_node_record_key;
 use ic_registry_keys::{
     make_catch_up_package_contents_key, make_crypto_threshold_signing_pubkey_key,
     make_subnet_list_record_key, make_subnet_record_key,
 };
-use ic_registry_subnet_features::SubnetFeatures;
+use ic_registry_subnet_features::{SubnetFeatures, DEFAULT_ECDSA_MAX_QUEUE_SIZE};
 use ic_registry_subnet_type::SubnetType;
 use ic_registry_transport::pb::v1::{registry_mutation, RegistryMutation, RegistryValue};
 
@@ -47,56 +46,18 @@ impl Registry {
     pub async fn do_create_subnet(&mut self, payload: CreateSubnetPayload) {
         println!("{}do_create_subnet: {:?}", LOG_PREFIX, payload);
 
-        let node_ids_hash_set: HashSet<NodeId> = payload.node_ids.iter().cloned().collect();
-
-        // Verify that all Nodes exist
-        payload.node_ids.iter().for_each(|node_id| {
-            match self.get(
-                make_node_record_key(*node_id).as_bytes(),
-                self.latest_version(),
-            ) {
-                Some(RegistryValue {
-                    value,
-                    version: _,
-                    deletion_marker: _,
-                }) => assert_ne!(
-                    decode_registry_value::<NodeRecord>(value.clone()),
-                    NodeRecord::default()
-                ),
-                None => panic!("A NodeRecord for Node with id {} was not found", node_id),
-            };
-        });
-
-        // Ensure that none of the Nodes are part of another Subnet
-        let mut subnet_members: HashSet<NodeId> = HashSet::new();
-        self.get_subnet_list_record()
-            .subnets
-            .iter()
-            .map(|s| SubnetId::from(PrincipalId::try_from(s).unwrap()))
-            .for_each(|subnet_id| {
-                let subnet_record = self.get_subnet_or_panic(subnet_id);
-                subnet_record.membership.iter().for_each(|v| {
-                    subnet_members.insert(NodeId::from(PrincipalId::try_from(v).unwrap()));
-                });
-            });
-        let intersection = subnet_members
-            .intersection(&node_ids_hash_set)
-            .copied()
-            .collect::<HashSet<_>>();
-        if !intersection.is_empty() {
-            panic!("Some Nodes are already members of Subnets");
-        }
+        self.validate_create_subnet_payload(&payload);
 
         // The steps are now:
         // 1. SetupInitialDKG gets a list of nodes l and a registry version rv.
         //    A guarantee that it expects is that all nodes in l exist in the
         //    registry at version rv. Thus, we get the latest registry version.
-        let request = SetupInitialDKGArgs {
-            node_ids: payload.node_ids.iter().map(|n| n.get()).collect(),
-            registry_version: self.latest_version(),
-        };
+        let request = SetupInitialDKGArgs::new(
+            payload.node_ids.clone(),
+            RegistryVersion::new(self.latest_version()),
+        );
 
-        // 2. Invoke NI-DKG on ic_00
+        // 2a. Invoke NI-DKG on ic_00
         let response_bytes = call(
             CanisterId::ic_00(),
             "setup_initial_dkg",
@@ -113,8 +74,22 @@ impl Registry {
         );
 
         let generated_subnet_id = response.fresh_subnet_id;
-        let subnet_id_principal = payload.subnet_id_override.unwrap_or(generated_subnet_id);
-        let subnet_id = SubnetId::new(subnet_id_principal);
+        let subnet_id = payload
+            .subnet_id_override
+            .map(SubnetId::new)
+            .unwrap_or(generated_subnet_id);
+        println!(
+            "{}do_create_subnet: {{payload: {:?}, subnet_id: {}}}",
+            LOG_PREFIX, payload, subnet_id
+        );
+
+        // 2b. Invoke compute_initial_ecdsa_dealings on ic_00
+        let ecdsa_initializations = self
+            .get_all_initial_ecdsa_dealings_from_ic00(
+                &payload.ecdsa_config,
+                payload.node_ids.clone(),
+            )
+            .await;
 
         // 3. Create subnet record and associated entries
         let cup_contents = CatchUpPackageContents {
@@ -122,8 +97,10 @@ impl Registry {
             initial_ni_dkg_transcript_high_threshold: Some(
                 response.high_threshold_transcript_record,
             ),
+            ecdsa_initializations,
             ..Default::default()
         };
+
         let new_subnet_dkg = RegistryMutation {
             mutation_type: registry_mutation::Type::Insert as i32,
             key: make_catch_up_package_contents_key(subnet_id)
@@ -184,6 +161,59 @@ impl Registry {
         // Check invariants before applying mutations
         self.maybe_apply_mutation_internal(mutations);
     }
+
+    /// Validates runtime payload values that aren't checked by invariants
+    /// Ensures all nodes for new subnet a) exist and b) are not in another subnet
+    /// Ensures that a valid subnet_id is specified for EcdsaKeyRequests
+    /// Ensures that ECDSA keys a) exist and b) are present on the requested subnet
+    fn validate_create_subnet_payload(&self, payload: &CreateSubnetPayload) {
+        // Verify that all Nodes exist
+        payload.node_ids.iter().for_each(|node_id| {
+            match self.get(
+                make_node_record_key(*node_id).as_bytes(),
+                self.latest_version(),
+            ) {
+                Some(RegistryValue {
+                    value,
+                    version: _,
+                    deletion_marker: _,
+                }) => assert_ne!(
+                    decode_registry_value::<NodeRecord>(value.clone()),
+                    NodeRecord::default()
+                ),
+                None => panic!("A NodeRecord for Node with id {} was not found", node_id),
+            };
+        });
+
+        // Ensure that none of the Nodes are part of another Subnet
+        let node_ids_hash_set: HashSet<NodeId> = payload.node_ids.iter().cloned().collect();
+
+        let mut subnet_members: HashSet<NodeId> = HashSet::new();
+        self.get_subnet_list_record()
+            .subnets
+            .iter()
+            .map(|s| SubnetId::from(PrincipalId::try_from(s).unwrap()))
+            .for_each(|subnet_id| {
+                let subnet_record = self.get_subnet_or_panic(subnet_id);
+                subnet_record.membership.iter().for_each(|v| {
+                    subnet_members.insert(NodeId::from(PrincipalId::try_from(v).unwrap()));
+                });
+            });
+        let intersection = subnet_members
+            .intersection(&node_ids_hash_set)
+            .copied()
+            .collect::<HashSet<_>>();
+        if !intersection.is_empty() {
+            panic!("Some Nodes are already members of Subnets");
+        }
+
+        if let Some(ref ecdsa_config) = payload.ecdsa_config {
+            match self.validate_ecdsa_initial_config(ecdsa_config, None) {
+                Ok(_) => {}
+                Err(message) => panic!("{}Cannot create subnet: {}", LOG_PREFIX, message),
+            }
+        }
+    }
 }
 
 /// The payload of a proposal to create a new subnet.
@@ -191,7 +221,7 @@ impl Registry {
 /// See /rs/protobuf/def/registry/subnet/v1/subnet.proto
 /// for the explanation of the fields for the SubnetRecord. All the fields
 /// will be used by the subnet canister to create SubnetRecord.
-#[derive(CandidType, Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+#[derive(CandidType, Serialize, Deserialize, Clone, Debug, PartialEq, Eq, Default)]
 pub struct CreateSubnetPayload {
     /// The list of node IDs that will be part of the new subnet.
     pub node_ids: Vec<NodeId>,
@@ -216,7 +246,6 @@ pub struct CreateSubnetPayload {
     pub gossip_pfn_evaluation_period_ms: u32,
     pub gossip_registry_poll_period_ms: u32,
     pub gossip_retransmission_request_ms: u32,
-    pub advert_best_effort_percentage: Option<u32>,
 
     pub start_as_nns: bool,
 
@@ -233,6 +262,40 @@ pub struct CreateSubnetPayload {
     pub max_number_of_canisters: u64,
     pub ssh_readonly_access: Vec<String>,
     pub ssh_backup_access: Vec<String>,
+
+    pub ecdsa_config: Option<EcdsaInitialConfig>,
+}
+
+#[derive(CandidType, Serialize, Deserialize, Clone, Debug, PartialEq, Eq, Default)]
+pub struct EcdsaInitialConfig {
+    pub quadruples_to_create_in_advance: u32,
+    pub keys: Vec<EcdsaKeyRequest>,
+    /// Must be optional for registry candid backwards compatibility.
+    pub max_queue_size: Option<u32>,
+    pub signature_request_timeout_ns: Option<u64>,
+    pub idkg_key_rotation_period_ms: Option<u64>,
+}
+
+#[derive(CandidType, Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct EcdsaKeyRequest {
+    pub key_id: EcdsaKeyId,
+    pub subnet_id: Option<PrincipalId>,
+}
+
+impl From<EcdsaInitialConfig> for EcdsaConfig {
+    fn from(val: EcdsaInitialConfig) -> Self {
+        Self {
+            quadruples_to_create_in_advance: val.quadruples_to_create_in_advance,
+            key_ids: val
+                .keys
+                .iter()
+                .map(|val| (&val.key_id).into())
+                .collect::<Vec<_>>(),
+            max_queue_size: val.max_queue_size.unwrap_or(DEFAULT_ECDSA_MAX_QUEUE_SIZE),
+            signature_request_timeout_ns: val.signature_request_timeout_ns,
+            idkg_key_rotation_period_ms: val.idkg_key_rotation_period_ms,
+        }
+    }
 }
 
 impl From<CreateSubnetPayload> for SubnetRecord {
@@ -261,11 +324,6 @@ impl From<CreateSubnetPayload> for SubnetRecord {
                 pfn_evaluation_period_ms: val.gossip_pfn_evaluation_period_ms,
                 registry_poll_period_ms: val.gossip_registry_poll_period_ms,
                 retransmission_request_ms: val.gossip_retransmission_request_ms,
-                advert_config: val
-                    .advert_best_effort_percentage
-                    .map(|val| GossipAdvertConfig {
-                        best_effort_percentage: val,
-                    }),
             }),
 
             start_as_nns: val.start_as_nns,
@@ -281,7 +339,161 @@ impl From<CreateSubnetPayload> for SubnetRecord {
             max_number_of_canisters: val.max_number_of_canisters,
             ssh_readonly_access: val.ssh_readonly_access,
             ssh_backup_access: val.ssh_backup_access,
-            ecdsa_config: None,
+            ecdsa_config: val.ecdsa_config.map(|x| x.into()),
         }
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use crate::common::test_helpers::{
+        add_fake_subnet, get_invariant_compliant_subnet_record, invariant_compliant_registry,
+        prepare_registry_with_nodes,
+    };
+    use crate::mutations::do_create_subnet::{
+        CreateSubnetPayload, EcdsaInitialConfig, EcdsaKeyRequest,
+    };
+    use ic_base_types::SubnetId;
+    use ic_ic00_types::{EcdsaCurve, EcdsaKeyId};
+    use ic_nervous_system_common_test_keys::{TEST_USER1_PRINCIPAL, TEST_USER2_PRINCIPAL};
+    use ic_protobuf::registry::subnet::v1::SubnetRecord;
+    use ic_registry_subnet_features::{EcdsaConfig, DEFAULT_ECDSA_MAX_QUEUE_SIZE};
+    use ic_types::ReplicaVersion;
+
+    // Note: this can only be unit-tested b/c it fails before we hit inter-canister calls
+    // for DKG + ECDSA
+    #[test]
+    #[should_panic(
+        expected = "The requested ECDSA key 'Secp256k1:fake_key_id' was not found in any subnet"
+    )]
+    fn should_panic_if_ecdsa_keys_non_existing() {
+        let mut registry = invariant_compliant_registry();
+        let payload = CreateSubnetPayload {
+            replica_version_id: ReplicaVersion::default().into(),
+            ecdsa_config: Some(EcdsaInitialConfig {
+                quadruples_to_create_in_advance: 1,
+                keys: vec![EcdsaKeyRequest {
+                    key_id: EcdsaKeyId {
+                        curve: EcdsaCurve::Secp256k1,
+                        name: "fake_key_id".to_string(),
+                    },
+                    subnet_id: None,
+                }],
+                max_queue_size: Some(DEFAULT_ECDSA_MAX_QUEUE_SIZE),
+                signature_request_timeout_ns: None,
+                idkg_key_rotation_period_ms: None,
+            }),
+            ..Default::default()
+        };
+
+        futures::executor::block_on(registry.do_create_subnet(payload));
+    }
+
+    #[test]
+    #[should_panic(
+        expected = "EcdsaKeyRequest for key 'Secp256k1:fake_key_id' did not specify subnet_id."
+    )]
+    fn should_panic_if_ecdsa_keys_subnet_not_specified() {
+        // Set up a subnet that has the key but fail to specify subnet_id in request
+        let key_id = EcdsaKeyId {
+            curve: EcdsaCurve::Secp256k1,
+            name: "fake_key_id".to_string(),
+        };
+        let signing_subnet = SubnetId::from(*TEST_USER1_PRINCIPAL);
+        let mut registry = invariant_compliant_registry();
+
+        // add a node for our existing subnet that has the ECDSA key
+        let (mutate_request, node_ids) = prepare_registry_with_nodes(1);
+        registry.maybe_apply_mutation_internal(mutate_request.mutations);
+
+        let mut subnet_list_record = registry.get_subnet_list_record();
+
+        let mut subnet_record: SubnetRecord = get_invariant_compliant_subnet_record(node_ids);
+        subnet_record.ecdsa_config = Some(
+            EcdsaConfig {
+                quadruples_to_create_in_advance: 1,
+                key_ids: vec![key_id.clone()],
+                max_queue_size: Some(DEFAULT_ECDSA_MAX_QUEUE_SIZE),
+                signature_request_timeout_ns: None,
+                idkg_key_rotation_period_ms: None,
+            }
+            .into(),
+        );
+
+        let fake_subnet_mutation =
+            add_fake_subnet(signing_subnet, &mut subnet_list_record, subnet_record);
+        registry.maybe_apply_mutation_internal(fake_subnet_mutation);
+
+        // Make a request for the key from a subnet that does not have the key
+        let payload = CreateSubnetPayload {
+            replica_version_id: ReplicaVersion::default().into(),
+            ecdsa_config: Some(EcdsaInitialConfig {
+                quadruples_to_create_in_advance: 1,
+                keys: vec![EcdsaKeyRequest {
+                    key_id,
+                    subnet_id: None,
+                }],
+                max_queue_size: Some(DEFAULT_ECDSA_MAX_QUEUE_SIZE),
+                signature_request_timeout_ns: None,
+                idkg_key_rotation_period_ms: None,
+            }),
+            ..Default::default()
+        };
+
+        futures::executor::block_on(registry.do_create_subnet(payload));
+    }
+
+    #[test]
+    #[should_panic(
+        expected = "The requested ECDSA key 'Secp256k1:fake_key_id' is not available in targeted \
+                    subnet 'l5ckc-b6p6l-4o5gj-fkfvl-3sq56-7vw6s-d6nof-q4j4j-jzead-nnwim-vqe'"
+    )]
+    fn should_panic_if_ecdsa_keys_non_existing_from_requested_subnet() {
+        let key_id = EcdsaKeyId {
+            curve: EcdsaCurve::Secp256k1,
+            name: "fake_key_id".to_string(),
+        };
+        let signing_subnet = SubnetId::from(*TEST_USER1_PRINCIPAL);
+        let mut registry = invariant_compliant_registry();
+
+        // add a node for our existing subnet that has the ECDSA key
+        let (mutate_request, node_ids) = prepare_registry_with_nodes(1);
+        registry.maybe_apply_mutation_internal(mutate_request.mutations);
+
+        let mut subnet_list_record = registry.get_subnet_list_record();
+
+        let mut subnet_record: SubnetRecord = get_invariant_compliant_subnet_record(node_ids);
+        subnet_record.ecdsa_config = Some(
+            EcdsaConfig {
+                quadruples_to_create_in_advance: 1,
+                key_ids: vec![key_id.clone()],
+                max_queue_size: Some(DEFAULT_ECDSA_MAX_QUEUE_SIZE),
+                signature_request_timeout_ns: None,
+                idkg_key_rotation_period_ms: None,
+            }
+            .into(),
+        );
+
+        let fake_subnet_mutation =
+            add_fake_subnet(signing_subnet, &mut subnet_list_record, subnet_record);
+        registry.maybe_apply_mutation_internal(fake_subnet_mutation);
+
+        // Make a request for the key from a subnet that does not have the key
+        let payload = CreateSubnetPayload {
+            replica_version_id: ReplicaVersion::default().into(),
+            ecdsa_config: Some(EcdsaInitialConfig {
+                quadruples_to_create_in_advance: 1,
+                keys: vec![EcdsaKeyRequest {
+                    key_id,
+                    subnet_id: Some(*TEST_USER2_PRINCIPAL),
+                }],
+                max_queue_size: Some(DEFAULT_ECDSA_MAX_QUEUE_SIZE),
+                signature_request_timeout_ns: None,
+                idkg_key_rotation_period_ms: None,
+            }),
+            ..Default::default()
+        };
+
+        futures::executor::block_on(registry.do_create_subnet(payload));
     }
 }

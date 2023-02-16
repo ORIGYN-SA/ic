@@ -1,29 +1,29 @@
+pub mod cycles_balance_change;
 mod request_in_prep;
 mod routing;
 pub mod sandbox_safe_system_state;
 mod stable_memory;
 pub mod system_api_empty;
 
+use ic_config::flag_status::FlagStatus;
 use ic_error_types::RejectCode;
-use ic_ic00_types::IC_00;
 use ic_interfaces::execution_environment::{
-    ExecutionParameters,
+    ExecutionComplexity, ExecutionMode,
     HypervisorError::{self, *},
-    HypervisorResult, OutOfInstructionsHandler, SubnetAvailableMemory, SystemApi,
-    TrapCode::CyclesAmountTooBigFor64Bit,
+    HypervisorResult, OutOfInstructionsHandler, PerformanceCounterType, StableGrowOutcome,
+    StableMemoryApi, SubnetAvailableMemory, SystemApi,
+    TrapCode::{self, CyclesAmountTooBigFor64Bit},
 };
-use ic_logger::{error, info, ReplicaLogger};
+use ic_logger::{error, ReplicaLogger};
 use ic_registry_subnet_type::SubnetType;
-use ic_replicated_state::{
-    canister_state::ENFORCE_MESSAGE_MEMORY_USAGE, memory_required_to_push_request,
-    page_map::PAGE_SIZE, Memory, NetworkTopology, NumWasmPages, PageIndex, StateError,
-};
+use ic_replicated_state::{memory_required_to_push_request, Memory, NumWasmPages, PageIndex};
 use ic_sys::PageBytes;
 use ic_types::{
     ingress::WasmResult,
     messages::{CallContextId, RejectContext, Request, MAX_INTER_CANISTER_PAYLOAD_IN_BYTES},
-    methods::{Callback, WasmClosure},
-    CanisterId, Cycles, NumBytes, NumInstructions, PrincipalId, SubnetId, Time,
+    methods::{SystemMethod, WasmClosure},
+    CanisterId, CanisterTimer, ComputeAllocation, Cycles, NumBytes, NumInstructions, NumPages,
+    PrincipalId, SubnetId, Time,
 };
 use ic_utils::deterministic_operations::deterministic_copy_from_slice;
 use request_in_prep::{into_request, RequestInPrep};
@@ -41,6 +41,12 @@ const CERTIFIED_DATA_MAX_LENGTH: u32 = 32;
 
 // Enables tracing of system calls for local debugging.
 const TRACE_SYSCALLS: bool = false;
+
+/// This error should be displayed if stable memory is used through the system
+/// API when Wasm-native stable memory is enabled.
+const WASM_NATIVE_STABLE_MEMORY_ERROR: &str = "Stable memory cannot be accessed through the System API when Wasm-native stable memory is enabled.";
+
+const MAX_32_BIT_STABLE_MEMORY_IN_PAGES: u64 = 64 * 1024; // 4GiB
 
 // This macro is used in system calls for tracing.
 macro_rules! trace_syscall {
@@ -71,7 +77,7 @@ macro_rules! trace_syscall {
 fn summarize(heap: &[u8], start: u32, size: u32) -> u64 {
     if TRACE_SYSCALLS {
         let start = (start as usize).min(heap.len());
-        let end = ((start as usize) + (size as usize)).min(heap.len());
+        let end = (start + (size as usize)).min(heap.len());
         // The actual hash function doesn't matter much as long as it is
         // cheap to compute and maps the input to u64 reasonably well.
         let mut sum = 0;
@@ -82,6 +88,71 @@ fn summarize(heap: &[u8], start: u32, size: u32) -> u64 {
     } else {
         0
     }
+}
+
+/// Keeps the message instruction limit and the maximum slice instruction limit.
+/// Supports operations to reduce the message limit while keeping the maximum
+/// slice limit the same, which is useful for messages that have multiple
+/// execution steps such as install, upgrade, and response.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct InstructionLimits {
+    /// The total instruction limit for message execution. With deterministic
+    /// time slicing this limit may exceed the per-round instruction limit.  The
+    /// message fails with an `InstructionLimitExceeded` error if it executes
+    /// more instructions than this limit.
+    message: NumInstructions,
+
+    /// The number of instructions in the largest possible slice. It may
+    /// exceed `self.message()` if the latter was reduced or updated by the
+    /// previous executions.
+    max_slice: NumInstructions,
+}
+
+impl InstructionLimits {
+    /// Returns the message and slice instruction limits based on the
+    /// deterministic time slicing flag.
+    pub fn new(dts: FlagStatus, message: NumInstructions, max_slice: NumInstructions) -> Self {
+        Self {
+            message,
+            max_slice: match dts {
+                FlagStatus::Enabled => max_slice,
+                FlagStatus::Disabled => message,
+            },
+        }
+    }
+
+    /// See the comments of the corresponding field.
+    pub fn message(&self) -> NumInstructions {
+        self.message
+    }
+
+    /// Returns the effective slice size, which is the smallest of
+    /// `self.max_slice` and `self.message`.
+    pub fn slice(&self) -> NumInstructions {
+        self.max_slice.min(self.message)
+    }
+
+    /// Reduces the message instruction limit by the given number.
+    /// Note that with DTS, the slice size is constant for a fixed message type.
+    pub fn reduce_by(&mut self, used: NumInstructions) {
+        self.message = NumInstructions::from(self.message.get().saturating_sub(used.get()));
+    }
+
+    /// Sets the message instruction limit to the given number.
+    /// Note that with DTS, the slice size is constant for a fixed message type.
+    pub fn update(&mut self, left: NumInstructions) {
+        self.message = left;
+    }
+}
+
+// Canister and subnet configuration parameters required for execution.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct ExecutionParameters {
+    pub instruction_limits: InstructionLimits,
+    pub canister_memory_limit: NumBytes,
+    pub compute_allocation: ComputeAllocation,
+    pub subnet_type: SubnetType,
+    pub execution_mode: ExecutionMode,
 }
 
 #[derive(Clone, Serialize, Deserialize, Debug, PartialEq, Eq)]
@@ -104,9 +175,6 @@ pub enum ResponseStatus {
 pub enum NonReplicatedQueryKind {
     Stateful {
         call_context_id: CallContextId,
-        #[serde(serialize_with = "ic_utils::serde_arc::serialize_arc")]
-        #[serde(deserialize_with = "ic_utils::serde_arc::deserialize_arc")]
-        network_topology: Arc<NetworkTopology>,
         /// Optional outgoing request under construction. If `None` no outgoing
         /// request is currently under construction.
         outgoing_request: Option<RequestInPrep>,
@@ -154,11 +222,6 @@ pub enum ApiType {
         #[serde(with = "serde_bytes")]
         response_data: Vec<u8>,
         response_status: ResponseStatus,
-        own_subnet_id: SubnetId,
-        own_subnet_type: SubnetType,
-        #[serde(serialize_with = "ic_utils::serde_arc::serialize_arc")]
-        #[serde(deserialize_with = "ic_utils::serde_arc::deserialize_arc")]
-        network_topology: Arc<NetworkTopology>,
         /// Optional outgoing request under construction. If `None` no outgoing
         /// request is currently under construction.
         outgoing_request: Option<RequestInPrep>,
@@ -204,15 +267,11 @@ pub enum ApiType {
         #[serde(with = "serde_bytes")]
         response_data: Vec<u8>,
         response_status: ResponseStatus,
-        own_subnet_id: SubnetId,
-        own_subnet_type: SubnetType,
-        #[serde(serialize_with = "ic_utils::serde_arc::serialize_arc")]
-        #[serde(deserialize_with = "ic_utils::serde_arc::deserialize_arc")]
-        network_topology: Arc<NetworkTopology>,
         /// Optional outgoing request under construction. If `None` no outgoing
         /// request is currently under construction.
         outgoing_request: Option<RequestInPrep>,
         max_reply_size: NumBytes,
+        execution_mode: ExecutionMode,
     },
 
     // For executing closures when a `Reject` is received
@@ -225,15 +284,11 @@ pub enum ApiType {
         #[serde(with = "serde_bytes")]
         response_data: Vec<u8>,
         response_status: ResponseStatus,
-        own_subnet_id: SubnetId,
-        own_subnet_type: SubnetType,
-        #[serde(serialize_with = "ic_utils::serde_arc::serialize_arc")]
-        #[serde(deserialize_with = "ic_utils::serde_arc::deserialize_arc")]
-        network_topology: Arc<NetworkTopology>,
         /// Optional outgoing request under construction. If `None` no outgoing
         /// request is currently under construction.
         outgoing_request: Option<RequestInPrep>,
         max_reply_size: NumBytes,
+        execution_mode: ExecutionMode,
     },
 
     PreUpgrade {
@@ -253,15 +308,13 @@ pub enum ApiType {
         message_accepted: bool,
     },
 
-    // For executing the `canister_heartbeat` method
-    Heartbeat {
+    // For executing the `canister_heartbeat` or `canister_global_timer` methods
+    SystemTask {
+        /// System task to execute.
+        /// Only `canister_heartbeat` and `canister_global_timer` are allowed.
+        system_task: SystemMethod,
         time: Time,
         call_context_id: CallContextId,
-        own_subnet_id: SubnetId,
-        own_subnet_type: SubnetType,
-        #[serde(serialize_with = "ic_utils::serde_arc::serialize_arc")]
-        #[serde(deserialize_with = "ic_utils::serde_arc::deserialize_arc")]
-        network_topology: Arc<NetworkTopology>,
         /// Optional outgoing request under construction. If `None` no outgoing
         /// request is currently under construction.
         outgoing_request: Option<RequestInPrep>,
@@ -291,20 +344,16 @@ impl ApiType {
         }
     }
 
-    pub fn heartbeat(
+    pub fn system_task(
+        system_task: SystemMethod,
         time: Time,
         call_context_id: CallContextId,
-        own_subnet_id: SubnetId,
-        own_subnet_type: SubnetType,
-        network_topology: Arc<NetworkTopology>,
     ) -> Self {
-        Self::Heartbeat {
+        Self::SystemTask {
             time,
             call_context_id,
-            own_subnet_id,
-            own_subnet_type,
-            network_topology,
             outgoing_request: None,
+            system_task,
         }
     }
 
@@ -315,9 +364,6 @@ impl ApiType {
         incoming_cycles: Cycles,
         caller: PrincipalId,
         call_context_id: CallContextId,
-        own_subnet_id: SubnetId,
-        own_subnet_type: SubnetType,
-        network_topology: Arc<NetworkTopology>,
     ) -> Self {
         Self::Update {
             time,
@@ -327,9 +373,6 @@ impl ApiType {
             call_context_id,
             response_data: vec![],
             response_status: ResponseStatus::NotRepliedYet,
-            own_subnet_id,
-            own_subnet_type,
-            network_topology,
             outgoing_request: None,
             max_reply_size: MAX_INTER_CANISTER_PAYLOAD_IN_BYTES,
         }
@@ -381,9 +424,7 @@ impl ApiType {
         incoming_cycles: Cycles,
         call_context_id: CallContextId,
         replied: bool,
-        own_subnet_id: SubnetId,
-        own_subnet_type: SubnetType,
-        network_topology: Arc<NetworkTopology>,
+        execution_mode: ExecutionMode,
     ) -> Self {
         Self::ReplyCallback {
             time,
@@ -396,11 +437,9 @@ impl ApiType {
             } else {
                 ResponseStatus::NotRepliedYet
             },
-            own_subnet_id,
-            own_subnet_type,
-            network_topology,
             outgoing_request: None,
             max_reply_size: MAX_INTER_CANISTER_PAYLOAD_IN_BYTES,
+            execution_mode,
         }
     }
 
@@ -411,9 +450,7 @@ impl ApiType {
         incoming_cycles: Cycles,
         call_context_id: CallContextId,
         replied: bool,
-        own_subnet_id: SubnetId,
-        own_subnet_type: SubnetType,
-        network_topology: Arc<NetworkTopology>,
+        execution_mode: ExecutionMode,
     ) -> Self {
         Self::RejectCallback {
             time,
@@ -426,11 +463,9 @@ impl ApiType {
             } else {
                 ResponseStatus::NotRepliedYet
             },
-            own_subnet_id,
-            own_subnet_type,
-            network_topology,
             outgoing_request: None,
             max_reply_size: MAX_INTER_CANISTER_PAYLOAD_IN_BYTES,
+            execution_mode,
         }
     }
 
@@ -473,7 +508,7 @@ impl ApiType {
             | ApiType::ReplyCallback { .. }
             | ApiType::RejectCallback { .. }
             | ApiType::PreUpgrade { .. }
-            | ApiType::Heartbeat { .. }
+            | ApiType::SystemTask { .. }
             | ApiType::Cleanup { .. } => ModificationTracking::Track,
         }
     }
@@ -484,12 +519,22 @@ impl ApiType {
         match self {
             ApiType::Start { .. } => "start",
             ApiType::Init { .. } => "init",
-            ApiType::Heartbeat { .. } => "heartbeat",
+            ApiType::SystemTask { system_task, .. } => match system_task {
+                SystemMethod::CanisterHeartbeat => "heartbeat",
+                SystemMethod::CanisterGlobalTimer => "global timer",
+                _ => panic!("Only `canister_heartbeat` and `canister_global_timer` are allowed."),
+            },
             ApiType::Update { .. } => "update",
             ApiType::ReplicatedQuery { .. } => "replicated query",
             ApiType::NonReplicatedQuery { .. } => "non replicated query",
-            ApiType::ReplyCallback { .. } => "reply callback",
-            ApiType::RejectCallback { .. } => "reject callback",
+            ApiType::ReplyCallback { execution_mode, .. } => match execution_mode {
+                ExecutionMode::Replicated => "replicated reply callback",
+                ExecutionMode::NonReplicated => "non-replicated reply callback",
+            },
+            ApiType::RejectCallback { execution_mode, .. } => match execution_mode {
+                ExecutionMode::Replicated => "replicated reject callback",
+                ExecutionMode::NonReplicated => "non-replicated reject callback",
+            },
             ApiType::PreUpgrade { .. } => "pre upgrade",
             ApiType::InspectMessage { .. } => "inspect message",
             ApiType::Cleanup { .. } => "cleanup",
@@ -510,13 +555,14 @@ impl std::fmt::Display for ApiType {
 struct MemoryUsage {
     /// Upper limit on how much the memory the canister could use.
     limit: NumBytes,
+
     /// The current amount of memory that the canister is using.
     current_usage: NumBytes,
+
     // This is the amount of memory that the subnet has available. Any
     // expansions in the canister's memory need to be deducted from here.
     subnet_available_memory: SubnetAvailableMemory,
 
-    stable_memory_delta: usize,
     /// Total memory allocated during this message execution. Note that
     /// `total_allocated_memory` should always be `>= allocated_message_memory`.
     total_allocated_memory: NumBytes,
@@ -552,7 +598,6 @@ impl MemoryUsage {
             limit,
             current_usage,
             subnet_available_memory,
-            stable_memory_delta: 0,
             total_allocated_memory: NumBytes::from(0),
             allocated_message_memory: NumBytes::from(0),
             log,
@@ -583,7 +628,7 @@ impl MemoryUsage {
 
     /// Validates that `total_bytes >= message_bytes` holds. In debug build it
     /// will panic in case this condition does not hold. In release builds an
-    /// error will be logged. This is because panicing due to this inconsitency
+    /// error will be logged. This is because panicking due to this inconsistency
     /// has the potential to put the entire subnet in a crash loop.
     fn validate_requested_memory(&self, total_bytes: NumBytes, message_bytes: NumBytes) {
         debug_assert!(total_bytes >= message_bytes);
@@ -666,7 +711,11 @@ pub struct SystemApiImpl {
 
     execution_parameters: ExecutionParameters,
 
-    stable_memory: StableMemory,
+    /// When `stable_memory` is absent, we are using Wasm-native stable memory
+    /// which means all stable memory operations should be handled within the
+    /// wasm itself and any use of stable memory through the system API should
+    /// crash.
+    stable_memory: Option<StableMemory>,
 
     /// System state information that is cached so that we don't need to go
     /// through the `SystemStateAccessor` to read it. This saves on IPC
@@ -674,16 +723,33 @@ pub struct SystemApiImpl {
     /// replica process.
     sandbox_safe_system_state: SandboxSafeSystemState,
 
+    /// A handler that is invoked when the instruction counter becomes negative
+    /// (exceeds the current slice instruction limit).
     out_of_instructions_handler: Arc<dyn OutOfInstructionsHandler>,
+
+    /// The instruction limit of the currently executing slice. It is
+    /// initialized to `execution_parameters.instruction_limits.slice()` and
+    /// updated after each out-of-instructions call that starts a new slice.
+    current_slice_instruction_limit: i64,
+
+    /// The total number of instructions executed before the current slice. It
+    /// is initialized to 0 and updated after each out-of-instructions call that
+    /// starts a new slice.
+    instructions_executed_before_current_slice: i64,
+
+    /// Tracks the complexity accumulated during the message execution.
+    execution_complexity: ExecutionComplexity,
 }
 
 impl SystemApiImpl {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         api_type: ApiType,
         sandbox_safe_system_state: SandboxSafeSystemState,
         canister_current_memory_usage: NumBytes,
         execution_parameters: ExecutionParameters,
-        stable_memory: Memory,
+        subnet_available_memory: SubnetAvailableMemory,
+        stable_memory: Option<Memory>,
         out_of_instructions_handler: Arc<dyn OutOfInstructionsHandler>,
         log: ReplicaLogger,
     ) -> Self {
@@ -692,10 +758,10 @@ impl SystemApiImpl {
             sandbox_safe_system_state.canister_id,
             execution_parameters.canister_memory_limit,
             canister_current_memory_usage,
-            execution_parameters.subnet_available_memory.clone(),
+            subnet_available_memory,
         );
-        let stable_memory = StableMemory::new(stable_memory);
-
+        let stable_memory = stable_memory.map(|m| StableMemory::new(m));
+        let slice_limit = execution_parameters.instruction_limits.slice().get();
         Self {
             execution_error: None,
             api_type,
@@ -705,6 +771,9 @@ impl SystemApiImpl {
             sandbox_safe_system_state,
             out_of_instructions_handler,
             log,
+            current_slice_instruction_limit: i64::try_from(slice_limit).unwrap_or(i64::MAX),
+            instructions_executed_before_current_slice: 0,
+            execution_complexity: ExecutionComplexity::default(),
         }
     }
 
@@ -719,13 +788,15 @@ impl SystemApiImpl {
         match &mut self.api_type {
             ApiType::Start { .. }
             | ApiType::Init { .. }
-            | ApiType::Heartbeat { .. }
             | ApiType::Cleanup { .. }
             | ApiType::ReplicatedQuery { .. }
             | ApiType::PreUpgrade { .. }
             | ApiType::InspectMessage { .. }
             | ApiType::NonReplicatedQuery { .. } => (),
-            ApiType::Update {
+            ApiType::SystemTask {
+                outgoing_request, ..
+            }
+            | ApiType::Update {
                 outgoing_request, ..
             }
             | ApiType::ReplyCallback {
@@ -756,7 +827,7 @@ impl SystemApiImpl {
             | ApiType::Init { .. }
             | ApiType::PreUpgrade { .. }
             | ApiType::Cleanup { .. }
-            | ApiType::Heartbeat { .. } => Ok(None),
+            | ApiType::SystemTask { .. } => Ok(None),
             ApiType::InspectMessage {
                 message_accepted, ..
             } => {
@@ -793,15 +864,13 @@ impl SystemApiImpl {
         self.memory_usage.current_usage
     }
 
-    /// Note that this function is made public only for the tests
-    #[doc(hidden)]
-    pub fn get_allocated_memory(&self) -> NumBytes {
+    /// Bytes allocated in the Wasm/stable memory and messages.
+    pub fn get_allocated_bytes(&self) -> NumBytes {
         self.memory_usage.total_allocated_memory
     }
 
-    /// Note that this function is made public only for the tests
-    #[doc(hidden)]
-    pub fn get_allocated_message_memory(&self) -> NumBytes {
+    /// Bytes allocated in messages.
+    pub fn get_allocated_message_bytes(&self) -> NumBytes {
         self.memory_usage.allocated_message_memory
     }
 
@@ -815,7 +884,7 @@ impl SystemApiImpl {
     fn get_msg_caller_id(&self, method_name: &str) -> Result<PrincipalId, HypervisorError> {
         match &self.api_type {
             ApiType::Start { .. }
-            | ApiType::Heartbeat { .. }
+            | ApiType::SystemTask { .. }
             | ApiType::Cleanup { .. }
             | ApiType::ReplyCallback { .. }
             | ApiType::RejectCallback { .. } => Err(self.error_for(method_name)),
@@ -833,7 +902,7 @@ impl SystemApiImpl {
             ApiType::Start { .. }
             | ApiType::Init { .. }
             | ApiType::PreUpgrade { .. }
-            | ApiType::Heartbeat { .. }
+            | ApiType::SystemTask { .. }
             | ApiType::Cleanup { .. }
             | ApiType::InspectMessage { .. } => None,
             ApiType::Update {
@@ -873,7 +942,7 @@ impl SystemApiImpl {
         match &self.api_type {
             ApiType::Start { .. }
             | ApiType::Init { .. }
-            | ApiType::Heartbeat { .. }
+            | ApiType::SystemTask { .. }
             | ApiType::Cleanup { .. }
             | ApiType::ReplicatedQuery { .. }
             | ApiType::NonReplicatedQuery { .. }
@@ -889,7 +958,7 @@ impl SystemApiImpl {
         match &self.api_type {
             ApiType::Start { .. }
             | ApiType::Init { .. }
-            | ApiType::Heartbeat { .. }
+            | ApiType::SystemTask { .. }
             | ApiType::Cleanup { .. }
             | ApiType::ReplicatedQuery { .. }
             | ApiType::NonReplicatedQuery { .. }
@@ -917,7 +986,7 @@ impl SystemApiImpl {
             ApiType::Update {
                 outgoing_request, ..
             }
-            | ApiType::Heartbeat {
+            | ApiType::SystemTask {
                 outgoing_request, ..
             }
             | ApiType::ReplyCallback {
@@ -944,11 +1013,11 @@ impl SystemApiImpl {
         }
     }
 
-    fn ic0_canister_cycles_balance_helper(&self, method_name: &str) -> HypervisorResult<Cycles> {
+    fn ic0_canister_cycle_balance_helper(&self, method_name: &str) -> HypervisorResult<Cycles> {
         match &self.api_type {
             ApiType::Start {} => Err(self.error_for(method_name)),
             ApiType::Init { .. }
-            | ApiType::Heartbeat { .. }
+            | ApiType::SystemTask { .. }
             | ApiType::Update { .. }
             | ApiType::Cleanup { .. }
             | ApiType::ReplicatedQuery { .. }
@@ -967,7 +1036,7 @@ impl SystemApiImpl {
         match &self.api_type {
             ApiType::Start { .. }
             | ApiType::Init { .. }
-            | ApiType::Heartbeat { .. }
+            | ApiType::SystemTask { .. }
             | ApiType::Cleanup { .. }
             | ApiType::ReplicatedQuery { .. }
             | ApiType::PreUpgrade { .. }
@@ -991,7 +1060,7 @@ impl SystemApiImpl {
         match &self.api_type {
             ApiType::Start { .. }
             | ApiType::Init { .. }
-            | ApiType::Heartbeat { .. }
+            | ApiType::SystemTask { .. }
             | ApiType::Cleanup { .. }
             | ApiType::ReplicatedQuery { .. }
             | ApiType::NonReplicatedQuery { .. }
@@ -1013,9 +1082,17 @@ impl SystemApiImpl {
         max_amount: Cycles,
     ) -> HypervisorResult<Cycles> {
         match &mut self.api_type {
+            ApiType::ReplyCallback {
+                response_status: ResponseStatus::AlreadyReplied,
+                ..
+            }
+            | ApiType::RejectCallback {
+                response_status: ResponseStatus::AlreadyReplied,
+                ..
+            } => Ok(Cycles::new(0)),
             ApiType::Start { .. }
             | ApiType::Init { .. }
-            | ApiType::Heartbeat { .. }
+            | ApiType::SystemTask { .. }
             | ApiType::PreUpgrade { .. }
             | ApiType::Cleanup { .. }
             | ApiType::ReplicatedQuery { .. }
@@ -1044,7 +1121,10 @@ impl SystemApiImpl {
     }
 
     pub fn stable_memory_size(&self) -> NumWasmPages {
-        self.stable_memory.stable_memory_size
+        self.stable_memory
+            .as_ref()
+            .expect(WASM_NATIVE_STABLE_MEMORY_ERROR)
+            .stable_memory_size
     }
 
     /// Wrapper around `self.sandbox_safe_system_state.push_output_request()` that
@@ -1055,21 +1135,28 @@ impl SystemApiImpl {
     ///
     /// Note that this function is made public only for the tests
     #[doc(hidden)]
-    pub fn push_output_request(&mut self, req: Request) -> HypervisorResult<i32> {
+    pub fn push_output_request(
+        &mut self,
+        req: Request,
+        prepayment_for_response_execution: Cycles,
+        prepayment_for_response_transmission: Cycles,
+    ) -> HypervisorResult<i32> {
         let abort = |request: Request, sandbox_safe_system_state: &mut SandboxSafeSystemState| {
             sandbox_safe_system_state.refund_cycles(request.payment);
             sandbox_safe_system_state.unregister_callback(request.sender_reply_callback);
             Ok(RejectCode::SysTransient as i32)
         };
 
-        let reservation_bytes = (memory_required_to_push_request(&req) as u64).into();
-        let enforce_message_memory_usage = ENFORCE_MESSAGE_MEMORY_USAGE
-            && self.execution_parameters.subnet_type != SubnetType::System;
-        if enforce_message_memory_usage
-            && self
-                .memory_usage
-                .allocate_memory(reservation_bytes, reservation_bytes)
-                .is_err()
+        let reservation_bytes = if self.execution_parameters.subnet_type == SubnetType::System {
+            // Effectively disable the memory limit checks on system subnets.
+            NumBytes::from(0)
+        } else {
+            (memory_required_to_push_request(&req) as u64).into()
+        };
+        if self
+            .memory_usage
+            .allocate_memory(reservation_bytes, reservation_bytes)
+            .is_err()
         {
             return abort(req, &mut self.sandbox_safe_system_state);
         }
@@ -1078,24 +1165,28 @@ impl SystemApiImpl {
             self.memory_usage.current_usage,
             self.execution_parameters.compute_allocation,
             req,
+            prepayment_for_response_execution,
+            prepayment_for_response_transmission,
         ) {
             Ok(()) => Ok(0),
-            Err((StateError::QueueFull { .. }, request))
-            | Err((StateError::CanisterOutOfCycles(_), request)) => {
-                if enforce_message_memory_usage {
-                    self.memory_usage
-                        .deallocate_memory(reservation_bytes, reservation_bytes);
-                }
+            Err(request) => {
+                self.memory_usage
+                    .deallocate_memory(reservation_bytes, reservation_bytes);
                 abort(request, &mut self.sandbox_safe_system_state)
-            }
-            Err((err, _)) => {
-                unreachable!("Unexpected error while pushing to output queue: {}", err)
             }
         }
     }
 }
 
 impl SystemApi for SystemApiImpl {
+    fn set_execution_complexity(&mut self, complexity: ExecutionComplexity) {
+        self.execution_complexity = complexity
+    }
+
+    fn execution_complexity(&self) -> &ExecutionComplexity {
+        &self.execution_complexity
+    }
+
     fn set_execution_error(&mut self, error: HypervisorError) {
         self.execution_error = Some(error)
     }
@@ -1115,21 +1206,47 @@ impl SystemApi for SystemApiImpl {
 
     fn stable_memory_dirty_pages(&self) -> Vec<(PageIndex, &PageBytes)> {
         self.stable_memory
+            .as_ref()
+            .expect(WASM_NATIVE_STABLE_MEMORY_ERROR)
             .stable_memory_buffer
             .dirty_pages()
             .collect()
     }
 
     fn stable_memory_size(&self) -> usize {
-        self.stable_memory.stable_memory_size.get()
+        self.stable_memory
+            .as_ref()
+            .expect(WASM_NATIVE_STABLE_MEMORY_ERROR)
+            .stable_memory_size
+            .get()
     }
 
     fn subnet_type(&self) -> SubnetType {
         self.execution_parameters.subnet_type
     }
 
+    fn message_instruction_limit(&self) -> NumInstructions {
+        self.execution_parameters.instruction_limits.message()
+    }
+
+    fn message_instructions_executed(&self, instruction_counter: i64) -> NumInstructions {
+        let result = (self.instructions_executed_before_current_slice as u64)
+            .saturating_add(self.slice_instructions_executed(instruction_counter).get());
+        NumInstructions::from(result)
+    }
+
     fn slice_instruction_limit(&self) -> NumInstructions {
-        self.execution_parameters.slice_instruction_limit
+        // Note that `self.execution_parameters.instruction_limits.slice()` is
+        // the instruction limit of the first slice, not the current one.
+        NumInstructions::from(u64::try_from(self.current_slice_instruction_limit).unwrap_or(0))
+    }
+
+    fn slice_instructions_executed(&self, instruction_counter: i64) -> NumInstructions {
+        let result = self
+            .current_slice_instruction_limit
+            .saturating_sub(instruction_counter)
+            .max(0) as u64;
+        NumInstructions::from(result)
     }
 
     fn ic0_msg_caller_size(&self) -> HypervisorResult<u32> {
@@ -1174,7 +1291,7 @@ impl SystemApi for SystemApiImpl {
         let result = match &self.api_type {
             ApiType::Start { .. }
             | ApiType::Cleanup { .. }
-            | ApiType::Heartbeat { .. }
+            | ApiType::SystemTask { .. }
             | ApiType::RejectCallback { .. }
             | ApiType::PreUpgrade { .. } => Err(self.error_for("ic0_msg_arg_data_size")),
             ApiType::Init {
@@ -1209,7 +1326,7 @@ impl SystemApi for SystemApiImpl {
     ) -> HypervisorResult<()> {
         let result = match &self.api_type {
             ApiType::Start { .. }
-            | ApiType::Heartbeat { .. }
+            | ApiType::SystemTask { .. }
             | ApiType::Cleanup { .. }
             | ApiType::RejectCallback { .. }
             | ApiType::PreUpgrade { .. } => Err(self.error_for("ic0_msg_arg_data_copy")),
@@ -1263,7 +1380,7 @@ impl SystemApi for SystemApiImpl {
             | ApiType::Cleanup { .. }
             | ApiType::Update { .. }
             | ApiType::ReplyCallback { .. }
-            | ApiType::Heartbeat { .. }
+            | ApiType::SystemTask { .. }
             | ApiType::ReplicatedQuery { .. }
             | ApiType::NonReplicatedQuery { .. }
             | ApiType::Init { .. } => Err(self.error_for("ic0_msg_method_name_size")),
@@ -1287,7 +1404,7 @@ impl SystemApi for SystemApiImpl {
             | ApiType::PreUpgrade { .. }
             | ApiType::Update { .. }
             | ApiType::ReplyCallback { .. }
-            | ApiType::Heartbeat { .. }
+            | ApiType::SystemTask { .. }
             | ApiType::ReplicatedQuery { .. }
             | ApiType::NonReplicatedQuery { .. }
             | ApiType::Init { .. } => Err(self.error_for("ic0_msg_method_name_copy")),
@@ -1324,7 +1441,7 @@ impl SystemApi for SystemApiImpl {
             | ApiType::Cleanup { .. }
             | ApiType::Update { .. }
             | ApiType::ReplyCallback { .. }
-            | ApiType::Heartbeat { .. }
+            | ApiType::SystemTask { .. }
             | ApiType::ReplicatedQuery { .. }
             | ApiType::NonReplicatedQuery { .. }
             | ApiType::Init { .. } => Err(self.error_for("ic0_accept_message")),
@@ -1496,7 +1613,7 @@ impl SystemApi for SystemApiImpl {
         let result = match &self.api_type {
             ApiType::Start { .. } => Err(self.error_for("ic0_canister_self_size")),
             ApiType::Init { .. }
-            | ApiType::Heartbeat { .. }
+            | ApiType::SystemTask { .. }
             | ApiType::Cleanup { .. }
             | ApiType::Update { .. }
             | ApiType::ReplicatedQuery { .. }
@@ -1525,7 +1642,7 @@ impl SystemApi for SystemApiImpl {
         let result = match &self.api_type {
             ApiType::Start { .. } => Err(self.error_for("ic0_canister_self_copy")),
             ApiType::Init { .. }
-            | ApiType::Heartbeat { .. }
+            | ApiType::SystemTask { .. }
             | ApiType::Cleanup { .. }
             | ApiType::Update { .. }
             | ApiType::ReplicatedQuery { .. }
@@ -1559,7 +1676,7 @@ impl SystemApi for SystemApiImpl {
         let result = match &self.api_type {
             ApiType::Start {} => Err(self.error_for("ic0_controller_size")),
             ApiType::Init { .. }
-            | ApiType::Heartbeat { .. }
+            | ApiType::SystemTask { .. }
             | ApiType::Update { .. }
             | ApiType::Cleanup { .. }
             | ApiType::ReplicatedQuery { .. }
@@ -1585,7 +1702,7 @@ impl SystemApi for SystemApiImpl {
         let result = match &self.api_type {
             ApiType::Start {} => Err(self.error_for("ic0_controller_copy")),
             ApiType::Init { .. }
-            | ApiType::Heartbeat { .. }
+            | ApiType::SystemTask { .. }
             | ApiType::Update { .. }
             | ApiType::Cleanup { .. }
             | ApiType::ReplicatedQuery { .. }
@@ -1604,156 +1721,6 @@ impl SystemApi for SystemApiImpl {
             }
         };
         trace_syscall!(self, ic0_controller_copy, result);
-        result
-    }
-
-    fn ic0_call_simple(
-        &mut self,
-        callee_src: u32,
-        callee_size: u32,
-        method_name_src: u32,
-        method_name_len: u32,
-        reply_fun: u32,
-        reply_env: u32,
-        reject_fun: u32,
-        reject_env: u32,
-        data_src: u32,
-        data_len: u32,
-        heap: &[u8],
-    ) -> HypervisorResult<i32> {
-        let result = match &mut self.api_type {
-            ApiType::Start { .. }
-            | ApiType::Init { .. }
-            | ApiType::Cleanup { .. }
-            | ApiType::ReplicatedQuery { .. }
-            | ApiType::NonReplicatedQuery {
-                query_kind: NonReplicatedQueryKind::Pure,
-                ..
-            }
-            | ApiType::PreUpgrade { .. }
-            | ApiType::InspectMessage { .. } => Err(self.error_for("ic0_call_simple")),
-            ApiType::Update {
-                call_context_id,
-                own_subnet_id,
-                network_topology,
-                ..
-            }
-            | ApiType::NonReplicatedQuery {
-                own_subnet_id,
-                query_kind:
-                    NonReplicatedQueryKind::Stateful {
-                        call_context_id,
-                        network_topology,
-                        ..
-                    },
-                ..
-            }
-            | ApiType::Heartbeat {
-                call_context_id,
-                own_subnet_id,
-                network_topology,
-                ..
-            }
-            | ApiType::ReplyCallback {
-                call_context_id,
-                own_subnet_id,
-                network_topology,
-                ..
-            }
-            | ApiType::RejectCallback {
-                call_context_id,
-                own_subnet_id,
-                network_topology,
-                ..
-            } => {
-                if data_len as u64 > MAX_INTER_CANISTER_PAYLOAD_IN_BYTES.get() {
-                    return Ok(RejectCode::SysFatal as i32);
-                }
-
-                let method_name = valid_subslice(
-                    "ic0.call_simple method_name",
-                    method_name_src,
-                    method_name_len,
-                    heap,
-                )?;
-                let method_name = String::from_utf8_lossy(method_name).to_string();
-                let payload = Vec::from(valid_subslice(
-                    "ic0.call_simple payload",
-                    data_src,
-                    data_len,
-                    heap,
-                )?);
-                let id_bytes =
-                    valid_subslice("ic0.call_simple callee_src", callee_src, callee_size, heap)?;
-
-                let callee =
-                    PrincipalId::try_from(id_bytes).map_err(HypervisorError::InvalidPrincipalId)?;
-
-                let callee = if callee == IC_00.get() {
-                    // This is a request to ic:00. Update `callee` to be the appropriate subnet.
-                    let callee = routing::resolve_destination(
-                        network_topology,
-                        method_name.as_str(),
-                        payload.as_slice(),
-                        *own_subnet_id,
-                    )
-                    .unwrap_or({
-                        info!(
-                            self.log,
-                            "Request destination: Couldn't find the right subnet. Send it to the current subnet {},
-                            which will handle rejecting the request gracefully: sender id {}, receiver id {}, method_name {}.",
-                            own_subnet_id,
-                            self.sandbox_safe_system_state.canister_id, callee, method_name
-                        );
-                        *own_subnet_id
-                    });
-                    CanisterId::new(callee.get()).unwrap()
-                } else {
-                    CanisterId::new(callee).map_err(HypervisorError::InvalidCanisterId)?
-                };
-
-                let on_reply = WasmClosure::new(reply_fun, reply_env);
-                let on_reject = WasmClosure::new(reject_fun, reject_env);
-                let callback_id =
-                    self.sandbox_safe_system_state
-                        .register_callback(Callback::new(
-                            *call_context_id,
-                            Some(self.sandbox_safe_system_state.canister_id),
-                            Some(callee),
-                            Cycles::from(0),
-                            on_reply,
-                            on_reject,
-                            None,
-                        ))?;
-
-                let msg = Request {
-                    sender: self.sandbox_safe_system_state.canister_id,
-                    receiver: callee,
-                    method_name,
-                    method_payload: payload,
-                    sender_reply_callback: callback_id,
-                    payment: Cycles::zero(),
-                };
-                self.push_output_request(msg)
-            }
-        };
-        trace_syscall!(
-            self,
-            ic0_call_simple,
-            result,
-            callee_src,
-            callee_size,
-            method_name_src,
-            method_name_len,
-            reply_fun,
-            reply_env,
-            reject_fun,
-            reject_env,
-            data_src,
-            data_len,
-            summarize(heap, method_name_src, method_name_len),
-            summarize(heap, data_src, data_len)
-        );
         result
     }
 
@@ -1790,7 +1757,7 @@ impl SystemApi for SystemApiImpl {
                     },
                 ..
             }
-            | ApiType::Heartbeat {
+            | ApiType::SystemTask {
                 outgoing_request, ..
             }
             | ApiType::ReplyCallback {
@@ -1859,7 +1826,7 @@ impl SystemApi for SystemApiImpl {
                     },
                 ..
             }
-            | ApiType::Heartbeat {
+            | ApiType::SystemTask {
                 outgoing_request, ..
             }
             | ApiType::ReplyCallback {
@@ -1906,7 +1873,7 @@ impl SystemApi for SystemApiImpl {
                     },
                 ..
             }
-            | ApiType::Heartbeat {
+            | ApiType::SystemTask {
                 outgoing_request, ..
             }
             | ApiType::ReplyCallback {
@@ -1960,60 +1927,28 @@ impl SystemApi for SystemApiImpl {
             | ApiType::InspectMessage { .. } => Err(self.error_for("ic0_call_perform")),
             ApiType::Update {
                 call_context_id,
-                own_subnet_id,
-                own_subnet_type,
                 outgoing_request,
-                network_topology,
                 ..
             }
-            | ApiType::Heartbeat {
+            | ApiType::SystemTask {
                 call_context_id,
-                own_subnet_id,
-                own_subnet_type,
                 outgoing_request,
-                network_topology,
                 ..
             }
             | ApiType::ReplyCallback {
                 call_context_id,
-                own_subnet_id,
-                own_subnet_type,
                 outgoing_request,
-                network_topology,
                 ..
             }
             | ApiType::RejectCallback {
                 call_context_id,
-                own_subnet_id,
-                own_subnet_type,
                 outgoing_request,
-                network_topology,
                 ..
-            } => {
-                let req_in_prep = outgoing_request.take().ok_or_else(|| {
-                    ContractViolation(
-                        "ic0.call_perform called when no call is under construction.".to_string(),
-                    )
-                })?;
-
-                let req = into_request(
-                    network_topology,
-                    req_in_prep,
-                    *call_context_id,
-                    *own_subnet_id,
-                    *own_subnet_type,
-                    &mut self.sandbox_safe_system_state,
-                    &self.log,
-                )?;
-
-                self.push_output_request(req)
             }
-            ApiType::NonReplicatedQuery {
-                own_subnet_id,
+            | ApiType::NonReplicatedQuery {
                 query_kind:
                     NonReplicatedQueryKind::Stateful {
                         call_context_id,
-                        network_topology,
                         outgoing_request,
                     },
                 ..
@@ -2025,20 +1960,17 @@ impl SystemApi for SystemApiImpl {
                 })?;
 
                 let req = into_request(
-                    network_topology,
                     req_in_prep,
                     *call_context_id,
-                    *own_subnet_id,
-                    // The subnet type is only used to prevent sending cycles
-                    // from Application to VerifiedApplication subnets. But we
-                    // can't send cycles in this context anyway, so there's
-                    // nothing wrong with fixing the type as `Application`.
-                    SubnetType::Application,
                     &mut self.sandbox_safe_system_state,
                     &self.log,
                 )?;
 
-                self.push_output_request(req)
+                self.push_output_request(
+                    req.request,
+                    req.prepayment_for_response_execution,
+                    req.prepayment_for_response_transmission,
+                )
             }
         };
         trace_syscall!(self, ic0_call_perform, result);
@@ -2047,9 +1979,11 @@ impl SystemApi for SystemApiImpl {
 
     fn ic0_stable_size(&self) -> HypervisorResult<u32> {
         let result = match &self.api_type {
-            ApiType::Start {} => Err(self.error_for("ic0_stable_size")),
+            ApiType::Start {} if self.stable_memory.is_some() => {
+                Err(self.error_for("ic0_stable_size"))
+            }
             ApiType::Init { .. }
-            | ApiType::Heartbeat { .. }
+            | ApiType::SystemTask { .. }
             | ApiType::Update { .. }
             | ApiType::Cleanup { .. }
             | ApiType::ReplicatedQuery { .. }
@@ -2057,7 +1991,12 @@ impl SystemApi for SystemApiImpl {
             | ApiType::PreUpgrade { .. }
             | ApiType::ReplyCallback { .. }
             | ApiType::RejectCallback { .. }
-            | ApiType::InspectMessage { .. } => self.stable_memory.stable_size(),
+            | ApiType::InspectMessage { .. }
+            | ApiType::Start {} => self
+                .stable_memory
+                .as_ref()
+                .expect(WASM_NATIVE_STABLE_MEMORY_ERROR)
+                .stable_size(),
         };
         trace_syscall!(self, ic0_stable_size, result);
         result
@@ -2065,9 +2004,11 @@ impl SystemApi for SystemApiImpl {
 
     fn ic0_stable_grow(&mut self, additional_pages: u32) -> HypervisorResult<i32> {
         let result = match &self.api_type {
-            ApiType::Start {} => Err(self.error_for("ic0_stable_grow")),
+            ApiType::Start {} if self.stable_memory.is_some() => {
+                Err(self.error_for("ic0_stable_grow"))
+            }
             ApiType::Init { .. }
-            | ApiType::Heartbeat { .. }
+            | ApiType::SystemTask { .. }
             | ApiType::Update { .. }
             | ApiType::Cleanup { .. }
             | ApiType::ReplicatedQuery { .. }
@@ -2075,10 +2016,15 @@ impl SystemApi for SystemApiImpl {
             | ApiType::PreUpgrade { .. }
             | ApiType::ReplyCallback { .. }
             | ApiType::RejectCallback { .. }
-            | ApiType::InspectMessage { .. } => {
+            | ApiType::InspectMessage { .. }
+            | ApiType::Start {} => {
                 match self.memory_usage.allocate_pages(additional_pages as usize) {
                     Ok(()) => {
-                        let res = self.stable_memory.stable_grow(additional_pages);
+                        let res = self
+                            .stable_memory
+                            .as_mut()
+                            .expect(WASM_NATIVE_STABLE_MEMORY_ERROR)
+                            .stable_grow(additional_pages);
                         match &res {
                             Err(_) | Ok(-1) => self
                                 .memory_usage
@@ -2103,9 +2049,11 @@ impl SystemApi for SystemApiImpl {
         heap: &mut [u8],
     ) -> HypervisorResult<()> {
         let result = match &self.api_type {
-            ApiType::Start {} => Err(self.error_for("ic0_stable_read")),
+            ApiType::Start {} if self.stable_memory.is_some() => {
+                Err(self.error_for("ic0_stable_read"))
+            }
             ApiType::Init { .. }
-            | ApiType::Heartbeat { .. }
+            | ApiType::SystemTask { .. }
             | ApiType::Update { .. }
             | ApiType::Cleanup { .. }
             | ApiType::ReplicatedQuery { .. }
@@ -2113,9 +2061,12 @@ impl SystemApi for SystemApiImpl {
             | ApiType::PreUpgrade { .. }
             | ApiType::ReplyCallback { .. }
             | ApiType::RejectCallback { .. }
-            | ApiType::InspectMessage { .. } => {
-                self.stable_memory.stable_read(dst, offset, size, heap)
-            }
+            | ApiType::InspectMessage { .. }
+            | ApiType::Start {} => self
+                .stable_memory
+                .as_ref()
+                .expect(WASM_NATIVE_STABLE_MEMORY_ERROR)
+                .stable_read(dst, offset, size, heap),
         };
         trace_syscall!(
             self,
@@ -2137,9 +2088,11 @@ impl SystemApi for SystemApiImpl {
         heap: &[u8],
     ) -> HypervisorResult<()> {
         let result = match &self.api_type {
-            ApiType::Start {} => Err(self.error_for("ic0_stable_write")),
+            ApiType::Start {} if self.stable_memory.is_some() => {
+                Err(self.error_for("ic0_stable_write"))
+            }
             ApiType::Init { .. }
-            | ApiType::Heartbeat { .. }
+            | ApiType::SystemTask { .. }
             | ApiType::Update { .. }
             | ApiType::Cleanup { .. }
             | ApiType::ReplicatedQuery { .. }
@@ -2147,13 +2100,12 @@ impl SystemApi for SystemApiImpl {
             | ApiType::PreUpgrade { .. }
             | ApiType::ReplyCallback { .. }
             | ApiType::RejectCallback { .. }
-            | ApiType::InspectMessage { .. } => self
+            | ApiType::InspectMessage { .. }
+            | ApiType::Start {} => self
                 .stable_memory
-                .stable_write(offset, src, size, heap)
-                .map(|_| {
-                    self.memory_usage.stable_memory_delta +=
-                        (size as usize / PAGE_SIZE) + std::cmp::min(1, size as usize % PAGE_SIZE);
-                }),
+                .as_mut()
+                .expect(WASM_NATIVE_STABLE_MEMORY_ERROR)
+                .stable_write(offset, src, size, heap),
         };
         trace_syscall!(
             self,
@@ -2169,9 +2121,11 @@ impl SystemApi for SystemApiImpl {
 
     fn ic0_stable64_size(&self) -> HypervisorResult<u64> {
         let result = match &self.api_type {
-            ApiType::Start {} => Err(self.error_for("ic0_stable64_size")),
+            ApiType::Start {} if self.stable_memory.is_some() => {
+                Err(self.error_for("ic0_stable64_size"))
+            }
             ApiType::Init { .. }
-            | ApiType::Heartbeat { .. }
+            | ApiType::SystemTask { .. }
             | ApiType::Update { .. }
             | ApiType::Cleanup { .. }
             | ApiType::ReplicatedQuery { .. }
@@ -2179,7 +2133,12 @@ impl SystemApi for SystemApiImpl {
             | ApiType::PreUpgrade { .. }
             | ApiType::ReplyCallback { .. }
             | ApiType::RejectCallback { .. }
-            | ApiType::InspectMessage { .. } => self.stable_memory.stable64_size(),
+            | ApiType::InspectMessage { .. }
+            | ApiType::Start {} => self
+                .stable_memory
+                .as_ref()
+                .expect(WASM_NATIVE_STABLE_MEMORY_ERROR)
+                .stable64_size(),
         };
         trace_syscall!(self, ic0_stable64_size, result);
         result
@@ -2187,9 +2146,11 @@ impl SystemApi for SystemApiImpl {
 
     fn ic0_stable64_grow(&mut self, additional_pages: u64) -> HypervisorResult<i64> {
         let result = match &self.api_type {
-            ApiType::Start {} => Err(self.error_for("ic0_stable64_grow")),
+            ApiType::Start {} if self.stable_memory.is_some() => {
+                Err(self.error_for("ic0_stable64_grow"))
+            }
             ApiType::Init { .. }
-            | ApiType::Heartbeat { .. }
+            | ApiType::SystemTask { .. }
             | ApiType::Update { .. }
             | ApiType::Cleanup { .. }
             | ApiType::ReplicatedQuery { .. }
@@ -2197,10 +2158,15 @@ impl SystemApi for SystemApiImpl {
             | ApiType::PreUpgrade { .. }
             | ApiType::ReplyCallback { .. }
             | ApiType::RejectCallback { .. }
-            | ApiType::InspectMessage { .. } => {
+            | ApiType::InspectMessage { .. }
+            | ApiType::Start {} => {
                 match self.memory_usage.allocate_pages(additional_pages as usize) {
                     Ok(()) => {
-                        let res = self.stable_memory.stable64_grow(additional_pages);
+                        let res = self
+                            .stable_memory
+                            .as_mut()
+                            .expect(WASM_NATIVE_STABLE_MEMORY_ERROR)
+                            .stable64_grow(additional_pages);
                         match &res {
                             Err(_) | Ok(-1) => self
                                 .memory_usage
@@ -2225,9 +2191,11 @@ impl SystemApi for SystemApiImpl {
         heap: &mut [u8],
     ) -> HypervisorResult<()> {
         let result = match &self.api_type {
-            ApiType::Start {} => Err(self.error_for("ic0_stable64_read")),
+            ApiType::Start {} if self.stable_memory.is_some() => {
+                Err(self.error_for("ic0_stable64_read"))
+            }
             ApiType::Init { .. }
-            | ApiType::Heartbeat { .. }
+            | ApiType::SystemTask { .. }
             | ApiType::Update { .. }
             | ApiType::Cleanup { .. }
             | ApiType::ReplicatedQuery { .. }
@@ -2235,9 +2203,12 @@ impl SystemApi for SystemApiImpl {
             | ApiType::PreUpgrade { .. }
             | ApiType::ReplyCallback { .. }
             | ApiType::RejectCallback { .. }
-            | ApiType::InspectMessage { .. } => {
-                self.stable_memory.stable64_read(dst, offset, size, heap)
-            }
+            | ApiType::InspectMessage { .. }
+            | ApiType::Start {} => self
+                .stable_memory
+                .as_ref()
+                .expect(WASM_NATIVE_STABLE_MEMORY_ERROR)
+                .stable64_read(dst, offset, size, heap),
         };
         trace_syscall!(
             self,
@@ -2259,9 +2230,11 @@ impl SystemApi for SystemApiImpl {
         heap: &[u8],
     ) -> HypervisorResult<()> {
         let result = match &self.api_type {
-            ApiType::Start {} => Err(self.error_for("ic0_stable64_write")),
+            ApiType::Start {} if self.stable_memory.is_some() => {
+                Err(self.error_for("ic0_stable64_write"))
+            }
             ApiType::Init { .. }
-            | ApiType::Heartbeat { .. }
+            | ApiType::SystemTask { .. }
             | ApiType::Update { .. }
             | ApiType::Cleanup { .. }
             | ApiType::ReplicatedQuery { .. }
@@ -2269,13 +2242,12 @@ impl SystemApi for SystemApiImpl {
             | ApiType::PreUpgrade { .. }
             | ApiType::ReplyCallback { .. }
             | ApiType::RejectCallback { .. }
-            | ApiType::InspectMessage { .. } => self
+            | ApiType::InspectMessage { .. }
+            | ApiType::Start {} => self
                 .stable_memory
-                .stable64_write(offset, src, size, heap)
-                .map(|_| {
-                    self.memory_usage.stable_memory_delta +=
-                        (size as usize / PAGE_SIZE) + std::cmp::min(1, size as usize % PAGE_SIZE);
-                }),
+                .as_mut()
+                .expect(WASM_NATIVE_STABLE_MEMORY_ERROR)
+                .stable64_write(offset, src, size, heap),
         };
         trace_syscall!(
             self,
@@ -2289,11 +2261,27 @@ impl SystemApi for SystemApiImpl {
         result
     }
 
+    fn dirty_pages_from_stable_write(
+        &self,
+        offset: u64,
+        size: u64,
+    ) -> HypervisorResult<(NumPages, NumInstructions)> {
+        let dirty_pages = self
+            .stable_memory
+            .as_ref()
+            .expect(WASM_NATIVE_STABLE_MEMORY_ERROR)
+            .dirty_pages_from_write(offset, size);
+        let cost = self
+            .sandbox_safe_system_state
+            .dirty_page_cost(dirty_pages)?;
+        Ok((dirty_pages, cost))
+    }
+
     fn ic0_time(&self) -> HypervisorResult<Time> {
         let result = match &self.api_type {
             ApiType::Start { .. } => Err(self.error_for("ic0_time")),
             ApiType::Init { time, .. }
-            | ApiType::Heartbeat { time, .. }
+            | ApiType::SystemTask { time, .. }
             | ApiType::Update { time, .. }
             | ApiType::Cleanup { time, .. }
             | ApiType::NonReplicatedQuery { time, .. }
@@ -2307,28 +2295,91 @@ impl SystemApi for SystemApiImpl {
         result
     }
 
-    fn out_of_instructions(
+    fn ic0_global_timer_set(&mut self, time: Time) -> HypervisorResult<Time> {
+        let result = match &self.api_type {
+            ApiType::Start { .. }
+            | ApiType::NonReplicatedQuery { .. }
+            | ApiType::ReplicatedQuery { .. }
+            | ApiType::InspectMessage { .. } => Err(self.error_for("ic0_global_timer_set")),
+            ApiType::Init { .. }
+            | ApiType::SystemTask { .. }
+            | ApiType::Update { .. }
+            | ApiType::Cleanup { .. }
+            | ApiType::PreUpgrade { .. }
+            | ApiType::ReplyCallback { .. }
+            | ApiType::RejectCallback { .. } => {
+                let prev_time = self.sandbox_safe_system_state.global_timer().to_time();
+                self.sandbox_safe_system_state
+                    .set_global_timer(CanisterTimer::from_time(time));
+                Ok(prev_time)
+            }
+        };
+        trace_syscall!(self, ic0_global_timer_set, result);
+        result
+    }
+
+    fn ic0_performance_counter(
         &self,
-        num_instructions_left: NumInstructions,
-    ) -> HypervisorResult<NumInstructions> {
+        performance_counter_type: PerformanceCounterType,
+    ) -> HypervisorResult<u64> {
+        let result = match performance_counter_type {
+            PerformanceCounterType::Instructions(instruction_counter) => Ok(self
+                .message_instructions_executed(instruction_counter)
+                .get()),
+        };
+        trace_syscall!(self, ic0_performance_counter, result);
+        result
+    }
+
+    fn ic0_canister_version(&self) -> HypervisorResult<u64> {
+        let result = match &self.api_type {
+            ApiType::Start { .. } => Err(self.error_for("ic0_canister_version")),
+            ApiType::Init { .. }
+            | ApiType::SystemTask { .. }
+            | ApiType::Update { .. }
+            | ApiType::Cleanup { .. }
+            | ApiType::NonReplicatedQuery { .. }
+            | ApiType::ReplicatedQuery { .. }
+            | ApiType::PreUpgrade { .. }
+            | ApiType::ReplyCallback { .. }
+            | ApiType::RejectCallback { .. }
+            | ApiType::InspectMessage { .. } => {
+                Ok(self.sandbox_safe_system_state.canister_version())
+            }
+        };
+        trace_syscall!(self, ic0_canister_version, result);
+        result
+    }
+
+    fn out_of_instructions(&mut self, instruction_counter: i64) -> HypervisorResult<i64> {
+        let execution_complexity = self.execution_complexity().clone();
         let result = self
             .out_of_instructions_handler
-            .out_of_instructions(num_instructions_left);
-        trace_syscall!(self, out_of_instructions, result);
+            .out_of_instructions(instruction_counter, execution_complexity);
+        if let Ok(new_slice_instruction_limit) = result {
+            // A new slice has started, update the instruction sum and limit.
+            let slice_instructions = self
+                .current_slice_instruction_limit
+                .saturating_sub(instruction_counter)
+                .max(0);
+            self.instructions_executed_before_current_slice += slice_instructions;
+            self.current_slice_instruction_limit = new_slice_instruction_limit;
+        }
+        trace_syscall!(self, out_of_instructions, result, instruction_counter);
         result
     }
 
     fn update_available_memory(
         &mut self,
-        native_memory_grow_res: i32,
-        additional_pages: u32,
-    ) -> HypervisorResult<i32> {
+        native_memory_grow_res: i64,
+        additional_pages: u64,
+    ) -> HypervisorResult<()> {
         let result = {
             if native_memory_grow_res == -1 {
-                return Ok(-1);
+                return Ok(());
             }
             match self.memory_usage.allocate_pages(additional_pages as usize) {
-                Ok(()) => Ok(native_memory_grow_res),
+                Ok(()) => Ok(()),
                 Err(_err) => Err(HypervisorError::OutOfMemory),
             }
         };
@@ -2342,10 +2393,37 @@ impl SystemApi for SystemApiImpl {
         result
     }
 
+    fn try_grow_stable_memory(
+        &mut self,
+        current_size: u64,
+        additional_pages: u64,
+        stable_memory_api: ic_interfaces::execution_environment::StableMemoryApi,
+    ) -> HypervisorResult<StableGrowOutcome> {
+        if let StableMemoryApi::Stable32 = stable_memory_api {
+            if current_size > MAX_32_BIT_STABLE_MEMORY_IN_PAGES {
+                return Err(HypervisorError::Trapped(
+                    TrapCode::StableMemoryTooBigFor32Bit,
+                ));
+            }
+            if current_size.saturating_add(additional_pages) > MAX_32_BIT_STABLE_MEMORY_IN_PAGES {
+                return Ok(StableGrowOutcome::Failure);
+            }
+        }
+        match self.memory_usage.allocate_pages(additional_pages as usize) {
+            Ok(()) => Ok(StableGrowOutcome::Success),
+            Err(_) => Ok(StableGrowOutcome::Failure),
+        }
+    }
+
+    fn deallocate_pages(&mut self, additional_pages: u64) {
+        self.memory_usage
+            .deallocate_pages(additional_pages as usize)
+    }
+
     fn ic0_canister_cycle_balance(&self) -> HypervisorResult<u64> {
         let result = {
             let (high_amount, low_amount) = self
-                .ic0_canister_cycles_balance_helper("ic0_canister_cycles_balance")?
+                .ic0_canister_cycle_balance_helper("ic0_canister_cycle_balance")?
                 .into_parts();
             if high_amount != 0 {
                 return Err(HypervisorError::Trapped(CyclesAmountTooBigFor64Bit));
@@ -2356,16 +2434,16 @@ impl SystemApi for SystemApiImpl {
         result
     }
 
-    fn ic0_canister_cycles_balance128(&self, dst: u32, heap: &mut [u8]) -> HypervisorResult<()> {
+    fn ic0_canister_cycle_balance128(&self, dst: u32, heap: &mut [u8]) -> HypervisorResult<()> {
         let result = {
-            let method_name = "ic0_canister_cycles_balance128";
-            let cycles = self.ic0_canister_cycles_balance_helper(method_name)?;
+            let method_name = "ic0_canister_cycle_balance128";
+            let cycles = self.ic0_canister_cycle_balance_helper(method_name)?;
             copy_cycles_to_heap(cycles, dst, heap, method_name)?;
             Ok(())
         };
         trace_syscall!(
             self,
-            ic0_canister_cycles_balance128,
+            ic0_canister_cycle_balance128,
             dst,
             summarize(heap, dst, 16)
         );
@@ -2465,15 +2543,15 @@ impl SystemApi for SystemApiImpl {
 
     fn ic0_data_certificate_present(&self) -> HypervisorResult<i32> {
         let result = match &self.api_type {
-            ApiType::Start { .. }
-            | ApiType::Init { .. }
+            ApiType::Start { .. } => Err(self.error_for("ic0_data_certificate_present")),
+            ApiType::Init { .. }
             | ApiType::ReplyCallback { .. }
             | ApiType::RejectCallback { .. }
             | ApiType::Cleanup { .. }
             | ApiType::PreUpgrade { .. }
             | ApiType::InspectMessage { .. }
             | ApiType::Update { .. }
-            | ApiType::Heartbeat { .. } => Ok(0),
+            | ApiType::SystemTask { .. } => Ok(0),
             ApiType::ReplicatedQuery {
                 data_certificate, ..
             }
@@ -2492,7 +2570,7 @@ impl SystemApi for SystemApiImpl {
         let result = match &self.api_type {
             ApiType::Start { .. }
             | ApiType::Init { .. }
-            | ApiType::Heartbeat { .. }
+            | ApiType::SystemTask { .. }
             | ApiType::Update { .. }
             | ApiType::ReplyCallback { .. }
             | ApiType::RejectCallback { .. }
@@ -2523,7 +2601,7 @@ impl SystemApi for SystemApiImpl {
         let result = match &self.api_type {
             ApiType::Start { .. }
             | ApiType::Init { .. }
-            | ApiType::Heartbeat { .. }
+            | ApiType::SystemTask { .. }
             | ApiType::Update { .. }
             | ApiType::ReplyCallback { .. }
             | ApiType::RejectCallback { .. }
@@ -2592,7 +2670,7 @@ impl SystemApi for SystemApiImpl {
             | ApiType::NonReplicatedQuery { .. }
             | ApiType::InspectMessage { .. } => Err(self.error_for("ic0_certified_data_set")),
             ApiType::Init { .. }
-            | ApiType::Heartbeat { .. }
+            | ApiType::SystemTask { .. }
             | ApiType::Update { .. }
             | ApiType::ReplyCallback { .. }
             | ApiType::RejectCallback { .. }
@@ -2643,7 +2721,7 @@ impl SystemApi for SystemApiImpl {
             | ApiType::NonReplicatedQuery { .. }
             | ApiType::Init { .. }
             | ApiType::Cleanup { .. }
-            | ApiType::Heartbeat { .. }
+            | ApiType::SystemTask { .. }
             | ApiType::Update { .. }
             | ApiType::ReplyCallback { .. }
             | ApiType::RejectCallback { .. }
@@ -2668,7 +2746,7 @@ impl SystemApi for SystemApiImpl {
             | ApiType::NonReplicatedQuery { .. }
             | ApiType::InspectMessage { .. } => Err(self.error_for("ic0_mint_cycles")),
             ApiType::Update { .. }
-            | ApiType::Heartbeat { .. }
+            | ApiType::SystemTask { .. }
             | ApiType::ReplyCallback { .. }
             | ApiType::RejectCallback { .. } => {
                 self.sandbox_safe_system_state
@@ -2721,8 +2799,9 @@ pub struct DefaultOutOfInstructionsHandler {}
 impl OutOfInstructionsHandler for DefaultOutOfInstructionsHandler {
     fn out_of_instructions(
         &self,
-        _num_instruction_left: NumInstructions,
-    ) -> HypervisorResult<NumInstructions> {
+        _instruction_counter: i64,
+        _execution_complexity: ExecutionComplexity,
+    ) -> HypervisorResult<i64> {
         Err(HypervisorError::InstructionLimitExceeded)
     }
 }

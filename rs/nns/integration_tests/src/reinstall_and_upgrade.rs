@@ -5,8 +5,11 @@ use prost::Message;
 use candid::Encode;
 use canister_test::{Canister, Project, Wasm};
 use dfn_candid::candid_one;
-use ic_canister_client::Sender;
+use ic_canister_client_sender::Sender;
 use ic_ic00_types::CanisterInstallMode;
+use ic_nervous_system_common_test_keys::{
+    TEST_NEURON_2_OWNER_KEYPAIR, TEST_NEURON_2_OWNER_PRINCIPAL,
+};
 use ic_nns_common::{
     pb::v1::MethodAuthzInfo, types::NeuronId, types::UpdateIcpXdrConversionRatePayload,
 };
@@ -17,19 +20,17 @@ use ic_nns_gtc::{
     pb::v1::{AccountState, Gtc as GtcProto},
     test_constants::{TEST_IDENTITY_1, TEST_IDENTITY_2, TEST_IDENTITY_3, TEST_IDENTITY_4},
 };
-use ic_nns_test_keys::{TEST_NEURON_2_OWNER_KEYPAIR, TEST_NEURON_2_OWNER_PRINCIPAL};
 use ic_nns_test_utils::{
+    common::{NnsInitPayloads, NnsInitPayloadsBuilder},
     governance::{
         append_inert, get_pending_proposals, reinstall_nns_canister_by_proposal,
         submit_external_update_proposal, upgrade_nns_canister_by_proposal,
         upgrade_nns_canister_with_arg_by_proposal, upgrade_root_canister_by_proposal,
     },
     ids::TEST_NEURON_2_ID,
-    itest_helpers::{
-        local_test_on_nns_subnet, NnsCanisters, NnsInitPayloads, NnsInitPayloadsBuilder,
-    },
+    itest_helpers::{local_test_on_nns_subnet, NnsCanisters},
 };
-use ledger_canister::{LedgerCanisterInitPayload, Tokens};
+use icp_ledger::{LedgerCanisterInitPayload, Tokens};
 use lifeline::LIFELINE_CANISTER_WASM;
 
 /// Seed Round (SR) neurons are released over 48 months in the following tests
@@ -109,7 +110,6 @@ fn test_reinstall_and_upgrade_canisters_canonical_ordering() {
 }
 
 #[test]
-#[ignore]
 fn test_reinstall_and_upgrade_canisters_with_state_changes() {
     local_test_on_nns_subnet(|runtime| async move {
         let init_state = construct_init_state();
@@ -274,33 +274,21 @@ fn get_nns_canister_wasm<'a>(
     let encoded_init_state = encode_init_state(init_state);
     vec![
         CanisterInstallInfo {
-            wasm: Project::cargo_bin_maybe_use_path_relative_to_rs(
-                "rosetta-api/ledger_canister",
-                "ledger-canister",
-                &[],
-            ),
+            wasm: Project::cargo_bin_maybe_from_env("ledger-canister", &[]),
             use_root: true,
             canister: &nns_canisters.ledger,
             init_payload: encoded_init_state[0].clone(),
             mode: CanisterInstallMode::Reinstall,
         },
         CanisterInstallInfo {
-            wasm: Project::cargo_bin_maybe_use_path_relative_to_rs(
-                "nns/gtc",
-                "genesis-token-canister",
-                &[],
-            ),
+            wasm: Project::cargo_bin_maybe_from_env("genesis-token-canister", &[]),
             use_root: true,
             canister: &nns_canisters.genesis_token,
             init_payload: encoded_init_state[1].clone(),
             mode: CanisterInstallMode::Reinstall,
         },
         CanisterInstallInfo {
-            wasm: Project::cargo_bin_maybe_use_path_relative_to_rs(
-                "rosetta-api/cycles_minting_canister",
-                "cycles-minting-canister",
-                &[],
-            ),
+            wasm: Project::cargo_bin_maybe_from_env("cycles-minting-canister", &[]),
             use_root: true,
             canister: &nns_canisters.cycles_minting,
             init_payload: encoded_init_state[2].clone(),
@@ -314,33 +302,21 @@ fn get_nns_canister_wasm<'a>(
             mode: CanisterInstallMode::Upgrade,
         },
         CanisterInstallInfo {
-            wasm: Project::cargo_bin_maybe_use_path_relative_to_rs(
-                "nns/governance",
-                "governance-canister",
-                &[],
-            ),
+            wasm: Project::cargo_bin_maybe_from_env("governance-canister", &[]),
             use_root: true,
             canister: &nns_canisters.governance,
             init_payload: encoded_init_state[4].clone(),
             mode: CanisterInstallMode::Reinstall,
         },
         CanisterInstallInfo {
-            wasm: Project::cargo_bin_maybe_use_path_relative_to_rs(
-                "nns/handlers/root",
-                "root-canister",
-                &[],
-            ),
+            wasm: Project::cargo_bin_maybe_from_env("root-canister", &[]),
             use_root: false,
             canister: &nns_canisters.root,
             init_payload: encoded_init_state[5].clone(),
             mode: CanisterInstallMode::Upgrade,
         },
         CanisterInstallInfo {
-            wasm: Project::cargo_bin_maybe_use_path_relative_to_rs(
-                "registry/canister",
-                "registry-canister",
-                &[],
-            ),
+            wasm: Project::cargo_bin_maybe_from_env("registry-canister", &[]),
             use_root: true,
             canister: &nns_canisters.registry,
             init_payload: encoded_init_state[6].clone(),
@@ -420,7 +396,10 @@ fn construct_init_state() -> NnsInitPayloads {
         .genesis_token
         .donate_account_recipient_neuron_id = Some(NeuronId(TEST_NEURON_2_ID).into());
 
-    let csv_file: PathBuf = ["src", "neurons.csv"].iter().collect();
+    let csv_file = match std::env::var("NEURON_CSV_PATH") {
+        Ok(v) => PathBuf::from(v),
+        Err(_) => PathBuf::from("src/neurons.csv"),
+    };
     nns_init_payload_builder
         .governance
         .with_test_neurons()

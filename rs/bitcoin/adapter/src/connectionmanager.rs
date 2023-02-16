@@ -10,7 +10,7 @@ use bitcoin::network::{
     message_network::VersionMessage,
     Address,
 };
-use ic_logger::{debug, error, info, warn, ReplicaLogger};
+use ic_logger::{error, info, trace, warn, ReplicaLogger};
 use rand::prelude::*;
 use thiserror::Error;
 use tokio::{
@@ -25,9 +25,11 @@ use crate::{
     },
     common::DEFAULT_CHANNEL_BUFFER_SIZE,
     common::*,
+    config::Config,
     connection::{Connection, ConnectionConfig, ConnectionState, PingState},
+    metrics::RouterMetrics,
     stream::{StreamConfig, StreamEvent, StreamEventKind},
-    Channel, ChannelError, Command, Config, ProcessBitcoinNetworkMessage,
+    Channel, ChannelError, Command, ProcessBitcoinNetworkMessage,
     ProcessBitcoinNetworkMessageError, ProcessEvent,
 };
 
@@ -92,7 +94,7 @@ pub struct ConnectionManager {
     connections: HashMap<SocketAddr, Connection>,
     /// This field determines whether or not we will be using a SOCKS proxy to communicate with
     /// the BTC network.
-    socks_proxy: Option<SocketAddr>,
+    socks_proxy: Option<String>,
     /// This field is used to receive stream events from the active connection streams.
     stream_event_receiver: Receiver<StreamEvent>,
     /// This field is used to allow new streams to send events back to the connection manager.
@@ -100,6 +102,7 @@ pub struct ConnectionManager {
     network_message_sender: Sender<(SocketAddr, NetworkMessage)>,
     /// This field is used for the version nonce generation.
     rng: StdRng,
+    metrics: RouterMetrics,
 }
 
 impl ConnectionManager {
@@ -108,6 +111,7 @@ impl ConnectionManager {
         config: &Config,
         logger: ReplicaLogger,
         network_message_sender: Sender<(SocketAddr, NetworkMessage)>,
+        metrics: RouterMetrics,
     ) -> Self {
         let address_book = AddressBook::new(config, logger.clone());
         let (stream_event_sender, stream_event_receiver) =
@@ -125,17 +129,19 @@ impl ConnectionManager {
             current_height: 0,
             connections: HashMap::with_capacity(max_connections),
             rng: StdRng::from_entropy(),
-            socks_proxy: config.socks_proxy,
+            socks_proxy: config.socks_proxy.clone(),
             stream_event_sender,
             network_message_sender,
             stream_event_receiver,
+            metrics,
         }
     }
 
     /// If there is an issue with a misbehaving node, the node is marked as
-    /// disconnected and
-    pub fn discard(&mut self, address: SocketAddr) {
-        if let Ok(conn) = self.get_connection(&address) {
+    /// disconnected and is not added back to the address book when disconnected/discarded
+    /// connections are reaped.
+    fn internal_discard(&mut self, address: &SocketAddr) {
+        if let Ok(conn) = self.get_connection(address) {
             conn.discard();
         }
     }
@@ -181,6 +187,12 @@ impl ConnectionManager {
         self.flag_version_handshake_timeouts();
         self.flag_seed_addr_retrieval_timeouts();
         self.reap_disconnected();
+        self.metrics
+            .available_connections
+            .set(self.available_connections().len() as i64);
+        self.metrics
+            .known_peer_addresses
+            .set(self.address_book.size() as i64);
         while self.connections.len() < self.get_max_number_of_connections() {
             self.make_connection(handle)?;
         }
@@ -214,7 +226,6 @@ impl ConnectionManager {
         }
 
         for addr in needs_ping {
-            info!(self.logger, "Sending ping to {}", addr);
             self.send_ping(&addr).ok();
         }
     }
@@ -256,19 +267,9 @@ impl ConnectionManager {
         for (addr, conn) in self.connections.iter() {
             match conn.state() {
                 ConnectionState::AdapterDiscarded { .. } => {
-                    warn!(
-                        self.logger,
-                        "Adapter discarded connection {}",
-                        conn.address_entry().addr(),
-                    );
                     self.address_book.discard(conn.address_entry());
                 }
                 ConnectionState::NodeDisconnected { .. } => {
-                    debug!(
-                        self.logger,
-                        "Node {} disconnected from adapter",
-                        conn.address_entry().addr(),
-                    );
                     self.address_book.remove_from_active(conn.address_entry());
                 }
                 _ => {}
@@ -289,6 +290,7 @@ impl ConnectionManager {
         &mut self,
         handle: fn(StreamConfig) -> JoinHandle<()>,
     ) -> ConnectionManagerResult<()> {
+        self.metrics.connections.inc();
         let address_entry_result = if !self.address_book.has_enough_addresses() {
             self.address_book.pop_seed()
         } else {
@@ -299,7 +301,6 @@ impl ConnectionManager {
         if self.connections.contains_key(&address) {
             return Err(ConnectionManagerError::AlreadyConnected(address));
         }
-        let socks_proxy = self.socks_proxy;
         let (writer, network_message_receiver) = unbounded_channel();
         let stream_event_sender = self.stream_event_sender.clone();
         let network_message_sender = self.network_message_sender.clone();
@@ -309,7 +310,7 @@ impl ConnectionManager {
             logger: self.logger.clone(),
             magic: self.magic,
             network_message_receiver,
-            socks_proxy,
+            socks_proxy: self.socks_proxy.clone(),
             stream_event_sender,
             network_message_sender,
         };
@@ -359,25 +360,21 @@ impl ConnectionManager {
             self.current_height as i32,
         ));
 
-        debug!(self.logger, "Sending version to {}", addr);
         self.send_to(addr, message)
     }
 
     /// This function is used to send a `verack` message to a specified connection.
     fn send_verack(&mut self, addr: &SocketAddr) -> ConnectionManagerResult<()> {
-        debug!(self.logger, "Sending verack to {}", addr);
         self.send_to(addr, NetworkMessage::Verack)
     }
 
     /// This function is used to send a `getaddr` message to a specified connection.
     fn send_getaddr(&mut self, addr: &SocketAddr) -> ConnectionManagerResult<()> {
-        debug!(self.logger, "Sending getaddr to {}", addr);
         self.send_to(addr, NetworkMessage::GetAddr)
     }
 
     /// This function is used to send a `ping` message to a specified connection.
     fn send_ping(&mut self, addr: &SocketAddr) -> ConnectionManagerResult<()> {
-        debug!(self.logger, "Sending ping to {}", addr);
         let nonce = self.rng.gen();
         let conn = self.get_connection(addr)?;
         conn.expect_pong(nonce);
@@ -426,7 +423,7 @@ impl ConnectionManager {
         address: &SocketAddr,
         message: &VersionMessage,
     ) -> Result<(), ProcessBitcoinNetworkMessageError> {
-        info!(self.logger, "Received version from {}", address);
+        trace!(self.logger, "Received version from {}", address);
         let conn = self
             .get_connection(address)
             .map_err(|_| ProcessBitcoinNetworkMessageError::InvalidMessage)?;
@@ -447,7 +444,7 @@ impl ConnectionManager {
         &mut self,
         address: &SocketAddr,
     ) -> Result<(), ProcessBitcoinNetworkMessageError> {
-        info!(self.logger, "Received verack from {}", address);
+        trace!(self.logger, "Received verack from {}", address);
         if let Ok(conn) = self.get_connection(address) {
             match conn.address_entry() {
                 AddressEntry::Seed(_) => conn.awaiting_addresses(),
@@ -455,9 +452,10 @@ impl ConnectionManager {
             };
         }
 
-        info!(
+        trace!(
             self.logger,
-            "Completed the version handshake with {}", address
+            "Completed the version handshake with {}",
+            address
         );
         Ok(())
     }
@@ -470,7 +468,7 @@ impl ConnectionManager {
     ) -> Result<(), ProcessBitcoinNetworkMessageError> {
         // If we cannot find the connection, the connection has been cleaned up before the
         // message has been received. It can be skipped.
-        debug!(self.logger, "Received ping from {}", address);
+        trace!(self.logger, "Received ping from {}", address);
         self.send_pong(address, nonce).ok();
         Ok(())
     }
@@ -483,7 +481,7 @@ impl ConnectionManager {
     ) -> Result<(), ProcessBitcoinNetworkMessageError> {
         // If we cannot find the connection, the connection has been cleaned up before the
         // message has been received. It can be skipped.
-        info!(self.logger, "Received pong from {}", address);
+        trace!(self.logger, "Received pong from {}", address);
         if let Ok(conn) = self.get_connection(address) {
             let valid_pong = match conn.ping_state() {
                 PingState::ExpectingPong {
@@ -532,6 +530,13 @@ impl ConnectionManager {
         }
 
         if self.address_book.has_enough_addresses() {
+            if self.initial_address_discovery {
+                info!(
+                    self.logger,
+                    "Adapter has discovered enough addresses: {}",
+                    self.address_book.size()
+                );
+            }
             self.initial_address_discovery = false;
         }
         Ok(())
@@ -553,7 +558,7 @@ impl ConnectionManager {
             command,
             hex::encode(payload),
         );
-        self.discard(*address);
+        self.internal_discard(address);
         Ok(())
     }
 
@@ -572,6 +577,10 @@ impl ConnectionManager {
 
 impl Channel for ConnectionManager {
     fn send(&mut self, command: Command) -> Result<(), ChannelError> {
+        self.metrics
+            .bitcoin_messages_sent
+            .with_label_values(&[command.message.cmd()])
+            .inc();
         let Command { address, message } = command;
         if let Some(addr) = address {
             self.send_to(&addr, message).ok();
@@ -598,6 +607,10 @@ impl Channel for ConnectionManager {
             })
             .collect()
     }
+
+    fn discard(&mut self, addr: &SocketAddr) {
+        self.internal_discard(addr);
+    }
 }
 
 impl ProcessEvent for ConnectionManager {
@@ -612,11 +625,11 @@ impl ProcessEvent for ConnectionManager {
                     match result {
                         Ok(_) => {
                             conn.connected();
-                            info!(self.logger, "Connected to {}", event.address);
+                            trace!(self.logger, "Connected to {}", event.address);
                         }
                         Err(err) => {
                             conn.disconnect();
-                            error!(self.logger, "{}", err);
+                            trace!(self.logger, "{}", err);
                         }
                     };
                 }
@@ -629,7 +642,7 @@ impl ProcessEvent for ConnectionManager {
                 Ok(())
             }
             StreamEventKind::FailedToConnect => {
-                self.discard(event.address);
+                self.internal_discard(&event.address);
                 Ok(())
             }
         }
@@ -674,6 +687,7 @@ mod test {
     use crate::config::test::ConfigBuilder;
     use bitcoin::{network::constants::ServiceFlags, Network};
     use ic_logger::replica_logger::no_op_logger;
+    use ic_metrics::MetricsRegistry;
     use std::str::FromStr;
 
     const BLOCK_HEIGHT_FOR_TESTS: BlockHeight = 1;
@@ -701,7 +715,12 @@ mod test {
         let (network_message_sender, _network_message_receiver) =
             channel::<(SocketAddr, NetworkMessage)>(DEFAULT_CHANNEL_BUFFER_SIZE);
 
-        let manager = ConnectionManager::new(&config, no_op_logger(), network_message_sender);
+        let manager = ConnectionManager::new(
+            &config,
+            no_op_logger(),
+            network_message_sender,
+            RouterMetrics::new(&MetricsRegistry::default()),
+        );
         assert!(!manager.validate_received_version(&version_message));
     }
 
@@ -728,7 +747,12 @@ mod test {
         let (network_message_sender, _network_message_receiver) =
             channel::<(SocketAddr, NetworkMessage)>(DEFAULT_CHANNEL_BUFFER_SIZE);
 
-        let mut manager = ConnectionManager::new(&config, no_op_logger(), network_message_sender);
+        let mut manager = ConnectionManager::new(
+            &config,
+            no_op_logger(),
+            network_message_sender,
+            RouterMetrics::new(&MetricsRegistry::default()),
+        );
         manager.current_height = 100_000;
 
         assert!(!manager.validate_received_version(&version_message));
@@ -757,13 +781,19 @@ mod test {
         let (network_message_sender, _network_message_receiver) =
             channel::<(SocketAddr, NetworkMessage)>(DEFAULT_CHANNEL_BUFFER_SIZE);
 
-        let manager = ConnectionManager::new(&config, no_op_logger(), network_message_sender);
+        let manager = ConnectionManager::new(
+            &config,
+            no_op_logger(),
+            network_message_sender,
+            RouterMetrics::new(&MetricsRegistry::default()),
+        );
 
         assert!(!manager.validate_received_version(&version_message));
     }
 
     fn simple_handle(config: StreamConfig) -> JoinHandle<()> {
         tokio::task::spawn(async move {
+            let _ = &config;
             let StreamConfig {
                 address,
                 mut network_message_receiver,
@@ -843,7 +873,12 @@ mod test {
             .build();
         let (network_message_sender, mut network_message_receiver) =
             channel::<(SocketAddr, NetworkMessage)>(DEFAULT_CHANNEL_BUFFER_SIZE);
-        let mut manager = ConnectionManager::new(&config, no_op_logger(), network_message_sender);
+        let mut manager = ConnectionManager::new(
+            &config,
+            no_op_logger(),
+            network_message_sender,
+            RouterMetrics::new(&MetricsRegistry::default()),
+        );
         let addr = SocketAddr::from_str("127.0.0.1:8333").expect("invalid address");
         assert!(manager.initial_address_discovery);
         assert_eq!(manager.current_height, 0);
@@ -903,7 +938,12 @@ mod test {
         let (network_message_sender, _network_message_receiver) =
             channel::<(SocketAddr, NetworkMessage)>(DEFAULT_CHANNEL_BUFFER_SIZE);
 
-        let mut manager = ConnectionManager::new(&config, no_op_logger(), network_message_sender);
+        let mut manager = ConnectionManager::new(
+            &config,
+            no_op_logger(),
+            network_message_sender,
+            RouterMetrics::new(&MetricsRegistry::default()),
+        );
         let timestamp = SystemTime::now() - Duration::from_secs(60);
         let (writer, _) = unbounded_channel();
         runtime.block_on(async {
@@ -942,7 +982,12 @@ mod test {
             .build();
         let (network_message_sender, _network_message_receiver) =
             channel::<(SocketAddr, NetworkMessage)>(DEFAULT_CHANNEL_BUFFER_SIZE);
-        let mut manager = ConnectionManager::new(&config, no_op_logger(), network_message_sender);
+        let mut manager = ConnectionManager::new(
+            &config,
+            no_op_logger(),
+            network_message_sender,
+            RouterMetrics::new(&MetricsRegistry::default()),
+        );
         let timestamp1 = SystemTime::now() - Duration::from_secs(SEED_ADDR_RETRIEVED_TIMEOUT_SECS);
         let timestamp2 = SystemTime::now() + Duration::from_secs(SEED_ADDR_RETRIEVED_TIMEOUT_SECS);
         let (writer, _) = unbounded_channel();
@@ -1006,7 +1051,12 @@ mod test {
         let (network_message_sender, _network_message_receiver) =
             channel::<(SocketAddr, NetworkMessage)>(DEFAULT_CHANNEL_BUFFER_SIZE);
 
-        let mut manager = ConnectionManager::new(&config, no_op_logger(), network_message_sender);
+        let mut manager = ConnectionManager::new(
+            &config,
+            no_op_logger(),
+            network_message_sender,
+            RouterMetrics::new(&MetricsRegistry::default()),
+        );
         let timestamp1 = SystemTime::now() - Duration::from_secs(SEED_ADDR_RETRIEVED_TIMEOUT_SECS);
         let timestamp2 = SystemTime::now() + Duration::from_secs(SEED_ADDR_RETRIEVED_TIMEOUT_SECS);
         let (writer, _) = unbounded_channel();
@@ -1063,7 +1113,12 @@ mod test {
         let (network_message_sender, _network_message_receiver) =
             channel::<(SocketAddr, NetworkMessage)>(DEFAULT_CHANNEL_BUFFER_SIZE);
 
-        let mut manager = ConnectionManager::new(&config, no_op_logger(), network_message_sender);
+        let mut manager = ConnectionManager::new(
+            &config,
+            no_op_logger(),
+            network_message_sender,
+            RouterMetrics::new(&MetricsRegistry::default()),
+        );
         let (writer, _) = unbounded_channel();
         let conn = Connection::new_with_state(
             ConnectionConfig {
@@ -1104,7 +1159,12 @@ mod test {
         let (network_message_sender, _network_message_receiver) =
             channel::<(SocketAddr, NetworkMessage)>(DEFAULT_CHANNEL_BUFFER_SIZE);
 
-        let mut manager = ConnectionManager::new(&config, no_op_logger(), network_message_sender);
+        let mut manager = ConnectionManager::new(
+            &config,
+            no_op_logger(),
+            network_message_sender,
+            RouterMetrics::new(&MetricsRegistry::default()),
+        );
         let (writer, _) = unbounded_channel();
         let conn = Connection::new_with_state(
             ConnectionConfig {

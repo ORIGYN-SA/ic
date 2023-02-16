@@ -1,0 +1,27 @@
+load("@rules_rust//rust:defs.bzl", "rust_library", "rust_test")
+
+package(default_visibility = ["//visibility:public"])
+
+rust_library(
+    name = "logger",
+    srcs = glob(["src/**"]),
+    crate_name = "ic_logger",
+    version = "0.8.0",
+    deps = [
+        "//rs/config",
+        "//rs/monitoring/context_logger",
+        "//rs/protobuf",
+        "@crate_index//:chrono",
+        "@crate_index//:serde",
+        "@crate_index//:slog",
+        "@crate_index//:slog-async",
+        "@crate_index//:slog-json",
+        "@crate_index//:slog-scope",
+        "@crate_index//:slog-term",
+    ],
+)
+
+rust_test(
+    name = "logger_test",
+    crate = ":logger",
+)

@@ -34,14 +34,14 @@
 
 pub mod args;
 mod catch_up_package_provider;
-mod crypto_helper;
-mod error;
+mod dashboard;
+pub mod error;
 mod firewall;
 mod metrics;
 pub mod orchestrator;
 mod registration;
 mod registry_helper;
 mod replica_process;
+mod signer;
 mod ssh_access_manager;
 mod upgrade;
-mod utils;

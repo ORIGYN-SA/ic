@@ -1,7 +1,7 @@
 mod setup;
 
 use ic_ic00_types::{
-    CanisterIdRecord, InstallCodeArgs, Method as Ic00Method, Payload,
+    CanisterIdRecord, CanisterInstallMode, InstallCodeArgs, Method as Ic00Method, Payload,
     ProvisionalCreateCanisterWithCyclesArgs, IC_00,
 };
 use ic_interfaces::{execution_environment::IngressHistoryReader, messaging::MessageRouting};
@@ -14,15 +14,14 @@ use ic_state_manager::StateManagerImpl;
 use ic_test_utilities::types::messages::SignedIngressBuilder;
 use ic_types::{
     artifact::SignedIngress,
-    batch::{Batch, BatchPayload, IngressPayload, SelfValidatingPayload, XNetPayload},
-    ingress::{IngressStatus, WasmResult},
-    messages::{CanisterInstallMode, MessageId},
+    batch::{Batch, BatchPayload, IngressPayload},
+    ingress::{IngressState, IngressStatus, WasmResult},
+    messages::MessageId,
     time::UNIX_EPOCH,
     CanisterId, CryptoHashOfState, Randomness, RegistryVersion,
 };
 use setup::setup;
-use std::{convert::TryFrom, sync::Arc, thread::sleep, time::Duration};
-use wabt::wat2wasm;
+use std::{collections::BTreeMap, convert::TryFrom, sync::Arc, thread::sleep, time::Duration};
 
 fn build_batch(message_routing: &dyn MessageRouting, msgs: Vec<SignedIngress>) -> Batch {
     Batch {
@@ -30,13 +29,10 @@ fn build_batch(message_routing: &dyn MessageRouting, msgs: Vec<SignedIngress>) -
         requires_full_state_hash: false,
         payload: BatchPayload {
             ingress: IngressPayload::from(msgs),
-            xnet: XNetPayload {
-                stream_slices: Default::default(),
-            },
-            self_validating: SelfValidatingPayload::default(),
+            ..BatchPayload::default()
         },
         randomness: Randomness::from([0; 32]),
-        ecdsa_subnet_public_key: None,
+        ecdsa_subnet_public_keys: BTreeMap::new(),
         registry_version: RegistryVersion::from(1),
         time: UNIX_EPOCH,
         consensus_responses: vec![],
@@ -49,13 +45,10 @@ fn build_batch_with_full_state_hash(message_routing: &dyn MessageRouting) -> Bat
         requires_full_state_hash: true,
         payload: BatchPayload {
             ingress: IngressPayload::from(vec![]),
-            xnet: XNetPayload {
-                stream_slices: Default::default(),
-            },
-            self_validating: SelfValidatingPayload::default(),
+            ..BatchPayload::default()
         },
         randomness: Randomness::from([0; 32]),
-        ecdsa_subnet_public_key: None,
+        ecdsa_subnet_public_keys: BTreeMap::new(),
         registry_version: RegistryVersion::from(1),
         time: UNIX_EPOCH,
         consensus_responses: vec![],
@@ -78,18 +71,20 @@ fn wait_for_ingress_message(
 ) -> Vec<u8> {
     loop {
         let result = (ingress_history_reader.get_latest_status())(&message_id);
+
         match result {
-            IngressStatus::Completed { result, .. } => match result {
-                WasmResult::Reject(msg) => panic!("{}", msg),
-                WasmResult::Reply(bytes) => return bytes,
+            IngressStatus::Known { state, .. } => match state {
+                IngressState::Completed(WasmResult::Reject(msg)) => panic!("{}", msg),
+                IngressState::Completed(WasmResult::Reply(bytes)) => return bytes,
+                IngressState::Failed(error) => panic!("{:?}", error),
+                IngressState::Done => {
+                    panic!("The call has completed but the reply/reject data has been pruned.")
+                }
+                IngressState::Received | IngressState::Processing => {
+                    sleep(Duration::from_millis(5))
+                }
             },
-            IngressStatus::Failed { error, .. } => panic!("{:?}", error),
-            IngressStatus::Done { .. } => {
-                panic!("The call has completed but the reply/reject data has been pruned.")
-            }
-            IngressStatus::Received { .. }
-            | IngressStatus::Processing { .. }
-            | IngressStatus::Unknown => sleep(Duration::from_millis(5)),
+            IngressStatus::Unknown => sleep(Duration::from_millis(5)),
         }
     }
 }
@@ -159,7 +154,7 @@ fn install_canister(
     let signed_ingress = SignedIngressBuilder::new()
         .method_name(Ic00Method::ProvisionalCreateCanisterWithCycles)
         .canister_id(IC_00)
-        .method_payload(ProvisionalCreateCanisterWithCyclesArgs::new(None).encode())
+        .method_payload(ProvisionalCreateCanisterWithCyclesArgs::new(None, None).encode())
         .expiry_time(UNIX_EPOCH + Duration::from_secs(60))
         .nonce(nonce)
         .build();
@@ -173,7 +168,7 @@ fn install_canister(
         Err(err) => panic!("{}", err),
     };
 
-    let wasm = wat2wasm(wasm).unwrap();
+    let wasm = wat::parse_str(wasm).unwrap();
     let signed_ingress = SignedIngressBuilder::new()
         .canister_id(IC_00)
         .expiry_time(UNIX_EPOCH + Duration::from_secs(60))
@@ -199,16 +194,19 @@ fn install_canister(
     loop {
         let result = (ingress_history_reader.get_latest_status())(&message_id);
         match result {
-            IngressStatus::Completed { .. } => {
-                break;
-            }
-            IngressStatus::Failed { error, .. } => panic!("{:?}", error),
-            IngressStatus::Done { .. } => {
-                panic!("The call has completed but the reply/reject data has been pruned.")
-            }
-            IngressStatus::Received { .. }
-            | IngressStatus::Processing { .. }
-            | IngressStatus::Unknown => sleep(Duration::from_millis(5)),
+            IngressStatus::Known { state, .. } => match state {
+                IngressState::Completed(_) => {
+                    break;
+                }
+                IngressState::Failed(error) => panic!("{:?}", error),
+                IngressState::Done => {
+                    panic!("The call has completed but the reply/reject data has been pruned.")
+                }
+                IngressState::Received | IngressState::Processing => {
+                    sleep(Duration::from_millis(5))
+                }
+            },
+            IngressStatus::Unknown => sleep(Duration::from_millis(5)),
         }
     }
     (canister_id, nonce)

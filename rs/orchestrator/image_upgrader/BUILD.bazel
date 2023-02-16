@@ -1,0 +1,43 @@
+load("@rules_rust//rust:defs.bzl", "rust_doc_test", "rust_library", "rust_test")
+
+package(default_visibility = ["//visibility:public"])
+
+DEPENDENCIES = [
+    "//rs/http_utils",
+    "//rs/monitoring/logger",
+    "@crate_index//:slog",
+    "@crate_index//:tokio",
+]
+
+MACRO_DEPENDENCIES = [
+    "@crate_index//:async-trait",
+]
+
+DEV_DEPENDENCIES = []
+
+MACRO_DEV_DEPENDENCIES = []
+
+ALIASES = {}
+
+rust_library(
+    name = "image_upgrader",
+    srcs = glob(["src/**"]),
+    aliases = ALIASES,
+    crate_name = "ic_image_upgrader",
+    proc_macro_deps = MACRO_DEPENDENCIES,
+    version = "0.8.0",
+    deps = DEPENDENCIES,
+)
+
+rust_doc_test(
+    name = "image_upgrader_doc_test",
+    crate = ":image_upgrader",
+)
+
+rust_test(
+    name = "image_upgrader_test",
+    aliases = ALIASES,
+    crate = ":image_upgrader",
+    proc_macro_deps = MACRO_DEPENDENCIES + MACRO_DEV_DEPENDENCIES,
+    deps = DEPENDENCIES + DEV_DEPENDENCIES,
+)

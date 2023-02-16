@@ -1,3 +1,4 @@
+use ic_crypto_internal_seed::xmd::expand_message_xmd;
 use ic_crypto_internal_threshold_sig_ecdsa::*;
 
 fn xmd_check(msg: &str, dst: &str, want: &str) {
@@ -34,7 +35,7 @@ fn test_hash2curve_kat_p256() -> Result<(), ThresholdEcdsaError> {
 
     /*
     The following tests are taken from section J.1.1 of the hash to curve draft:
-    https://www.ietf.org/archive/id/draft-irtf-cfrg-hash-to-curve-12.html#name-p256_xmdsha-256_sswu_ro_
+    https://www.ietf.org/archive/id/draft-irtf-cfrg-hash-to-curve-14.html#name-p256_xmdsha-256_sswu_ro_
 
     For all tests in the draft, the same domain separator is used.
     */
@@ -85,7 +86,7 @@ fn test_hash2curve_kat_k256() -> Result<(), ThresholdEcdsaError> {
 
     /*
     The following tests are taken from section J.8.1 of the hash to curve draft:
-    https://www.ietf.org/archive/id/draft-irtf-cfrg-hash-to-curve-12.html
+    https://www.ietf.org/archive/id/draft-irtf-cfrg-hash-to-curve-14.html#name-secp256k1_xmdsha-256_sswu_r
 
     For all tests in the draft, the same domain separator is used.
     */

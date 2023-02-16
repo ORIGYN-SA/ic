@@ -54,3 +54,11 @@ loggers:
       - rosetta-api
       - stdout
     additive: false
+
+  # include logs from blocks synchronizer to rosetta-api logs as well
+  ic_ledger_canister_blocks_synchronizer:
+    level: trace
+    appenders:
+      - rosetta-api
+      - stdout
+    additive: false

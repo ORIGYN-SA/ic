@@ -26,6 +26,11 @@ pub enum WasmMethod {
     /// execution.
     Query(String),
 
+    /// An exported composite query method along with its name.
+    /// It is similar to `Query` method above, but support query calls
+    /// and for now does not support replicated execution.
+    CompositeQuery(String),
+
     /// An exported system method. Unlike query or update method, there
     /// are a few fixed system methods as defined in `SystemMethod`.
     System(SystemMethod),
@@ -36,6 +41,7 @@ impl WasmMethod {
         match self {
             Self::Update(name) => name.to_string(),
             Self::Query(name) => name.to_string(),
+            Self::CompositeQuery(name) => name.to_string(),
             Self::System(system_method) => system_method.to_string(),
         }
     }
@@ -46,6 +52,7 @@ impl fmt::Display for WasmMethod {
         match self {
             Self::Update(name) => write!(f, "canister_update {}", name),
             Self::Query(name) => write!(f, "canister_query {}", name),
+            Self::CompositeQuery(name) => write!(f, "canister_composite_query {}", name),
             Self::System(system_method) => system_method.fmt(f),
         }
     }
@@ -56,16 +63,20 @@ impl TryFrom<String> for WasmMethod {
 
     fn try_from(name: String) -> Result<Self, Self::Error> {
         if name.starts_with("canister_update ") {
-            // Take the part after the first space
+            // Take the part after the first space.
             let parts: Vec<&str> = name.splitn(2, ' ').collect();
             Ok(WasmMethod::Update(parts[1].to_string()))
         } else if name.starts_with("canister_query ") {
-            // Take the part after the first space
+            // Take the part after the first space.
             let parts: Vec<&str> = name.splitn(2, ' ').collect();
             Ok(WasmMethod::Query(parts[1].to_string()))
+        } else if name.starts_with("canister_composite_query ") {
+            // Take the part after the first space.
+            let parts: Vec<&str> = name.splitn(2, ' ').collect();
+            Ok(WasmMethod::CompositeQuery(parts[1].to_string()))
         } else {
             match SystemMethod::try_from(name.as_ref()) {
-                Ok(system_method) => Ok(WasmMethod::System(system_method)),
+                Ok(name) => Ok(WasmMethod::System(name)),
                 _ => Err(format!("Cannot convert {} to WasmFunction.", name)),
             }
         }
@@ -83,6 +94,9 @@ impl From<&WasmMethod> for pb::WasmMethod {
             WasmMethod::Query(value) => Self {
                 wasm_method: Some(PbWasmMethod::Query(value.clone())),
             },
+            WasmMethod::CompositeQuery(value) => Self {
+                wasm_method: Some(PbWasmMethod::CompositeQuery(value.clone())),
+            },
             WasmMethod::System(value) => Self {
                 wasm_method: Some(PbWasmMethod::System(match value {
                     SystemMethod::CanisterStart => PbSystemMethod::CanisterStart,
@@ -92,6 +106,7 @@ impl From<&WasmMethod> for pb::WasmMethod {
                     SystemMethod::CanisterInspectMessage => PbSystemMethod::CanisterInspectMessage,
                     SystemMethod::CanisterHeartbeat => PbSystemMethod::CanisterHeartbeat,
                     SystemMethod::Empty => PbSystemMethod::Empty,
+                    SystemMethod::CanisterGlobalTimer => PbSystemMethod::CanisterGlobalTimer,
                 } as i32)),
             },
         }
@@ -107,6 +122,7 @@ impl TryFrom<pb::WasmMethod> for WasmMethod {
         match try_from_option_field(method.wasm_method, "WasmMethod::wasm_method")? {
             PbWasmMethod::Update(update) => Ok(Self::Update(update)),
             PbWasmMethod::Query(query) => Ok(Self::Query(query)),
+            PbWasmMethod::CompositeQuery(query) => Ok(Self::CompositeQuery(query)),
             PbWasmMethod::System(system) => {
                 let method =
                     PbSystemMethod::from_i32(system).unwrap_or(PbSystemMethod::Unspecified);
@@ -125,6 +141,7 @@ impl TryFrom<pb::WasmMethod> for WasmMethod {
                     PbSystemMethod::CanisterInspectMessage => SystemMethod::CanisterInspectMessage,
                     PbSystemMethod::CanisterHeartbeat => SystemMethod::CanisterHeartbeat,
                     PbSystemMethod::Empty => SystemMethod::Empty,
+                    PbSystemMethod::CanisterGlobalTimer => SystemMethod::CanisterGlobalTimer,
                 }))
             }
         }
@@ -147,6 +164,8 @@ pub enum SystemMethod {
     CanisterInspectMessage,
     /// A system method that is run at regular intervals for cron support.
     CanisterHeartbeat,
+    /// A system method that is run after a specified time.
+    CanisterGlobalTimer,
     /// This is introduced as temporary scaffolding to aid in construction of
     /// the initial ExecutionState. This isn't used to execute any actual wasm
     /// but as a way to get to the wasm embedder from execution. Eventually, we
@@ -166,6 +185,7 @@ impl TryFrom<&str> for SystemMethod {
             "canister_start" => Ok(SystemMethod::CanisterStart),
             "canister_inspect_message" => Ok(SystemMethod::CanisterInspectMessage),
             "canister_heartbeat" => Ok(SystemMethod::CanisterHeartbeat),
+            "canister_global_timer" => Ok(SystemMethod::CanisterGlobalTimer),
             "empty" => Ok(SystemMethod::Empty),
             _ => Err(format!("Cannot convert {} to SystemMethod.", value)),
         }
@@ -182,6 +202,7 @@ impl fmt::Display for SystemMethod {
             Self::CanisterInspectMessage => write!(f, "canister_inspect_message"),
             Self::CanisterHeartbeat => write!(f, "canister_heartbeat"),
             Self::Empty => write!(f, "empty"),
+            Self::CanisterGlobalTimer => write!(f, "canister_global_timer"),
         }
     }
 }
@@ -214,6 +235,12 @@ pub struct Callback {
     pub respondent: Option<CanisterId>,
     /// The number of cycles that were sent in the original request.
     pub cycles_sent: Cycles,
+    /// Cycles prepaid by the caller for response execution.
+    /// The field is optional for backwards compatibility.
+    pub prepayment_for_response_execution: Option<Cycles>,
+    /// Cycles prepaid by the caller for response transimission.
+    /// The field is optional for backwards compatibility.
+    pub prepayment_for_response_transmission: Option<Cycles>,
     /// A closure to be executed if the call succeeded.
     pub on_reply: WasmClosure,
     /// A closure to be executed if the call was rejected.
@@ -229,6 +256,8 @@ impl Callback {
         originator: Option<CanisterId>,
         respondent: Option<CanisterId>,
         cycles_sent: Cycles,
+        prepayment_for_response_execution: Option<Cycles>,
+        prepayment_for_response_transmission: Option<Cycles>,
         on_reply: WasmClosure,
         on_reject: WasmClosure,
         on_cleanup: Option<WasmClosure>,
@@ -238,6 +267,8 @@ impl Callback {
             originator,
             respondent,
             cycles_sent,
+            prepayment_for_response_execution,
+            prepayment_for_response_transmission,
             on_reply,
             on_reject,
             on_cleanup,
@@ -258,6 +289,12 @@ impl From<&Callback> for pb::Callback {
                 .as_ref()
                 .map(|respondent| pb_types::CanisterId::from(*respondent)),
             cycles_sent: Some(item.cycles_sent.into()),
+            prepayment_for_response_execution: item
+                .prepayment_for_response_execution
+                .map(|cycles| cycles.into()),
+            prepayment_for_response_transmission: item
+                .prepayment_for_response_transmission
+                .map(|cycles| cycles.into()),
             on_reply: Some(pb::WasmClosure {
                 func_idx: item.on_reply.func_idx,
                 env: item.on_reply.env,
@@ -285,11 +322,23 @@ impl TryFrom<pb::Callback> for Callback {
         let cycles_sent: PbCycles =
             try_from_option_field(value.cycles_sent, "Callback::cycles_sent")?;
 
+        let prepayment_for_response_execution = value
+            .prepayment_for_response_execution
+            .map(|c| c.try_into())
+            .transpose()?;
+
+        let prepayment_for_response_transmission = value
+            .prepayment_for_response_transmission
+            .map(|c| c.try_into())
+            .transpose()?;
+
         Ok(Self {
             call_context_id: CallContextId::from(value.call_context_id),
             originator: try_from_option_field(value.originator, "Callback::originator").ok(),
             respondent: try_from_option_field(value.respondent, "Callback::respondent").ok(),
             cycles_sent: Cycles::from(cycles_sent),
+            prepayment_for_response_execution,
+            prepayment_for_response_transmission,
             on_reply: WasmClosure {
                 func_idx: on_reply.func_idx,
                 env: on_reply.env,
@@ -318,25 +367,4 @@ pub enum FuncRef {
     UpdateClosure(WasmClosure),
 
     QueryClosure(WasmClosure),
-}
-
-impl FuncRef {
-    /// We utilize the function reference `FuncRef` to decide if a
-    /// state modification resulting from evaluating of the proposed
-    /// function reference should be committed or not.
-    pub fn to_commit(&self) -> bool {
-        match self {
-            Self::Method(WasmMethod::Update(_))
-            | Self::Method(WasmMethod::System(SystemMethod::CanisterStart))
-            | Self::Method(WasmMethod::System(SystemMethod::CanisterInit))
-            | Self::Method(WasmMethod::System(SystemMethod::CanisterPreUpgrade))
-            | Self::Method(WasmMethod::System(SystemMethod::CanisterPostUpgrade))
-            | Self::Method(WasmMethod::System(SystemMethod::CanisterHeartbeat))
-            | Self::UpdateClosure(_) => true,
-            Self::QueryClosure(_)
-            | Self::Method(WasmMethod::Query(_))
-            | Self::Method(WasmMethod::System(SystemMethod::Empty))
-            | Self::Method(WasmMethod::System(SystemMethod::CanisterInspectMessage)) => false,
-        }
-    }
 }

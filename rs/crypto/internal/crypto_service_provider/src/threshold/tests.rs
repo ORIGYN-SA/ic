@@ -2,21 +2,23 @@
 //! Tests for threshold signature implementations
 
 use crate::api::ThresholdSignatureCspClient;
-use crate::secret_key_store::test_utils::TempSecretKeyStore;
-use crate::secret_key_store::SecretKeyStore;
+use crate::key_id::KeyId;
 use crate::types::{CspPublicCoefficients, CspSignature, ThresBls12_381_Signature};
 use crate::Csp;
+use ic_crypto_internal_seed::Seed;
 use ic_crypto_internal_threshold_sig_bls12381::test_utils::select_n;
-use ic_types::crypto::{AlgorithmId, KeyId};
-use ic_types::{NodeIndex, NumberOfNodes, Randomness};
+use ic_crypto_test_utils_reproducible_rng::ReproducibleRng;
+use ic_types::crypto::AlgorithmId;
+use ic_types::{NodeIndex, NumberOfNodes};
 use proptest::prelude::*;
-use rand::{CryptoRng, Rng, SeedableRng};
+use rand::{Rng, SeedableRng};
 use rand_chacha::ChaChaRng;
 use strum::IntoEnumIterator;
 
 pub mod util {
     use super::*;
     use crate::api::CspThresholdSignError;
+    use crate::LocalCspVault;
     use ic_crypto_internal_threshold_sig_bls12381::types::public_coefficients::conversions::try_number_of_nodes_from_csp_pub_coeffs;
 
     /// Test that a set of threshold signatures behaves correctly.
@@ -36,22 +38,22 @@ pub mod util {
     ///   provider, which contains the secret key, and the key identifier.
     /// * `seed` is a source of randomness.
     /// * `message` is a test message.
-    pub fn test_threshold_signatures<
-        R: Rng + CryptoRng + Send + Sync,
-        S: SecretKeyStore,
-        C: SecretKeyStore,
-    >(
+    pub fn test_threshold_signatures(
         public_coefficients: &CspPublicCoefficients,
-        signers: &[(&Csp<R, S, C>, KeyId)],
-        seed: Randomness,
+        signers: &[(&Csp, KeyId)],
+        seed: Seed,
         message: &[u8],
     ) {
-        let mut rng = ChaChaRng::from_seed(seed.get());
-        let verifier = {
-            let key_store = TempSecretKeyStore::new();
-            let csprng = ChaChaRng::from_seed(rng.gen::<[u8; 32]>());
-            Csp::of(csprng, key_store)
-        };
+        let signature_selection_seed =
+            seed.derive("test_threshold_signatures::signature_selection");
+        let mut rng = seed.into_rng();
+        let verifier = Csp::builder()
+            .with_vault(
+                LocalCspVault::builder()
+                    .with_rng(ChaChaRng::from_seed(rng.gen::<[u8; 32]>()))
+                    .build(),
+            )
+            .build();
         let threshold = try_number_of_nodes_from_csp_pub_coeffs(public_coefficients)
             .expect("Intolerable number of nodes");
         let incorrect_message = [&b"pound of flesh"[..], message].concat();
@@ -162,7 +164,7 @@ pub mod util {
         }
 
         // Combine a random subset of signatures:
-        let signature_selection = select_n(seed, threshold, &signatures);
+        let signature_selection = select_n(signature_selection_seed, threshold, &signatures);
         let signature = verifier
             .threshold_combine_signatures(
                 AlgorithmId::ThresBls12_381,
@@ -240,39 +242,26 @@ pub mod util {
     ///   * If the threshold is higher than the number of signers, keygen fails.
     /// * Correct keygen arguments yield keys that behave correctly with regards
     ///   to signing and verification.
-    pub fn test_threshold_scheme_with_basic_keygen(seed: Randomness, message: &[u8]) {
-        let mut rng = ChaChaRng::from_seed(seed.get());
-        let threshold = NumberOfNodes::from(rng.gen_range(0, 10));
-        let number_of_signers = NumberOfNodes::from(rng.gen_range(0, 10));
+    pub fn test_threshold_scheme_with_basic_keygen(seed: Seed, message: &[u8]) {
+        let mut rng = seed.into_rng();
+        let seed = Seed::from_rng(&mut rng);
+        let threshold = NumberOfNodes::from(rng.gen_range(0..10));
+        let number_of_signers = NumberOfNodes::from(rng.gen_range(0..10));
 
-        let mut csp = {
-            let key_store = TempSecretKeyStore::new();
-            let csprng = ChaChaRng::from_seed(rng.gen::<[u8; 32]>());
-            Csp::of(csprng, key_store)
-        };
+        let csp = Csp::builder()
+            .with_vault(LocalCspVault::builder().with_rng(rng).build())
+            .build();
 
-        match csp.threshold_keygen(
-            AlgorithmId::ThresBls12_381,
-            threshold,
-            &vec![true; number_of_signers.get() as usize],
-        ) {
+        match csp.threshold_keygen(AlgorithmId::ThresBls12_381, threshold, number_of_signers) {
             Ok((public_coefficients, key_ids)) => {
                 assert!(
                     number_of_signers >= threshold,
                     "Generated keys even though the threshold is too high"
                 );
 
-                let signers: Vec<_> = key_ids
-                    .iter()
-                    .map(|key_id_maybe| (&csp, key_id_maybe.expect("Missing key")))
-                    .collect();
+                let signers: Vec<_> = key_ids.iter().map(|key_id| (&csp, *key_id)).collect();
 
-                test_threshold_signatures(
-                    &public_coefficients,
-                    &signers,
-                    Randomness::from(rng.gen::<[u8; 32]>()),
-                    message,
-                );
+                test_threshold_signatures(&public_coefficients, &signers, seed, message);
             }
             Err(_) => assert!(number_of_signers < threshold, "Failed to generate keys"),
         }
@@ -287,7 +276,8 @@ proptest! {
     })]
 
     #[test]
-    fn test_threshold_scheme_with_basic_keygen(seed: [u8;32], message in proptest::collection::vec(any::<u8>(), 0..100)) {
-        util::test_threshold_scheme_with_basic_keygen(Randomness::from(seed), &message);
+    fn test_threshold_scheme_with_basic_keygen(message in proptest::collection::vec(any::<u8>(), 0..100)) {
+        let mut rng = ReproducibleRng::new();
+        util::test_threshold_scheme_with_basic_keygen(Seed::from_rng(&mut rng), &message);
     }
 }

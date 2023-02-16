@@ -5,13 +5,16 @@
 use crate::consensus::{
     crypto::ConsensusCrypto, dkg_key_manager::DkgKeyManager, pool_reader::PoolReader,
 };
-use ic_crypto::crypto_hash;
+use crate::ecdsa::{
+    make_bootstrap_summary, payload_builder::get_ecdsa_config_if_enabled,
+    utils::inspect_ecdsa_initializations,
+};
 use ic_interfaces::{
     consensus_pool::ConsensusPoolCache,
     dkg::{ChangeAction, ChangeSet, Dkg, DkgGossip, DkgPool},
-    registry::RegistryClient,
     validation::{ValidationError, ValidationResult},
 };
+use ic_interfaces_registry::RegistryClient;
 use ic_interfaces_state_manager::{StateManager, StateManagerError};
 use ic_logger::{error, info, warn, ReplicaLogger};
 use ic_metrics::buckets::{decimal_buckets, linear_buckets};
@@ -31,6 +34,7 @@ use ic_types::{
         HashedRandomBeacon, Payload, RandomBeaconContent, Rank,
     },
     crypto::{
+        crypto_hash,
         threshold_sig::ni_dkg::{
             config::{errors::NiDkgConfigValidationError, NiDkgConfig, NiDkgConfigData},
             errors::{
@@ -41,6 +45,7 @@ use ic_types::{
         },
         CryptoError, Signed,
     },
+    messages::CallbackId,
     registry::RegistryClientError,
     signature::ThresholdSignature,
     Height, NodeId, NumberOfNodes, RegistryVersion, SubnetId, Time,
@@ -402,7 +407,7 @@ fn get_dealers_from_chain(
 ) -> HashMap<NiDkgId, HashSet<NodeId>> {
     get_dkg_dealings(pool_reader, block)
         .into_iter()
-        .map(|(dkg_id, dealings)| (dkg_id, dealings.into_iter().map(|(key, _)| key).collect()))
+        .map(|(dkg_id, dealings)| (dkg_id, dealings.into_keys().collect()))
         .collect()
 }
 
@@ -413,7 +418,10 @@ fn contains_dkg_messages(dkg_pool: &dyn DkgPool, config: &NiDkgConfig, replica_i
 }
 
 fn get_handle_invalid_change_action<T: AsRef<str>>(message: &Message, reason: T) -> ChangeAction {
-    ChangeAction::HandleInvalid(ic_crypto::crypto_hash(message), reason.as_ref().to_string())
+    ChangeAction::HandleInvalid(
+        ic_types::crypto::crypto_hash(message),
+        reason.as_ref().to_string(),
+    )
 }
 
 /// Validates the DKG payload. The parent block is expected to be a valid block.
@@ -519,7 +527,7 @@ pub fn create_payload(
         return create_summary_payload(
             subnet_id,
             registry_client,
-            &*crypto,
+            crypto,
             pool_reader,
             last_dkg_summary,
             parent,
@@ -632,7 +640,11 @@ fn create_summary_payload(
         state_manager,
         validation_context,
         transcripts_for_new_subnets,
-        last_summary.transcripts_for_new_subnets(),
+        &last_summary
+            .transcripts_for_new_subnets_with_callback_ids
+            .iter()
+            .map(|(id, _, result)| (*id, result.clone()))
+            .collect(),
         &last_summary.initial_dkg_attempts,
         &logger,
     )?;
@@ -866,16 +878,19 @@ fn compute_remote_dkg_data(
 ) -> Result<
     (
         Vec<NiDkgConfig>,
-        BTreeMap<NiDkgId, Result<NiDkgTranscript, String>>,
+        Vec<(NiDkgId, CallbackId, Result<NiDkgTranscript, String>)>,
         BTreeMap<NiDkgTargetId, u32>,
     ),
     TransientError,
 > {
+    let state = state_manager
+        .get_state_at(validation_context.certified_height)
+        .map_err(TransientError::StateManagerError)?;
     let (context_configs, errors, valid_target_ids) = process_subnet_call_context(
         subnet_id,
         height,
         registry_client,
-        state_manager,
+        state.get_ref(),
         validation_context,
         logger,
     )?;
@@ -977,7 +992,47 @@ fn compute_remote_dkg_data(
         new_transcripts.insert(dkg_id, Err(err_str));
     }
 
-    Ok((configs, new_transcripts, attempts))
+    let new_transcripts_vec =
+        add_callback_ids_to_transcript_results(new_transcripts, state.get_ref(), logger);
+
+    Ok((configs, new_transcripts_vec, attempts))
+}
+
+fn add_callback_ids_to_transcript_results(
+    new_transcripts: BTreeMap<NiDkgId, Result<NiDkgTranscript, String>>,
+    state: &ReplicatedState,
+    log: &ReplicaLogger,
+) -> Vec<(NiDkgId, CallbackId, Result<NiDkgTranscript, String>)> {
+    let setup_initial_dkg_contexts = &state
+        .metadata
+        .subnet_call_context_manager
+        .setup_initial_dkg_contexts;
+
+    new_transcripts
+        .into_iter()
+        .filter_map(|(id, result)| {
+            if let Some(callback_id) = setup_initial_dkg_contexts
+                .iter()
+                .filter_map(|(callback_id, context)| {
+                    if NiDkgTargetSubnet::Remote(context.target_id) == id.target_subnet {
+                        Some(*callback_id)
+                    } else {
+                        None
+                    }
+                })
+                .last()
+            {
+                Some((id, callback_id, result))
+            } else {
+                error!(
+                    log,
+                    "Unable to find callback id associated with remote dkg id {}, this should not happen",
+                    id
+                );
+                None
+            }
+        })
+        .collect()
 }
 
 // Reads the SubnetCallContext and attempts to create DKG configs for new
@@ -989,7 +1044,7 @@ fn process_subnet_call_context(
     this_subnet_id: SubnetId,
     start_block_height: Height,
     registry_client: &dyn RegistryClient,
-    state_manager: &dyn StateManager<State = ReplicatedState>,
+    state: &ReplicatedState,
     validation_context: &ValidationContext,
     logger: &ReplicaLogger,
 ) -> Result<
@@ -1003,11 +1058,7 @@ fn process_subnet_call_context(
     let mut new_configs = Vec::new();
     let mut errors = Vec::new();
     let mut valid_target_ids = Vec::new();
-    let state = state_manager
-        .get_state_at(validation_context.certified_height)
-        .map_err(TransientError::StateManagerError)?;
     let contexts = &state
-        .get_ref()
         .metadata
         .subnet_call_context_manager
         .setup_initial_dkg_contexts;
@@ -1019,6 +1070,7 @@ fn process_subnet_call_context(
             nodes_in_target_subnet,
             target_id,
             registry_version,
+            time: _,
         } = context;
 
         // if we haven't reached the required registry version yet, skip this context
@@ -1249,43 +1301,11 @@ pub fn make_genesis_summary(
                 let summary_registry_version =
                     registry_version_to_put_in_summary.unwrap_or(registry_version);
                 let cup_contents = versioned_record.value.expect("Missing CUP contents");
-                let cup_height = Height::new(cup_contents.height);
-
-                let transcripts = get_dkg_transcripts_from_cup_contents(cup_contents);
-                let transcripts = vec![
-                    (NiDkgTag::LowThreshold, transcripts.low_threshold),
-                    (NiDkgTag::HighThreshold, transcripts.high_threshold),
-                ]
-                .into_iter()
-                .collect();
-
-                let committee = get_node_list(subnet_id, registry, registry_version)
-                    .expect("Could not retrieve committee list");
-
-                let configs = get_configs_for_local_transcripts(
+                return get_dkg_summary_from_cup_contents(
+                    cup_contents,
                     subnet_id,
-                    committee,
-                    cup_height,
-                    &transcripts,
-                    registry_version,
-                )
-                .expect("Couldn't generate configs for the genesis summary");
-                // For the first 2 intervals we use the length value contained in the
-                // genesis subnet record.
-                let interval_length =
-                    get_dkg_interval_length(registry, registry_version, subnet_id)
-                        .expect("Could not retieve the interval length for the genesis summary.");
-                let next_interval_length = interval_length;
-                return Summary::new(
-                    configs,
-                    transcripts,
-                    BTreeMap::new(), // next transcripts
-                    BTreeMap::new(), // transcripts for other subnets
+                    registry,
                     summary_registry_version,
-                    interval_length,
-                    next_interval_length,
-                    cup_height,
-                    BTreeMap::new(), // initial_dkg_attempts
                 );
             }
             _ => {
@@ -1299,8 +1319,19 @@ pub fn make_genesis_summary(
     }
 }
 
-fn get_dkg_transcripts_from_cup_contents(cup_contents: CatchUpPackageContents) -> DkgTranscripts {
-    DkgTranscripts {
+fn get_dkg_summary_from_cup_contents(
+    cup_contents: CatchUpPackageContents,
+    subnet_id: SubnetId,
+    registry: &dyn RegistryClient,
+    registry_version: RegistryVersion,
+) -> Summary {
+    // If we're in a NNS subnet recovery case with failover nodes, we extract the registry of the
+    // NNS we're recovering.
+    let registry_version_of_original_registry = cup_contents
+        .registry_store_uri
+        .as_ref()
+        .map(|v| RegistryVersion::from(v.registry_version));
+    let mut transcripts = DkgTranscripts {
         low_threshold: cup_contents
             .initial_ni_dkg_transcript_low_threshold
             .map(initial_ni_dkg_transcript_from_registry_record)
@@ -1309,59 +1340,147 @@ fn get_dkg_transcripts_from_cup_contents(cup_contents: CatchUpPackageContents) -
             .initial_ni_dkg_transcript_high_threshold
             .map(initial_ni_dkg_transcript_from_registry_record)
             .expect("Missing initial high-threshold DKG transcript"),
+    };
+
+    // If we're in a NNS subnet recovery with failover nodes, we set the transcript versions to the
+    // registry version of the recovered NNS, otherwise the oldest registry version used in a CUP is
+    // computed incorrectly.
+    if let Some(version) = registry_version_of_original_registry {
+        transcripts.low_threshold.registry_version = version;
+        transcripts.high_threshold.registry_version = version;
     }
+
+    let transcripts = vec![
+        (NiDkgTag::LowThreshold, transcripts.low_threshold),
+        (NiDkgTag::HighThreshold, transcripts.high_threshold),
+    ]
+    .into_iter()
+    .collect();
+
+    let committee = get_node_list(subnet_id, registry, registry_version)
+        .expect("Could not retrieve committee list");
+
+    let height = Height::from(cup_contents.height);
+    let configs = get_configs_for_local_transcripts(
+        subnet_id,
+        committee,
+        height,
+        &transcripts,
+        // If we are in a NNS subnet recovery with failover nodes, we use the registry version of
+        // the recovered NNS so that the DKG configs point to the correct registry version and new
+        // dealings can be created in the first DKG interval.
+        registry_version_of_original_registry.unwrap_or(registry_version),
+    )
+    .expect("Couldn't generate configs for the genesis summary");
+    // For the first 2 intervals we use the length value contained in the
+    // genesis subnet record.
+    let interval_length = get_dkg_interval_length(registry, registry_version, subnet_id)
+        .expect("Could not retieve the interval length for the genesis summary.");
+    let next_interval_length = interval_length;
+    Summary::new(
+        configs,
+        transcripts,
+        BTreeMap::new(), // next transcripts
+        Vec::new(),      // transcripts for other subnets
+        // If we are in a NNS subnet recovery with failover nodes, we use the registry version of
+        // the recovered NNS as a DKG summary version which is used as the CUP version.
+        registry_version_of_original_registry.unwrap_or(registry_version),
+        interval_length,
+        next_interval_length,
+        height,
+        BTreeMap::new(), // initial_dkg_attempts
+    )
 }
 
-/// Construcs a genesis/recovery CUP from the CUP contents associated with the
+/// Constructs a genesis/recovery CUP from the CUP contents associated with the
 /// given subnet
 pub fn make_registry_cup(
     registry: &dyn RegistryClient,
     subnet_id: SubnetId,
     logger: Option<&ReplicaLogger>,
 ) -> Option<CatchUpPackage> {
+    let no_op_logger = ic_logger::replica_logger::no_op_logger();
+    let logger = logger.unwrap_or(&no_op_logger);
     let versioned_record = match registry.get_cup_contents(subnet_id, registry.get_latest_version())
     {
         Ok(versioned_record) => versioned_record,
         Err(e) => {
-            if let Some(logger) = logger {
-                warn!(
-                    logger,
-                    "Failed to retrieve versioned record from the registry {:?}", e,
-                );
-            }
+            warn!(
+                logger,
+                "Failed to retrieve versioned record from the registry {:?}", e,
+            );
             return None;
         }
     };
 
     let cup_contents = versioned_record.value.expect("Missing CUP contents");
-    let registry_version = if let Some(registry_info) = cup_contents.registry_store_uri {
-        RegistryVersion::from(registry_info.registry_version)
-    } else {
-        versioned_record.version
-    };
-    // We do not use `registry_version` here because doing so would cause issues
-    // for full NNS (4b) subnet recovery. When we are calling
-    // make_registry_cup, our notion of the the NNS registry is still that of
-    // the temporary NNS that is used to spawn the recovered NNS. However the
-    // registry version store in `registry_store_uri` is a registry version from
-    // the original/restored NNS, and so we can not use that version here.
-    let replica_version = match registry.get_replica_version(subnet_id, versioned_record.version) {
+    make_registry_cup_from_cup_contents(
+        registry,
+        subnet_id,
+        cup_contents,
+        versioned_record.version,
+        logger,
+    )
+}
+
+/// Constructs a genesis/recovery CUP from the CUP contents associated with the
+/// given subnet from the provided CUP contents
+pub fn make_registry_cup_from_cup_contents(
+    registry: &dyn RegistryClient,
+    subnet_id: SubnetId,
+    cup_contents: CatchUpPackageContents,
+    registry_version: RegistryVersion,
+    logger: &ReplicaLogger,
+) -> Option<CatchUpPackage> {
+    let replica_version = match registry.get_replica_version(subnet_id, registry_version) {
         Ok(Some(replica_version)) => replica_version,
         err => {
-            if let Some(logger) = logger {
-                warn!(
-                    logger,
-                    "Failed to retrieve subnet replica version at registry version {:?}: {:?}",
-                    registry_version,
-                    err
-                );
-            }
+            warn!(
+                logger,
+                "Failed to retrieve subnet replica version at registry version {:?}: {:?}",
+                registry_version,
+                err
+            );
             return None;
         }
     };
-    let dkg_summary = make_genesis_summary(registry, subnet_id, Some(registry_version));
-    let ecdsa_summary = None;
+    let dkg_summary = get_dkg_summary_from_cup_contents(
+        cup_contents.clone(),
+        subnet_id,
+        registry,
+        registry_version,
+    );
     let cup_height = Height::new(cup_contents.height);
+
+    let ecdsa_init = match inspect_ecdsa_initializations(&cup_contents.ecdsa_initializations) {
+        Ok(Some((key_id, dealings))) => Some((key_id, Some(dealings))),
+        Ok(None) => {
+            match get_ecdsa_config_if_enabled(subnet_id, registry_version, registry, logger) {
+                Ok(Some(ecdsa_config)) => Some((ecdsa_config.key_ids[0].clone(), None)),
+                _ => None,
+            }
+        }
+        Err(err) => {
+            warn!(logger, "{}", err);
+            None
+        }
+    };
+    let ecdsa_summary = ecdsa_init.and_then(|(key_id, dealings)| {
+        match make_bootstrap_summary(subnet_id, key_id, cup_height, dealings, logger) {
+            Ok(summary) => {
+                info!(
+                    logger,
+                    "Making CUP with ecdsa_summary with key_id {:?}",
+                    summary.as_ref().map(|x| &x.key_transcript.key_id)
+                );
+                summary
+            }
+            Err(err) => {
+                warn!(logger, "{:?}", err);
+                None
+            }
+        }
+    });
 
     let low_dkg_id = dkg_summary
         .current_transcript(&NiDkgTag::LowThreshold)
@@ -1369,6 +1488,15 @@ pub fn make_registry_cup(
     let high_dkg_id = dkg_summary
         .current_transcript(&NiDkgTag::HighThreshold)
         .dkg_id;
+
+    // In a NNS subnet recovery case the block validation context needs to reference a registry
+    // version of the NNS to be recovered. Otherwise the validation context points to a registry
+    // version without the NNS subnet record.
+    let block_registry_version = cup_contents
+        .registry_store_uri
+        .as_ref()
+        .map(|v| RegistryVersion::from(v.registry_version))
+        .unwrap_or(registry_version);
     let block = Block::new_with_replica_version(
         replica_version.clone(),
         Id::from(CryptoHash(Vec::new())),
@@ -1377,7 +1505,7 @@ pub fn make_registry_cup(
         Rank(0),
         ValidationContext {
             certified_height: cup_height,
-            registry_version,
+            registry_version: block_registry_version,
             time: Time::from_nanos_since_unix_epoch(cup_contents.time),
         },
     );
@@ -1416,8 +1544,8 @@ mod tests {
     use ic_artifact_pool::dkg_pool::DkgPoolImpl;
     use ic_interfaces::{
         artifact_pool::UnvalidatedArtifact, consensus_pool::ConsensusPool, dkg::MutableDkgPool,
-        registry::RegistryVersionedRecord,
     };
+    use ic_interfaces_registry::RegistryVersionedRecord;
     use ic_logger::replica_logger::no_op_logger;
     use ic_metrics::MetricsRegistry;
     use ic_protobuf::registry::subnet::v1::{
@@ -1432,8 +1560,8 @@ mod tests {
         state_manager::RefMockStateManager,
         types::ids::{node_test_id, subnet_test_id},
         types::messages::RequestBuilder,
-        with_test_replica_logger,
     };
+    use ic_test_utilities_logger::with_test_replica_logger;
     use ic_test_utilities_registry::{add_subnet_record, SubnetRecordBuilder};
     use ic_types::{
         batch::BatchPayload,
@@ -1473,7 +1601,8 @@ mod tests {
 
                 // Now we instantiate the DKG component for node Id = 1, who is a dealer.
                 let replica_1 = node_test_id(1);
-                let dkg_key_manager = new_dkg_key_manager(crypto.clone(), logger.clone());
+                let dkg_key_manager =
+                    new_dkg_key_manager(crypto.clone(), logger.clone(), &PoolReader::new(&pool));
                 let dkg = DkgImpl::new(
                     replica_1,
                     crypto.clone(),
@@ -1539,7 +1668,8 @@ mod tests {
                 // Create another dealer and add his dealings into the unvalidated pool of
                 // replica 1.
                 let replica_2 = node_test_id(2);
-                let dkg_key_manager_2 = new_dkg_key_manager(crypto.clone(), logger.clone());
+                let dkg_key_manager_2 =
+                    new_dkg_key_manager(crypto.clone(), logger.clone(), &PoolReader::new(&pool));
                 let dkg_2 = DkgImpl::new(
                     replica_2,
                     crypto,
@@ -1979,7 +2109,8 @@ mod tests {
                 } = dependencies(pool_config.clone(), 2);
                 let mut dkg_pool = DkgPoolImpl::new(MetricsRegistry::new());
                 // Let's check that replica 3, who's not a dealer, does not produce dealings.
-                let dkg_key_manager = new_dkg_key_manager(crypto.clone(), logger.clone());
+                let dkg_key_manager =
+                    new_dkg_key_manager(crypto.clone(), logger.clone(), &PoolReader::new(&pool));
                 let dkg = DkgImpl::new(
                     node_test_id(3),
                     crypto.clone(),
@@ -1991,7 +2122,8 @@ mod tests {
                 assert!(dkg.on_state_change(&dkg_pool).is_empty());
 
                 // Now we instantiate the DKG component for node Id = 1, who is a dealer.
-                let dkg_key_manager = new_dkg_key_manager(crypto.clone(), logger.clone());
+                let dkg_key_manager =
+                    new_dkg_key_manager(crypto.clone(), logger.clone(), &PoolReader::new(&pool));
                 let dkg = DkgImpl::new(
                     node_test_id(1),
                     crypto,
@@ -2064,6 +2196,7 @@ mod tests {
                     nodes_in_target_subnet,
                     target_id,
                     registry_version,
+                    time: state.time(),
                 });
         }
 
@@ -2114,7 +2247,8 @@ mod tests {
                 );
 
                 // Now we instantiate the DKG component for node Id = 1, who is a dealer.
-                let dkg_key_manager = new_dkg_key_manager(crypto.clone(), logger.clone());
+                let dkg_key_manager =
+                    new_dkg_key_manager(crypto.clone(), logger.clone(), &PoolReader::new(&pool));
                 let dkg = DkgImpl::new(
                     node_test_id(1),
                     crypto,
@@ -2235,8 +2369,18 @@ mod tests {
                 for (dkg_id, _) in summary.dkg.configs.iter() {
                     assert_eq!(dkg_id.target_subnet, NiDkgTargetSubnet::Local);
                 }
-                assert_eq!(summary.dkg.transcripts_for_new_subnets().len(), 2);
-                for (dkg_id, result) in summary.dkg.transcripts_for_new_subnets().iter() {
+                assert_eq!(
+                    summary
+                        .dkg
+                        .transcripts_for_new_subnets_with_callback_ids
+                        .len(),
+                    2
+                );
+                for (dkg_id, _, result) in summary
+                    .dkg
+                    .transcripts_for_new_subnets_with_callback_ids
+                    .iter()
+                {
                     assert_eq!(dkg_id.target_subnet, NiDkgTargetSubnet::Remote(target_id));
                     assert!(result.is_err());
                 }
@@ -2277,7 +2421,11 @@ mod tests {
 
                 with_test_replica_logger(|logger| {
                     // We instantiate the DKG component for node Id = 1 nd Id = 2.
-                    let dkg_key_manager_1 = new_dkg_key_manager(crypto.clone(), logger.clone());
+                    let dkg_key_manager_1 = new_dkg_key_manager(
+                        crypto.clone(),
+                        logger.clone(),
+                        &PoolReader::new(&consensus_pool_1),
+                    );
                     let dkg_1 = DkgImpl::new(
                         node_id_1,
                         crypto.clone(),
@@ -2287,7 +2435,11 @@ mod tests {
                         logger.clone(),
                     );
 
-                    let dkg_key_manager_2 = new_dkg_key_manager(crypto.clone(), logger.clone());
+                    let dkg_key_manager_2 = new_dkg_key_manager(
+                        crypto.clone(),
+                        logger.clone(),
+                        &PoolReader::new(&consensus_pool_2),
+                    );
                     let dkg_2 = DkgImpl::new(
                         node_id_2,
                         crypto.clone(),
@@ -2714,7 +2866,11 @@ mod tests {
                     }
 
                     // Now we instantiate the DKG components. Node Id = 1 is a dealer.
-                    let dgk_key_manager_1 = new_dkg_key_manager(crypto_1.clone(), logger.clone());
+                    let dgk_key_manager_1 = new_dkg_key_manager(
+                        crypto_1.clone(),
+                        logger.clone(),
+                        &PoolReader::new(&pool_1),
+                    );
                     let dkg_1 = DkgImpl::new(
                         node_test_id(1),
                         crypto_1,
@@ -2728,7 +2884,7 @@ mod tests {
                         node_test_id(2),
                         crypto_2.clone(),
                         pool_2.get_cache(),
-                        new_dkg_key_manager(crypto_2, logger.clone()),
+                        new_dkg_key_manager(crypto_2, logger.clone(), &PoolReader::new(&pool_2)),
                         MetricsRegistry::new(),
                         logger,
                     );
@@ -2878,7 +3034,9 @@ mod tests {
                         .count(),
                     2
                 );
-                assert!(dkg_summary.transcripts_for_new_subnets().is_empty());
+                assert!(dkg_summary
+                    .transcripts_for_new_subnets_with_callback_ids
+                    .is_empty());
             } else {
                 panic!(
                     "block at height {} is not a summary block",
@@ -2909,9 +3067,11 @@ mod tests {
                 );
                 assert_eq!(
                     dkg_summary
-                        .transcripts_for_new_subnets()
-                        .keys()
-                        .filter(|id| id.target_subnet == NiDkgTargetSubnet::Remote(target_id))
+                        .transcripts_for_new_subnets_with_callback_ids
+                        .iter()
+                        .filter(
+                            |(id, _, _)| id.target_subnet == NiDkgTargetSubnet::Remote(target_id)
+                        )
                         .count(),
                     2
                 );
@@ -2962,6 +3122,9 @@ mod tests {
                     state_manager.clone(),
                     registry.get_latest_version(),
                     vec![10, 11, 12],
+                    // XXX: This is a very brittle way to set up this test since
+                    // it will cause issues if we access the state manager more
+                    // than once in any call.
                     Some(2),
                     Some(target_id),
                 );
@@ -3038,13 +3201,14 @@ mod tests {
                         .count(),
                     0
                 );
+
                 // We rather respond with errors for this target.
                 assert_eq!(
                     transcripts_for_new_subnets
                         .iter()
-                        .filter(|(dkg_id, result)| dkg_id.target_subnet
+                        .filter(|(dkg_id, _, result)| dkg_id.target_subnet
                             == NiDkgTargetSubnet::Remote(target_id)
-                            && **result == Err(REMOTE_DKG_REPEATED_FAILURE_ERROR.to_string()))
+                            && *result == Err(REMOTE_DKG_REPEATED_FAILURE_ERROR.to_string()))
                         .count(),
                     2
                 );
@@ -3237,7 +3401,7 @@ mod tests {
             // is returned.
             let messages = vec![Message::fake(valid_dealing_content, node_test_id(0))];
             let payload = Payload::new(
-                ic_crypto::crypto_hash,
+                ic_types::crypto::crypto_hash,
                 BlockPayload::Data(DataPayload {
                     batch: BatchPayload::default(),
                     dealings: dkg::Dealings::new(Height::from(0), messages.clone()),
@@ -3592,7 +3756,7 @@ mod tests {
             &self,
             key: &str,
             version: RegistryVersion,
-        ) -> ic_interfaces::registry::RegistryClientVersionedResult<Vec<u8>> {
+        ) -> ic_interfaces_registry::RegistryClientVersionedResult<Vec<u8>> {
             let value = (self.get_versioned_value_fun)(key, version);
             Ok(RegistryVersionedRecord {
                 key: key.to_string(),
@@ -3662,6 +3826,7 @@ mod tests {
                         time: 1,
                         state_hash: vec![1, 2, 3, 4, 5],
                         registry_store_uri: None,
+                        ecdsa_initializations: vec![],
                     };
 
                 // Encode the cup to protobuf
@@ -3709,11 +3874,13 @@ mod tests {
     fn new_dkg_key_manager(
         crypto: Arc<dyn ConsensusCrypto>,
         logger: ReplicaLogger,
+        pool_reader: &PoolReader<'_>,
     ) -> Arc<Mutex<DkgKeyManager>> {
         Arc::new(Mutex::new(DkgKeyManager::new(
             MetricsRegistry::new(),
             crypto,
             logger,
+            pool_reader,
         )))
     }
 

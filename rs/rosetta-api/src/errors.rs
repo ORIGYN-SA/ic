@@ -1,12 +1,14 @@
-use crate::request_types::TransactionOperationResults;
+use crate::request::transaction_operation_results::TransactionOperationResults;
+use crate::request::transaction_results::TransactionResults;
 use crate::{
     convert,
     models::{Error, Object},
-    request_types::TransactionResults,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::convert::TryFrom;
+
+use ic_ledger_canister_blocks_synchronizer::blocks::BlockStoreError;
 
 /// Each Rosetta `Error` has a "retriable" flag and optional "details"
 /// Rosetta error code and message are determined by the `ApiError` variant.
@@ -38,6 +40,7 @@ pub enum ApiError {
     TransactionRejected(bool, Details),
     TransactionExpired,
     OperationsErrors(TransactionResults, String),
+    InvalidTipOfChain(Details),
 }
 
 impl ApiError {
@@ -58,6 +61,7 @@ impl ApiError {
             | ApiError::TransactionRejected(r, _) => *r,
             ApiError::OperationsErrors(e, _) => e.retriable(),
             ApiError::TransactionExpired => false,
+            ApiError::InvalidTipOfChain(_) => false,
         }
     }
 
@@ -91,6 +95,35 @@ impl ApiError {
 
     pub fn invalid_account_id<T: Into<Details>>(t: T) -> ApiError {
         ApiError::InvalidAccountId(false, t.into())
+    }
+
+    pub fn invalid_tip_of_chain<T: Into<Details>>(t: T) -> ApiError {
+        ApiError::InvalidTipOfChain(t.into())
+    }
+}
+
+impl From<BlockStoreError> for ApiError {
+    fn from(e: BlockStoreError) -> Self {
+        match e {
+            BlockStoreError::NotFound(idx) => {
+                ApiError::invalid_block_id(format!("Block not found: {}", idx))
+            }
+            BlockStoreError::NotAvailable(idx) => {
+                ApiError::invalid_block_id(format!("Block not available for query: {}", idx))
+            }
+            BlockStoreError::Other(msg) => ApiError::internal_error(msg),
+        }
+    }
+}
+
+impl From<ic_ledger_canister_blocks_synchronizer::errors::Error> for ApiError {
+    fn from(e: ic_ledger_canister_blocks_synchronizer::errors::Error) -> Self {
+        use ic_ledger_canister_blocks_synchronizer::errors::Error;
+        match e {
+            Error::InvalidBlockId(err) => ApiError::invalid_block_id(err),
+            Error::InternalError(err) => ApiError::internal_error(err),
+            Error::InvalidTipOfChain(err) => ApiError::invalid_tip_of_chain(err),
+        }
     }
 }
 
@@ -130,6 +163,7 @@ pub fn convert_to_error(api_err: &ApiError) -> Error {
                 ),
             }
         }
+        ApiError::InvalidTipOfChain(d) => (715, "Invalid tip of the chain", false, d.into()),
     };
     Error {
         code,
@@ -240,7 +274,7 @@ pub fn convert_to_api_error(err: Error, token_name: &str) -> ApiError {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct ICError {
     #[serde(skip)]
     pub retriable: bool,
@@ -278,7 +312,7 @@ impl TryFrom<Option<Object>> for ICError {
 
 /// A arbitrary JSON object passed to `RosettaError`.
 /// More specific error variants should be preferred.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct Details {
     /// An extra, more detailed error message.
     /// This is distinct from Rosetta `Error.message`.

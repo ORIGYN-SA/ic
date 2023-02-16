@@ -27,10 +27,39 @@ impl XNetPayloadBuilder for FakeXNetPayloadBuilder {
         &self,
         _validation_context: &ValidationContext,
         _past_payloads: &[&XNetPayload],
-        _byte_limit: NumBytes,
-    ) -> XNetPayload {
-        XNetPayload {
-            stream_slices: self.0.lock().unwrap().pop_front().unwrap_or_default(),
+        byte_limit: NumBytes,
+    ) -> (XNetPayload, NumBytes) {
+        let mut streams = self.0.lock().unwrap();
+
+        // Pick a stream that fits the size requirements
+        let mut picked_stream = None;
+        let mut size_bytes = 0.into();
+        for (index, stream_slices) in streams.iter().enumerate() {
+            let stream_size: usize = stream_slices
+                .iter()
+                .map(|(_, stream_slice)| {
+                    stream_slice.payload.len() + stream_slice.merkle_proof.len()
+                })
+                .sum();
+
+            if NumBytes::from(stream_size as u64) < byte_limit {
+                picked_stream = Some(index);
+                size_bytes = (stream_size as u64).into();
+                break;
+            }
+        }
+
+        match picked_stream {
+            None => (XNetPayload::default(), 0.into()),
+            Some(stream_index) => {
+                let stream = streams.remove(stream_index).unwrap();
+                (
+                    XNetPayload {
+                        stream_slices: stream,
+                    },
+                    size_bytes,
+                )
+            }
         }
     }
 
@@ -42,8 +71,8 @@ impl XNetPayloadBuilder for FakeXNetPayloadBuilder {
     ) -> Result<NumBytes, XNetPayloadValidationError> {
         let size: usize = payload
             .stream_slices
-            .iter()
-            .map(|(_, stream_slice)| stream_slice.payload.len() + stream_slice.merkle_proof.len())
+            .values()
+            .map(|stream_slice| stream_slice.payload.len() + stream_slice.merkle_proof.len())
             .sum();
 
         Ok(NumBytes::from(size as u64))

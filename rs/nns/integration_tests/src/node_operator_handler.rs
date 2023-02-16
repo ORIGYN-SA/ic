@@ -2,7 +2,10 @@ use assert_matches::assert_matches;
 use dfn_candid::candid_one;
 
 use ic_base_types::NodeId;
-use ic_canister_client::Sender;
+use ic_canister_client_sender::Sender;
+use ic_nervous_system_common_test_keys::{
+    TEST_NEURON_1_OWNER_KEYPAIR, TEST_NEURON_1_OWNER_PRINCIPAL, TEST_NEURON_2_OWNER_PRINCIPAL,
+};
 use ic_nns_common::types::{NeuronId, ProposalId};
 use ic_nns_governance::pb::v1::{
     add_or_remove_node_provider::Change,
@@ -12,15 +15,13 @@ use ic_nns_governance::pb::v1::{
     AddOrRemoveNodeProvider, ManageNeuron, ManageNeuronResponse, NnsFunction, NodeProvider,
     Proposal, ProposalStatus,
 };
-use ic_nns_test_keys::{
-    TEST_NEURON_1_OWNER_KEYPAIR, TEST_NEURON_1_OWNER_PRINCIPAL, TEST_NEURON_2_OWNER_PRINCIPAL,
-};
-use ic_nns_test_utils::registry::prepare_add_node_payload;
 use ic_nns_test_utils::{
+    common::NnsInitPayloadsBuilder,
     governance::{submit_external_update_proposal, wait_for_final_state},
     ids::TEST_NEURON_1_ID,
-    itest_helpers::{local_test_on_nns_subnet, NnsCanisters, NnsInitPayloadsBuilder},
-    registry::get_value,
+    itest_helpers::{local_test_on_nns_subnet, NnsCanisters},
+    registry::get_value_or_panic,
+    registry::prepare_add_node_payload,
 };
 use ic_protobuf::registry::node_operator::v1::{NodeOperatorRecord, RemoveNodeOperatorsPayload};
 use ic_registry_keys::make_node_operator_record_key;
@@ -89,8 +90,8 @@ fn test_node_operator_records_can_be_added_and_removed() {
             ProposalStatus::Executed
         );
 
-        add_node_operator(&nns_canisters, &*TEST_NEURON_1_OWNER_PRINCIPAL).await;
-        add_node_operator(&nns_canisters, &*TEST_NEURON_2_OWNER_PRINCIPAL).await;
+        add_node_operator(&nns_canisters, &TEST_NEURON_1_OWNER_PRINCIPAL).await;
+        add_node_operator(&nns_canisters, &TEST_NEURON_2_OWNER_PRINCIPAL).await;
 
         // Assert that a Node Operator with no nodes can be removed
         let (payload, _, _) = prepare_add_node_payload();
@@ -136,7 +137,7 @@ fn test_node_operator_records_can_be_added_and_removed() {
         );
 
         // Node Operator 1 is not removed because it has associated node records
-        let node_operator_record = get_value::<NodeOperatorRecord>(
+        let node_operator_record = get_value_or_panic::<NodeOperatorRecord>(
             &nns_canisters.registry,
             node_operator_record_key_1.as_slice(),
         )
@@ -174,6 +175,7 @@ async fn add_node_operator(nns_canisters: &NnsCanisters<'_>, node_operator_id: &
         node_provider_principal_id: Some(*TEST_NEURON_1_OWNER_PRINCIPAL),
         dc_id: "DC".into(),
         rewardable_nodes: rewardable_nodes.clone(),
+        ipv6: Some("0:0:0:0:0:0:0:0".into()),
     };
 
     let node_operator_record_key = make_node_operator_record_key(*node_operator_id).into_bytes();
@@ -199,7 +201,7 @@ async fn add_node_operator(nns_canisters: &NnsCanisters<'_>, node_operator_id: &
 
     // Assert that the executed proposal had the expected result
     let fetched_node_operator_record: NodeOperatorRecord =
-        get_value(&nns_canisters.registry, &node_operator_record_key).await;
+        get_value_or_panic(&nns_canisters.registry, &node_operator_record_key).await;
 
     let expected_node_operator_record: NodeOperatorRecord = proposal_payload.into();
 

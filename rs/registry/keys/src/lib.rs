@@ -3,9 +3,14 @@
 //! Since registry mutations come from various NNS canisters, this library MUST
 //! be compilable to WASM as well a native.
 
+use candid::{CandidType, Deserialize};
+use core::fmt;
 use ic_base_types::{NodeId, SubnetId};
+use ic_ic00_types::EcdsaKeyId;
 use ic_types::crypto::KeyPurpose;
+use ic_types::registry::RegistryClientError;
 use ic_types::PrincipalId;
+use serde::Serialize;
 use std::str::FromStr;
 
 const SUBNET_LIST_KEY: &str = "subnet_list";
@@ -27,12 +32,29 @@ pub const CRYPTO_THRESHOLD_SIGNING_KEY_PREFIX: &str = "crypto_threshold_signing_
 pub const DATA_CENTER_KEY_PREFIX: &str = "data_center_record_";
 pub const ECDSA_SIGNING_SUBNET_LIST_KEY_PREFIX: &str = "key_id_";
 
-pub fn make_ecdsa_signing_subnet_list_key<S: AsRef<str>>(key_id: S) -> String {
-    format!(
-        "{}{}",
-        ECDSA_SIGNING_SUBNET_LIST_KEY_PREFIX,
-        key_id.as_ref()
-    )
+pub fn make_ecdsa_signing_subnet_list_key(key_id: &EcdsaKeyId) -> String {
+    format!("{}{}", ECDSA_SIGNING_SUBNET_LIST_KEY_PREFIX, key_id)
+}
+
+pub fn get_ecdsa_key_id_from_signing_subnet_list_key(
+    signing_subnet_list_key: &str,
+) -> Result<EcdsaKeyId, RegistryClientError> {
+    let prefix_removed = signing_subnet_list_key
+        .strip_prefix(ECDSA_SIGNING_SUBNET_LIST_KEY_PREFIX)
+        .ok_or_else(|| RegistryClientError::DecodeError {
+            error: format!(
+                "ECDSA Signing Subnet List key id {} does not start with prefix {}",
+                signing_subnet_list_key, ECDSA_SIGNING_SUBNET_LIST_KEY_PREFIX
+            ),
+        })?;
+    prefix_removed
+        .parse::<EcdsaKeyId>()
+        .map_err(|error| RegistryClientError::DecodeError {
+            error: format!(
+                "ECDSA Signing Subnet List key id {} could not be converted to an EcdsaKeyId: {:?}",
+                signing_subnet_list_key, error
+            ),
+        })
 }
 
 /// Returns the only key whose payload is the list of subnets.
@@ -66,8 +88,94 @@ pub fn make_canister_migrations_record_key() -> String {
     "canister_migrations".to_string()
 }
 
+// TODO: Remove when all subnets are upgraded with IC-1026
 pub fn make_firewall_config_record_key() -> String {
     "firewall_config".to_string()
+}
+
+const FIREWALL_RULES_RECORD_KEY_PREFIX: &str = "firewall_rules_";
+const FIREWALL_RULES_SCOPE_GLOBAL: &str = "global";
+const FIREWALL_RULES_SCOPE_REPLICA_NODES: &str = "replica_nodes";
+const FIREWALL_RULES_SCOPE_SUBNET_PREFIX: &str = "subnet";
+const FIREWALL_RULES_SCOPE_NODE_PREFIX: &str = "node";
+
+/// The scope for a firewall ruleset
+#[derive(CandidType, Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
+pub enum FirewallRulesScope {
+    Node(NodeId),
+    Subnet(SubnetId),
+    ReplicaNodes,
+    Global,
+}
+
+impl fmt::Display for FirewallRulesScope {
+    fn fmt(&self, fmt: &mut std::fmt::Formatter<'_>) -> std::result::Result<(), std::fmt::Error> {
+        match self {
+            FirewallRulesScope::Node(node_id) => write!(
+                fmt,
+                "{}_{}",
+                FIREWALL_RULES_SCOPE_NODE_PREFIX,
+                node_id.get()
+            )?,
+            FirewallRulesScope::Subnet(subnet_id) => write!(
+                fmt,
+                "{}_{}",
+                FIREWALL_RULES_SCOPE_SUBNET_PREFIX,
+                subnet_id.get()
+            )?,
+            FirewallRulesScope::ReplicaNodes => {
+                write!(fmt, "{}", FIREWALL_RULES_SCOPE_REPLICA_NODES)?
+            }
+            FirewallRulesScope::Global => write!(fmt, "{}", FIREWALL_RULES_SCOPE_GLOBAL)?,
+        };
+        Ok(())
+    }
+}
+
+impl FromStr for FirewallRulesScope {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let parts: Vec<_> = s.split(&['(', ')']).filter(|s| !s.is_empty()).collect();
+        if parts.is_empty() || parts.len() > 2 {
+            return Err("Invalid scope".to_string());
+        }
+        match parts[0].to_lowercase().as_str() {
+            FIREWALL_RULES_SCOPE_GLOBAL => Ok(FirewallRulesScope::Global),
+            FIREWALL_RULES_SCOPE_REPLICA_NODES => Ok(FirewallRulesScope::ReplicaNodes),
+            FIREWALL_RULES_SCOPE_SUBNET_PREFIX => Ok(FirewallRulesScope::Subnet(SubnetId::from(
+                PrincipalId::from_str(parts[1]).unwrap(),
+            ))),
+            FIREWALL_RULES_SCOPE_NODE_PREFIX => Ok(FirewallRulesScope::Node(NodeId::from(
+                PrincipalId::from_str(parts[1]).unwrap(),
+            ))),
+            _ => Err("Invalid scope type".to_string()),
+        }
+    }
+}
+
+pub fn make_firewall_rules_record_key(scope: &FirewallRulesScope) -> String {
+    format!("{}{}", FIREWALL_RULES_RECORD_KEY_PREFIX, scope)
+}
+
+/// Returns the principal_id associated with a given firewall_record key if
+/// the key is, in fact, a valid firewall_record_key of node or subnet scope.
+pub fn get_firewall_rules_record_principal_id(key: &str) -> Option<PrincipalId> {
+    let firewall_node_record_prefix = format!(
+        "{}{}_",
+        FIREWALL_RULES_RECORD_KEY_PREFIX, FIREWALL_RULES_SCOPE_NODE_PREFIX
+    );
+    let firewall_subnet_record_prefix = format!(
+        "{}{}_",
+        FIREWALL_RULES_RECORD_KEY_PREFIX, FIREWALL_RULES_SCOPE_SUBNET_PREFIX
+    );
+    if let Some(key) = key.strip_prefix(&firewall_node_record_prefix) {
+        PrincipalId::from_str(key).ok()
+    } else if let Some(key) = key.strip_prefix(&firewall_subnet_record_prefix) {
+        PrincipalId::from_str(key).ok()
+    } else {
+        None
+    }
 }
 
 pub fn make_provisional_whitelist_record_key() -> String {
@@ -191,6 +299,7 @@ pub fn make_nns_canister_records_key() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ic_ic00_types::EcdsaCurve;
     use rand::Rng;
 
     #[test]
@@ -254,5 +363,88 @@ mod tests {
         let wrong_key = make_crypto_tls_cert_key(node_id);
         let parsed = maybe_parse_crypto_threshold_signing_pubkey_key(&wrong_key);
         assert!(parsed.is_none());
+    }
+
+    #[test]
+    fn escdsa_signing_subnet_list_key_round_trips() {
+        let key_id = EcdsaKeyId {
+            curve: EcdsaCurve::Secp256k1,
+            name: "some_key".to_string(),
+        };
+        let signing_subnet_list_key = make_ecdsa_signing_subnet_list_key(&key_id);
+        assert_eq!(
+            get_ecdsa_key_id_from_signing_subnet_list_key(&signing_subnet_list_key).unwrap(),
+            key_id
+        );
+    }
+
+    #[test]
+    fn escdsa_signing_subnet_list_bad_key_id_error_message() {
+        let bad_key = "key_without_curve";
+        let signing_subnet_list_key =
+            format!("{}{}", ECDSA_SIGNING_SUBNET_LIST_KEY_PREFIX, bad_key);
+        assert_eq!(
+            get_ecdsa_key_id_from_signing_subnet_list_key(&signing_subnet_list_key).unwrap_err(),
+            RegistryClientError::DecodeError {
+                error: "ECDSA Signing Subnet List key id key_id_key_without_curve could not be converted to an EcdsaKeyId: \"ECDSA key id key_without_curve does not contain a ':'\"".to_string()
+            }
+        )
+    }
+
+    #[test]
+    fn escdsa_signing_subnet_list_bad_curve_error_message() {
+        let bad_key = "UnknownCurve:key_name";
+        let signing_subnet_list_key =
+            format!("{}{}", ECDSA_SIGNING_SUBNET_LIST_KEY_PREFIX, bad_key);
+        assert_eq!(
+            get_ecdsa_key_id_from_signing_subnet_list_key(&signing_subnet_list_key).unwrap_err(),
+            RegistryClientError::DecodeError {
+                error: "ECDSA Signing Subnet List key id key_id_UnknownCurve:key_name could not be converted to an EcdsaKeyId: \"UnknownCurve is not a recognized ECDSA curve\"".to_string()
+            }
+        )
+    }
+
+    #[test]
+    fn firewall_scope_parsing() {
+        let id = PrincipalId::new_node_test_id(42);
+        assert_eq!(
+            format!("{}", FirewallRulesScope::Global),
+            FIREWALL_RULES_SCOPE_GLOBAL
+        );
+        assert_eq!(
+            format!("{}", FirewallRulesScope::ReplicaNodes),
+            FIREWALL_RULES_SCOPE_REPLICA_NODES
+        );
+        assert_eq!(
+            format!("{}", FirewallRulesScope::Subnet(SubnetId::from(id))),
+            format!("{}_{}", FIREWALL_RULES_SCOPE_SUBNET_PREFIX, id)
+        );
+        assert_eq!(
+            format!("{}", FirewallRulesScope::Node(NodeId::from(id))),
+            format!("{}_{}", FIREWALL_RULES_SCOPE_NODE_PREFIX, id)
+        );
+
+        assert_eq!(
+            FirewallRulesScope::from_str(FIREWALL_RULES_SCOPE_GLOBAL).unwrap(),
+            FirewallRulesScope::Global
+        );
+        assert_eq!(
+            FirewallRulesScope::from_str(FIREWALL_RULES_SCOPE_REPLICA_NODES).unwrap(),
+            FirewallRulesScope::ReplicaNodes
+        );
+        assert_eq!(
+            FirewallRulesScope::from_str(
+                format!("{}({})", FIREWALL_RULES_SCOPE_SUBNET_PREFIX, id).as_str()
+            )
+            .unwrap(),
+            FirewallRulesScope::Subnet(SubnetId::from(id))
+        );
+        assert_eq!(
+            FirewallRulesScope::from_str(
+                format!("{}({})", FIREWALL_RULES_SCOPE_NODE_PREFIX, id).as_str()
+            )
+            .unwrap(),
+            FirewallRulesScope::Node(NodeId::from(id))
+        );
     }
 }

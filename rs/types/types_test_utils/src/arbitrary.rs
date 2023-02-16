@@ -1,16 +1,14 @@
 use crate::ids::{canister_test_id, node_test_id, subnet_test_id, user_test_id};
-use ic_types::crypto::{AlgorithmId, KeyId, KeyPurpose, UserPublicKey};
-use ic_types::messages::{Payload, RejectContext, RequestOrResponse, Response};
-use ic_types::RegistryVersion;
 use ic_types::{
-    messages::{CallbackId, Request},
+    crypto::{AlgorithmId, KeyPurpose, UserPublicKey},
+    messages::{CallbackId, Payload, RejectContext, Request, RequestOrResponse, Response},
+    state_sync::{ChunkInfo, FileInfo},
     time::UNIX_EPOCH,
     xnet::StreamIndex,
-    CanisterId, Cycles, Height, IDkgId, NodeId, SubnetId, Time, UserId,
+    CanisterId, Cycles, Height, IDkgId, NodeId, RegistryVersion, SubnetId, Time, UserId,
 };
 use proptest::prelude::*;
-use std::convert::TryInto;
-use std::time::Duration;
+use std::{convert::TryInto, time::Duration};
 use strum::IntoEnumIterator;
 
 prop_compose! {
@@ -31,13 +29,6 @@ prop_compose! {
     /// Returns an arbitrary [`CanisterId`].
     pub fn canister_id()(id in any::<u64>()) -> CanisterId {
         canister_test_id(id)
-    }
-}
-
-prop_compose! {
-    /// Returns an arbitrary [`KeyId`].
-    pub fn key_id()(id in any::<[u8;32]>()) -> KeyId {
-        KeyId::from(id)
     }
 }
 
@@ -173,8 +164,8 @@ prop_compose! {
 /// Produces an arbitrary [`RequestOrResponse`].
 pub fn request_or_response() -> impl Strategy<Value = RequestOrResponse> {
     prop_oneof![
-        request().prop_flat_map(|req| Just(RequestOrResponse::Request(req))),
-        response().prop_flat_map(|rep| Just(RequestOrResponse::Response(rep))),
+        request().prop_flat_map(|req| Just(req.into())),
+        response().prop_flat_map(|rep| Just(rep.into())),
     ]
 }
 
@@ -184,5 +175,37 @@ prop_compose! {
       index in 0..max,
     ) -> StreamIndex {
         StreamIndex::from(index)
+    }
+}
+
+prop_compose! {
+    /// Returns an arbitrary [`ChunkInfo`].
+    pub fn chunk_info() (
+        file_index in any::<u32>(),
+        size_bytes in any::<u32>(),
+        offset in any::<u64>(),
+        hash in any::<[u8; 32]>(),
+    ) -> ChunkInfo {
+        ChunkInfo {
+            file_index,
+            size_bytes,
+            offset,
+            hash,
+        }
+    }
+}
+
+prop_compose! {
+    /// Returns an arbitrary [`ChunkInfo`].
+    pub fn file_info() (
+        relative_path in any::<String>(),
+        size_bytes in any::<u64>(),
+        hash in any::<[u8; 32]>(),
+    ) -> FileInfo {
+        FileInfo {
+            relative_path: std::path::PathBuf::from(relative_path),
+            size_bytes,
+            hash,
+        }
     }
 }

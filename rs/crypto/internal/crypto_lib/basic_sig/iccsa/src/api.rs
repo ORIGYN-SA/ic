@@ -1,6 +1,6 @@
 //! ICCSA (Internet Computer Canister Signature Algorithm) API
 use crate::types::{PublicKey, PublicKeyBytes, Signature, SignatureBytes};
-use ic_certified_vars::CertificateValidationError;
+use ic_certification::CertificateValidationError;
 use ic_crypto_internal_basic_sig_der_utils as der_utils;
 use ic_crypto_sha::Sha256;
 use ic_crypto_tree_hash::{Digest, LabeledTree};
@@ -56,7 +56,7 @@ pub fn verify(
 ) -> CryptoResult<()> {
     let (canister_id, seed) = parse_pubkey_bytes(&pk)?;
     let parsed_sig = parse_signature_bytes(&sig)?;
-    verify_certified_vars_certificate(
+    verify_certified_data(
         parsed_sig.certificate.as_ref(),
         &canister_id,
         root_pubkey,
@@ -96,7 +96,7 @@ fn parse_signature_bytes(sig: &SignatureBytes) -> CryptoResult<Signature> {
     })
 }
 
-fn verify_certified_vars_certificate(
+fn verify_certified_data(
     certificate: &[u8],
     canister_id: &CanisterId,
     root_pubkey: &ThresholdSigPublicKey,
@@ -104,26 +104,29 @@ fn verify_certified_vars_certificate(
     sig: &SignatureBytes,
     pk: &PublicKeyBytes,
 ) -> CryptoResult<()> {
-    ic_certified_vars::verify_certificate(certificate, canister_id, root_pubkey, digest.as_bytes())
-        .map_err(|err| match &err {
-            CertificateValidationError::DeserError(_)
-            | CertificateValidationError::MalformedHashTree(_) => CryptoError::MalformedSignature {
-                algorithm: AlgorithmId::IcCanisterSignature,
-                sig_bytes: sig.0.clone(),
-                internal_error: format!("malformed certificate: {}", err),
-            },
-            CertificateValidationError::InvalidSignature(_)
-            | CertificateValidationError::CertifiedDataMismatch { .. }
-            | CertificateValidationError::MultipleSubnetDelegationsNotAllowed
-            | CertificateValidationError::CanisterIdOutOfRange => {
-                CryptoError::SignatureVerification {
-                    algorithm: AlgorithmId::IcCanisterSignature,
-                    public_key_bytes: pk.0.clone(),
-                    sig_bytes: sig.0.clone(),
-                    internal_error: format!("certificate verification failed: {}", err),
-                }
-            }
-        })?;
+    ic_certification::verify_certified_data_with_cache(
+        certificate,
+        canister_id,
+        root_pubkey,
+        digest.as_bytes(),
+    )
+    .map_err(|err| match &err {
+        CertificateValidationError::DeserError(_)
+        | CertificateValidationError::MalformedHashTree(_) => CryptoError::MalformedSignature {
+            algorithm: AlgorithmId::IcCanisterSignature,
+            sig_bytes: sig.0.clone(),
+            internal_error: format!("malformed certificate: {}", err),
+        },
+        CertificateValidationError::InvalidSignature(_)
+        | CertificateValidationError::CertifiedDataMismatch { .. }
+        | CertificateValidationError::MultipleSubnetDelegationsNotAllowed
+        | CertificateValidationError::CanisterIdOutOfRange => CryptoError::SignatureVerification {
+            algorithm: AlgorithmId::IcCanisterSignature,
+            public_key_bytes: pk.0.clone(),
+            sig_bytes: sig.0.clone(),
+            internal_error: format!("certificate verification failed: {}", err),
+        },
+    })?;
     Ok(())
 }
 
@@ -157,8 +160,8 @@ fn lookup_path_in_tree(
                 sig_bytes: sig.0.clone(),
                 internal_error: format!(
                     "the signature tree doesn't contain sig/{}/{} path",
-                    hex::encode(&seed_hash),
-                    hex::encode(&msg_hash)
+                    hex::encode(seed_hash),
+                    hex::encode(msg_hash)
                 ),
             })?;
     match tree {

@@ -46,6 +46,14 @@ crates_config_override:
     artifacts:
       paths:
         - "logs/*"
+  ic-sns-integration-tests:
+    extends: .cargo-crate-tests-process-per-test
+    variables:
+      TARGET_CRATE: ic-sns-integration-tests
+      CARGO_TEST_TIMEOUT: 3600
+    artifacts:
+      paths:
+        - "logs/*"
   ic-nns-handler-root:
     extends: .cargo-crate-tests-process-per-test
   ic-nns-handler-subnet:
@@ -70,27 +78,12 @@ ci_jobs_required:
   - cargo-audit
   - gen-cargo-pipeline
   - pre-commit
-  - python-tests
-  - dependencies-check
-  - crash-safe-io
+  - gitlab-ci-config-validation
+  - python-scalability-tests
+  - python-gitlab-ci-tests
   # prod tests
-  - generic-hourly
-  - subnet-update-workload-nightly
-  - network-reliability-test
   - rejoin-nightly
-  - maximum-capacity-subnet-update-nightly
-  - maximum-capacity-subnet-query-nightly
-  - maximum-capacity-xnet-slo-nightly
-  - subnet-update-workload-slo-100-1kb
-  - large-subnet-update-workload-slo-200-1kb
-  - subnet-update-workload-slo-5-100kb
-  - network-reliability-test-slo
-  - subnet-query-workload-slo-300-1kb
   - rejoin-test-slo
-  - maximum-capacity-rejoin-script
-  - maximum-capacity-xnet-script
-  - maximum-capacity-system-baseline-update
-  - maximum-capacity-system-baseline-query
   # finalize stage
   - notify-gitlab-success
   - notify-gitlab-failure

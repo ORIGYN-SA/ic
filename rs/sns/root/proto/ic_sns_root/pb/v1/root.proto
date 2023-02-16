@@ -15,5 +15,94 @@ message SnsRootCanister {
   // The SNS root canister is supposed to be able to control this canister.  The
   // governance canister sends the SNS root canister change_governance_canister
   // update method calls (and possibly other things).
-  optional ic_base_types.pb.v1.PrincipalId governance_canister_id = 1;
+  ic_base_types.pb.v1.PrincipalId governance_canister_id = 1;
+
+  // Required.
+  //
+  // The SNS Ledger canister ID
+  ic_base_types.pb.v1.PrincipalId ledger_canister_id = 2;
+
+  // Dapp canister IDs.
+  repeated ic_base_types.pb.v1.PrincipalId dapp_canister_ids = 3;
+
+  // Required.
+  //
+  // The swap canister ID.
+  ic_base_types.pb.v1.PrincipalId swap_canister_id = 4;
+
+  // CanisterIds of the archives of the SNS Ledger blocks.
+  repeated ic_base_types.pb.v1.PrincipalId archive_canister_ids = 5;
+
+  // The timestamp of the latest poll for archives of the ledger canister,
+  // in seconds since the Unix epoch.
+  optional uint64 latest_ledger_archive_poll_timestamp_seconds = 6;
+
+  // Required.
+  //
+  // The SNS Index canister ID
+  ic_base_types.pb.v1.PrincipalId index_canister_id = 7;
+
+  // True if the SNS is running in testflight mode. Then additional
+  // controllers beyond SNS root are allowed when registering a dapp.
+  bool testflight = 8;
+}
+
+message RegisterDappCanisterRequest {
+  ic_base_types.pb.v1.PrincipalId canister_id = 1;
+}
+
+message RegisterDappCanisterResponse {
+}
+
+// This message has an identical message defined in governace.proto, both need to be changed together
+// TODO(NNS1-1589)
+message RegisterDappCanistersRequest {
+ repeated ic_base_types.pb.v1.PrincipalId canister_ids = 1;
+}
+
+message RegisterDappCanistersResponse {
+}
+
+// Change control of the listed canisters to the listed principal id.
+// Same proto in governance.proto. TODO(NNS1-1589)
+message SetDappControllersRequest {
+  message CanisterIds {
+    repeated ic_base_types.pb.v1.PrincipalId canister_ids = 1;
+  }
+  optional CanisterIds canister_ids = 1;
+
+  repeated ic_base_types.pb.v1.PrincipalId controller_principal_ids = 2;
+}
+
+message SetDappControllersResponse {
+  message FailedUpdate {
+    ic_base_types.pb.v1.PrincipalId dapp_canister_id = 1;
+    CanisterCallError err = 2;
+  }
+  repeated FailedUpdate failed_updates = 1;
+}
+
+message CanisterCallError {
+  optional int32 code = 1;
+  string description = 2;
+}
+
+// Request struct for the ListSnsCanisters API on the
+// SNS Root canister. ListSnsCanisters will return Principals
+// of all the associated canisters in an SNS.
+message ListSnsCanistersRequest {
+  // This struct intentionally left blank (for now).
+}
+
+// Response struct for the ListSnsCanisters API on the
+// SNS Root canister. ListSnsCanisters will return Principals
+// of all the associated canisters in an SNS.
+message ListSnsCanistersResponse {
+  ic_base_types.pb.v1.PrincipalId root = 1;
+  ic_base_types.pb.v1.PrincipalId governance = 2;
+  ic_base_types.pb.v1.PrincipalId ledger = 3;
+  ic_base_types.pb.v1.PrincipalId swap = 4;
+  repeated ic_base_types.pb.v1.PrincipalId dapps = 5;
+  repeated ic_base_types.pb.v1.PrincipalId archives = 6;
+  ic_base_types.pb.v1.PrincipalId index = 7;
 }

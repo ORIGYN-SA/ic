@@ -3,25 +3,24 @@
 //! Use this artifact pool *ONLY* for representing and testing pools backed by a
 //! filesystem tree like layout.
 
-use ic_interfaces::artifact_manager::{
-    ArtifactAcceptance, ArtifactClient, ArtifactProcessor, ProcessingResult,
-};
+use ic_interfaces::artifact_manager::{ArtifactClient, ArtifactProcessor, ProcessingResult};
 use ic_interfaces::artifact_pool::{ArtifactPoolError, UnvalidatedArtifact};
 use ic_interfaces::time_source::TimeSource;
 use ic_replica_setup_ic_network::{
     TestArtifact, TestArtifactAttribute, TestArtifactId, TestArtifactMessage,
 };
-use ic_types::artifact::{Advert, AdvertClass, AdvertSendRequest, ArtifactId, Priority};
+use ic_types::artifact::{Advert, AdvertSendRequest, ArtifactDestination, ArtifactId, Priority};
 use ic_types::chunkable::Chunkable;
 use ic_types::crypto::CryptoHash;
 use ic_types::filetree_sync::{
     FileTreeSyncArtifact, FileTreeSyncChunksTracker, UnderConstructionState,
 };
 use ic_types::NodeId;
+use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::error::Error;
 use std::path::PathBuf;
-use std::sync::Mutex;
+use std::sync::Arc;
 
 const NODE_PREFIX: &str = "NODE";
 const POOL: &str = "POOL";
@@ -31,13 +30,14 @@ const MAX_CHUNKS: u32 = 5;
 
 type FileTreeSyncInMemoryPool = HashMap<TestArtifactId, FileTreeSyncArtifact>;
 
+#[derive(Clone)]
 pub struct ArtifactChunkingTestImpl {
     node_pool_dir: PathBuf, // Path to on disk pool
     node_id: NodeId,
-    file_tree_sync_unvalidated_pool: Mutex<FileTreeSyncInMemoryPool>, /* In memory representaion
-                                                                       * on on-disk
-                                                                       * pool */
-    file_tree_sync_validated_pool: Mutex<FileTreeSyncInMemoryPool>,
+    file_tree_sync_unvalidated_pool: Arc<Mutex<FileTreeSyncInMemoryPool>>, /* In memory representaion
+                                                                            * on on-disk
+                                                                            * pool */
+    file_tree_sync_validated_pool: Arc<Mutex<FileTreeSyncInMemoryPool>>,
 }
 
 impl ArtifactProcessor<TestArtifact> for ArtifactChunkingTestImpl {
@@ -46,8 +46,8 @@ impl ArtifactProcessor<TestArtifact> for ArtifactChunkingTestImpl {
         _time_source: &dyn TimeSource,
         _artifacts: Vec<UnvalidatedArtifact<FileTreeSyncArtifact>>,
     ) -> (Vec<AdvertSendRequest<TestArtifact>>, ProcessingResult) {
-        let mut unvalidated_pool = self.file_tree_sync_unvalidated_pool.lock().unwrap();
-        let mut validated_pool = self.file_tree_sync_validated_pool.lock().unwrap();
+        let mut unvalidated_pool = self.file_tree_sync_unvalidated_pool.lock();
+        let mut validated_pool = self.file_tree_sync_validated_pool.lock();
         let adverts = unvalidated_pool
             .iter()
             .map(|(artifact_id, artifact)| AdvertSendRequest {
@@ -57,7 +57,7 @@ impl ArtifactProcessor<TestArtifact> for ArtifactChunkingTestImpl {
                     id: artifact.id.clone(),
                     integrity_hash: CryptoHash(artifact_id.clone().into_bytes()),
                 },
-                advert_class: AdvertClass::Critical,
+                dest: ArtifactDestination::AllPeersInSubnet,
             })
             .collect::<Vec<_>>();
         let changed = if !adverts.is_empty() {
@@ -73,20 +73,20 @@ impl ArtifactProcessor<TestArtifact> for ArtifactChunkingTestImpl {
 impl ArtifactClient<TestArtifact> for ArtifactChunkingTestImpl {
     fn check_artifact_acceptance(
         &self,
-        artifact: TestArtifactMessage,
+        artifact: &TestArtifactMessage,
         peer_id: &NodeId,
-    ) -> Result<ArtifactAcceptance<FileTreeSyncArtifact>, ArtifactPoolError> {
+    ) -> Result<(), ArtifactPoolError> {
         println!(
             "Node-{} Receive complete for artifact {:?} from last node {}",
             self.node_id.get(),
             artifact,
             peer_id
         );
-        Ok(ArtifactAcceptance::Processed)
+        Ok(())
     }
 
     fn has_artifact(&self, message_id: &TestArtifactId) -> bool {
-        let pool = self.file_tree_sync_validated_pool.lock().unwrap();
+        let pool = self.file_tree_sync_validated_pool.lock();
         pool.contains_key(message_id)
     }
 
@@ -94,7 +94,7 @@ impl ArtifactClient<TestArtifact> for ArtifactChunkingTestImpl {
         &self,
         message_id: &TestArtifactId,
     ) -> Option<TestArtifactMessage> {
-        let pool = self.file_tree_sync_validated_pool.lock().unwrap();
+        let pool = self.file_tree_sync_validated_pool.lock();
         pool.get(message_id).cloned()
     }
 
@@ -134,8 +134,8 @@ impl ArtifactChunkingTestImpl {
         ArtifactChunkingTestImpl {
             node_pool_dir: on_disk_pool_path,
             node_id,
-            file_tree_sync_unvalidated_pool: Mutex::new(mem_pool),
-            file_tree_sync_validated_pool: Mutex::new(HashMap::new()),
+            file_tree_sync_unvalidated_pool: Arc::new(Mutex::new(mem_pool)),
+            file_tree_sync_validated_pool: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 

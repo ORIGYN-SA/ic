@@ -3,7 +3,6 @@
 
 use criterion::{criterion_group, criterion_main, Criterion};
 use ic_artifact_pool::consensus_pool::ConsensusPoolImpl;
-use ic_consensus_message::ConsensusMessageHashable;
 use ic_interfaces::consensus_pool::{ChangeAction, ChangeSet, ConsensusPool, MutableConsensusPool};
 use ic_logger::replica_logger::no_op_logger;
 use ic_test_utilities::FastForwardTimeSource;
@@ -12,10 +11,9 @@ use ic_test_utilities::{
     types::ids::{node_test_id, subnet_test_id},
     types::messages::SignedIngressBuilder,
 };
-use ic_types::batch::SelfValidatingPayload;
 use ic_types::{
-    batch::{BatchPayload, IngressPayload, XNetPayload},
-    consensus::{dkg, Block, BlockProposal, HasHeight, Payload, Rank},
+    batch::{BatchPayload, IngressPayload},
+    consensus::{dkg, Block, BlockProposal, ConsensusMessageHashable, HasHeight, Payload, Rank},
     Height,
 };
 
@@ -53,12 +51,13 @@ fn prepare(pool: &mut ConsensusPoolImpl, num: usize) {
         let ingress = IngressPayload::from(vec![SignedIngressBuilder::new()
             .method_payload(vec![0; 128 * 1024])
             .build()]);
-        let xnet = XNetPayload::default();
-        let self_validating = SelfValidatingPayload::default();
         block.payload = Payload::new(
-            ic_crypto::crypto_hash,
+            ic_types::crypto::crypto_hash,
             (
-                BatchPayload::new(ingress, xnet, self_validating),
+                BatchPayload {
+                    ingress,
+                    ..BatchPayload::default()
+                },
                 dkg::Dealings::new_empty(parent.payload.as_ref().dkg_interval_start_height()),
                 None,
             )

@@ -1,10 +1,12 @@
-use crate::ic_types::{Principal, PrincipalError};
 use crate::pb_internal::v1::PrincipalId as PrincipalIdProto;
+use candid::types::principal::{Principal, PrincipalError};
 use candid::types::{Type, TypeId};
 use ic_crypto_sha::Sha224;
 use ic_protobuf::types::v1 as pb;
+use ic_stable_structures::{BoundedStorable, Storable};
 use serde::{Deserialize, Serialize};
 use std::{
+    borrow::Cow,
     convert::TryFrom,
     error::Error,
     fmt,
@@ -20,11 +22,12 @@ use std::{
 /// Principals have variable length, bounded by 29 bytes. Since we
 /// want [`PrincipalId`] to implement the Copy trait, we encode them as
 /// a fixed-size array and a length.
-#[derive(Clone, Copy, Eq, PartialOrd, Ord, Serialize, Deserialize)]
-#[cfg_attr(feature = "test", derive(comparable::Comparable), describe_type(String), describe_body(self.to_string()))]
+#[derive(Clone, Copy, Eq, PartialOrd, Ord, Serialize, Deserialize, comparable::Comparable)]
+#[describe_type(String)]
+#[describe_body(self.to_string())]
 #[repr(transparent)]
 #[serde(transparent)]
-pub struct PrincipalId(#[cfg_attr(feature = "test", comparable_ignore)] pub Principal);
+pub struct PrincipalId(#[comparable_ignore] pub Principal);
 
 impl PartialEq for PrincipalId {
     fn eq(&self, other: &PrincipalId) -> bool {
@@ -50,7 +53,7 @@ pub struct PrincipalIdError(pub PrincipalError);
 impl PrincipalIdError {
     #[allow(non_snake_case)]
     pub fn TooLong(_: usize) -> Self {
-        PrincipalIdError(PrincipalError::BufferTooLong())
+        PrincipalIdError(PrincipalError::BytesTooLong())
     }
 }
 
@@ -182,7 +185,7 @@ impl PrincipalId {
     pub(crate) fn new_opaque(blob: &[u8]) -> Self {
         let mut bytes = blob.to_vec();
         bytes.push(Self::TYPE_OPAQUE);
-        PrincipalId(Principal::from_slice(&bytes[..]))
+        PrincipalId(Principal::try_from_slice(&bytes[..]).expect("Input blob too long."))
     }
 
     /// Creates an opaque id from the first `len` bytes of `blob`.
@@ -239,33 +242,28 @@ impl PrincipalId {
             Some(data)
         }
         pub const fn range(data: &[u8], r: Range<usize>) -> &[u8] {
-            let (start, end) = (r.start, r.end);
             match get(data, r) {
                 Some(v) => v,
                 None => {
-                    // TODO: remove (blocked by rust-lang/rust#85194)
-                    // Give good panic messages
-                    let _ = &data[start];
-                    let _ = &data[end];
-                    let _ = &data[end - start];
-                    const ASSERT: [(); 1] = [()];
-                    #[allow(unconditional_panic)]
-                    let _ = ASSERT[1];
-
-                    data
+                    panic!("Out of bounds range access.",);
                 }
             }
         }
 
         //PrincipalId(Principal::from_slice(&data[0..len]))
-        PrincipalId(Principal::from_slice(range(&data, 0..len)))
+        // PrincipalId(Principal::from_slice(range(&data, 0..len)));
+        match Principal::try_from_slice(range(&data, 0..len)) {
+            Ok(v) => PrincipalId(v),
+            _ => panic!("slice length exceeds capacity"),
+        }
     }
 
     pub fn new_self_authenticating(pubkey: &[u8]) -> Self {
         let mut id: [u8; 29] = [0; 29];
         id[..28].copy_from_slice(&Sha224::hash(pubkey));
         id[28] = Self::TYPE_SELF_AUTH;
-        PrincipalId(Principal::from_slice(&id))
+        // id has fixed length of 29, safe to unwrap here
+        PrincipalId(Principal::try_from_slice(&id).unwrap())
     }
 
     pub fn new_derived(registerer: &PrincipalId, seed: &[u8]) -> Self {
@@ -416,6 +414,27 @@ impl TryFrom<pb::PrincipalId> for PrincipalId {
     }
 }
 
+/// Super trait implementation for the BoundedStorable trait on PrincipalId for use
+/// in StableStructures
+impl Storable for PrincipalId {
+    fn to_bytes(&self) -> Cow<[u8]> {
+        self.to_vec().into()
+    }
+
+    fn from_bytes(bytes: Cow<[u8]>) -> Self {
+        PrincipalId::try_from(&bytes[..]).expect("Cannot decode PrincipalId")
+    }
+}
+
+/// Impl of the BoundedStorable trait on PrincipalId for use in StableStructures
+impl BoundedStorable for PrincipalId {
+    /// The upper bound of a PrincipalId is 29 bytes.
+    const MAX_SIZE: u32 = Self::MAX_LENGTH_IN_BYTES as u32;
+
+    /// PrincipalIds can be variable length.
+    const IS_FIXED_SIZE: bool = false;
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -462,25 +481,21 @@ mod tests {
 
     #[test]
     fn parse_bad_checksum() {
-        let good = PrincipalId::from_str(&"bfozs-kwa73-7nadi".to_string())
-            .expect("PrincipalId::from_str failed");
         assert_eq!(
-            PrincipalId::from_str(&"5h74t-uga73-7nadi".to_string()),
-            Err(PrincipalIdError(PrincipalError::AbnormalTextualFormat(
-                good.into()
-            )))
+            PrincipalId::from_str("5h74t-uga73-7nadi"),
+            Err(PrincipalIdError(PrincipalError::CheckSequenceNotMatch()))
         );
     }
 
     #[test]
     fn parse_too_short() {
         assert_eq!(
-            PrincipalId::from_str(&"".to_string()),
-            Err(PrincipalIdError(PrincipalError::TextTooSmall()))
+            PrincipalId::from_str(""),
+            Err(PrincipalIdError(PrincipalError::TextTooShort()))
         );
         assert_eq!(
-            PrincipalId::from_str(&"vpgq".to_string()),
-            Err(PrincipalIdError(PrincipalError::TextTooSmall()))
+            PrincipalId::from_str("vpgq"),
+            Err(PrincipalIdError(PrincipalError::TextTooShort()))
         );
     }
 
@@ -490,29 +505,26 @@ mod tests {
             PrincipalId::from_str(
                 "fmakz-kp753-o4zo5-ktgeh-ozsvi-qzsee-ia77x-n3tf3-vkmyq-53gkv-cdgiq"
             ),
-            Err(PrincipalIdError(PrincipalError::BufferTooLong()))
+            Err(PrincipalIdError(PrincipalError::TextTooLong()))
         )
     }
 
     #[test]
     fn parse_not_normalized() {
-        let good = PrincipalId::from_str(&"bfozs-kwa73-7nadi".to_string())
-            .expect("PrincipalId::from_str failed");
+        let good =
+            PrincipalId::from_str("bfozs-kwa73-7nadi").expect("PrincipalId::from_str failed");
+        // In the SPEC:
+        // The textual representation is conventionally printed with lower case letters, but parsed case-insensitively.
+        assert_eq!(PrincipalId::from_str("BFOZS-KWA73-7NADI"), Ok(good));
         assert_eq!(
-            PrincipalId::from_str(&"BFOZS-KWA73-7NADI".to_string()),
-            Err(PrincipalIdError(PrincipalError::AbnormalTextualFormat(
+            PrincipalId::from_str("bfozskwa737nadi"),
+            Err(PrincipalIdError(PrincipalError::AbnormalGrouped(
                 good.into()
             )))
         );
         assert_eq!(
-            PrincipalId::from_str(&"bfozskwa737nadi".to_string()),
-            Err(PrincipalIdError(PrincipalError::AbnormalTextualFormat(
-                good.into()
-            )))
-        );
-        assert_eq!(
-            PrincipalId::from_str(&"bf-oz-sk-wa737-nadi".to_string()),
-            Err(PrincipalIdError(PrincipalError::AbnormalTextualFormat(
+            PrincipalId::from_str("bf-oz-sk-wa737-nadi"),
+            Err(PrincipalIdError(PrincipalError::AbnormalGrouped(
                 good.into()
             )))
         );

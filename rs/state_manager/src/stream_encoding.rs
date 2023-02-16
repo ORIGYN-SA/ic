@@ -6,7 +6,7 @@ use ic_canonical_state::{
     traverse, LabelLike,
 };
 use ic_crypto_tree_hash::{FlatMap, Label, LabeledTree};
-use ic_interfaces::certified_stream_store::DecodeStreamError;
+use ic_interfaces_certified_stream_store::DecodeStreamError;
 use ic_protobuf::messaging::xnet::v1;
 use ic_protobuf::proxy::ProtoProxy;
 use ic_replicated_state::ReplicatedState;
@@ -200,7 +200,11 @@ pub fn decode_labeled_tree(bytes: &[u8]) -> Result<LabeledTree<Vec<u8>>, DecodeS
 
 /// An auxiliary structure that mirrors the xnet streams data encoded in
 /// canonical form, starting from the root of the tree.
+///
+/// Fail on unknown fields, to prevent malicious replicas from arbitrarily
+/// padding `CertifiedStreamSlices`.
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct EncodedStreams<'a> {
     #[serde(borrow)]
     streams: BTreeMap<SubnetId, EncodedStream<'a>>,
@@ -208,7 +212,11 @@ struct EncodedStreams<'a> {
 
 /// An auxiliary structure that mirrors a single xnet stream slice encoded in
 /// canonical form.
+///
+/// Fail on unknown fields, to prevent malicious replicas from arbitrarily
+/// padding `CertifiedStreamSlices`.
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct EncodedStream<'a> {
     #[serde(borrow)]
     header: &'a serde_bytes::Bytes,

@@ -5,21 +5,21 @@ use mockall::*;
 
 use crate::crypto::empty_ni_dkg_transcripts_with_committee;
 use ic_base_types::RegistryVersion;
-use ic_consensus_message::ConsensusMessageHashable;
-use ic_crypto::crypto_hash;
 use ic_interfaces::{
     consensus::*,
     consensus_pool::{ChangeAction, ChangeSet, ConsensusPool, ConsensusPoolCache},
-    registry::RegistryClient,
     validation::*,
 };
+use ic_interfaces_registry::RegistryClient;
 use ic_registry_client_helpers::subnet::SubnetRegistry;
+use ic_types::crypto::crypto_hash;
 use ic_types::{
     artifact::*,
     batch::ValidationContext,
     consensus::{
-        catchup::CUPWithOriginalProtobuf, dkg, Block, CatchUpContent, CatchUpPackage, HasHeight,
-        HashedBlock, HashedRandomBeacon, Payload, RandomBeaconContent, Rank,
+        catchup::CUPWithOriginalProtobuf, dkg, Block, CatchUpContent, CatchUpPackage,
+        ConsensusMessageHashable, HasHeight, HashedBlock, HashedRandomBeacon, Payload,
+        RandomBeaconContent, Rank,
     },
     crypto::{
         threshold_sig::ni_dkg::NiDkgTag, CombinedThresholdSig, CombinedThresholdSigOf, CryptoHash,

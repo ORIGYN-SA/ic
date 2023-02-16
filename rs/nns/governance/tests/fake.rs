@@ -1,35 +1,53 @@
 use async_trait::async_trait;
-use candid::Encode;
+use candid::{Decode, Encode};
 use futures::future::FutureExt;
-use ic_base_types::PrincipalId;
-use ic_nervous_system_common::{ledger::Ledger, NervousSystemError};
+use ic_base_types::{CanisterId, PrincipalId};
+use ic_nervous_system_common::{ledger::IcpLedger, NervousSystemError};
 use ic_nns_common::pb::v1::{NeuronId, ProposalId};
 use ic_nns_common::types::UpdateIcpXdrConversionRatePayload;
-use ic_nns_constants::GOVERNANCE_CANISTER_ID;
+use ic_nns_constants::{GOVERNANCE_CANISTER_ID, LEDGER_CANISTER_ID, SNS_WASM_CANISTER_ID};
 use ic_nns_governance::{
-    governance::{Environment, Governance},
+    governance::{Environment, Governance, HeapGrowthPotential, CMC},
     pb::v1::{
         manage_neuron, manage_neuron::NeuronIdOrSubaccount, manage_neuron_response, proposal,
-        ExecuteNnsFunction, GovernanceError, ManageNeuron, Motion, NetworkEconomics, Neuron,
-        NnsFunction, Proposal, Vote,
+        ExecuteNnsFunction, GovernanceError, ManageNeuron, ManageNeuronResponse, Motion,
+        NetworkEconomics, Neuron, NnsFunction, Proposal, Vote,
     },
 };
-use ledger_canister::{AccountIdentifier, Tokens};
-use rand::rngs::StdRng;
-use rand_core::{RngCore, SeedableRng};
+use ic_sns_root::{GetSnsCanistersSummaryRequest, GetSnsCanistersSummaryResponse};
+use ic_sns_swap::pb::v1 as sns_swap_pb;
+use ic_sns_wasm::pb::v1::{DeployedSns, ListDeployedSnsesRequest, ListDeployedSnsesResponse};
+use icp_ledger::{AccountIdentifier, Subaccount, Tokens};
+use lazy_static::lazy_static;
+use rand::{RngCore, SeedableRng};
+use rand_chacha::ChaCha20Rng;
 use std::collections::hash_map::Entry;
 use std::collections::BTreeMap;
 use std::collections::HashMap;
+use std::collections::VecDeque;
 use std::convert::TryFrom;
 use std::convert::TryInto;
 use std::sync::Arc;
 use std::sync::Mutex;
 
-use ic_nns_governance::governance::HeapGrowthPotential;
-use ic_nns_governance::pb::v1::ManageNeuronResponse;
-use ledger_canister::Subaccount;
-
 const DEFAULT_TEST_START_TIMESTAMP_SECONDS: u64 = 999_111_000_u64;
+
+lazy_static! {
+    pub(crate) static ref SNS_ROOT_CANISTER_ID: PrincipalId = PrincipalId::new_user_test_id(213599);
+    pub(crate) static ref SNS_GOVERNANCE_CANISTER_ID: PrincipalId =
+        PrincipalId::new_user_test_id(127565);
+    pub(crate) static ref SNS_LEDGER_CANISTER_ID: PrincipalId =
+        PrincipalId::new_user_test_id(315611);
+    pub(crate) static ref SNS_LEDGER_ARCHIVE_CANISTER_ID: PrincipalId =
+        PrincipalId::new_user_test_id(864704);
+    pub(crate) static ref SNS_LEDGER_INDEX_CANISTER_ID: PrincipalId =
+        PrincipalId::new_user_test_id(450226);
+    pub(crate) static ref TARGET_SWAP_CANISTER_ID: PrincipalId =
+        PrincipalId::new_user_test_id(129844);
+    pub(crate) static ref DAPP_CANISTER_ID: PrincipalId = PrincipalId::new_user_test_id(504845);
+    pub(crate) static ref DEVELOPER_PRINCIPAL_ID: PrincipalId =
+        PrincipalId::new_user_test_id(739631);
+}
 
 #[derive(Clone, Debug)]
 pub struct FakeAccount {
@@ -39,12 +57,15 @@ pub struct FakeAccount {
 
 type LedgerMap = HashMap<AccountIdentifier, u64>;
 
+type CallCanisterResult = Result<Vec<u8>, (Option<i32>, String)>;
+
 /// The state required for fake implementations of `Environment` and
 /// `Ledger`.
 pub struct FakeState {
     pub now: u64,
-    pub rng: StdRng,
+    pub rng: ChaCha20Rng,
     pub accounts: LedgerMap,
+    pub call_canister_method_results: VecDeque<CallCanisterResult>,
 }
 
 impl Default for FakeState {
@@ -63,13 +84,14 @@ impl Default for FakeState {
             // to make the tests deterministic. Make sure this seed is
             // different from other seeds so test data generated from
             // different places doesn't conflict.
-            rng: StdRng::seed_from_u64(9539),
+            rng: ChaCha20Rng::seed_from_u64(9539),
             accounts: HashMap::new(),
+            call_canister_method_results: vec![Ok(vec![])].into(),
         }
     }
 }
 
-/// A struct that produces a fake enviroment where time can be
+/// A struct that produces a fake environment where time can be
 /// advanced, and ledger accounts manipulated.
 pub struct FakeDriver {
     pub state: Arc<Mutex<FakeState>>,
@@ -137,15 +159,7 @@ impl FakeDriver {
     }
 
     pub fn get_supply(&self) -> Tokens {
-        Tokens::from_e8s(
-            self.state
-                .lock()
-                .unwrap()
-                .accounts
-                .iter()
-                .map(|(_, y)| y)
-                .sum(),
-        )
+        Tokens::from_e8s(self.state.lock().unwrap().accounts.values().sum())
     }
 
     /// Increases the time by the given amount.
@@ -153,15 +167,21 @@ impl FakeDriver {
         self.state.lock().unwrap().now += delta_seconds;
     }
 
-    /// Contructs an `Environment` that interacts with this driver.
+    /// Constructs an `Environment` that interacts with this driver.
     pub fn get_fake_env(&self) -> Box<dyn Environment> {
         Box::new(FakeDriver {
             state: Arc::clone(&self.state),
         })
     }
 
-    /// Contructs a `Ledger` that interacts with this driver.
-    pub fn get_fake_ledger(&self) -> Box<dyn Ledger> {
+    /// Constructs a `Ledger` that interacts with this driver.
+    pub fn get_fake_ledger(&self) -> Box<dyn IcpLedger> {
+        Box::new(FakeDriver {
+            state: Arc::clone(&self.state),
+        })
+    }
+
+    pub fn get_fake_cmc(&self) -> Box<dyn CMC> {
         Box::new(FakeDriver {
             state: Arc::clone(&self.state),
         })
@@ -214,7 +234,7 @@ impl FakeDriver {
 }
 
 #[async_trait]
-impl Ledger for FakeDriver {
+impl IcpLedger for FakeDriver {
     async fn transfer_funds(
         &self,
         amount_e8s: u64,
@@ -223,6 +243,9 @@ impl Ledger for FakeDriver {
         to_account: AccountIdentifier,
         _: u64,
     ) -> Result<u64, NervousSystemError> {
+        // Minting operations (sending ICP from Gov main account) should just create ICP.
+        let is_minting_operation = from_subaccount.is_none();
+
         let from_account = AccountIdentifier::new(
             ic_base_types::PrincipalId::from(GOVERNANCE_CANISTER_ID),
             from_subaccount,
@@ -239,14 +262,15 @@ impl Ledger for FakeDriver {
 
         let requested_e8s = amount_e8s + fee_e8s;
 
-        if *from_e8s < requested_e8s {
-            return Err(NervousSystemError::new_with_message(format!(
-                "Insufficient funds. Available {} requested {}",
-                *from_e8s, requested_e8s
-            )));
+        if !is_minting_operation {
+            if *from_e8s < requested_e8s {
+                return Err(NervousSystemError::new_with_message(format!(
+                    "Insufficient funds. Available {} requested {}",
+                    *from_e8s, requested_e8s
+                )));
+            }
+            *from_e8s -= requested_e8s;
         }
-
-        *from_e8s -= requested_e8s;
 
         *accounts.entry(to_account).or_default() += amount_e8s;
 
@@ -265,8 +289,20 @@ impl Ledger for FakeDriver {
         let account_e8s = accounts.get(&account).unwrap_or(&0);
         Ok(Tokens::from_e8s(*account_e8s))
     }
+
+    fn canister_id(&self) -> CanisterId {
+        LEDGER_CANISTER_ID
+    }
 }
 
+#[async_trait]
+impl CMC for FakeDriver {
+    async fn neuron_maturity_modulation(&mut self) -> Result<i32, String> {
+        Ok(100)
+    }
+}
+
+#[async_trait]
 impl Environment for FakeDriver {
     fn now(&self) -> u64 {
         self.state.try_lock().unwrap().now
@@ -293,6 +329,113 @@ impl Environment for FakeDriver {
 
     fn heap_growth_potential(&self) -> HeapGrowthPotential {
         HeapGrowthPotential::NoIssue
+    }
+
+    async fn call_canister_method(
+        &mut self,
+        target: CanisterId,
+        method_name: &str,
+        request: Vec<u8>,
+    ) -> Result<Vec<u8>, (Option<i32>, String)> {
+        if method_name == "list_deployed_snses" {
+            assert_eq!(target, SNS_WASM_CANISTER_ID);
+
+            let request = Decode!(&request, ListDeployedSnsesRequest).unwrap();
+            assert_eq!(request, ListDeployedSnsesRequest {});
+
+            return Ok(Encode!(&ListDeployedSnsesResponse {
+                instances: vec![DeployedSns {
+                    swap_canister_id: Some(*TARGET_SWAP_CANISTER_ID),
+                    // Not realistic, but sufficient for test(s) that use this.
+                    ..Default::default()
+                }],
+            })
+            .unwrap());
+        }
+
+        if method_name == "get_state" {
+            assert_eq!(PrincipalId::from(target), *TARGET_SWAP_CANISTER_ID);
+
+            let request = Decode!(&request, sns_swap_pb::GetStateRequest).unwrap();
+            assert_eq!(request, sns_swap_pb::GetStateRequest {});
+
+            return Ok(Encode!(&sns_swap_pb::GetStateResponse {
+                swap: Some(sns_swap_pb::Swap {
+                    init: Some(sns_swap_pb::Init {
+                        nns_governance_canister_id: GOVERNANCE_CANISTER_ID.to_string(),
+                        sns_governance_canister_id: SNS_GOVERNANCE_CANISTER_ID.to_string(),
+                        sns_ledger_canister_id: SNS_LEDGER_CANISTER_ID.to_string(),
+                        icp_ledger_canister_id: LEDGER_CANISTER_ID.to_string(),
+                        sns_root_canister_id: SNS_ROOT_CANISTER_ID.to_string(),
+
+                        fallback_controller_principal_ids: vec![DEVELOPER_PRINCIPAL_ID.to_string()],
+
+                        // Similar to NNS, but different.
+                        transaction_fee_e8s: Some(12_345),
+                        neuron_minimum_stake_e8s: Some(123_456_789),
+                    }),
+                    ..Default::default() // Not realistic, but sufficient for tests.
+                }),
+                ..Default::default() // Ditto previous comment.
+            })
+            .unwrap());
+        }
+
+        if method_name == "get_sns_canisters_summary" {
+            assert_eq!(PrincipalId::from(target), *SNS_ROOT_CANISTER_ID);
+
+            let request = Decode!(&request, GetSnsCanistersSummaryRequest).unwrap();
+            assert_eq!(
+                request,
+                GetSnsCanistersSummaryRequest {
+                    update_canister_list: None
+                }
+            );
+
+            return Ok(Encode!(&GetSnsCanistersSummaryResponse {
+                root: Some(ic_sns_root::CanisterSummary {
+                    canister_id: Some(*SNS_ROOT_CANISTER_ID),
+                    status: None,
+                }),
+                governance: Some(ic_sns_root::CanisterSummary {
+                    canister_id: Some(*SNS_GOVERNANCE_CANISTER_ID),
+                    status: None,
+                }),
+                ledger: Some(ic_sns_root::CanisterSummary {
+                    canister_id: Some(*SNS_LEDGER_CANISTER_ID),
+                    status: None,
+                }),
+                swap: Some(ic_sns_root::CanisterSummary {
+                    canister_id: Some(*TARGET_SWAP_CANISTER_ID),
+                    status: None,
+                }),
+                dapps: vec![ic_sns_root::CanisterSummary {
+                    canister_id: Some(*DAPP_CANISTER_ID),
+                    status: None,
+                }],
+                archives: vec![ic_sns_root::CanisterSummary {
+                    canister_id: Some(*SNS_LEDGER_ARCHIVE_CANISTER_ID),
+                    status: None,
+                }],
+                index: Some(ic_sns_root::CanisterSummary {
+                    canister_id: Some(*SNS_LEDGER_INDEX_CANISTER_ID),
+                    status: None,
+                }),
+            })
+            .unwrap());
+        }
+
+        println!(
+            "WARNING: Unexpected canister call:\n\
+             ..target = {}\n\
+             ..method_name = {}\n\
+             ..request.len() = {}",
+            target,
+            method_name,
+            request.len(),
+        );
+
+        Ok(vec![])
     }
 }
 
@@ -394,18 +537,17 @@ impl ProposalNeuronBehavior {
                 })
             }
         };
-        let pid = gov
-            .make_proposal(
-                &NeuronId { id: self.proposer },
-                &principal(self.proposer),
-                &Proposal {
-                    title: Some("A Reasonable Title".to_string()),
-                    summary,
-                    action: Some(action),
-                    ..Default::default()
-                },
-            )
-            .unwrap();
+        let pid = tokio_test::block_on(gov.make_proposal(
+            &NeuronId { id: self.proposer },
+            &principal(self.proposer),
+            &Proposal {
+                title: Some("A Reasonable Title".to_string()),
+                summary,
+                action: Some(action),
+                ..Default::default()
+            },
+        ))
+        .unwrap();
         // Vote
         for (voter, vote) in &self.votes {
             register_vote_assert_success(

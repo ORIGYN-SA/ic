@@ -1,4 +1,5 @@
 use crate::{fdenum::EnumerateInnerFileDescriptors, protocol::logging::LogRequest};
+use ic_embedders::wasm_executor::SliceExecutionOutput;
 use serde::{Deserialize, Serialize};
 
 use super::{id::ExecId, structs::SandboxExecOutput};
@@ -18,6 +19,16 @@ pub struct ExecutionFinishedRequest {
 #[derive(Serialize, Deserialize, Clone)]
 pub struct ExecutionFinishedReply {}
 
+// Notify controller that a canister run is paused.
+#[derive(Serialize, Deserialize, Clone)]
+pub struct ExecutionPausedRequest {
+    pub exec_id: ExecId,
+    pub slice: SliceExecutionOutput,
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+pub struct ExecutionPausedReply {}
+
 /// We reply to the replica controller that either the execution was
 /// finished or the request failed, or request a system call or a log
 /// to be applied.
@@ -25,6 +36,7 @@ pub struct ExecutionFinishedReply {}
 #[derive(Serialize, Deserialize, Clone)]
 pub enum Request {
     ExecutionFinished(ExecutionFinishedRequest),
+    ExecutionPaused(ExecutionPausedRequest),
     LogViaReplica(LogRequest),
 }
 
@@ -38,6 +50,7 @@ impl EnumerateInnerFileDescriptors for Request {
 #[derive(Serialize, Deserialize, Clone)]
 pub enum Reply {
     ExecutionFinished(ExecutionFinishedReply),
+    ExecutionPaused(ExecutionPausedReply),
     LogViaReplica(()),
 }
 

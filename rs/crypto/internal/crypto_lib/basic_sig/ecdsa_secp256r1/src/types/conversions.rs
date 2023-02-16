@@ -60,7 +60,7 @@ impl TryFrom<Vec<u8>> for SignatureBytes {
 
 impl From<SignatureBytes> for String {
     fn from(val: SignatureBytes) -> Self {
-        base64::encode(&val.0.to_vec())
+        base64::encode(&val.0)
     }
 }
 
@@ -103,7 +103,9 @@ mod tests {
         let bytes = vec![0; SignatureBytes::SIZE + 1];
         let result = SignatureBytes::try_from(bytes);
         assert!(result.is_err());
-        assert!(result.unwrap_err().is_malformed_signature());
+        assert!(result
+            .expect_err("Unexpected success.")
+            .is_malformed_signature());
     }
 
     #[test]
@@ -111,6 +113,8 @@ mod tests {
         let bytes = vec![0; SignatureBytes::SIZE - 1];
         let result = SignatureBytes::try_from(bytes);
         assert!(result.is_err());
-        assert!(result.unwrap_err().is_malformed_signature());
+        assert!(result
+            .expect_err("Unexpected success.")
+            .is_malformed_signature());
     }
 }

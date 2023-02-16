@@ -1,17 +1,17 @@
 use ic_crypto_internal_threshold_sig_ecdsa::*;
+use ic_crypto_test_utils_reproducible_rng::reproducible_rng;
 use ic_types::crypto::AlgorithmId;
 use ic_types::*;
-use rand::Rng;
 
 fn gen_private_keys(
     curve: EccCurveType,
     cnt: usize,
 ) -> Result<(Vec<MEGaPrivateKey>, Vec<MEGaPublicKey>), ThresholdEcdsaError> {
-    let mut rng = rand::thread_rng();
+    let mut rng = reproducible_rng();
     let mut private_keys = Vec::with_capacity(cnt);
 
     for _i in 0..cnt {
-        private_keys.push(MEGaPrivateKey::generate(curve, &mut rng)?);
+        private_keys.push(MEGaPrivateKey::generate(curve, &mut rng));
     }
 
     let public_keys = private_keys
@@ -25,12 +25,11 @@ fn gen_private_keys(
 #[test]
 fn create_random_dealing() -> Result<(), IdkgCreateDealingInternalError> {
     let curve = EccCurveType::K256;
-    let mut rng = rand::thread_rng();
+    let mut rng = reproducible_rng();
     let associated_data = vec![1, 2, 3];
     let (private_keys, public_keys) = gen_private_keys(curve, 5)?;
     let threshold = 2;
     let dealer_index = 0;
-    let randomness = Randomness::from(rng.gen::<[u8; 32]>());
 
     let shares = SecretShares::Random;
 
@@ -41,7 +40,7 @@ fn create_random_dealing() -> Result<(), IdkgCreateDealingInternalError> {
         NumberOfNodes::from(threshold as u32),
         &public_keys,
         &shares,
-        randomness,
+        Seed::from_rng(&mut rng),
     )?;
 
     match dealing.commitment {
@@ -66,14 +65,13 @@ fn create_random_dealing() -> Result<(), IdkgCreateDealingInternalError> {
 #[test]
 fn create_reshare_unmasked_dealing() -> Result<(), IdkgCreateDealingInternalError> {
     let curve = EccCurveType::K256;
-    let mut rng = rand::thread_rng();
+    let mut rng = reproducible_rng();
     let associated_data = vec![1, 2, 3];
     let (private_keys, public_keys) = gen_private_keys(curve, 5)?;
     let threshold = 2;
     let dealer_index = 0;
-    let randomness = Randomness::from(rng.gen::<[u8; 32]>());
 
-    let secret = EccScalar::random(curve, &mut rng)?;
+    let secret = EccScalar::random(curve, &mut rng);
     let shares = SecretShares::ReshareOfUnmasked(secret);
 
     let dealing = create_dealing(
@@ -83,7 +81,7 @@ fn create_reshare_unmasked_dealing() -> Result<(), IdkgCreateDealingInternalErro
         NumberOfNodes::from(threshold as u32),
         &public_keys,
         &shares,
-        randomness,
+        Seed::from_rng(&mut rng),
     )?;
 
     match dealing.commitment {
@@ -106,15 +104,14 @@ fn create_reshare_unmasked_dealing() -> Result<(), IdkgCreateDealingInternalErro
 #[test]
 fn create_reshare_masked_dealings() -> Result<(), IdkgCreateDealingInternalError> {
     let curve = EccCurveType::K256;
-    let mut rng = rand::thread_rng();
+    let mut rng = reproducible_rng();
     let associated_data = vec![1, 2, 3];
     let (private_keys, public_keys) = gen_private_keys(curve, 5)?;
     let threshold = 2;
     let dealer_index = 0;
-    let randomness = Randomness::from(rng.gen::<[u8; 32]>());
 
-    let secret = EccScalar::random(curve, &mut rng)?;
-    let mask = EccScalar::random(curve, &mut rng)?;
+    let secret = EccScalar::random(curve, &mut rng);
+    let mask = EccScalar::random(curve, &mut rng);
     let shares = SecretShares::ReshareOfMasked(secret, mask);
 
     let dealing = create_dealing(
@@ -124,7 +121,7 @@ fn create_reshare_masked_dealings() -> Result<(), IdkgCreateDealingInternalError
         NumberOfNodes::from(threshold as u32),
         &public_keys,
         &shares,
-        randomness,
+        Seed::from_rng(&mut rng),
     )?;
 
     match dealing.commitment {
@@ -147,16 +144,15 @@ fn create_reshare_masked_dealings() -> Result<(), IdkgCreateDealingInternalError
 #[test]
 fn create_mult_dealing() -> Result<(), IdkgCreateDealingInternalError> {
     let curve = EccCurveType::K256;
-    let mut rng = rand::thread_rng();
+    let mut rng = reproducible_rng();
     let associated_data = vec![1, 2, 3];
     let (private_keys, public_keys) = gen_private_keys(curve, 5)?;
     let threshold = 2;
     let dealer_index = 0;
-    let randomness = Randomness::from(rng.gen::<[u8; 32]>());
 
-    let lhs = EccScalar::random(curve, &mut rng)?;
-    let rhs = EccScalar::random(curve, &mut rng)?;
-    let mask = EccScalar::random(curve, &mut rng)?;
+    let lhs = EccScalar::random(curve, &mut rng);
+    let rhs = EccScalar::random(curve, &mut rng);
+    let mask = EccScalar::random(curve, &mut rng);
     let shares = SecretShares::UnmaskedTimesMasked(lhs, (rhs, mask));
 
     let dealing = create_dealing(
@@ -166,7 +162,7 @@ fn create_mult_dealing() -> Result<(), IdkgCreateDealingInternalError> {
         NumberOfNodes::from(threshold as u32),
         &public_keys,
         &shares,
-        randomness,
+        Seed::from_rng(&mut rng),
     )?;
 
     match dealing.commitment {
@@ -189,12 +185,11 @@ fn create_mult_dealing() -> Result<(), IdkgCreateDealingInternalError> {
 #[test]
 fn invalid_create_dealing_requests() -> Result<(), IdkgCreateDealingInternalError> {
     let curve = EccCurveType::K256;
-    let mut rng = rand::thread_rng();
+    let mut rng = reproducible_rng();
     let associated_data = vec![1, 2, 3];
     let (private_keys, public_keys) = gen_private_keys(curve, 5)?;
     let threshold = 2;
     let dealer_index = 0;
-    let randomness = Randomness::from(rng.gen::<[u8; 32]>());
 
     let shares = SecretShares::Random;
 
@@ -206,7 +201,7 @@ fn invalid_create_dealing_requests() -> Result<(), IdkgCreateDealingInternalErro
         NumberOfNodes::from(private_keys.len() as u32 + 1),
         &public_keys,
         &shares,
-        randomness,
+        Seed::from_rng(&mut rng),
     )
     .is_err());
 
@@ -220,7 +215,7 @@ fn invalid_create_dealing_requests() -> Result<(), IdkgCreateDealingInternalErro
         NumberOfNodes::from(threshold),
         &wrong_public_keys,
         &shares,
-        randomness,
+        Seed::from_rng(&mut rng),
     )
     .is_err());
 
@@ -232,7 +227,7 @@ fn invalid_create_dealing_requests() -> Result<(), IdkgCreateDealingInternalErro
         NumberOfNodes::from(threshold),
         &public_keys,
         &shares,
-        randomness,
+        Seed::from_rng(&mut rng),
     )
     .is_err());
 
@@ -242,7 +237,7 @@ fn invalid_create_dealing_requests() -> Result<(), IdkgCreateDealingInternalErro
 #[test]
 fn secret_shares_should_redact_logs() -> Result<(), ThresholdEcdsaError> {
     let curve = EccCurveType::K256;
-    let mut rng = rand::thread_rng();
+    let mut rng = reproducible_rng();
 
     {
         let shares = SecretShares::Random;
@@ -251,7 +246,7 @@ fn secret_shares_should_redact_logs() -> Result<(), ThresholdEcdsaError> {
     }
 
     {
-        let secret = EccScalar::random(curve, &mut rng)?;
+        let secret = EccScalar::random(curve, &mut rng);
         let shares = SecretShares::ReshareOfUnmasked(secret);
         let log = format!("{:?}", shares);
         assert_eq!(
@@ -261,8 +256,8 @@ fn secret_shares_should_redact_logs() -> Result<(), ThresholdEcdsaError> {
     }
 
     {
-        let secret = EccScalar::random(curve, &mut rng)?;
-        let mask = EccScalar::random(curve, &mut rng)?;
+        let secret = EccScalar::random(curve, &mut rng);
+        let mask = EccScalar::random(curve, &mut rng);
         let shares = SecretShares::ReshareOfMasked(secret, mask);
         let log = format!("{:?}", shares);
         assert_eq!(
@@ -272,9 +267,9 @@ fn secret_shares_should_redact_logs() -> Result<(), ThresholdEcdsaError> {
     }
 
     {
-        let lhs = EccScalar::random(curve, &mut rng)?;
-        let rhs = EccScalar::random(curve, &mut rng)?;
-        let mask = EccScalar::random(curve, &mut rng)?;
+        let lhs = EccScalar::random(curve, &mut rng);
+        let rhs = EccScalar::random(curve, &mut rng);
+        let mask = EccScalar::random(curve, &mut rng);
         let shares = SecretShares::UnmaskedTimesMasked(lhs, (rhs, mask));
         let log = format!("{:?}", shares);
         assert_eq!(
@@ -300,15 +295,14 @@ fn flip_curve(s: &EccScalar) -> EccScalar {
 
 #[test]
 fn wrong_curve_reshare_of_unmasked_rejected() -> Result<(), ThresholdEcdsaError> {
-    let mut rng = rand::thread_rng();
+    let mut rng = reproducible_rng();
 
     let curve = EccCurveType::K256;
     let associated_data = vec![1, 2, 3];
     let (_private_keys, public_keys) = gen_private_keys(curve, 5)?;
     let threshold = 3;
-    let randomness = Randomness::from(rng.gen::<[u8; 32]>());
 
-    let secret = EccScalar::random(curve, &mut rng)?;
+    let secret = EccScalar::random(curve, &mut rng);
     let shares = SecretShares::ReshareOfUnmasked(flip_curve(&secret));
 
     let dealing = create_dealing(
@@ -318,7 +312,7 @@ fn wrong_curve_reshare_of_unmasked_rejected() -> Result<(), ThresholdEcdsaError>
         NumberOfNodes::from(threshold as u32),
         &public_keys,
         &shares,
-        randomness,
+        Seed::from_rng(&mut rng),
     );
 
     assert_eq!(
@@ -331,16 +325,15 @@ fn wrong_curve_reshare_of_unmasked_rejected() -> Result<(), ThresholdEcdsaError>
 
 #[test]
 fn wrong_curve_reshare_of_masked_rejected() -> Result<(), ThresholdEcdsaError> {
-    let mut rng = rand::thread_rng();
+    let mut rng = reproducible_rng();
 
     let curve = EccCurveType::K256;
     let associated_data = vec![1, 2, 3];
     let (_private_keys, public_keys) = gen_private_keys(curve, 5)?;
     let threshold = 3;
-    let randomness = Randomness::from(rng.gen::<[u8; 32]>());
 
-    let secret = EccScalar::random(curve, &mut rng)?;
-    let mask = EccScalar::random(curve, &mut rng)?;
+    let secret = EccScalar::random(curve, &mut rng);
+    let mask = EccScalar::random(curve, &mut rng);
     let shares = SecretShares::ReshareOfMasked(flip_curve(&secret), mask);
 
     let dealing = create_dealing(
@@ -350,7 +343,7 @@ fn wrong_curve_reshare_of_masked_rejected() -> Result<(), ThresholdEcdsaError> {
         NumberOfNodes::from(threshold as u32),
         &public_keys,
         &shares,
-        randomness,
+        Seed::from_rng(&mut rng),
     );
 
     assert_eq!(
@@ -363,19 +356,18 @@ fn wrong_curve_reshare_of_masked_rejected() -> Result<(), ThresholdEcdsaError> {
 
 #[test]
 fn wrong_curve_mul_share_rejected() -> Result<(), ThresholdEcdsaError> {
-    let mut rng = rand::thread_rng();
+    let mut rng = reproducible_rng();
 
     let curve = EccCurveType::K256;
     let associated_data = vec![1, 2, 3];
     let (_private_keys, public_keys) = gen_private_keys(curve, 5)?;
     let threshold = 3;
-    let randomness = Randomness::from(rng.gen::<[u8; 32]>());
 
-    let lhs = EccScalar::random(curve, &mut rng)?;
-    let rhs = EccScalar::random(curve, &mut rng)?;
-    let mask = EccScalar::random(curve, &mut rng)?;
+    let lhs = EccScalar::random(curve, &mut rng);
+    let rhs = EccScalar::random(curve, &mut rng);
+    let mask = EccScalar::random(curve, &mut rng);
 
-    let shares = SecretShares::UnmaskedTimesMasked(flip_curve(&lhs), (rhs, mask));
+    let shares = SecretShares::UnmaskedTimesMasked(flip_curve(&lhs), (rhs.clone(), mask.clone()));
 
     let dealing = create_dealing(
         AlgorithmId::ThresholdEcdsaSecp256k1,
@@ -384,7 +376,7 @@ fn wrong_curve_mul_share_rejected() -> Result<(), ThresholdEcdsaError> {
         NumberOfNodes::from(threshold as u32),
         &public_keys,
         &shares,
-        randomness,
+        Seed::from_rng(&mut rng),
     );
 
     assert_eq!(
@@ -401,7 +393,7 @@ fn wrong_curve_mul_share_rejected() -> Result<(), ThresholdEcdsaError> {
         NumberOfNodes::from(threshold as u32),
         &public_keys,
         &shares,
-        randomness,
+        Seed::from_rng(&mut rng),
     );
 
     assert_eq!(

@@ -64,6 +64,9 @@ message IngressStatusEntry {
 message IngressHistoryState {
     repeated IngressStatusEntry statuses = 1;
     repeated PruningEntry pruning_times = 2;
+    // The earliest time in `pruning_times` with associated message IDs that
+    // may still be of type completed or failed.
+    uint64 next_terminal_time = 3;
 }
 
 message Ingress {
@@ -73,4 +76,7 @@ message Ingress {
     bytes method_payload = 4;
     bytes message_id = 5;
     uint64 expiry_time_nanos = 6;
+    // It may be present for a subnet message.
+    // Represents the id of the canister that the message is targeting.
+    types.v1.CanisterId effective_canister_id = 7;
 }

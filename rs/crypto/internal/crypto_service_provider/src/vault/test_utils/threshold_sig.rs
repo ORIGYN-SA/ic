@@ -1,14 +1,14 @@
 use crate::api::{CspThresholdSignError, ThresholdSignatureCspClient};
-use crate::secret_key_store::test_utils::TempSecretKeyStore;
+use crate::key_id::KeyId;
 use crate::types::{CspPublicCoefficients, CspSignature, ThresBls12_381_Signature};
 use crate::vault::api::CspVault;
-use crate::Csp;
+use crate::{Csp, LocalCspVault};
+use ic_crypto_internal_seed::Seed;
 use ic_crypto_internal_threshold_sig_bls12381::test_utils::select_n;
 use ic_crypto_internal_threshold_sig_bls12381::types::public_coefficients::conversions::try_number_of_nodes_from_csp_pub_coeffs;
-use ic_types::crypto::{AlgorithmId, KeyId};
-use ic_types::{NodeIndex, NumberOfNodes, Randomness};
-use rand::{Rng, SeedableRng};
-use rand_chacha::ChaChaRng;
+use ic_types::crypto::AlgorithmId;
+use ic_types::{NodeIndex, NumberOfNodes};
+use rand::Rng;
 use std::sync::Arc;
 use strum::IntoEnumIterator;
 
@@ -32,10 +32,10 @@ use strum::IntoEnumIterator;
 pub fn test_threshold_signatures(
     public_coefficients: &CspPublicCoefficients,
     signers: &[(Arc<dyn CspVault>, KeyId)],
-    seed: Randomness,
+    seed: Seed,
     message: &[u8],
 ) {
-    let mut rng = ChaChaRng::from_seed(seed.get());
+    let mut rng = seed.into_rng();
     let threshold = try_number_of_nodes_from_csp_pub_coeffs(public_coefficients)
         .expect("Intolerable number of nodes");
     let incorrect_message = [&b"pound of flesh"[..], message].concat();
@@ -83,11 +83,13 @@ pub fn test_threshold_signatures(
         }
     }
     // Verify each individual signature:
-    let verifier = {
-        let dummy_key_store = TempSecretKeyStore::new();
-        let csprng = ChaChaRng::from_seed(rng.gen::<[u8; 32]>());
-        Csp::of(csprng, dummy_key_store)
-    };
+    let verifier = Csp::builder()
+        .with_vault(
+            LocalCspVault::builder()
+                .with_rng(Seed::from_rng(&mut rng).into_rng())
+                .build(),
+        )
+        .build();
     for (index, signature) in signatures.iter().enumerate() {
         let public_key = match verifier.threshold_individual_public_key(
             AlgorithmId::ThresBls12_381,
@@ -149,7 +151,7 @@ pub fn test_threshold_signatures(
     }
 
     // Combine a random subset of signatures:
-    let signature_selection = select_n(seed, threshold, &signatures);
+    let signature_selection = select_n(Seed::from_rng(&mut rng), threshold, &signatures);
     let signature = verifier
         .threshold_combine_signatures(
             AlgorithmId::ThresBls12_381,
@@ -227,13 +229,13 @@ pub fn test_threshold_signatures(
 /// * Correct keygen arguments yield keys that behave correctly with regards to
 ///   signing and verification.
 pub fn test_threshold_scheme_with_basic_keygen(
-    seed: Randomness,
+    seed: Seed,
     csp_vault: Arc<dyn CspVault>,
     message: &[u8],
 ) {
-    let mut rng = ChaChaRng::from_seed(seed.get());
-    let threshold = NumberOfNodes::from(rng.gen_range(0, 10));
-    let number_of_signers = NumberOfNodes::from(rng.gen_range(0, 10));
+    let mut rng = seed.into_rng();
+    let threshold = NumberOfNodes::from(rng.gen_range(0..10));
+    let number_of_signers = NumberOfNodes::from(rng.gen_range(0..10));
     println!(
         "--- threshold: {}, number_of_signers: {}",
         threshold, number_of_signers
@@ -241,7 +243,7 @@ pub fn test_threshold_scheme_with_basic_keygen(
     match csp_vault.threshold_keygen_for_test(
         AlgorithmId::ThresBls12_381,
         threshold,
-        &vec![true; number_of_signers.get() as usize],
+        number_of_signers,
     ) {
         Ok((public_coefficients, key_ids)) => {
             assert!(
@@ -251,13 +253,13 @@ pub fn test_threshold_scheme_with_basic_keygen(
 
             let signers: Vec<_> = key_ids
                 .iter()
-                .map(|key_id_maybe| (csp_vault.clone(), key_id_maybe.expect("Missing key")))
+                .map(|key_id| (csp_vault.clone(), *key_id))
                 .collect();
 
             test_threshold_signatures(
                 &public_coefficients,
                 &signers,
-                Randomness::from(rng.gen::<[u8; 32]>()),
+                Seed::from_rng(&mut rng),
                 message,
             );
         }

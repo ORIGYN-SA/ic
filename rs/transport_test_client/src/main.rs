@@ -1,6 +1,4 @@
 //! Transport client implementation for testing.
-
-use async_trait::async_trait;
 ///
 /// The test client instantiates the transport object and goes through the
 /// sequence, expected to be followed by transport clients like P2P:
@@ -22,39 +20,43 @@ use async_trait::async_trait;
 ///
 /// If not specified, message_count = 100 (default, applies only for the source
 /// node)
-use clap::{App, Arg, ArgMatches};
+use clap::{Arg, ArgMatches, Command};
 use crossbeam_channel::{self, Receiver, RecvTimeoutError, Sender};
 use rand::Rng;
 use std::collections::HashSet;
+use std::convert::Infallible;
 use std::convert::TryFrom;
+use std::future::Future;
+use std::net::SocketAddr;
+use std::pin::Pin;
 use std::sync::{Arc, Mutex};
+use std::task::{Context, Poll};
 use std::time;
 
 mod utils;
 
 use ic_config::{
     logger::{Config as LoggerConfig, LogTarget},
-    transport::{TransportConfig, TransportFlowConfig},
+    transport::TransportConfig,
 };
 use ic_interfaces_transport::{
-    AsyncTransportEventHandler, FlowId, FlowTag, SendError, Transport, TransportErrorCode,
-    TransportPayload, TransportStateChange,
+    Transport, TransportChannelId, TransportError, TransportEvent, TransportPayload,
 };
-use ic_logger::{error, info, warn, LoggerImpl, ReplicaLogger};
+use ic_logger::{info, warn, LoggerImpl, ReplicaLogger};
 use ic_metrics::MetricsRegistry;
-use ic_protobuf::registry::node::v1::{
-    connection_endpoint::Protocol, ConnectionEndpoint, FlowEndpoint, NodeRecord,
-};
 use ic_transport::transport::create_transport;
 use ic_types::{NodeId, PrincipalId, RegistryVersion, SubnetId};
 use std::path::PathBuf;
+use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::time::Duration;
+use tower::util::BoxCloneService;
+use tower::Service;
 use utils::{create_crypto, to_node_id};
 
 // From the on_message() handler
 struct TestMessage {
-    flow_id: FlowId,
+    peer_id: NodeId,
     payload: TransportPayload,
 }
 
@@ -66,8 +68,7 @@ const ARG_MSG_COUNT: &str = "count";
 
 const REG_V1: RegistryVersion = RegistryVersion::new(1);
 const SUBNET_ID: u8 = 100;
-const FLOW_TAG_1: u32 = 1234;
-const FLOW_TAG_2: u32 = 5678;
+const TRANSPORT_CHANNEL: usize = 0;
 
 const TEST_MESSAGE_LEN: usize = 1_000_000;
 
@@ -81,7 +82,7 @@ enum Role {
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 enum TestClientErrorCode {
-    TransportError(TransportErrorCode),
+    TransportError(TransportError),
     MessageMismatch,
     NotAllFlowsUp,
     Timeout,
@@ -90,13 +91,12 @@ enum TestClientErrorCode {
 
 struct TestClient {
     transport: Arc<dyn Transport>,
-    _event_handler: Arc<TestClientEventHandler>,
     prev: NodeId,
     next: NodeId,
-    prev_node_record: NodeRecord,
-    next_node_record: NodeRecord,
+    prev_node_record: SocketAddr,
+    next_node_record: SocketAddr,
     receiver: MpscReceiver,
-    active_flows: Arc<Mutex<HashSet<FlowId>>>,
+    active_flows: Arc<Mutex<HashSet<NodeId>>>,
     registry_version: RegistryVersion,
     log: ReplicaLogger,
     active: Arc<AtomicBool>,
@@ -105,7 +105,7 @@ struct TestClient {
 impl TestClient {
     fn new(
         transport: Arc<dyn Transport>,
-        registry_node_list: &[(NodeId, NodeRecord)],
+        node_socket_list: &[(NodeId, SocketAddr)],
         prev: &NodeId,
         next: &NodeId,
         registry_version: RegistryVersion,
@@ -114,27 +114,23 @@ impl TestClient {
     ) -> Self {
         let (sender, receiver) = crossbeam_channel::unbounded();
         let active_flows = Arc::new(Mutex::new(HashSet::new()));
-        let event_handler = Arc::new(TestClientEventHandler {
+        let event_handler = BoxCloneService::new(TestClientEventHandler {
             sender,
             active_flows: active_flows.clone(),
-            log: log.clone(),
         });
-        if let Err(e) = transport.register_client(event_handler.clone()) {
-            panic!("Failed to register client: {:?}", e);
-        };
+        transport.set_event_handler(event_handler);
 
-        let prev_node_record = match registry_node_list.iter().position(|n| n.0 == *prev) {
-            Some(pos) => registry_node_list[pos].1.clone(),
+        let prev_node_record = match node_socket_list.iter().position(|n| n.0 == *prev) {
+            Some(pos) => node_socket_list[pos].1,
             None => panic!("Failed to find prev record"),
         };
-        let next_node_record = match registry_node_list.iter().position(|n| n.0 == *next) {
-            Some(pos) => registry_node_list[pos].1.clone(),
+        let next_node_record = match node_socket_list.iter().position(|n| n.0 == *next) {
+            Some(pos) => node_socket_list[pos].1,
             None => panic!("Failed to find next record"),
         };
 
         TestClient {
             transport,
-            _event_handler: event_handler,
             prev: *prev,
             next: *next,
             prev_node_record,
@@ -147,49 +143,21 @@ impl TestClient {
         }
     }
 
-    fn start_connections(&self) -> Result<(), TransportErrorCode> {
+    fn start_connection(&self) {
         self.transport
-            .start_connections(&self.prev, &self.prev_node_record, self.registry_version)
-            .map_err(|e| {
-                warn!(
-                    self.log,
-                    "Failed to start_connections(): peer = {:?} err = {:?}", self.prev, e
-                );
-                e
-            })?;
+            .start_connection(&self.prev, self.prev_node_record, self.registry_version);
         self.transport
-            .start_connections(&self.next, &self.next_node_record, self.registry_version)
-            .map_err(|e| {
-                warn!(
-                    self.log,
-                    "Failed to start_connections(): peer = {:?} err = {:?}", self.next, e
-                );
-                e
-            })?;
-        Ok(())
+            .start_connection(&self.next, self.next_node_record, self.registry_version);
     }
 
-    fn stop_connections(&self) -> Result<(), TransportErrorCode> {
-        self.transport.stop_connections(&self.prev).map_err(|e| {
-            warn!(
-                self.log,
-                "Failed to stop_connections(): peer = {:?} err = {:?}", self.prev, e
-            );
-            e
-        })?;
-        self.transport.stop_connections(&self.next).map_err(|e| {
-            warn!(
-                self.log,
-                "Failed to stop_connections(): peer = {:?} err = {:?}", self.next, e
-            );
-            e
-        })?;
-        Ok(())
+    fn stop_connection(&self) {
+        self.transport.stop_connection(&self.prev);
+        self.transport.stop_connection(&self.next);
     }
 
     // Waits for the flows/connections to be up
-    async fn wait_for_flow_up(&self) -> Result<(), TestClientErrorCode> {
-        let expected_flows = 4;
+    fn wait_for_flow_up(&self) -> Result<(), TestClientErrorCode> {
+        let expected_flows = 2;
         for _ in 0..10 {
             let num_flows = self.active_flows.lock().unwrap().len();
             if num_flows == expected_flows {
@@ -200,7 +168,7 @@ impl TestClient {
                 self.log,
                 "Flows up: {}/{}, to wait ...", num_flows, expected_flows
             );
-            tokio::time::sleep(Duration::from_secs(3)).await;
+            std::thread::sleep(Duration::from_secs(3));
         }
 
         warn!(self.log, "All flows not up, exiting");
@@ -208,7 +176,7 @@ impl TestClient {
     }
 
     // Relay processing. Receives the messages and relays it to next peer.
-    fn relay_loop(&self) -> Result<(), TransportErrorCode> {
+    fn relay_loop(&self) -> Result<(), TransportError> {
         loop {
             if !self.active.load(Ordering::Relaxed) {
                 info!(self.log, "Relay thread exiting");
@@ -233,31 +201,27 @@ impl TestClient {
                 };
             }
 
-            if msg.flow_id.peer_id != self.prev {
-                warn!(self.log, "relay(): unexpected flow id: {:?}", msg.flow_id);
-                return Err(TransportErrorCode::FlowNotFound);
+            if msg.peer_id != self.prev {
+                return Err(TransportError::NotFound);
             }
 
-            let flow_id = msg.flow_id;
             let msg_len = msg.payload.0.len();
             self.transport
-                .send(&self.next, flow_id.flow_tag, msg.payload)
+                .send(
+                    &self.next,
+                    TransportChannelId::from(TRANSPORT_CHANNEL),
+                    msg.payload,
+                )
                 .map_err(|e| {
                     warn!(
                         self.log,
-                        "relay(): Failed to send(): peer = {:?}, flow = {:?}, err = {:?}",
-                        self.next,
-                        flow_id,
-                        e
+                        "relay(): Failed to send(): peer = {:?},  err = {:?}", self.next, e
                     );
                     e
                 })?;
             info!(
                 self.log,
-                "relay(): relayed from {:?} -> peer {:?}, msg_len = {}",
-                flow_id,
-                self.next,
-                msg_len
+                "relay(): relayed from peer {:?}, msg_len = {}", self.next, msg_len
             );
         }
     }
@@ -266,28 +230,28 @@ impl TestClient {
     fn send_receive_compare(
         &self,
         count: usize,
-        flow_tag: FlowTag,
+        channel_id: TransportChannelId,
     ) -> Result<(), TestClientErrorCode> {
-        let send_flow = FlowId::new(self.next, flow_tag);
-        let receive_flow = FlowId::new(self.prev, flow_tag);
+        let send_peer_id = self.next;
+        let receive_peer_id = self.prev;
         let send_msg = TestClient::build_message();
         let send_copy = send_msg.clone();
         self.transport
-            .send(&send_flow.peer_id, send_flow.flow_tag, send_msg)
+            .send(&send_peer_id, channel_id, send_msg)
             .map_err(|e| {
                 warn!(
                     self.log,
-                    "send_receive_compare(): failed to send(): flow = {:?} err = {:?}",
-                    send_flow,
+                    "send_receive_compare(): failed to send(): peer_id = {:?} err = {:?}",
+                    send_peer_id,
                     e
                 );
                 TestClientErrorCode::TransportError(e)
             })?;
         info!(
             self.log,
-            "send_receive_compare([{}]): sent message: flow = {:?}, msg_len = {}",
+            "send_receive_compare([{}]): sent message: peer_id = {:?}, msg_len = {}",
             count,
-            send_flow,
+            send_peer_id,
             send_copy.0.len(),
         );
 
@@ -297,13 +261,13 @@ impl TestClient {
         };
         info!(
             self.log,
-            "send_receive_compare([{}]): received response: flow = {:?}, msg_len = {}",
+            "send_receive_compare([{}]): received response: peer_id = {:?}, msg_len = {}",
             count,
-            rcv_msg.flow_id,
+            rcv_msg.peer_id,
             rcv_msg.payload.0.len()
         );
 
-        if !self.compare(receive_flow, send_copy, rcv_msg) {
+        if !self.compare(receive_peer_id, send_copy, rcv_msg) {
             return Err(TestClientErrorCode::MessageMismatch);
         }
         Ok(())
@@ -340,9 +304,9 @@ impl TestClient {
     }
 
     // Compares the two messages(hdr and payload parts)
-    fn compare(&self, flow_id: FlowId, payload: TransportPayload, rcv_msg: TestMessage) -> bool {
-        if rcv_msg.flow_id != flow_id {
-            warn!(self.log, "compare(): FlowTag mismatch");
+    fn compare(&self, peer_id: NodeId, payload: TransportPayload, rcv_msg: TestMessage) -> bool {
+        if rcv_msg.peer_id != peer_id {
+            warn!(self.log, "compare(): TransportChannelId mismatch");
             return false;
         }
 
@@ -362,72 +326,73 @@ impl TestClient {
     }
 }
 
+#[derive(Clone)]
 struct TestClientEventHandler {
     sender: MpscSender,
-    active_flows: Arc<Mutex<HashSet<FlowId>>>,
-    log: ReplicaLogger,
+    active_flows: Arc<Mutex<HashSet<NodeId>>>,
 }
 
 impl TestClientEventHandler {
-    fn on_message(&self, flow_id: FlowId, message: TransportPayload) -> Option<TransportPayload> {
+    fn on_message(
+        sender: MpscSender,
+        peer_id: NodeId,
+        message: TransportPayload,
+    ) -> Option<TransportPayload> {
         tokio::task::block_in_place(move || {
-            self.sender
+            sender
                 .send(TestMessage {
-                    flow_id,
+                    peer_id,
                     payload: message,
                 })
                 .expect("on_message(): failed to send")
         });
-
         None
-    }
-
-    fn on_error(&self, flow: FlowId, error: TransportErrorCode) {
-        error!(self.log, "on_error(): Flow: {:?}, error: {:?}", flow, error);
-    }
-
-    fn on_state_change(&self, change: TransportStateChange) {
-        info!(self.log, "on_state_change(): {:?}", change);
-        match change {
-            TransportStateChange::PeerFlowUp(flow) => {
-                self.active_flows.lock().unwrap().insert(flow);
-            }
-            TransportStateChange::PeerFlowDown(flow) => {
-                self.active_flows.lock().unwrap().remove(&flow);
-            }
-        }
     }
 }
 
-#[async_trait]
-impl AsyncTransportEventHandler for TestClientEventHandler {
-    async fn send_message(&self, flow: FlowId, message: TransportPayload) -> Result<(), SendError> {
-        self.on_message(flow, message);
-        Ok(())
+impl Service<TransportEvent> for TestClientEventHandler {
+    type Response = ();
+    type Error = Infallible;
+    #[allow(clippy::type_complexity)]
+    type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send + Sync>>;
+
+    fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        Poll::Ready(Ok(()))
     }
 
-    async fn state_changed(&self, state_change: TransportStateChange) {
-        self.on_state_change(state_change)
-    }
-
-    async fn error(&self, flow: FlowId, error: TransportErrorCode) {
-        self.on_error(flow, error);
+    fn call(&mut self, event: TransportEvent) -> Self::Future {
+        let active_flows = self.active_flows.clone();
+        let sender = self.sender.clone();
+        Box::pin(async move {
+            match event {
+                TransportEvent::Message(msg) => {
+                    Self::on_message(sender, msg.peer_id, msg.payload);
+                }
+                TransportEvent::PeerUp(peer_id) => {
+                    active_flows.lock().unwrap().insert(peer_id);
+                }
+                TransportEvent::PeerDown(peer_id) => {
+                    active_flows.lock().unwrap().remove(&peer_id);
+                }
+            }
+            Ok(())
+        })
     }
 }
 
 // Returns the command line argument matcher.
-fn cmd_line_matches() -> ArgMatches<'static> {
-    App::new("Test Transport Client")
+fn cmd_line_matches() -> ArgMatches {
+    Command::new("Test Transport Client")
         .about("Test program to test the transport layer")
         .arg(
-            Arg::with_name(ARG_NODE_ID)
+            Arg::new(ARG_NODE_ID)
                 .long("node")
                 .help("node id [1..3]")
                 .required(true)
                 .takes_value(true),
         )
         .arg(
-            Arg::with_name(ARG_MSG_COUNT)
+            Arg::new(ARG_MSG_COUNT)
                 .long("message_count")
                 .help("Message Count")
                 .default_value("100")
@@ -437,76 +402,50 @@ fn cmd_line_matches() -> ArgMatches<'static> {
 }
 
 #[derive(Debug)]
-struct ConfigAndRecords {
+struct ConfigAndPeerSockets {
     config: TransportConfig,
-    node_records: Vec<(NodeId, NodeRecord)>,
+    peer_sockets: Vec<(NodeId, SocketAddr)>,
 }
 
 // Generates the config and the registry node records for the three nodes
 // Returns a map of NodeId -> (TransportConfig, NodeRecord)
 // TODO: P2P-517 read from a config file
-fn generate_config_and_registry(node_id: &NodeId) -> ConfigAndRecords {
+fn generate_config_and_registry(node_id: &NodeId) -> ConfigAndPeerSockets {
     // Tuples: (NodeId, IP, server port 1, server port 2)
     let node_info = vec![
-        (to_node_id(1), "127.0.0.1".to_string(), 4100, 4101),
-        (to_node_id(2), "127.0.0.1".to_string(), 4102, 4103),
-        (to_node_id(3), "127.0.0.1".to_string(), 4104, 4105),
+        (to_node_id(1), "127.0.0.1".to_string(), 4100),
+        (to_node_id(2), "127.0.0.1".to_string(), 4102),
+        (to_node_id(3), "127.0.0.1".to_string(), 4104),
     ];
 
     let mut config = None;
-    let mut node_records = Vec::new();
+    let mut peer_sockets = Vec::new();
     for n in node_info.iter() {
         if *node_id == n.0 {
             config = Some(TransportConfig {
                 node_ip: n.1.clone(),
-                p2p_flows: vec![
-                    TransportFlowConfig {
-                        flow_tag: FLOW_TAG_1,
-                        server_port: n.2,
-                        queue_size: 1024,
-                    },
-                    TransportFlowConfig {
-                        flow_tag: FLOW_TAG_2,
-                        server_port: n.3,
-                        queue_size: 1024,
-                    },
-                ],
+                listening_port: n.2,
+                send_queue_size: 1024,
+                ..Default::default()
             });
         }
 
-        let mut node_record: NodeRecord = Default::default();
-        node_record.p2p_flow_endpoints.push(FlowEndpoint {
-            flow_tag: FLOW_TAG_1,
-            endpoint: Some(ConnectionEndpoint {
-                ip_addr: n.1.clone(),
-                port: n.2 as u32,
-                protocol: Protocol::P2p1Tls13 as i32,
-            }),
-        });
-        node_record.p2p_flow_endpoints.push(FlowEndpoint {
-            flow_tag: FLOW_TAG_2,
-            endpoint: Some(ConnectionEndpoint {
-                ip_addr: n.1.clone(),
-                port: n.3 as u32,
-                protocol: Protocol::P2p1Tls13 as i32,
-            }),
-        });
-
-        node_records.push((n.0, node_record));
+        let peer_socket = SocketAddr::from_str(&format!("{}:{}", n.1.clone(), n.2)).unwrap();
+        peer_sockets.push((n.0, peer_socket));
     }
 
-    ConfigAndRecords {
+    ConfigAndPeerSockets {
         config: config.unwrap(),
-        node_records,
+        peer_sockets,
     }
 }
 
 // Returns the peers: prev/next in the ring.
 fn parse_topology(
-    registry_node_list: &[(NodeId, NodeRecord)],
+    node_socket_list: &[(NodeId, SocketAddr)],
     node_id: &NodeId,
 ) -> (NodeId, NodeId, Role) {
-    let node_ids: Vec<NodeId> = registry_node_list.iter().map(|n| n.0).collect();
+    let node_ids: Vec<NodeId> = node_socket_list.iter().map(|n| n.0).collect();
     assert!(node_ids.contains(node_id));
 
     let l = node_ids.len();
@@ -516,7 +455,7 @@ fn parse_topology(
     } else {
         Role::Relay
     };
-    match registry_node_list.iter().position(|n| n.0 == *node_id) {
+    match node_socket_list.iter().position(|n| n.0 == *node_id) {
         Some(pos) => {
             let prev = if pos == 0 { l - 1 } else { pos - 1 };
             let next = (pos + 1) % l;
@@ -526,26 +465,22 @@ fn parse_topology(
     }
 }
 
-async fn do_work_source(
+fn do_work_source(
     test_client: &TestClient,
     message_count: usize,
 ) -> Result<(), TestClientErrorCode> {
-    test_client.wait_for_flow_up().await?;
+    test_client.wait_for_flow_up()?;
 
     for i in 1..=message_count {
         test_client
-            .send_receive_compare(i, FlowTag::from(FLOW_TAG_1))
-            .map_err(|e| println!("send_receive_compare(): failed with error: {:?}", e))
-            .unwrap();
-        test_client
-            .send_receive_compare(i, FlowTag::from(FLOW_TAG_2))
+            .send_receive_compare(i, TransportChannelId::from(TRANSPORT_CHANNEL))
             .map_err(|e| println!("send_receive_compare(): failed with error: {:?}", e))
             .unwrap();
     }
     Ok(())
 }
 
-async fn task_main(
+fn task_main(
     node_id_val: u8,
     message_count: usize,
     active_flag: Arc<AtomicBool>,
@@ -554,6 +489,7 @@ async fn task_main(
     let subnet_id = SubnetId::from(PrincipalId::try_from(v.as_slice()).unwrap());
     let node_id = to_node_id(node_id_val);
     let node_number = node_id_val as usize;
+    let rt = tokio::runtime::Runtime::new().unwrap();
 
     let logger_config = LoggerConfig {
         target: LogTarget::File(PathBuf::from(format!(
@@ -569,7 +505,7 @@ async fn task_main(
     let log = ReplicaLogger::new(logger.root.clone().into());
     let config_and_records = generate_config_and_registry(&node_id);
 
-    let (prev, next, role) = parse_topology(config_and_records.node_records.as_slice(), &node_id);
+    let (prev, next, role) = parse_topology(config_and_records.peer_sockets.as_slice(), &node_id);
     info!(log, "subnet_id = {:?} node_id = {:?}", subnet_id, node_id,);
     info!(
         log,
@@ -578,9 +514,7 @@ async fn task_main(
 
     println!("creating crypto... [Node: {}]", node_id_val);
     let registry_version = REG_V1;
-    let crypto = match tokio::task::block_in_place(|| {
-        create_crypto(node_number, 3, node_id, registry_version)
-    }) {
+    let crypto = match create_crypto(node_number, 3, node_id, registry_version) {
         Ok(crypto) => crypto,
         Err(_) => {
             panic!("unable to create crypto");
@@ -595,14 +529,15 @@ async fn task_main(
         registry_version,
         MetricsRegistry::new(),
         crypto,
-        tokio::runtime::Handle::current(),
+        rt.handle().clone(),
         log.clone(),
+        false,
     );
 
     println!("starting test client... [Node: {}]", node_id_val);
     let test_client = TestClient::new(
         transport,
-        config_and_records.node_records.as_slice(),
+        config_and_records.peer_sockets.as_slice(),
         &prev,
         &next,
         registry_version,
@@ -610,37 +545,32 @@ async fn task_main(
         active_flag.clone(),
     );
     println!("starting connections... [Node: {}]", node_id_val);
-    test_client
-        .start_connections()
-        .map_err(TestClientErrorCode::TransportError)?;
+    test_client.start_connection();
 
     println!("starting test... [Node: {}]", node_id_val);
     match role {
         Role::Source => {
-            let res = do_work_source(&test_client, message_count).await;
+            let res = do_work_source(&test_client, message_count);
             active_flag.store(false, Ordering::Relaxed);
             if let Err(e) = res {
                 info!(log, "Source thread failed, attempting to stop connections");
-                let _x = test_client.stop_connections();
+                test_client.stop_connection();
                 Err(e)
             } else {
-                test_client
-                    .stop_connections()
-                    .map_err(TestClientErrorCode::TransportError)?;
+                test_client.stop_connection();
                 info!(log, "Test successful");
                 Ok(())
             }
         }
         Role::Relay => {
             let res = test_client.relay_loop();
-            let _x = test_client.stop_connections();
+            test_client.stop_connection();
             res.map_err(TestClientErrorCode::TransportError)
         }
     }
 }
 
-#[tokio::main]
-async fn main() -> Result<(), TestClientErrorCode> {
+fn main() {
     // Cmd line params.
     let matches = cmd_line_matches();
     let node_id_val = matches
@@ -653,7 +583,7 @@ async fn main() -> Result<(), TestClientErrorCode> {
         .unwrap()
         .parse::<usize>()
         .unwrap();
-    task_main(node_id_val, message_count, Arc::new(AtomicBool::new(true))).await
+    task_main(node_id_val, message_count, Arc::new(AtomicBool::new(true))).unwrap()
 }
 
 #[cfg(test)]
@@ -669,13 +599,12 @@ async fn test_transport_spawn_tasks() {
     // Spawn tokio tasks
     for node_id in 1..(TEST_NODE_COUNT + 1) {
         let flag = active_flag.clone();
-        let handle =
-            tokio::spawn(async move { task_main(node_id, TEST_MESSAGE_COUNT, flag).await });
+        let handle = std::thread::spawn(move || task_main(node_id, TEST_MESSAGE_COUNT, flag));
         handles.push(handle);
     }
 
-    let res = futures::future::join_all(handles).await;
-    let results = res.iter().map(|x| x.as_ref().unwrap());
-
-    results.for_each(|x| assert!(x.is_ok()));
+    for x in handles {
+        let res = x.join().unwrap();
+        assert!(res.is_ok());
+    }
 }

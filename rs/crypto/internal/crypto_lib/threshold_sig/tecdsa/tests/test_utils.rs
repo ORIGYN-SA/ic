@@ -42,7 +42,7 @@ impl ProtocolSetup {
         let mut pk = Vec::with_capacity(receivers);
 
         for _i in 0..receivers {
-            let k = MEGaPrivateKey::generate(curve, &mut rng)?;
+            let k = MEGaPrivateKey::generate(curve, &mut rng);
             pk.push(k.public_key()?);
             sk.push(k);
         }
@@ -93,7 +93,7 @@ impl ProtocolSetup {
     pub fn receiver_info(&self) -> Vec<(MEGaPrivateKey, MEGaPublicKey, NodeIndex)> {
         let mut info = Vec::with_capacity(self.receivers);
         for i in 0..self.receivers {
-            info.push((self.sk[i].clone(), self.pk[i], i as NodeIndex));
+            info.push((self.sk[i].clone(), self.pk[i].clone(), i as NodeIndex));
         }
         info
     }
@@ -105,6 +105,7 @@ pub struct ProtocolRound {
     pub transcript: IDkgTranscriptInternal,
     pub openings: Vec<CommitmentOpening>,
     pub dealings: BTreeMap<NodeIndex, IDkgDealingInternal>,
+    pub mode: IDkgTranscriptOperationInternal,
 }
 
 impl ProtocolRound {
@@ -113,6 +114,7 @@ impl ProtocolRound {
         setup: &ProtocolSetup,
         dealings: BTreeMap<NodeIndex, IDkgDealingInternal>,
         transcript: IDkgTranscriptInternal,
+        mode: IDkgTranscriptOperationInternal,
     ) -> Self {
         let openings = Self::open_dealings(setup, &dealings, &transcript);
         let commitment = transcript.combined_commitment.commitment().clone();
@@ -123,6 +125,7 @@ impl ProtocolRound {
             transcript,
             openings,
             dealings,
+            mode,
         }
     }
 
@@ -136,7 +139,7 @@ impl ProtocolRound {
         number_of_dealers: usize,
         number_of_dealings_corrupted: usize,
     ) -> ThresholdEcdsaResult<Self> {
-        let shares = vec![SecretShares::Random; number_of_dealers as usize];
+        let shares = vec![SecretShares::Random; number_of_dealers];
         let mode = IDkgTranscriptOperationInternal::Random;
 
         let dealings = Self::create_dealings(
@@ -154,7 +157,7 @@ impl ProtocolRound {
             _ => panic!("Unexpected transcript commitment type"),
         }
 
-        Ok(Self::new(setup, dealings, transcript))
+        Ok(Self::new(setup, dealings, transcript, mode))
     }
 
     /// Runs a `ProtocolRound` for a `ReshareOfMasked` transcript with `number_of_dealers`
@@ -172,7 +175,7 @@ impl ProtocolRound {
         for opening in &masked.openings {
             match opening {
                 CommitmentOpening::Pedersen(v, m) => {
-                    shares.push(SecretShares::ReshareOfMasked(*v, *m));
+                    shares.push(SecretShares::ReshareOfMasked(v.clone(), m.clone()));
                 }
                 _ => panic!("Unexpected opening type"),
             }
@@ -195,7 +198,7 @@ impl ProtocolRound {
             _ => panic!("Unexpected transcript commitment type"),
         }
 
-        Ok(Self::new(setup, dealings, transcript))
+        Ok(Self::new(setup, dealings, transcript, mode))
     }
 
     /// Runs a `ProtocolRound` for a `ReshareOfUnmasked` transcript with
@@ -213,7 +216,7 @@ impl ProtocolRound {
         for opening in &unmasked.openings {
             match opening {
                 CommitmentOpening::Simple(v) => {
-                    shares.push(SecretShares::ReshareOfUnmasked(*v));
+                    shares.push(SecretShares::ReshareOfUnmasked(v.clone()));
                 }
                 _ => panic!("Unexpected opening type"),
             }
@@ -241,7 +244,7 @@ impl ProtocolRound {
             unmasked.constant_term()
         );
 
-        Ok(Self::new(setup, dealings, transcript))
+        Ok(Self::new(setup, dealings, transcript, mode))
     }
 
     /// Runs a `ProtocolRound` for a `UnmaskedTimesMasked` transcript with
@@ -260,7 +263,10 @@ impl ProtocolRound {
         for opening in unmasked.openings.iter().zip(masked.openings.iter()) {
             match opening {
                 (CommitmentOpening::Simple(lhs_v), CommitmentOpening::Pedersen(rhs_v, rhs_m)) => {
-                    shares.push(SecretShares::UnmaskedTimesMasked(*lhs_v, (*rhs_v, *rhs_m)))
+                    shares.push(SecretShares::UnmaskedTimesMasked(
+                        lhs_v.clone(),
+                        (rhs_v.clone(), rhs_m.clone()),
+                    ))
                 }
                 _ => panic!("Unexpected opening type"),
             }
@@ -286,7 +292,7 @@ impl ProtocolRound {
             _ => panic!("Unexpected transcript commitment type"),
         }
 
-        Ok(Self::new(setup, dealings, transcript))
+        Ok(Self::new(setup, dealings, transcript, mode))
     }
 
     /// Verified that parties holding secret `openings` can reconstruct the
@@ -306,7 +312,7 @@ impl ProtocolRound {
                 for (idx, opening) in openings.iter().enumerate() {
                     if let CommitmentOpening::Simple(value) = opening {
                         indexes.push(idx as NodeIndex);
-                        g_openings.push(*value);
+                        g_openings.push(value.clone());
                     } else {
                         panic!("Unexpected opening type");
                     }
@@ -326,8 +332,8 @@ impl ProtocolRound {
                 for (idx, opening) in openings.iter().enumerate() {
                     if let CommitmentOpening::Pedersen(value, mask) = opening {
                         indexes.push(idx as NodeIndex);
-                        g_openings.push(*value);
-                        h_openings.push(*mask);
+                        g_openings.push(value.clone());
+                        h_openings.push(mask.clone());
                     } else {
                         panic!("Unexpected opening type");
                     }
@@ -483,10 +489,24 @@ impl ProtocolRound {
                 Err(ThresholdEcdsaError::InsufficientDealings)
             }
             Err(IDkgCreateTranscriptInternalError::InconsistentCommitments) => {
-                Err(ThresholdEcdsaError::InconsistentCommitments)
+                Err(ThresholdEcdsaError::InvalidCommitment)
             }
             Err(_) => panic!("Unexpected error from create_transcript"),
         }
+    }
+
+    pub fn verify_transcript(
+        &self,
+        setup: &ProtocolSetup,
+        dealings: &BTreeMap<NodeIndex, IDkgDealingInternal>,
+    ) -> Result<(), IDkgVerifyTranscriptInternalError> {
+        verify_transcript(
+            &self.transcript,
+            setup.alg,
+            setup.threshold,
+            dealings,
+            &self.mode,
+        )
     }
 
     /// Create dealings generated by `number_of_dealers` random dealers.
@@ -501,14 +521,11 @@ impl ProtocolRound {
         assert!(number_of_dealers <= shares.len());
         assert!(number_of_dealings_corrupted <= number_of_dealers);
 
-        let rng = &mut seed.into_rng();
+        let mut rng = &mut seed.into_rng();
 
         let mut dealings = BTreeMap::new();
 
-        let number_of_receivers = NumberOfNodes::from(setup.receivers as u32);
-
         for (dealer_index, share) in shares.iter().enumerate() {
-            let dealing_randomness = Randomness::from(rng.gen::<[u8; 32]>());
             let dealer_index = dealer_index as u32;
 
             let dealing = create_dealing(
@@ -518,27 +535,14 @@ impl ProtocolRound {
                 setup.threshold,
                 &setup.pk,
                 share,
-                dealing_randomness,
+                Seed::from_rng(&mut rng),
             )
             .expect("failed to create dealing");
 
-            let publicly_invalid = publicly_verify_dealing(
-                setup.alg,
-                &dealing,
-                transcript_type,
-                setup.threshold,
-                dealer_index,
-                number_of_receivers,
-                &setup.ad,
-            )
-            .is_err();
-
-            if publicly_invalid {
-                panic!("Created a publicly invalid dealing");
-            }
+            Self::test_public_dealing_verification(setup, &dealing, transcript_type, dealer_index);
 
             for (private_key, public_key, recipient_index) in setup.receiver_info() {
-                let locally_invalid = privately_verify_dealing(
+                let is_locally_valid = privately_verify_dealing(
                     setup.alg,
                     &dealing,
                     &private_key,
@@ -547,11 +551,9 @@ impl ProtocolRound {
                     dealer_index,
                     recipient_index,
                 )
-                .is_err();
+                .is_ok();
 
-                if locally_invalid {
-                    panic!("Created a locally invalid dealing");
-                }
+                assert!(is_locally_valid, "Created a locally invalid dealing");
             }
 
             dealings.insert(dealer_index, dealing);
@@ -568,12 +570,15 @@ impl ProtocolRound {
             .choose_multiple(rng, number_of_dealings_corrupted);
 
         for (dealer_index, dealing) in dealings_to_damage {
-            let number_of_corruptions = rng.gen_range(1, setup.threshold.get() as usize + 1);
+            let max_corruptions = setup.threshold.get() as usize;
+            let number_of_corruptions = rng.gen_range(1..=max_corruptions);
 
             let corrupted_recip =
                 (0..setup.receivers as NodeIndex).choose_multiple(rng, number_of_corruptions);
 
-            let bad_dealing = test_utils::corrupt_dealing(dealing, &corrupted_recip, rng).unwrap();
+            let bad_dealing =
+                test_utils::corrupt_dealing(dealing, &corrupted_recip, Seed::from_rng(&mut rng))
+                    .unwrap();
 
             // Privately invalid iff we were corrupted
             for (private_key, public_key, recipient_index) in setup.receiver_info() {
@@ -601,6 +606,66 @@ impl ProtocolRound {
             *dealing = bad_dealing;
         }
         dealings
+    }
+
+    fn test_public_dealing_verification(
+        setup: &ProtocolSetup,
+        dealing: &IDkgDealingInternal,
+        transcript_type: &IDkgTranscriptOperationInternal,
+        dealer_index: NodeIndex,
+    ) {
+        let number_of_receivers = NumberOfNodes::from(setup.receivers as u32);
+
+        let publicly_invalid = publicly_verify_dealing(
+            setup.alg,
+            dealing,
+            transcript_type,
+            setup.threshold,
+            dealer_index,
+            number_of_receivers,
+            &setup.ad,
+        )
+        .is_err();
+
+        if publicly_invalid {
+            panic!("Created a publicly invalid dealing");
+        }
+
+        // wrong dealer index -> invalid
+        assert!(publicly_verify_dealing(
+            setup.alg,
+            dealing,
+            transcript_type,
+            setup.threshold,
+            dealer_index + 1,
+            number_of_receivers,
+            &setup.ad
+        )
+        .is_err());
+
+        // wrong number of receivers -> invalid
+        assert!(publicly_verify_dealing(
+            setup.alg,
+            dealing,
+            transcript_type,
+            setup.threshold,
+            dealer_index,
+            NumberOfNodes::from(1 + setup.receivers as u32),
+            &setup.ad
+        )
+        .is_err());
+
+        // wrong associated data -> invalid
+        assert!(publicly_verify_dealing(
+            setup.alg,
+            dealing,
+            transcript_type,
+            setup.threshold,
+            dealer_index,
+            number_of_receivers,
+            "wrong ad".as_bytes()
+        )
+        .is_err());
     }
 
     pub fn constant_term(&self) -> EccPoint {
@@ -797,9 +862,4 @@ impl SignatureProtocolExecution {
 
         Ok(())
     }
-}
-
-pub fn random_seed() -> Seed {
-    let mut rng = rand::thread_rng();
-    Seed::from_rng(&mut rng)
 }

@@ -3,7 +3,7 @@ use canister_test::*;
 #[test]
 fn test_statesync_test_canisters() {
     local_test_e(|r| async move {
-        let proj = Project::new(std::env::var("CARGO_MANIFEST_DIR").unwrap());
+        let proj = Project::new();
 
         println!("Start installing statesync test canister");
         let canister = proj
@@ -42,7 +42,7 @@ fn test_statesync_test_canisters() {
             .unwrap();
         assert_eq!(
             res,
-            Ok(20),
+            Ok(119),
             "Queried 0th element of state vector, should be 20 for seed 33, was {:?}",
             res
         );

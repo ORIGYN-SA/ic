@@ -95,34 +95,31 @@
 //! width="540"/> </div> <hr/>
 
 use ic_config::transport::TransportConfig;
-use ic_interfaces::{
-    artifact_manager::ArtifactManager, consensus_pool::ConsensusPoolCache, registry::RegistryClient,
-};
-use ic_interfaces_p2p::IngressIngestionService;
-use ic_interfaces_transport::{FlowTag, Transport};
+use ic_interfaces::{artifact_manager::ArtifactManager, consensus_pool::ConsensusPoolCache};
+use ic_interfaces_registry::RegistryClient;
+use ic_interfaces_transport::{Transport, TransportChannelId};
 use ic_logger::ReplicaLogger;
 use ic_metrics::MetricsRegistry;
-use ic_protobuf::registry::subnet::v1::GossipConfig;
-use ic_registry_client_helpers::subnet::SubnetRegistry;
-use ic_types::{malicious_flags::MaliciousFlags, NodeId, SubnetId};
+use ic_types::{NodeId, SubnetId};
 use serde::{Deserialize, Serialize};
 use std::{
     error,
     fmt::{Display, Formatter, Result as FmtResult},
     sync::Arc,
-    time::Duration,
 };
-use tower::{util::BoxService, ServiceBuilder};
+use tower::util::BoxCloneService;
 
 mod artifact_download_list;
+mod discovery;
 mod download_management;
 mod download_prioritization;
 mod event_handler;
 mod gossip_protocol;
-mod malicious_gossip;
+mod gossip_types;
 mod metrics;
+mod peer_context;
 
-pub use event_handler::{AdvertSubscriber, P2PThreadJoiner};
+pub use event_handler::{AdvertBroadcaster, P2PThreadJoiner};
 
 /// Custom P2P result type returning a P2P error in case of error.
 pub(crate) type P2PResult<T> = std::result::Result<T, P2PError>;
@@ -130,42 +127,27 @@ pub(crate) type P2PResult<T> = std::result::Result<T, P2PError>;
 pub(crate) mod utils {
     //! The utils module provides a mapping from a gossip message to the
     //! corresponding flow tag.
-    use crate::gossip_protocol::GossipMessage;
-    use ic_interfaces_transport::FlowTag;
+    use crate::gossip_types::GossipMessage;
+    use ic_interfaces_transport::TransportChannelId;
 
-    /// The FlowMapper struct holds a vector of flow tags.
-    pub(crate) struct FlowMapper {
-        flow_tags: Vec<FlowTag>,
+    /// An ordered collection of transport channels.
+    pub(crate) struct TransportChannelIdMapper {
+        transport_channels: Vec<TransportChannelId>,
     }
 
-    impl FlowMapper {
-        /// The function creates a new FlowMapper instance.
-        pub(crate) fn new(flow_tags: Vec<FlowTag>) -> Self {
-            assert_eq!(flow_tags.len(), 1);
-            Self { flow_tags }
+    impl TransportChannelIdMapper {
+        /// The function creates a new TransportChannelIdMapper instance.
+        pub(crate) fn new(transport_channels: Vec<TransportChannelId>) -> Self {
+            assert_eq!(transport_channels.len(), 1);
+            Self { transport_channels }
         }
 
         /// The function returns the flow tag of the flow the message maps to.
-        pub(crate) fn map(&self, _msg: &GossipMessage) -> FlowTag {
-            self.flow_tags[0]
+        pub(crate) fn map(&self, _msg: &GossipMessage) -> TransportChannelId {
+            self.transport_channels[0]
         }
     }
 }
-
-/// Max number of ingress message we can buffer until the P2P layer is ready to
-/// accept them.
-// The latency SLO for 'call' requests is set for 2s. Given the rate limiter of
-// 100 per second this buffer should not be bigger than 200. We are conservite
-// setting it to 100.
-const MAX_BUFFERED_INGRESS_MESSAGES: usize = 100;
-/// Max number of inflight requests into P2P. Note each each requests requires a
-/// dedicated thread to execute on so this number should be relatively small.
-// Do not increase the number until we get to the root cause of NET-743.
-const MAX_INFLIGHT_INGRESS_MESSAGES: usize = 1;
-/// Max ingress messages per second that can go into P2P.
-// There is some internal contention inside P2P (NET-743). We achieve lower
-// throughput if we process messages one after the other.
-const MAX_INGRESS_MESSAGES_PER_SECOND: u64 = 100;
 
 /// Starts the P2P stack and returns the objects that interact with P2P.
 #[allow(clippy::too_many_arguments)]
@@ -174,31 +156,14 @@ pub fn start_p2p(
     log: ReplicaLogger,
     node_id: NodeId,
     subnet_id: SubnetId,
-    transport_config: TransportConfig,
-    gossip_config: GossipConfig,
+    _transport_config: TransportConfig,
     registry_client: Arc<dyn RegistryClient>,
     transport: Arc<dyn Transport>,
     consensus_pool_cache: Arc<dyn ConsensusPoolCache>,
     artifact_manager: Arc<dyn ArtifactManager>,
-    ingress_throttler: event_handler::IngressThrottler,
-    malicious_flags: MaliciousFlags,
-    advert_subscriber: &AdvertSubscriber,
-) -> (IngressIngestionService, P2PThreadJoiner) {
-    let event_handler = Arc::new(event_handler::AsyncTransportEventHandlerImpl::new(
-        node_id,
-        log.clone(),
-        &metrics_registry,
-        event_handler::ChannelConfig::from(gossip_config),
-    ));
-    transport
-        .register_client(event_handler.clone())
-        .expect("transport registration failed");
-
-    let p2p_flow_tags = transport_config
-        .p2p_flows
-        .iter()
-        .map(|flow_config| FlowTag::from(flow_config.flow_tag))
-        .collect();
+    advert_broadcaster: &AdvertBroadcaster,
+) -> P2PThreadJoiner {
+    let p2p_transport_channels = vec![TransportChannelId::from(0)];
     let gossip = Arc::new(gossip_protocol::GossipImpl::new(
         node_id,
         subnet_id,
@@ -206,137 +171,22 @@ pub fn start_p2p(
         registry_client.clone(),
         artifact_manager.clone(),
         transport.clone(),
-        p2p_flow_tags,
+        p2p_transport_channels,
         log.clone(),
         &metrics_registry,
-        malicious_flags,
     ));
-    event_handler.start(gossip.clone());
-    advert_subscriber.start(gossip.clone());
 
-    let p2p_thread_joiner = P2PThreadJoiner::new(log, gossip.clone());
-
-    let ingress_event_handler = BoxService::new(event_handler::IngressEventHandler::new(
-        ingress_throttler,
-        gossip,
+    let event_handler = event_handler::AsyncTransportEventHandlerImpl::new(
         node_id,
-    ));
-
-    let ingress_ingestion_service = BoxService::new(
-        ServiceBuilder::new()
-            .concurrency_limit(MAX_INFLIGHT_INGRESS_MESSAGES)
-            .rate_limit(MAX_INGRESS_MESSAGES_PER_SECOND, Duration::from_secs(1))
-            .service(ingress_event_handler),
+        log.clone(),
+        &metrics_registry,
+        event_handler::ChannelConfig::default(),
+        gossip.clone(),
     );
-    let ingress_ingestion_service = ServiceBuilder::new()
-        .buffer(MAX_BUFFERED_INGRESS_MESSAGES)
-        .service(ingress_ingestion_service);
-    (ingress_ingestion_service, p2p_thread_joiner)
-}
+    transport.set_event_handler(BoxCloneService::new(event_handler));
+    advert_broadcaster.start(gossip.clone());
 
-pub(crate) mod advert_utils {
-    use crate::gossip_protocol::{GossipAdvertAction, GossipAdvertSendRequest, Percentage};
-    use ic_logger::replica_logger::ReplicaLogger;
-    use ic_logger::{error, warn};
-    use ic_metrics::MetricsRegistry;
-    use ic_protobuf::registry::subnet::v1::GossipAdvertConfig;
-    use ic_types::artifact::AdvertClass;
-    use ic_types::p2p::GossipAdvert;
-    use prometheus::IntCounterVec;
-
-    /// Maps the P2P client advert send requests to the internal format,
-    /// based on the config
-    #[derive(Clone)]
-    pub(crate) struct AdvertRequestBuilder {
-        pub(crate) advert_config: Option<GossipAdvertConfig>,
-        adverts_by_class: IntCounterVec,
-    }
-
-    impl AdvertRequestBuilder {
-        pub(crate) fn new(
-            mut advert_config: Option<GossipAdvertConfig>,
-            metrics_registry: &MetricsRegistry,
-            log: ReplicaLogger,
-        ) -> Self {
-            warn!(
-                log,
-                "AdvertRequestBuilder::new(): advert_config = {:?}", advert_config
-            );
-
-            if let Some(config) = &advert_config {
-                if let Err(e) = validate_advert_config(config) {
-                    error!(log, "AdvertRequestBuilder::new(): invalid config = {:?}", e);
-                    // Disable the feature on invalid config
-                    advert_config.take();
-                }
-            }
-
-            Self {
-                advert_config,
-                adverts_by_class: metrics_registry.int_counter_vec(
-                    "gossip_adverts_by_class",
-                    "Number of adverts from clients, by advert class",
-                    &["type"],
-                ),
-            }
-        }
-
-        /// Maps the client advert send request to the internal format
-        pub(crate) fn build(
-            &self,
-            advert: GossipAdvert,
-            advert_class: AdvertClass,
-        ) -> Option<GossipAdvertSendRequest> {
-            self.adverts_by_class
-                .with_label_values(&[advert_class.as_str()])
-                .inc();
-
-            let config = match &self.advert_config {
-                Some(config) => config,
-                None => {
-                    // Feature disabled, send to all peers
-                    return Some(GossipAdvertSendRequest {
-                        advert,
-                        action: GossipAdvertAction::SendToAllPeers,
-                    });
-                }
-            };
-
-            let action = match advert_class {
-                AdvertClass::Critical => Some(GossipAdvertAction::SendToAllPeers),
-                AdvertClass::BestEffort => Some(GossipAdvertAction::SendToRandomSubset(
-                    Percentage::from(config.best_effort_percentage),
-                )),
-                AdvertClass::None => None,
-            };
-            action.map(|action| GossipAdvertSendRequest { advert, action })
-        }
-    }
-
-    pub(crate) fn validate_advert_config(config: &GossipAdvertConfig) -> Result<(), String> {
-        if config.best_effort_percentage == 0 || config.best_effort_percentage > 100 {
-            return Err(format!(
-                "Invalid best effort percentage: {}",
-                config.best_effort_percentage
-            ));
-        }
-
-        Ok(())
-    }
-}
-
-/// Fetch the Gossip configuration from the registry.
-pub fn fetch_gossip_config(
-    registry_client: Arc<dyn RegistryClient>,
-    subnet_id: SubnetId,
-) -> GossipConfig {
-    if let Ok(Some(Some(gossip_config))) =
-        registry_client.get_gossip_config(subnet_id, registry_client.get_latest_version())
-    {
-        gossip_config
-    } else {
-        ic_types::p2p::build_default_gossip_config()
-    }
+    P2PThreadJoiner::new(log, gossip)
 }
 
 /// Generic P2P Error codes.
@@ -387,113 +237,5 @@ impl<T> From<P2PErrorCode> for P2PResult<T> {
     /// The function converts a P2P error code to a P2P result.
     fn from(p2p_error_code: P2PErrorCode) -> P2PResult<T> {
         Err(P2PError { p2p_error_code })
-    }
-}
-
-#[cfg(test)]
-pub mod tests {
-    use crate::advert_utils::{validate_advert_config, AdvertRequestBuilder};
-    use crate::download_prioritization::test::make_gossip_advert;
-    use crate::gossip_protocol::{GossipAdvertAction, GossipAdvertSendRequest, Percentage};
-    use ic_metrics::MetricsRegistry;
-    use ic_protobuf::registry::subnet::v1::GossipAdvertConfig;
-    use ic_test_utilities::p2p::p2p_test_setup_logger;
-    use ic_types::artifact::AdvertClass;
-
-    #[test]
-    fn test_advert_config_validation() {
-        assert!(validate_advert_config(&GossipAdvertConfig {
-            best_effort_percentage: 10,
-        })
-        .is_ok());
-        assert!(validate_advert_config(&GossipAdvertConfig {
-            best_effort_percentage: 90,
-        })
-        .is_ok());
-        assert!(validate_advert_config(&GossipAdvertConfig {
-            best_effort_percentage: 100,
-        })
-        .is_ok());
-
-        assert_eq!(
-            validate_advert_config(&GossipAdvertConfig {
-                best_effort_percentage: 0,
-            })
-            .err()
-            .unwrap(),
-            "Invalid best effort percentage: 0"
-        );
-        assert_eq!(
-            validate_advert_config(&GossipAdvertConfig {
-                best_effort_percentage: 110,
-            })
-            .err()
-            .unwrap(),
-            "Invalid best effort percentage: 110"
-        );
-    }
-
-    #[test]
-    fn test_advert_optimization_disabled() {
-        let builder = AdvertRequestBuilder::new(
-            None,
-            &MetricsRegistry::new(),
-            p2p_test_setup_logger().root.clone().into(),
-        );
-        let result = builder.build(make_gossip_advert(10), AdvertClass::Critical);
-        let expected = GossipAdvertSendRequest {
-            advert: make_gossip_advert(10),
-            action: GossipAdvertAction::SendToAllPeers,
-        };
-        assert_eq!(result.unwrap(), expected);
-    }
-
-    #[test]
-    fn test_advert_optimization_enabled() {
-        let builder = AdvertRequestBuilder::new(
-            Some(GossipAdvertConfig {
-                best_effort_percentage: 25,
-            }),
-            &MetricsRegistry::new(),
-            p2p_test_setup_logger().root.clone().into(),
-        );
-
-        // AdvertClass::Critical
-        {
-            let result = builder.build(make_gossip_advert(10), AdvertClass::Critical);
-            let expected = GossipAdvertSendRequest {
-                advert: make_gossip_advert(10),
-                action: GossipAdvertAction::SendToAllPeers,
-            };
-            assert_eq!(result.unwrap(), expected);
-        }
-
-        // AdvertClass::BestEffort
-        {
-            let result = builder.build(make_gossip_advert(10), AdvertClass::BestEffort);
-            let expected = GossipAdvertSendRequest {
-                advert: make_gossip_advert(10),
-                action: GossipAdvertAction::SendToRandomSubset(Percentage::from(25)),
-            };
-            assert_eq!(result.unwrap(), expected);
-        }
-
-        // AdvertClass::None
-        {
-            let result = builder.build(make_gossip_advert(10), AdvertClass::None);
-            assert!(result.is_none());
-        }
-    }
-
-    #[test]
-    fn test_advert_invalid_config() {
-        let builder = AdvertRequestBuilder::new(
-            Some(GossipAdvertConfig {
-                best_effort_percentage: 125,
-            }),
-            &MetricsRegistry::new(),
-            p2p_test_setup_logger().root.clone().into(),
-        );
-        assert!(builder.advert_config.is_none());
     }
 }

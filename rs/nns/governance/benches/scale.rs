@@ -18,10 +18,10 @@ use criterion::{criterion_group, criterion_main, Criterion};
 use futures::future::FutureExt;
 use std::convert::TryFrom;
 
-use ic_base_types::PrincipalId;
-use ic_nervous_system_common::{ledger::Ledger, NervousSystemError};
+use ic_base_types::{CanisterId, PrincipalId};
+use ic_nervous_system_common::{ledger::IcpLedger, NervousSystemError};
 use ic_nns_common::pb::v1::NeuronId;
-use ic_nns_governance::governance::{Environment, Governance, HeapGrowthPotential};
+use ic_nns_governance::governance::{Environment, Governance, HeapGrowthPotential, CMC};
 
 use ic_nns_governance::pb::v1::neuron;
 use ic_nns_governance::pb::v1::proposal;
@@ -29,7 +29,7 @@ use ic_nns_governance::pb::v1::{
     ExecuteNnsFunction, Governance as GovernanceProto, GovernanceError, Motion, NetworkEconomics,
     Neuron, Proposal, Topic,
 };
-use ledger_canister::{AccountIdentifier, Subaccount, Tokens};
+use icp_ledger::{AccountIdentifier, Subaccount, Tokens};
 
 criterion_group! {
     name = benches;
@@ -44,6 +44,7 @@ struct MockEnvironment {
     secs: u64,
 }
 
+#[async_trait]
 impl Environment for MockEnvironment {
     fn now(&self) -> u64 {
         self.secs
@@ -68,12 +69,21 @@ impl Environment for MockEnvironment {
     fn heap_growth_potential(&self) -> HeapGrowthPotential {
         HeapGrowthPotential::NoIssue
     }
+
+    async fn call_canister_method(
+        &mut self,
+        _target: CanisterId,
+        _method_name: &str,
+        _request: Vec<u8>,
+    ) -> Result<Vec<u8>, (Option<i32>, String)> {
+        unimplemented!();
+    }
 }
 
 struct MockLedger {}
 
 #[async_trait]
-impl Ledger for MockLedger {
+impl IcpLedger for MockLedger {
     async fn transfer_funds(
         &self,
         _amount_e8s: u64,
@@ -86,7 +96,7 @@ impl Ledger for MockLedger {
     }
 
     async fn total_supply(&self) -> Result<Tokens, NervousSystemError> {
-        unimplemented!()
+        Err(NervousSystemError::default())
     }
 
     async fn account_balance(
@@ -95,14 +105,27 @@ impl Ledger for MockLedger {
     ) -> Result<Tokens, NervousSystemError> {
         unimplemented!()
     }
+
+    fn canister_id(&self) -> CanisterId {
+        unimplemented!()
+    }
 }
 
-// Make a proposal for neuron 0 and call proccess proposals. The
+struct MockCMC {}
+
+#[async_trait]
+impl CMC for MockCMC {
+    async fn neuron_maturity_modulation(&mut self) -> Result<i32, String> {
+        unimplemented!()
+    }
+}
+
+// Make a proposal for neuron 0 and call process proposals. The
 // following graph is set up to cascade following, so the proposal
 // will be accepted when submitted and executed in the call to process
 // proposals.
 fn make_and_process_proposal(gov: &mut Governance) {
-    gov.make_proposal(
+    tokio_test::block_on(gov.make_proposal(
         &NeuronId { id: 0 },
         // Must match neuron 1's serialized_id.
         &PrincipalId::try_from(b"SID0".to_vec()).unwrap(),
@@ -114,7 +137,7 @@ fn make_and_process_proposal(gov: &mut Governance) {
             })),
             ..Default::default()
         },
-    )
+    ))
     .unwrap();
     gov.run_periodic_tasks().now_or_never();
 }
@@ -125,6 +148,7 @@ fn linear_20k(c: &mut Criterion) {
         fixture_for_scale(20_000, true),
         Box::new(MockEnvironment { secs }),
         Box::new(MockLedger {}),
+        Box::new(MockCMC {}),
     );
     c.bench_function("linear 20k", |b| {
         b.iter(|| make_and_process_proposal(&mut gov))
@@ -137,6 +161,7 @@ fn tree_20k(c: &mut Criterion) {
         fixture_for_scale(20_000, false),
         Box::new(MockEnvironment { secs }),
         Box::new(MockLedger {}),
+        Box::new(MockCMC {}),
     );
     c.bench_function("tree 20k", |b| {
         b.iter(|| make_and_process_proposal(&mut gov))
@@ -149,6 +174,7 @@ fn linear_200k(c: &mut Criterion) {
         fixture_for_scale(200_000, true),
         Box::new(MockEnvironment { secs }),
         Box::new(MockLedger {}),
+        Box::new(MockCMC {}),
     );
     c.bench_function("linear 200k", |b| {
         b.iter(|| make_and_process_proposal(&mut gov))
@@ -161,6 +187,7 @@ fn tree_200k(c: &mut Criterion) {
         fixture_for_scale(200_000, false),
         Box::new(MockEnvironment { secs }),
         Box::new(MockLedger {}),
+        Box::new(MockCMC {}),
     );
     c.bench_function("tree 200k", |b| {
         b.iter(|| make_and_process_proposal(&mut gov))
@@ -220,8 +247,8 @@ fn fixture_for_scale(num_neurons: u32, linear_following: bool) -> GovernanceProt
             ),
             //
             followees: [(Topic::Unspecified as i32, neuron::Followees { followees })]
-                .to_vec()
-                .into_iter()
+                .iter()
+                .cloned()
                 .collect(),
             ..Default::default()
         };

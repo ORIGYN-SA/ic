@@ -22,9 +22,6 @@ mod bad_input;
 mod cycles_minting_canister;
 
 #[cfg(test)]
-mod fuzz;
-
-#[cfg(test)]
 mod node_provider_remuneration;
 
 #[cfg(test)]
@@ -104,3 +101,12 @@ mod update_node_provider;
 
 #[cfg(test)]
 mod list_node_providers;
+
+#[cfg(test)]
+mod network_economics;
+
+#[cfg(test)]
+mod sns_token_swap_proposal;
+
+#[cfg(test)]
+mod sns_wasm_allowed_principals;

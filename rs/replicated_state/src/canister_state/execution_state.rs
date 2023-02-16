@@ -1,9 +1,11 @@
 use super::SessionNonce;
-use crate::{num_bytes_try_from, NumWasmPages, PageMap};
+use crate::hash::ic_hashtree_leaf_hash;
+use crate::{canister_state::WASM_PAGE_SIZE_IN_BYTES, num_bytes_try_from, NumWasmPages, PageMap};
 use ic_protobuf::{
     proxy::{try_from_option_field, ProxyDecodeError},
     state::canister_state_bits::v1 as pb,
 };
+use ic_sys::PAGE_SIZE;
 use ic_types::{methods::WasmMethod, ExecutionRound, NumBytes};
 use ic_wasm_types::CanisterModule;
 use maplit::btreemap;
@@ -230,14 +232,30 @@ impl Memory {
             sandbox_memory: SandboxMemory::new(),
         }
     }
-}
-
-impl Default for Memory {
-    fn default() -> Self {
+    /// New method for testing, overriding the default trait.
+    pub fn new_for_testing() -> Self {
         Self {
-            page_map: PageMap::default(),
+            page_map: PageMap::new_for_testing(),
             size: NumWasmPages::from(0),
             sandbox_memory: SandboxMemory::new(),
+        }
+    }
+
+    /// Returns an error if `self.size` is less than the modified prefix of
+    /// `self.page_map`. The impact of such case:
+    ///  - if the canister tries to access pages above `self.size`, then
+    ///    it will crash.
+    ///  - otherwise, charging for storage will be inaccurate.
+    pub fn verify_size(&self) -> Result<(), String> {
+        let page_map_bytes = self.page_map.num_host_pages() * PAGE_SIZE;
+        let memory_bytes = self.size.get() * WASM_PAGE_SIZE_IN_BYTES;
+        if page_map_bytes <= memory_bytes {
+            Ok(())
+        } else {
+            Err(format!(
+                "The page map size {} exceeds the memory size {}",
+                page_map_bytes, memory_bytes
+            ))
         }
     }
 }
@@ -273,7 +291,8 @@ impl SandboxMemory {
 /// The owner of the sandbox memory. It's destructor must close the
 /// corresponding memory in the sandbox process.
 pub trait SandboxMemoryOwner: std::fmt::Debug + Send + Sync {
-    fn get_id(&self) -> usize;
+    fn get_sandbox_memory_id(&self) -> usize;
+    fn get_sandbox_process_id(&self) -> Option<usize>;
 }
 
 /// A handle to the sandbox memory that keeps the corresponding memory in the
@@ -295,11 +314,16 @@ impl SandboxMemoryHandle {
 
     /// Returns a raw id of the memory in the sandbox process, which can be
     /// converted to sandbox `MemoryId` using `MemoryId::from()`.
-    pub fn get_id(&self) -> usize {
-        self.0.get_id()
+    pub fn get_sandbox_memory_id(&self) -> usize {
+        self.0.get_sandbox_memory_id()
+    }
+
+    /// Returns the id of the sandbox process if the process is still running.
+    /// Returns `None` if the sandbox process has exited.
+    pub fn get_sandbox_process_id(&self) -> Option<usize> {
+        self.0.get_sandbox_process_id()
     }
 }
-
 /// The part of the canister state that can be accessed during execution
 ///
 /// Note that execution state is used to track ephemeral information.
@@ -428,7 +452,7 @@ impl ExecutionState {
 
 /// An enum that represents the possible visibility levels a custom section
 /// defined in the wasm module can have.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum CustomSectionType {
     Public,
     Private,
@@ -460,16 +484,30 @@ impl TryFrom<pb::CustomSectionType> for CustomSectionType {
 /// Represents the data a custom section holds.
 #[derive(Debug, PartialEq, Eq, Clone, serde::Serialize, serde::Deserialize)]
 pub struct CustomSection {
-    pub visibility: CustomSectionType,
-    pub content: Vec<u8>,
+    visibility: CustomSectionType,
+    content: Vec<u8>,
+    hash: [u8; 32],
 }
 
 impl CustomSection {
     pub fn new(visibility: CustomSectionType, content: Vec<u8>) -> Self {
         Self {
             visibility,
+            hash: ic_hashtree_leaf_hash(&content),
             content,
         }
+    }
+
+    pub fn visibility(&self) -> CustomSectionType {
+        self.visibility
+    }
+
+    pub fn content(&self) -> &[u8] {
+        &self.content
+    }
+
+    pub fn hash(&self) -> [u8; 32] {
+        self.hash
     }
 }
 
@@ -478,6 +516,7 @@ impl From<&CustomSection> for pb::WasmCustomSection {
         Self {
             visibility: pb::CustomSectionType::from(&item.visibility).into(),
             content: item.content.clone(),
+            hash: Some(item.hash.to_vec()),
         }
     }
 }
@@ -490,6 +529,15 @@ impl TryFrom<pb::WasmCustomSection> for CustomSection {
         )?;
         Ok(Self {
             visibility,
+            hash: match item.hash {
+                Some(hash_bytes) => hash_bytes.try_into().map_err(|h: Vec<u8>| {
+                    ProxyDecodeError::InvalidDigestLength {
+                        expected: 32,
+                        actual: h.len(),
+                    }
+                })?,
+                None => ic_hashtree_leaf_hash(&item.content),
+            },
             content: item.content,
         })
     }

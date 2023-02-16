@@ -28,7 +28,7 @@ fn copy_recursively(src: &Path, dst: &Path) -> Result<(), String> {
                 .read_dir()
                 .map_err(|e| format!("failed to read directory {}: {}", src.display(), e))?;
 
-            fs::create_dir_all(&dst)
+            fs::create_dir_all(dst)
                 .map_err(|e| format!("failed to create directory {}: {}", dst.display(), e))?;
 
             for entry_result in entries {
@@ -90,11 +90,11 @@ pub fn do_import(state_path: PathBuf, config_path: PathBuf, height: u64) -> Resu
 
     copy_recursively(&state_path, &scratchpad_dir)?;
 
-    let cp_layout = CheckpointLayout::<RwPolicy>::new(scratchpad_dir, height)
+    let cp_layout = CheckpointLayout::<RwPolicy<()>>::new_untracked(scratchpad_dir, height)
         .map_err(|e| format!("Failed to create scratchpad checkpoint layout: {}", e))?;
 
     state_layout
-        .scratchpad_to_checkpoint(cp_layout, height)
+        .scratchpad_to_checkpoint(cp_layout, height, None)
         .map_err(|e| e.to_string())?;
 
     println!(

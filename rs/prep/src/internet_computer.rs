@@ -20,7 +20,7 @@ use serde_json::Value;
 use thiserror::Error;
 use url::Url;
 
-use ic_interfaces::registry::{
+use ic_interfaces_registry::{
     RegistryDataProvider, RegistryTransportRecord, ZERO_REGISTRY_VERSION,
 };
 use ic_protobuf::registry::{
@@ -33,17 +33,22 @@ use ic_protobuf::registry::{
 };
 use ic_protobuf::types::v1::{PrincipalId as PrincipalIdProto, SubnetId as SubnetIdProto};
 use ic_registry_client::client::RegistryDataProviderError;
-use ic_registry_common::local_store::{Changelog, KeyMutation, LocalStoreImpl, LocalStoreWriter};
 use ic_registry_keys::{
     make_blessed_replica_version_key, make_node_operator_record_key,
     make_provisional_whitelist_record_key, make_replica_version_key, make_routing_table_record_key,
     make_subnet_list_record_key, make_unassigned_nodes_config_record_key, ROOT_SUBNET_ID_KEY,
 };
+use ic_registry_local_store::{Changelog, KeyMutation, LocalStoreImpl, LocalStoreWriter};
 use ic_registry_proto_data_provider::ProtoRegistryDataProvider;
 use ic_registry_provisional_whitelist::ProvisionalWhitelist;
-use ic_registry_routing_table::{routing_table_insert_subnet, RoutingTable};
+use ic_registry_routing_table::{
+    routing_table_insert_subnet, CanisterIdRange, RoutingTable, WellFormedError,
+    CANISTER_IDS_PER_SUBNET,
+};
 use ic_registry_transport::pb::v1::RegistryMutation;
-use ic_types::{PrincipalId, PrincipalIdParseError, RegistryVersion, ReplicaVersion, SubnetId};
+use ic_types::{
+    CanisterId, PrincipalId, PrincipalIdParseError, RegistryVersion, ReplicaVersion, SubnetId,
+};
 
 use crate::subnet_configuration::{SubnetConfig, SubnetIndex};
 use crate::util::write_registry_entry;
@@ -81,6 +86,40 @@ impl TopologyConfig {
     pub fn insert_subnet(&mut self, subnet_index: SubnetIndex, config: SubnetConfig) {
         assert_eq!(subnet_index, config.subnet_index);
         self.subnets.insert(subnet_index, config);
+    }
+
+    pub fn get_subnet(&self, subnet_index: SubnetIndex) -> Option<SubnetConfig> {
+        self.subnets.get(&subnet_index).cloned()
+    }
+
+    /// Create a routing table with an allocation range for the creation of canisters with specified Canister IDs.
+    fn get_routing_table_with_specified_ids_allocation_range(
+        &self,
+    ) -> Result<RoutingTable, WellFormedError> {
+        let specified_ids_range_start: u64 = 0;
+        let specified_ids_range_end: u64 = u64::MAX / 2;
+
+        let specified_ids_range = CanisterIdRange {
+            start: CanisterId::from(specified_ids_range_start),
+            end: CanisterId::from(specified_ids_range_end),
+        };
+
+        let subnets_allocation_range_start =
+            ((specified_ids_range_end / CANISTER_IDS_PER_SUBNET) + 2) * CANISTER_IDS_PER_SUBNET;
+        let subnets_allocation_range_end =
+            subnets_allocation_range_start + CANISTER_IDS_PER_SUBNET - 1;
+
+        let subnets_allocation_range = CanisterIdRange {
+            start: CanisterId::from(subnets_allocation_range_start),
+            end: CanisterId::from(subnets_allocation_range_end),
+        };
+
+        let mut routing_table = RoutingTable::default();
+        let subnet_index = self.subnets.keys().next().unwrap();
+        let subnet_id = self.subnet_ids[subnet_index];
+        routing_table.insert(specified_ids_range, subnet_id)?;
+        routing_table.insert(subnets_allocation_range, subnet_id)?;
+        Ok(routing_table)
     }
 
     /// Based on the setting of `self.subnets` generate a suitable
@@ -151,6 +190,7 @@ pub struct NodeOperatorEntry {
     node_allowance: u64,
     dc_id: String,
     rewardable_nodes: BTreeMap<String, u32>,
+    ipv6: Option<String>,
 }
 
 // We must be able to inject a values of type NodeOperatorEntry into the
@@ -166,6 +206,7 @@ impl From<NodeOperatorEntry> for NodeOperatorRecord {
                 .unwrap_or_else(Vec::new),
             dc_id: item.dc_id,
             rewardable_nodes: item.rewardable_nodes,
+            ipv6: item.ipv6,
         }
     }
 }
@@ -176,7 +217,7 @@ pub type UnassignedNodes = BTreeMap<NodeIndex, InitializedNode>;
 #[derive(Clone, Debug)]
 pub struct IcConfig {
     target_dir: PathBuf,
-    topology_config: TopologyConfig,
+    pub topology_config: TopologyConfig,
     /// When a node starts up, the orchestrator fetches the replica binary found
     /// at the URL in the blessed version record that carries the version
     /// id referred to in the subnet record that the node belongs to.
@@ -210,18 +251,23 @@ pub struct IcConfig {
     ///
     /// A corresponding `NodeOperatorRecord` will be created with a
     /// `node_allowance` equal to the number of initially created nodes.
-    pub initial_node_operator: Option<PrincipalId>,
+    initial_node_operator: Option<PrincipalId>,
 
     /// The node provider principal id of the node operator record will be set
     /// to to this initial node provider id.
-    pub initial_node_provider: Option<PrincipalId>,
+    initial_node_provider: Option<PrincipalId>,
 
     /// The initial set of SSH public keys to populate the registry with, to
     /// give "readonly" access to all unassigned nodes.
-    pub ssh_readonly_access_to_unassigned_nodes: Vec<String>,
+    ssh_readonly_access_to_unassigned_nodes: Vec<String>,
 
-    /// Disables the setup of iDKG keys for the nodes of the network
-    pub no_idkg_key: bool,
+    /// Whether or not to assign canister ID allocation range for specified IDs to subnet.
+    /// By default, it has the value 'false', but it can be set to true when ic-starter is
+    /// run with --use_specified_ids_allocation_range flag.
+    use_specified_ids_allocation_range: bool,
+
+    /// The hex-formatted SHA-256 hash measurement of the SEV guest launch context.
+    initial_guest_launch_measurement_sha256_hex: Option<String>,
 }
 
 #[derive(Error, Debug)]
@@ -299,6 +345,7 @@ impl IcConfig {
         initial_node_operator: Option<PrincipalId>,
         initial_node_provider: Option<PrincipalId>,
         ssh_readonly_access_to_unassigned_nodes: Vec<String>,
+        initial_guest_launch_measurement_sha256_hex: Option<String>,
     ) -> Self {
         Self {
             target_dir: PathBuf::from(target_dir.as_ref()),
@@ -314,8 +361,16 @@ impl IcConfig {
             initial_node_operator,
             initial_node_provider,
             ssh_readonly_access_to_unassigned_nodes,
-            no_idkg_key: false,
+            use_specified_ids_allocation_range: false,
+            initial_guest_launch_measurement_sha256_hex,
         }
+    }
+
+    pub fn set_use_specified_ids_allocation_range(
+        &mut self,
+        use_specified_ids_allocation_range: bool,
+    ) {
+        self.use_specified_ids_allocation_range = use_specified_ids_allocation_range;
     }
 
     /// initialize the IC. Generates ...
@@ -350,6 +405,7 @@ impl IcConfig {
                     node_provider_principal_id: self.initial_node_provider,
                     dc_id: "".into(),
                     rewardable_nodes: BTreeMap::new(),
+                    ipv6: None,
                 });
         }
 
@@ -378,10 +434,13 @@ impl IcConfig {
 
         // Set the routing table after initializing the subnet ids
         let routing_table_record = if self.generate_subnet_records {
-            PbRoutingTable::from(
+            PbRoutingTable::from(if self.use_specified_ids_allocation_range {
+                self.topology_config.get_routing_table_with_specified_ids_allocation_range(
+                ).expect("Failed to create a routing table with an allocation range for the creation of canisters with specified Canister IDs.")
+            } else {
                 self.topology_config
-                    .get_routing_table(self.nns_subnet_index.as_ref()),
-            )
+                    .get_routing_table(self.nns_subnet_index.as_ref())
+            })
         } else {
             PbRoutingTable::from(RoutingTable::default())
         };
@@ -434,16 +493,19 @@ impl IcConfig {
             routing_table_record,
         );
 
+        fn opturl_to_string_vec(opt_url: Option<Url>) -> Vec<String> {
+            opt_url.map(|u| vec![u.to_string()]).unwrap_or_default()
+        }
+
+        let initial_replica_version = self.initial_replica_version_id.to_string();
         let replica_version_record = ReplicaVersionRecord {
-            release_package_url: self
-                .initial_release_package_url
-                .map(|url| url.to_string())
-                .unwrap_or_default(),
             release_package_sha256_hex: self.initial_release_package_sha256_hex.unwrap_or_default(),
+            release_package_urls: opturl_to_string_vec(self.initial_release_package_url),
+            guest_launch_measurement_sha256_hex: self.initial_guest_launch_measurement_sha256_hex,
         };
 
         let blessed_replica_versions_record = BlessedReplicaVersions {
-            blessed_version_ids: vec![self.initial_replica_version_id.to_string()],
+            blessed_version_ids: vec![initial_replica_version],
         };
 
         write_registry_entry(
@@ -698,6 +760,7 @@ impl IcConfig {
                 node_allowance,
                 dc_id: "".into(),
                 rewardable_nodes: BTreeMap::new(),
+                ipv6: None,
             });
         }
 

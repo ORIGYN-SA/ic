@@ -11,11 +11,11 @@ use std::convert::TryFrom;
 /// Struct used for decoding CanisterSettingsArgs
 #[derive(Default)]
 pub(crate) struct CanisterSettings {
-    controller: Option<PrincipalId>,
-    controllers: Option<Vec<PrincipalId>>,
-    compute_allocation: Option<ComputeAllocation>,
-    memory_allocation: Option<MemoryAllocation>,
-    freezing_threshold: Option<NumSeconds>,
+    pub(crate) controller: Option<PrincipalId>,
+    pub(crate) controllers: Option<Vec<PrincipalId>>,
+    pub(crate) compute_allocation: Option<ComputeAllocation>,
+    pub(crate) memory_allocation: Option<MemoryAllocation>,
+    pub(crate) freezing_threshold: Option<NumSeconds>,
 }
 
 impl CanisterSettings {
@@ -60,6 +60,7 @@ impl TryFrom<CanisterSettingsArgs> for CanisterSettings {
     type Error = UpdateSettingsError;
 
     fn try_from(input: CanisterSettingsArgs) -> Result<Self, Self::Error> {
+        let controller = input.get_controller();
         let compute_allocation = match input.compute_allocation {
             Some(ca) => Some(ComputeAllocation::try_from(ca.0.to_u64().ok_or_else(
                 || UpdateSettingsError::ComputeAllocation(InvalidComputeAllocationError::new(ca)),
@@ -84,7 +85,7 @@ impl TryFrom<CanisterSettingsArgs> for CanisterSettings {
         };
 
         Ok(CanisterSettings::new(
-            input.controller,
+            controller,
             input.controllers,
             compute_allocation,
             memory_allocation,
@@ -100,6 +101,72 @@ impl TryFrom<Option<CanisterSettingsArgs>> for CanisterSettings {
         match input {
             Some(settings) => CanisterSettings::try_from(settings),
             None => Ok(CanisterSettings::default()),
+        }
+    }
+}
+
+pub(crate) struct CanisterSettingsBuilder {
+    controller: Option<PrincipalId>,
+    controllers: Option<Vec<PrincipalId>>,
+    compute_allocation: Option<ComputeAllocation>,
+    memory_allocation: Option<MemoryAllocation>,
+    freezing_threshold: Option<NumSeconds>,
+}
+
+#[allow(dead_code)]
+impl CanisterSettingsBuilder {
+    pub fn new() -> Self {
+        Self {
+            controller: None,
+            controllers: None,
+            compute_allocation: None,
+            memory_allocation: None,
+            freezing_threshold: None,
+        }
+    }
+
+    pub fn build(self) -> CanisterSettings {
+        CanisterSettings {
+            controller: self.controller,
+            controllers: self.controllers,
+            compute_allocation: self.compute_allocation,
+            memory_allocation: self.memory_allocation,
+            freezing_threshold: self.freezing_threshold,
+        }
+    }
+
+    pub fn with_controller(self, controller: PrincipalId) -> Self {
+        Self {
+            controller: Some(controller),
+            ..self
+        }
+    }
+
+    pub fn with_controllerr(self, controllers: Vec<PrincipalId>) -> Self {
+        Self {
+            controllers: Some(controllers),
+            ..self
+        }
+    }
+
+    pub fn with_compute_allocation(self, compute_allocation: ComputeAllocation) -> Self {
+        Self {
+            compute_allocation: Some(compute_allocation),
+            ..self
+        }
+    }
+
+    pub fn with_memory_allocation(self, memory_allocation: MemoryAllocation) -> Self {
+        Self {
+            memory_allocation: Some(memory_allocation),
+            ..self
+        }
+    }
+
+    pub fn with_freezing_threshold(self, freezing_threshold: NumSeconds) -> Self {
+        Self {
+            freezing_threshold: Some(freezing_threshold),
+            ..self
         }
     }
 }

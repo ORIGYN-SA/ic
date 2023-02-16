@@ -1,12 +1,12 @@
-use ic_config::subnet_config::SchedulerConfig;
-use ic_metrics::{buckets::decimal_buckets_with_zero, MetricsRegistry};
-use ic_registry_subnet_type::SubnetType;
+use ic_metrics::{
+    buckets::{decimal_buckets, decimal_buckets_with_zero},
+    MetricsRegistry,
+};
 use ic_types::{
-    NumInstructions, NumMessages, MAX_STABLE_MEMORY_IN_BYTES, MAX_WASM_MEMORY_IN_BYTES,
+    NumInstructions, NumMessages, NumSlices, MAX_STABLE_MEMORY_IN_BYTES, MAX_WASM_MEMORY_IN_BYTES,
 };
 use prometheus::Histogram;
 use std::{cell::RefCell, rc::Rc, time::Instant};
-use strum::IntoEnumIterator;
 
 pub(crate) struct QueryHandlerMetrics {
     pub query: ScopedMetrics,
@@ -29,6 +29,11 @@ impl QueryHandlerMetrics {
                     "The number of instructions executed in query handling",
                     metrics_registry,
                 ),
+                slices: slices_histogram(
+                    "execution_query_slices",
+                    "The number of slices executed in query handling",
+                    metrics_registry,
+                ),
                 messages: messages_histogram(
                     "execution_query_messages",
                     "The number of messages executed in query handling",
@@ -45,6 +50,12 @@ impl QueryHandlerMetrics {
                     "execution_query_initial_call_instructions",
                     "The number of instructions executed in the initial call \
                     in query handling",
+                    metrics_registry,
+                ),
+                slices: slices_histogram(
+                    "execution_query_initial_call_slices",
+                    "The number of slices executed in the initial call in \
+                    query handling",
                     metrics_registry,
                 ),
                 messages: messages_histogram(
@@ -64,6 +75,12 @@ impl QueryHandlerMetrics {
                     "execution_query_retry_call_instructions",
                     "The number of instructions executed in the retry call \
                     in query handling",
+                    metrics_registry,
+                ),
+                slices: slices_histogram(
+                    "execution_query_retry_call_slices",
+                    "The number of slices executed in the retry call in \
+                    query handling",
                     metrics_registry,
                 ),
                 messages: messages_histogram(
@@ -86,6 +103,12 @@ impl QueryHandlerMetrics {
                     by the initial call in query handling",
                     metrics_registry,
                 ),
+                slices: messages_histogram(
+                    "execution_query_spawned_calls_slices",
+                    "The number of slices executed in calls spawned by \
+                    the initial calls in query handling",
+                    metrics_registry,
+                ),
                 messages: messages_histogram(
                     "execution_query_spawned_calls_messages",
                     "The number of messages executed in calls spawned by \
@@ -102,12 +125,14 @@ impl QueryHandlerMetrics {
 /// Currently the set includes:
 /// - the duration of the phase,
 /// - the number of instructions executed in the phase,
-/// In the future, it will be extended with messages and cycles.
+/// - the number of slices executed in the phase,
+/// - the number of messages executed in the phase.
 /// Use `MeasurementScope` instead of observing the metrics manually.
 #[derive(Debug)]
 pub(crate) struct ScopedMetrics {
     pub duration: Histogram,
     pub instructions: Histogram,
+    pub slices: Histogram,
     pub messages: Histogram,
 }
 
@@ -142,6 +167,7 @@ impl<'a> MeasurementScope<'a> {
             core: Rc::new(RefCell::new(MeasurementScopeCore {
                 metrics,
                 instructions: NumInstructions::from(0),
+                slices: NumSlices::from(0),
                 messages: NumMessages::from(0),
                 outer: None,
                 start_time: Instant::now(),
@@ -161,6 +187,7 @@ impl<'a> MeasurementScope<'a> {
             core: Rc::new(RefCell::new(MeasurementScopeCore {
                 metrics,
                 instructions: NumInstructions::from(0),
+                slices: NumSlices::from(0),
                 messages: NumMessages::from(0),
                 outer: Some(outer.clone()),
                 start_time: Instant::now(),
@@ -176,9 +203,10 @@ impl<'a> MeasurementScope<'a> {
     }
 
     /// Increments the instruction and message counters.
-    pub fn add(&self, instructions: NumInstructions, messages: NumMessages) {
+    pub fn add(&self, instructions: NumInstructions, slices: NumSlices, messages: NumMessages) {
         let mut core = self.core.borrow_mut();
         core.instructions += instructions;
+        core.slices += slices;
         core.messages += messages;
     }
 }
@@ -205,42 +233,36 @@ pub fn duration_histogram<S: Into<String>>(
 
 /// Returns buckets appropriate for instructions.
 fn instructions_buckets() -> Vec<f64> {
-    fn add_limits(buckets: &mut Vec<NumInstructions>, config: SchedulerConfig) {
-        buckets.push(config.max_instructions_per_message);
-        buckets.push(config.max_instructions_per_round);
-        buckets.push(config.max_instructions_per_install_code);
-    }
-    let mut buckets: Vec<NumInstructions> = decimal_buckets_with_zero(4, 10)
+    let mut buckets: Vec<NumInstructions> = decimal_buckets_with_zero(4, 11)
         .into_iter()
         .map(|x| NumInstructions::from(x as u64))
         .collect();
+
     // Add buckets for counting no-op and small messages.
     buckets.push(NumInstructions::from(10));
     buckets.push(NumInstructions::from(1000));
-    // Add buckets for all known instruction limits.
-    for t in SubnetType::iter() {
-        let config = match t {
-            SubnetType::Application => SchedulerConfig::application_subnet(),
-            SubnetType::System => SchedulerConfig::system_subnet(),
-            SubnetType::VerifiedApplication => SchedulerConfig::verified_application_subnet(),
-        };
-        add_limits(&mut buckets, config);
-    }
-
-    // Add buckets with higher resolution between [round_limit,
-    // round_limit+message_limit] for app subnets.
-    let app_subnet_config = SchedulerConfig::application_subnet();
-    let round_limit = app_subnet_config.max_instructions_per_round.get();
-    let message_limit = app_subnet_config.max_instructions_per_message.get();
-    for value in (round_limit..(round_limit + message_limit)).step_by(1_000_000_000) {
+    for value in (1_000_000_000..10_000_000_000).step_by(1_000_000_000) {
         buckets.push(NumInstructions::from(value));
     }
+
+    buckets.push(NumInstructions::from(1_000_000_000_000));
 
     // Ensure that all buckets are unique.
     buckets.sort_unstable();
     buckets.dedup();
-    // Buckets are [0, 10, 1K, 10K, 20K, ...,  10B, 20B, 50B] + [subnet limits]
+    // Buckets are [0, 10, 1K, 10K, 20K, ..., 100B, 200B, 500B, 1T] + [1B, 2B, 3B, ..., 9B]
     buckets.into_iter().map(|x| x.get() as f64).collect()
+}
+
+/// Returns a histogram with buckets appropriate for dts pause/abort executions.
+pub fn dts_pause_or_abort_histogram<S: Into<String>>(
+    name: S,
+    help: S,
+    metrics_registry: &MetricsRegistry,
+) -> Histogram {
+    let mut buckets: Vec<f64> = (0..10).map(f64::from).collect();
+    buckets.extend(decimal_buckets(1, 4));
+    metrics_registry.histogram(name, help, buckets)
 }
 
 /// Returns a histogram with buckets appropriate for instructions.
@@ -315,10 +337,21 @@ pub fn messages_histogram<S: Into<String>>(
     metrics_registry.histogram(name, help, buckets)
 }
 
+/// Returns a histogram with buckets appropriate for slices.
+pub fn slices_histogram<S: Into<String>>(
+    name: S,
+    help: S,
+    metrics_registry: &MetricsRegistry,
+) -> Histogram {
+    // Re-use the messages histogram.
+    messages_histogram(name, help, metrics_registry)
+}
+
 #[derive(Debug)]
 struct MeasurementScopeCore<'a> {
     metrics: &'a ScopedMetrics,
     instructions: NumInstructions,
+    slices: NumSlices,
     messages: NumMessages,
     outer: Option<MeasurementScope<'a>>,
     start_time: Instant,
@@ -328,12 +361,13 @@ struct MeasurementScopeCore<'a> {
 impl<'a> Drop for MeasurementScopeCore<'a> {
     fn drop(&mut self) {
         if let Some(outer) = &self.outer {
-            outer.add(self.instructions, self.messages);
+            outer.add(self.instructions, self.slices, self.messages);
         }
         if self.record_zeros || self.messages.get() != 0 {
             self.metrics
                 .instructions
                 .observe(self.instructions.get() as f64);
+            self.metrics.slices.observe(self.slices.get() as f64);
             self.metrics.messages.observe(self.messages.get() as f64);
             self.metrics
                 .duration
@@ -355,11 +389,13 @@ mod tests {
         let round_metrics = ScopedMetrics {
             duration: duration_histogram("round_duration_seconds", "...", &mr),
             instructions: instructions_histogram("round_instructions", "...", &mr),
+            slices: slices_histogram("round_slices", "...", &mr),
             messages: messages_histogram("round_messages", "...", &mr),
         };
         let canister_metrics = ScopedMetrics {
             duration: duration_histogram("canister_duration_seconds", "...", &mr),
             instructions: instructions_histogram("canister_instructions", "...", &mr),
+            slices: messages_histogram("canister_slices", "...", &mr),
             messages: messages_histogram("canister_messages", "...", &mr),
         };
 
@@ -369,7 +405,11 @@ mod tests {
             for _ in 0..10 {
                 // Canister execution:
                 let scope = MeasurementScope::nested(&canister_metrics, &scope);
-                scope.add(NumInstructions::from(10), NumMessages::from(1));
+                scope.add(
+                    NumInstructions::from(10),
+                    NumSlices::from(2),
+                    NumMessages::from(1),
+                );
             }
         }
 
@@ -379,11 +419,15 @@ mod tests {
         assert_eq!(10, canister_metrics.duration.get_sample_count());
         assert_eq!(10, canister_metrics.instructions.get_sample_count());
         assert_eq!(100, canister_metrics.instructions.get_sample_sum() as u64);
+        assert_eq!(10, canister_metrics.slices.get_sample_count());
+        assert_eq!(20, canister_metrics.slices.get_sample_sum() as u64);
         assert_eq!(10, canister_metrics.messages.get_sample_count());
         assert_eq!(10, canister_metrics.messages.get_sample_sum() as u64);
         assert_eq!(1, round_metrics.duration.get_sample_count());
         assert_eq!(1, round_metrics.instructions.get_sample_count());
         assert_eq!(100, round_metrics.instructions.get_sample_sum() as u64);
+        assert_eq!(1, round_metrics.slices.get_sample_count());
+        assert_eq!(20, round_metrics.slices.get_sample_sum() as u64);
         assert_eq!(1, round_metrics.messages.get_sample_count());
         assert_eq!(10, round_metrics.messages.get_sample_sum() as u64);
     }
@@ -394,16 +438,19 @@ mod tests {
         let l1 = ScopedMetrics {
             duration: duration_histogram("l1_duration_seconds", "...", &mr),
             instructions: instructions_histogram("l1_instructions", "...", &mr),
+            slices: slices_histogram("l1_slices", "...", &mr),
             messages: messages_histogram("l1_messages", "...", &mr),
         };
         let l2 = ScopedMetrics {
             duration: duration_histogram("l2_duration_seconds", "...", &mr),
             instructions: instructions_histogram("l2_instructions", "...", &mr),
+            slices: slices_histogram("l2_slices", "...", &mr),
             messages: messages_histogram("l2_messages", "...", &mr),
         };
         let l3 = ScopedMetrics {
             duration: duration_histogram("l3_duration_seconds", "...", &mr),
             instructions: instructions_histogram("l3_instructions", "...", &mr),
+            slices: slices_histogram("l3_slices", "...", &mr),
             messages: messages_histogram("l3_messages", "...", &mr),
         };
 
@@ -413,23 +460,33 @@ mod tests {
                 let scope = MeasurementScope::nested(&l2, &scope);
                 {
                     let scope = MeasurementScope::nested(&l3, &scope);
-                    scope.add(NumInstructions::from(10), NumMessages::from(1));
+                    scope.add(
+                        NumInstructions::from(10),
+                        NumSlices::from(2),
+                        NumMessages::from(1),
+                    );
                 }
             }
         }
         assert_eq!(1, l1.duration.get_sample_count());
         assert_eq!(1, l1.instructions.get_sample_count());
         assert_eq!(10, l1.instructions.get_sample_sum() as u64);
+        assert_eq!(1, l1.slices.get_sample_count());
+        assert_eq!(2, l1.slices.get_sample_sum() as u64);
         assert_eq!(1, l1.messages.get_sample_count());
         assert_eq!(1, l1.messages.get_sample_sum() as u64);
         assert_eq!(1, l2.duration.get_sample_count());
         assert_eq!(1, l2.instructions.get_sample_count());
         assert_eq!(10, l2.instructions.get_sample_sum() as u64);
+        assert_eq!(1, l2.slices.get_sample_count());
+        assert_eq!(2, l2.slices.get_sample_sum() as u64);
         assert_eq!(1, l2.messages.get_sample_count());
         assert_eq!(1, l2.messages.get_sample_sum() as u64);
         assert_eq!(1, l3.duration.get_sample_count());
         assert_eq!(1, l3.instructions.get_sample_count());
         assert_eq!(10, l3.instructions.get_sample_sum() as u64);
+        assert_eq!(1, l3.slices.get_sample_count());
+        assert_eq!(2, l3.slices.get_sample_sum() as u64);
         assert_eq!(1, l3.messages.get_sample_count());
         assert_eq!(1, l3.messages.get_sample_sum() as u64);
     }
@@ -440,33 +497,59 @@ mod tests {
         let l1 = ScopedMetrics {
             duration: duration_histogram("l1_duration_seconds", "...", &mr),
             instructions: instructions_histogram("l1_instructions", "...", &mr),
+            slices: slices_histogram("l1_slices", "...", &mr),
             messages: messages_histogram("l1_messages", "...", &mr),
         };
         let l2 = ScopedMetrics {
             duration: duration_histogram("l2_duration_seconds", "...", &mr),
             instructions: instructions_histogram("l2_instructions", "...", &mr),
+            slices: slices_histogram("l2_slices", "...", &mr),
             messages: messages_histogram("l2_messages", "...", &mr),
         };
 
         {
             let scope = MeasurementScope::root(&l1);
-            scope.add(NumInstructions::from(100), NumMessages::from(1));
+            scope.add(
+                NumInstructions::from(100),
+                NumSlices::from(2),
+                NumMessages::from(1),
+            );
             {
                 let scope = MeasurementScope::nested(&l2, &scope);
-                scope.add(NumInstructions::from(10), NumMessages::from(1));
-                scope.add(NumInstructions::from(20), NumMessages::from(1));
-                scope.add(NumInstructions::from(30), NumMessages::from(1));
+                scope.add(
+                    NumInstructions::from(10),
+                    NumSlices::from(2),
+                    NumMessages::from(1),
+                );
+                scope.add(
+                    NumInstructions::from(20),
+                    NumSlices::from(2),
+                    NumMessages::from(1),
+                );
+                scope.add(
+                    NumInstructions::from(30),
+                    NumSlices::from(2),
+                    NumMessages::from(1),
+                );
             }
-            scope.add(NumInstructions::from(200), NumMessages::from(1));
+            scope.add(
+                NumInstructions::from(200),
+                NumSlices::from(2),
+                NumMessages::from(1),
+            );
         }
         assert_eq!(1, l1.duration.get_sample_count());
         assert_eq!(1, l1.instructions.get_sample_count());
         assert_eq!(360, l1.instructions.get_sample_sum() as u64);
+        assert_eq!(1, l1.slices.get_sample_count());
+        assert_eq!(10, l1.slices.get_sample_sum() as u64);
         assert_eq!(1, l1.messages.get_sample_count());
         assert_eq!(5, l1.messages.get_sample_sum() as u64);
         assert_eq!(1, l2.duration.get_sample_count());
         assert_eq!(1, l2.instructions.get_sample_count());
         assert_eq!(60, l2.instructions.get_sample_sum() as u64);
+        assert_eq!(1, l2.slices.get_sample_count());
+        assert_eq!(6, l2.slices.get_sample_sum() as u64);
         assert_eq!(1, l2.messages.get_sample_count());
         assert_eq!(3, l2.messages.get_sample_sum() as u64);
     }
@@ -477,16 +560,19 @@ mod tests {
         let outer = ScopedMetrics {
             duration: duration_histogram("l1_duration_seconds", "...", &mr),
             instructions: instructions_histogram("l1_instructions", "...", &mr),
+            slices: slices_histogram("l1_slices", "...", &mr),
             messages: messages_histogram("l1_messages", "...", &mr),
         };
         let middle = ScopedMetrics {
             duration: duration_histogram("l2_duration_seconds", "...", &mr),
             instructions: instructions_histogram("l2_instructions", "...", &mr),
+            slices: slices_histogram("l2_slices", "...", &mr),
             messages: messages_histogram("l2_messages", "...", &mr),
         };
         let inner = ScopedMetrics {
             duration: duration_histogram("l3_duration_seconds", "...", &mr),
             instructions: instructions_histogram("l3_instructions", "...", &mr),
+            slices: slices_histogram("l3_slices", "...", &mr),
             messages: messages_histogram("l3_messages", "...", &mr),
         };
 
@@ -500,6 +586,8 @@ mod tests {
         assert_eq!(1, outer.duration.get_sample_count());
         assert_eq!(1, outer.instructions.get_sample_count());
         assert_eq!(0, outer.instructions.get_sample_sum() as u64);
+        assert_eq!(1, outer.slices.get_sample_count());
+        assert_eq!(0, outer.slices.get_sample_sum() as u64);
         assert_eq!(1, outer.messages.get_sample_count());
         assert_eq!(0, outer.messages.get_sample_sum() as u64);
 
@@ -508,6 +596,8 @@ mod tests {
         assert_eq!(0, middle.duration.get_sample_count());
         assert_eq!(0, middle.instructions.get_sample_count());
         assert_eq!(0, middle.instructions.get_sample_sum() as u64);
+        assert_eq!(0, middle.slices.get_sample_count());
+        assert_eq!(0, middle.slices.get_sample_sum() as u64);
         assert_eq!(0, middle.messages.get_sample_count());
         assert_eq!(0, middle.messages.get_sample_sum() as u64);
 
@@ -515,6 +605,8 @@ mod tests {
         assert_eq!(1, inner.duration.get_sample_count());
         assert_eq!(1, inner.instructions.get_sample_count());
         assert_eq!(0, inner.instructions.get_sample_sum() as u64);
+        assert_eq!(1, inner.slices.get_sample_count());
+        assert_eq!(0, inner.slices.get_sample_sum() as u64);
         assert_eq!(1, inner.messages.get_sample_count());
         assert_eq!(0, inner.messages.get_sample_sum() as u64);
     }
@@ -526,24 +618,7 @@ mod tests {
             .map(|x| x as u64)
             .collect();
         assert!(!buckets.is_empty());
-        // Collect all Instructions limits
-        let limits: Vec<_> = SubnetType::iter()
-            .flat_map(|t| {
-                let config = match t {
-                    SubnetType::Application => SchedulerConfig::application_subnet(),
-                    SubnetType::System => SchedulerConfig::system_subnet(),
-                    SubnetType::VerifiedApplication => {
-                        SchedulerConfig::verified_application_subnet()
-                    }
-                };
-                [
-                    config.max_instructions_per_message.get(),
-                    config.max_instructions_per_round.get(),
-                    config.max_instructions_per_install_code.get(),
-                ]
-            })
-            .collect();
-        assert!(!limits.is_empty());
+        let limits = [10, 1_000, 1_000_000_000, 200_000_000_000, 500_000_000_000];
         for l in limits {
             assert!(buckets.contains(&l));
         }

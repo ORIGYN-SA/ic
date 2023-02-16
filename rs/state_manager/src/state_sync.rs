@@ -1,23 +1,68 @@
 pub(crate) mod chunkable;
 
 use super::StateManagerImpl;
-use crate::EXTRA_CHECKPOINTS_TO_KEEP;
-use ic_crypto_hash::crypto_hash;
+use crate::{
+    manifest::build_file_group_chunks, StateSyncRefs, EXTRA_CHECKPOINTS_TO_KEEP,
+    NUMBER_OF_CHECKPOINT_THREADS,
+};
 use ic_interfaces::{
-    artifact_manager::{ArtifactAcceptance, ArtifactClient, ArtifactProcessor, ProcessingResult},
+    artifact_manager::{ArtifactClient, ArtifactProcessor, ProcessingResult},
     artifact_pool::{ArtifactPoolError, UnvalidatedArtifact},
     time_source::TimeSource,
 };
 use ic_interfaces_state_manager::{StateManager, CERT_CERTIFIED};
-use ic_logger::{info, warn};
+use ic_logger::{info, warn, ReplicaLogger};
 use ic_types::{
     artifact::{
-        Advert, AdvertClass, AdvertSendRequest, ArtifactKind, ArtifactTag, Priority,
+        Advert, AdvertSendRequest, ArtifactDestination, ArtifactKind, ArtifactTag, Priority,
         StateSyncArtifactId, StateSyncAttribute, StateSyncFilter, StateSyncMessage,
     },
     chunkable::Chunkable,
+    crypto::crypto_hash,
+    state_sync::FileGroupChunks,
     Height, NodeId,
 };
+use std::sync::{Arc, Mutex};
+
+#[derive(Clone)]
+pub struct StateSync {
+    state_manager: Arc<StateManagerImpl>,
+    state_sync_refs: StateSyncRefs,
+    log: ReplicaLogger,
+}
+
+impl StateSync {
+    pub fn new(state_manager: Arc<StateManagerImpl>, log: ReplicaLogger) -> Self {
+        Self {
+            state_manager,
+            state_sync_refs: StateSyncRefs::new(log.clone()),
+            log,
+        }
+    }
+    /// Returns requested state as a Chunkable artifact for StateSync.
+    pub fn create_chunkable_state(
+        &self,
+        id: &StateSyncArtifactId,
+    ) -> Box<dyn Chunkable + Send + Sync> {
+        info!(self.log, "Starting state sync @{}", id.height);
+
+        Box::new(crate::state_sync::chunkable::IncompleteState::new(
+            self.log.clone(),
+            id.height,
+            id.hash.clone(),
+            self.state_manager.state_layout.clone(),
+            self.state_manager.latest_manifest(),
+            self.state_manager.metrics.clone(),
+            self.state_manager.own_subnet_type,
+            Arc::new(Mutex::new(scoped_threadpool::Pool::new(
+                NUMBER_OF_CHECKPOINT_THREADS,
+            ))),
+            self.state_sync_refs.clone(),
+            self.state_manager.get_fd_factory(),
+            self.state_manager.malicious_flags.clone(),
+        ))
+    }
+}
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub struct StateSyncArtifact;
@@ -26,7 +71,6 @@ impl ArtifactKind for StateSyncArtifact {
     const TAG: ArtifactTag = ArtifactTag::StateSyncArtifact;
     type Id = StateSyncArtifactId;
     type Message = StateSyncMessage;
-    type SerializeAs = StateSyncMessage;
     type Attribute = StateSyncAttribute;
     type Filter = StateSyncFilter;
 
@@ -52,63 +96,76 @@ impl ArtifactKind for StateSyncArtifact {
     }
 }
 
-impl ArtifactClient<StateSyncArtifact> for StateManagerImpl {
+impl ArtifactClient<StateSyncArtifact> for StateSync {
     fn check_artifact_acceptance(
         &self,
-        msg: StateSyncMessage,
-        peer_id: &NodeId,
-    ) -> Result<ArtifactAcceptance<StateSyncMessage>, ArtifactPoolError> {
-        let height = msg.height;
-        info!(
-            self.log,
-            "Received state {} from peer {}", msg.height, peer_id
-        );
-
-        let ro_layout = self
-            .state_layout
-            .checkpoint(height)
-            .expect("failed to create checkpoint layout");
-        let state = crate::checkpoint::load_checkpoint(&ro_layout, self.own_subnet_type, None)
-            .expect("failed to recover checkpoint");
-        self.on_synced_checkpoint(state, height, msg.manifest, msg.root_hash);
-
-        Ok(ArtifactAcceptance::Processed)
+        _msg: &StateSyncMessage,
+        _peer_id: &NodeId,
+    ) -> Result<(), ArtifactPoolError> {
+        Ok(())
     }
 
     fn get_validated_by_identifier(
         &self,
         msg_id: &StateSyncArtifactId,
     ) -> Option<StateSyncMessage> {
-        self.states
+        let mut file_group_to_populate: Option<Arc<FileGroupChunks>> = None;
+        let state_sync_message = self
+            .state_manager
+            .states
             .read()
             .states_metadata
             .iter()
             .find_map(|(height, metadata)| {
-                if metadata.root_hash.as_ref() == Some(&msg_id.hash) {
-                    let manifest = metadata.manifest.as_ref()?;
-                    let checkpoint_root = self.state_layout.checkpoint(*height).ok()?;
+                if metadata.root_hash() == Some(&msg_id.hash) {
+                    let manifest = metadata.manifest()?;
+                    let checkpoint_root =
+                        self.state_manager.state_layout.checkpoint(*height).ok()?;
+                    let state_sync_file_group = match &metadata.state_sync_file_group {
+                        Some(value) => value.clone(),
+                        None => {
+                            // Note that this code path will be called at most once because the value is then populated.
+                            let computed_file_group_chunks =
+                                Arc::new(build_file_group_chunks(manifest));
+                            file_group_to_populate = Some(computed_file_group_chunks.clone());
+                            computed_file_group_chunks
+                        }
+                    };
+
                     Some(StateSyncMessage {
                         height: *height,
                         root_hash: msg_id.hash.clone(),
                         checkpoint_root: checkpoint_root.raw_path().to_path_buf(),
                         manifest: manifest.clone(),
-                        get_state_sync_chunk: Some(
-                            crate::state_sync::chunkable::get_state_sync_chunk,
-                        ),
+                        state_sync_file_group,
                     })
                 } else {
                     None
                 }
-            })
+            });
+
+        if let Some(state_sync_file_group) = file_group_to_populate {
+            if let Some(metadata) = self
+                .state_manager
+                .states
+                .write()
+                .states_metadata
+                .get_mut(&msg_id.height)
+            {
+                metadata.state_sync_file_group = Some(state_sync_file_group);
+            }
+        }
+        state_sync_message
     }
 
     fn has_artifact(&self, msg_id: &StateSyncArtifactId) -> bool {
-        self.states
+        self.state_manager
+            .states
             .read()
             .states_metadata
             .iter()
             .any(|(height, metadata)| {
-                *height == msg_id.height && metadata.root_hash.as_ref() == Some(&msg_id.hash)
+                *height == msg_id.height && metadata.root_hash() == Some(&msg_id.hash)
             })
     }
 
@@ -118,7 +175,7 @@ impl ArtifactClient<StateSyncArtifact> for StateManagerImpl {
         &self,
         filter: &StateSyncFilter,
     ) -> Vec<Advert<StateSyncArtifact>> {
-        let heights = match self.state_layout.checkpoint_heights() {
+        let heights = match self.state_manager.state_layout.checkpoint_heights() {
             Ok(heights) => heights,
             Err(err) => {
                 warn!(
@@ -128,23 +185,21 @@ impl ArtifactClient<StateSyncArtifact> for StateManagerImpl {
                 return Vec::new();
             }
         };
-        let states = self.states.read();
+        let states = self.state_manager.states.read();
 
         heights
             .into_iter()
             .filter_map(|h| {
                 if h > filter.height {
                     let metadata = states.states_metadata.get(&h)?;
-                    let manifest = metadata.manifest.as_ref()?;
-                    let checkpoint_root = self.state_layout.checkpoint(h).ok()?;
+                    let manifest = metadata.manifest()?;
+                    let checkpoint_root = self.state_manager.state_layout.checkpoint(h).ok()?;
                     let msg = StateSyncMessage {
                         height: h,
-                        root_hash: metadata.root_hash.as_ref()?.clone(),
+                        root_hash: metadata.root_hash()?.clone(),
                         checkpoint_root: checkpoint_root.raw_path().to_path_buf(),
                         manifest: manifest.clone(),
-                        get_state_sync_chunk: Some(
-                            crate::state_sync::chunkable::get_state_sync_chunk,
-                        ),
+                        state_sync_file_group: Default::default(),
                     };
                     Some(StateSyncArtifact::message_to_advert(&msg))
                 } else {
@@ -161,8 +216,8 @@ impl ArtifactClient<StateSyncArtifact> for StateManagerImpl {
     > {
         use ic_interfaces_state_manager::StateReader;
 
-        let latest_height = self.latest_state_height();
-        let fetch_state = self.states.read().fetch_state.clone();
+        let latest_height = self.state_manager.latest_state_height();
+        let fetch_state = self.state_manager.states.read().fetch_state.clone();
         let state_sync_refs = self.state_sync_refs.clone();
         let log = self.log.clone();
 
@@ -237,6 +292,7 @@ impl ArtifactClient<StateSyncArtifact> for StateManagerImpl {
     fn get_filter(&self) -> StateSyncFilter {
         StateSyncFilter {
             height: *self
+                .state_manager
                 .list_state_heights(CERT_CERTIFIED)
                 .last()
                 .unwrap_or(&Height::from(0)),
@@ -249,16 +305,49 @@ impl ArtifactClient<StateSyncArtifact> for StateManagerImpl {
     }
 }
 
-impl ArtifactProcessor<StateSyncArtifact> for StateManagerImpl {
+impl ArtifactProcessor<StateSyncArtifact> for StateSync {
     // Returns the states checkpointed since the last time process_changes was
     // called.
     fn process_changes(
         &self,
         _time_source: &dyn TimeSource,
-        _artifacts: Vec<UnvalidatedArtifact<StateSyncMessage>>,
+        artifacts: Vec<UnvalidatedArtifact<StateSyncMessage>>,
     ) -> (Vec<AdvertSendRequest<StateSyncArtifact>>, ProcessingResult) {
+        // Processes received state sync artifacts.
+        for UnvalidatedArtifact {
+            message,
+            peer_id,
+            timestamp: _,
+        } in artifacts
+        {
+            let height = message.height;
+            info!(
+                self.log,
+                "Received state {} from peer {}", message.height, peer_id
+            );
+
+            let ro_layout = self
+                .state_manager
+                .state_layout
+                .checkpoint(height)
+                .expect("failed to create checkpoint layout");
+            let state = crate::checkpoint::load_checkpoint_parallel(
+                &ro_layout,
+                self.state_manager.own_subnet_type,
+                &self.state_manager.metrics.checkpoint_metrics,
+                self.state_manager.get_fd_factory(),
+            )
+            .expect("failed to recover checkpoint");
+            self.state_manager.on_synced_checkpoint(
+                state,
+                height,
+                message.manifest,
+                message.root_hash,
+            );
+        }
+
         let filter = StateSyncFilter {
-            height: self.states.read().last_advertised,
+            height: self.state_manager.states.read().last_advertised,
         };
         let artifacts = self.get_all_validated_by_filter(&filter);
         let artifacts: Vec<AdvertSendRequest<StateSyncArtifact>> = artifacts
@@ -266,12 +355,12 @@ impl ArtifactProcessor<StateSyncArtifact> for StateManagerImpl {
             .cloned()
             .map(|advert| AdvertSendRequest {
                 advert,
-                advert_class: AdvertClass::Critical,
+                dest: ArtifactDestination::AllPeersInSubnet,
             })
             .collect();
 
         if let Some(artifact) = artifacts.last() {
-            self.states.write().last_advertised = artifact.advert.attribute.height;
+            self.state_manager.states.write().last_advertised = artifact.advert.attribute.height;
         }
 
         (artifacts, ProcessingResult::StateUnchanged)

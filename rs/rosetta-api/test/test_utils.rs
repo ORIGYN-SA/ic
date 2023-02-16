@@ -1,31 +1,33 @@
 mod basic_tests;
 mod rosetta_cli_tests;
-mod store_tests;
 
+use ic_ledger_canister_blocks_synchronizer_test_utils::sample_data::{acc_id, Scribe};
+use ic_ledger_canister_core::ledger::LedgerTransaction;
+use ic_ledger_core::block::BlockType;
+use ic_ledger_core::timestamp::TimeStamp;
 use ic_rosetta_api::errors::ApiError;
 use ic_rosetta_api::models::{
     AccountBalanceRequest, EnvelopePair, PartialBlockIdentifier, SignedTransaction,
 };
-use ic_rosetta_api::request_types::{
-    Request, RequestResult, RequestType, Status, TransactionResults,
-};
-use ledger_canister::{
-    self, AccountIdentifier, Block, BlockHeight, Operation, SendArgs, Tokens, TransferFee,
+use ic_rosetta_api::request_types::{RequestType, Status};
+use icp_ledger::{
+    self, AccountIdentifier, Block, BlockIndex, Operation, SendArgs, Tokens, TransferFee,
     DEFAULT_TRANSFER_FEE,
 };
 use tokio::sync::RwLock;
 
 use async_trait::async_trait;
-use dfn_core::CanisterId;
-use ic_rosetta_api::balance_book::BalanceBook;
+use ic_ledger_canister_blocks_synchronizer::blocks::Blocks;
+use ic_ledger_canister_blocks_synchronizer::blocks::HashedBlock;
 
 use ic_rosetta_api::convert::{from_arg, to_model_account_identifier};
-use ic_rosetta_api::ledger_client::{Blocks, LedgerAccess};
+use ic_rosetta_api::ledger_client::LedgerAccess;
+use ic_rosetta_api::request_handler::RosettaRequestHandler;
 use ic_rosetta_api::rosetta_server::RosettaApiServer;
-use ic_rosetta_api::{store::HashedBlock, RosettaRequestHandler, DEFAULT_TOKEN_SYMBOL};
+use ic_rosetta_api::DEFAULT_TOKEN_SYMBOL;
 use ic_types::{
     messages::{HttpCallContent, HttpCanisterUpdate},
-    PrincipalId,
+    CanisterId, PrincipalId,
 };
 use std::collections::BTreeMap;
 use std::convert::TryFrom;
@@ -33,27 +35,14 @@ use std::ops::Deref;
 use std::process::Command;
 use std::str::FromStr;
 use std::sync::atomic::AtomicBool;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use ic_nns_governance::pb::v1::manage_neuron::NeuronIdOrSubaccount;
-use ic_nns_governance::pb::v1::NeuronInfo;
-use ic_rosetta_test_utils::{acc_id, sample_data::Scribe};
+use ic_rosetta_api::request::request_result::RequestResult;
+use ic_rosetta_api::request::transaction_results::TransactionResults;
+use ic_rosetta_api::request::Request;
 
-fn init_test_logger() {
-    // Unfortunately cargo test doesn't capture stdout properly
-    // so we set the level to warn (so we don't spam).
-    // I tried to use env logger here, which is supposed to work,
-    // and sure, cargo test captures it's output on MacOS, but it
-    // doesn't on linux.
-    log4rs::init_file("log_config_tests.yml", Default::default()).ok();
-}
-
-fn create_tmp_dir() -> tempfile::TempDir {
-    tempfile::Builder::new()
-        .prefix("test_tmp_")
-        .tempdir_in(".")
-        .unwrap()
-}
+const FIRST_BLOCK_TIMESTAMP_NANOS_SINCE_EPOC: u64 = 1_656_147_600_000_000_000; // 25 June 2022 09:00:00
 
 pub struct TestLedger {
     pub blockchain: RwLock<Blocks>,
@@ -61,12 +50,13 @@ pub struct TestLedger {
     pub governance_canister_id: CanisterId,
     pub submit_queue: RwLock<Vec<HashedBlock>>,
     pub transfer_fee: Tokens,
+    next_block_timestamp: Mutex<TimeStamp>,
 }
 
 impl TestLedger {
     pub fn new() -> Self {
         Self {
-            blockchain: RwLock::new(Blocks::new_in_memory()),
+            blockchain: RwLock::new(Blocks::new_in_memory().unwrap()),
             canister_id: CanisterId::new(
                 PrincipalId::from_str("5v3p4-iyaaa-aaaaa-qaaaa-cai").unwrap(),
             )
@@ -74,6 +64,9 @@ impl TestLedger {
             governance_canister_id: ic_nns_constants::GOVERNANCE_CANISTER_ID,
             submit_queue: RwLock::new(Vec::new()),
             transfer_fee: DEFAULT_TRANSFER_FEE,
+            next_block_timestamp: Mutex::new(TimeStamp::from_nanos_since_unix_epoch(
+                FIRST_BLOCK_TIMESTAMP_NANOS_SINCE_EPOC,
+            )),
         }
     }
 
@@ -84,18 +77,36 @@ impl TestLedger {
         }
     }
 
-    async fn last_submitted(&self) -> Result<Option<HashedBlock>, ApiError> {
+    async fn last_submitted(&self) -> Result<HashedBlock, ApiError> {
         match self.submit_queue.read().await.last() {
-            Some(b) => Ok(Some(b.clone())),
-            None => self.read_blocks().await.last_verified(),
+            Some(b) => Ok(b.clone()),
+            None => self
+                .read_blocks()
+                .await
+                .get_latest_verified_hashed_block()
+                .map_err(ApiError::from),
         }
     }
 
     async fn add_block(&self, hb: HashedBlock) -> Result<(), ApiError> {
         let mut blockchain = self.blockchain.write().await;
-        blockchain.block_store.mark_last_verified(hb.index)?;
-        blockchain.add_block(hb)
+        blockchain.push(&hb).map_err(ApiError::from)?;
+        blockchain
+            .set_hashed_block_to_verified(&hb.index)
+            .map_err(ApiError::from)
     }
+
+    fn next_block_timestamp(&self) -> TimeStamp {
+        let mut next_block_timestamp = self.next_block_timestamp.lock().unwrap();
+        let res = *next_block_timestamp;
+        *next_block_timestamp = next_millisecond(res);
+        res
+    }
+}
+
+// return a timestamp with +1 millisecond
+fn next_millisecond(t: TimeStamp) -> TimeStamp {
+    TimeStamp::from_nanos_since_unix_epoch(t.as_nanos_since_unix_epoch() + 1_000_000)
 }
 
 impl Default for TestLedger {
@@ -122,8 +133,8 @@ impl LedgerAccess for TestLedger {
         {
             let mut blockchain = self.blockchain.write().await;
             for hb in queue.iter() {
-                blockchain.block_store.mark_last_verified(hb.index)?;
-                blockchain.add_block(hb.clone())?;
+                blockchain.push(hb)?;
+                blockchain.set_hashed_block_to_verified(&hb.index)?;
             }
         }
 
@@ -165,7 +176,7 @@ impl LedgerAccess for TestLedger {
             } = from_arg(arg.0).unwrap();
             let created_at_time = created_at_time.unwrap();
 
-            let from = ledger_canister::AccountIdentifier::new(from, from_subaccount);
+            let from = icp_ledger::AccountIdentifier::new(from, from_subaccount);
 
             let transaction = Operation::Transfer {
                 from,
@@ -174,21 +185,22 @@ impl LedgerAccess for TestLedger {
                 fee,
             };
 
-            let (parent_hash, index) = match self.last_submitted().await? {
+            let (parent_hash, index) = match self.last_submitted().await.ok() {
                 None => (None, 0),
                 Some(hb) => (Some(hb.hash), hb.index + 1),
             };
 
             let block = Block::new(
-                None, /* FIXME */
+                parent_hash,
                 transaction.clone(),
                 memo,
                 created_at_time,
-                dfn_core::api::now().into(),
+                self.next_block_timestamp(),
+                DEFAULT_TRANSFER_FEE,
             )
             .map_err(ApiError::internal_error)?;
 
-            let raw_block = block.clone().encode().map_err(ApiError::internal_error)?;
+            let raw_block = block.clone().encode();
 
             let hb = HashedBlock::hash_block(raw_block, parent_hash, index);
 
@@ -211,7 +223,7 @@ impl LedgerAccess for TestLedger {
         &self,
         _id: NeuronIdOrSubaccount,
         _: bool,
-    ) -> Result<NeuronInfo, ApiError> {
+    ) -> Result<ic_nns_governance::pb::v1::NeuronInfo, ApiError> {
         panic!("Neuron info not available through TestLedger");
     }
 
@@ -220,18 +232,6 @@ impl LedgerAccess for TestLedger {
             transfer_fee: self.transfer_fee,
         })
     }
-}
-
-pub(crate) fn to_balances(
-    b: BTreeMap<AccountIdentifier, Tokens>,
-    index: BlockHeight,
-) -> BalanceBook {
-    let mut balance_book = BalanceBook::default();
-    for (acc, amount) in b {
-        balance_book.token_pool -= amount;
-        balance_book.store.insert(acc, index, amount);
-    }
-    balance_book
 }
 
 pub async fn get_balance(

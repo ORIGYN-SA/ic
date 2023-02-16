@@ -1,21 +1,27 @@
+mod anonymous_query_handler;
+mod bitcoin;
 mod canister_manager;
 mod canister_settings;
+pub mod execution;
 mod execution_environment;
 mod execution_environment_metrics;
 mod history;
 mod hypervisor;
 mod ingress_filter;
-mod internal_query_handler;
 mod metrics;
 mod query_handler;
 mod scheduler;
 mod types;
-mod util;
+pub mod util;
 
-use crate::internal_query_handler::AnonymousQueryHandler;
-pub use execution_environment::{ExecutionEnvironment, ExecutionEnvironmentImpl};
+use crate::anonymous_query_handler::AnonymousQueryHandler;
+pub use execution_environment::{
+    as_num_instructions, as_round_instructions, execute_canister, CompilationCostHandling,
+    ExecuteMessageResult, ExecutionEnvironment, ExecutionResponse, RoundInstructions, RoundLimits,
+};
 pub use history::{IngressHistoryReaderImpl, IngressHistoryWriterImpl};
 pub use hypervisor::{Hypervisor, HypervisorMetrics};
+use ic_base_types::PrincipalId;
 use ic_config::{execution_environment::Config, subnet_config::SchedulerConfig};
 use ic_cycles_account_manager::CyclesAccountManager;
 use ic_interfaces::execution_environment::AnonymousQueryService;
@@ -27,15 +33,18 @@ use ic_interfaces_state_manager::StateReader;
 use ic_logger::ReplicaLogger;
 use ic_metrics::MetricsRegistry;
 use ic_registry_subnet_type::SubnetType;
-use ic_replicated_state::{NetworkTopology, ReplicatedState};
+use ic_replicated_state::page_map::PageAllocatorFileDescriptor;
+use ic_replicated_state::{CallOrigin, NetworkTopology, ReplicatedState};
 use ic_types::{messages::CallContextId, SubnetId};
 use ingress_filter::IngressFilter;
-use query_handler::{HttpQueryHandler, InternalHttpQueryHandler};
+pub use query_handler::InternalHttpQueryHandler;
+use query_handler::{HttpQueryHandler, QueryScheduler, QuerySchedulerFlag};
+pub use scheduler::RoundSchedule;
 use scheduler::SchedulerImpl;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+use tower::limit::GlobalConcurrencyLimitLayer;
 
-const MAX_BUFFERED_QUERIES: usize = 2000;
-const CONCURRENT_QUERIES_PER_THREAD: usize = 4;
+const MAX_INFLIGHT_QUERIES_PER_THREAD: usize = 100;
 
 /// When executing a wasm method of query type, this enum indicates if we are
 /// running in an replicated or non-replicated context. This information is
@@ -64,8 +73,8 @@ pub enum QueryExecutionType {
 #[doc(hidden)]
 #[derive(Clone, PartialEq, Eq)]
 pub enum NonReplicatedQueryKind {
-    Stateful,
-    Pure,
+    Stateful { call_origin: CallOrigin },
+    Pure { caller: PrincipalId },
 }
 
 // This struct holds public facing components that are created by Execution.
@@ -92,6 +101,7 @@ impl ExecutionServices {
         config: Config,
         cycles_account_manager: Arc<CyclesAccountManager>,
         state_reader: Arc<dyn StateReader<State = ReplicatedState>>,
+        fd_factory: Arc<dyn PageAllocatorFileDescriptor>,
     ) -> ExecutionServices {
         let hypervisor = Arc::new(Hypervisor::new(
             config.clone(),
@@ -100,23 +110,26 @@ impl ExecutionServices {
             own_subnet_type,
             logger.clone(),
             Arc::clone(&cycles_account_manager),
+            scheduler_config.dirty_page_overhead,
+            Arc::clone(&fd_factory),
         ));
 
         let ingress_history_writer = Arc::new(IngressHistoryWriterImpl::new(
+            config.clone(),
             logger.clone(),
             metrics_registry,
         ));
         let ingress_history_reader =
             Box::new(IngressHistoryReaderImpl::new(Arc::clone(&state_reader)));
 
-        let exec_env = Arc::new(ExecutionEnvironmentImpl::new(
+        let exec_env = Arc::new(ExecutionEnvironment::new(
             logger.clone(),
             Arc::clone(&hypervisor),
             Arc::clone(&ingress_history_writer) as Arc<_>,
             metrics_registry,
             own_subnet_id,
             own_subnet_type,
-            scheduler_config.scheduler_cores,
+            SchedulerImpl::compute_capacity_percent(scheduler_config.scheduler_cores),
             config.clone(),
             Arc::clone(&cycles_account_manager),
         ));
@@ -126,39 +139,41 @@ impl ExecutionServices {
             own_subnet_type,
             config.clone(),
             metrics_registry,
-            scheduler_config.max_instructions_per_message,
+            scheduler_config.max_instructions_per_message_without_dts,
+            Arc::clone(&cycles_account_manager),
+            config.composite_queries,
         ));
-        let threadpool = threadpool::Builder::new()
-            .num_threads(config.query_execution_threads)
-            .thread_name("query_execution".into())
-            .thread_stack_size(8_192_000)
-            .build();
 
-        let threadpool = Arc::new(Mutex::new(threadpool));
+        let query_scheduler = QueryScheduler::new(
+            config.query_execution_threads_total,
+            config.query_execution_threads_per_canister,
+            config.query_scheduling_time_slice_per_canister,
+            QuerySchedulerFlag::UseOldSchedulingAlgorithm,
+        );
+
+        let concurrency_buffer = GlobalConcurrencyLimitLayer::new(
+            config.query_execution_threads_total * MAX_INFLIGHT_QUERIES_PER_THREAD,
+        );
+        // Creating the async services require that a tokio runtime context is available.
 
         let async_query_handler = HttpQueryHandler::new_service(
-            MAX_BUFFERED_QUERIES,
-            config.query_execution_threads * CONCURRENT_QUERIES_PER_THREAD,
+            concurrency_buffer.clone(),
             Arc::clone(&sync_query_handler) as Arc<_>,
-            Arc::clone(&threadpool),
+            query_scheduler.clone(),
             Arc::clone(&state_reader),
         );
-
         let ingress_filter = IngressFilter::new_service(
-            MAX_BUFFERED_QUERIES,
-            config.query_execution_threads * CONCURRENT_QUERIES_PER_THREAD,
-            Arc::clone(&threadpool),
+            concurrency_buffer.clone(),
+            query_scheduler.clone(),
             Arc::clone(&state_reader),
             Arc::clone(&exec_env),
         );
-
         let anonymous_query_handler = AnonymousQueryHandler::new_service(
-            MAX_BUFFERED_QUERIES,
-            config.query_execution_threads * CONCURRENT_QUERIES_PER_THREAD,
-            threadpool,
+            concurrency_buffer,
+            query_scheduler,
             Arc::clone(&state_reader),
             Arc::clone(&exec_env),
-            scheduler_config.max_instructions_per_message,
+            scheduler_config.max_instructions_per_message_without_dts,
         );
 
         let scheduler = Box::new(SchedulerImpl::new(
@@ -171,6 +186,7 @@ impl ExecutionServices {
             logger,
             config.rate_limiting_of_heap_delta,
             config.rate_limiting_of_instructions,
+            config.deterministic_time_slicing,
         ));
 
         Self {

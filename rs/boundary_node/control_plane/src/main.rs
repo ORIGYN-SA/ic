@@ -1,827 +1,749 @@
-//! Internet Computer Boundary Node Control Plane
-//!
-//! See README.md for details.
-use anyhow::Result;
+use std::{
+    cmp::min,
+    io::BufRead,
+    net::SocketAddr,
+    path::PathBuf,
+    sync::{Arc, Mutex, RwLock},
+    time::{Duration, Instant},
+};
+
+use anyhow::{anyhow, Context, Error};
 use async_trait::async_trait;
-use boundary_node_control_plane::{CanisterRoute, NodeRoute, Routes, SubnetRoute};
-use futures::future::join_all;
-use hyper::{
-    body::HttpBody, client::HttpConnector, server::conn::Http, service::service_fn, Body, Client,
-    Method, Request, Response, Uri,
+use axum::{
+    body::Body,
+    handler::Handler,
+    http::{Request, Response, StatusCode},
+    routing::get,
+    Extension, Router,
 };
-use hyper_tls::HttpsConnector;
-use ic_crypto_utils_basic_sig::conversions::pem::der_to_pem;
-use ic_crypto_utils_threshold_sig::parse_threshold_sig_key;
-use ic_registry_client::client::{
-    create_data_provider, DataProviderConfig, RegistryClient, RegistryClientImpl,
-    RegistryDataProvider,
-};
-use ic_registry_client_helpers::{
-    crypto::CryptoRegistry,
-    node::NodeRegistry,
-    routing_table::RoutingTableRegistry,
-    subnet::{SubnetListRegistry, SubnetRegistry},
-};
+use bytes::Buf;
+use clap::Parser;
+use dashmap::{DashMap, DashSet};
+use futures::{future::TryFutureExt, stream::FuturesUnordered};
 use ic_types::messages::{HttpStatusResponse, ReplicaHealthStatus};
 use lazy_static::lazy_static;
-use openssl::{
-    asn1::Asn1Time,
-    hash::MessageDigest,
-    nid::Nid,
-    pkey::{PKey, Private},
-    ssl::{Ssl, SslAcceptor, SslMethod, SslVerifyMode, SslVersion},
-    x509::{
-        store::{X509Store, X509StoreBuilder},
-        X509Name, X509,
+use nix::sys::signal::Signal;
+use opentelemetry::{
+    baggage::BaggageExt,
+    global,
+    sdk::{
+        export::metrics::aggregation,
+        metrics::{controllers, processors, selectors},
+        Resource,
     },
+    trace::FutureExt,
+    KeyValue,
 };
-use prometheus::{
-    register_int_counter, register_int_gauge, Encoder, IntCounter, IntGauge, TextEncoder,
+use opentelemetry_prometheus::{ExporterBuilder, PrometheusExporter};
+use persist::{Persist, PersistStatus};
+use prometheus::{Encoder as PrometheusEncoder, TextEncoder};
+use regex::Regex;
+use registry::{RoutingTable, Subnet};
+use tokio::{sync::Semaphore, task};
+use tracing::info;
+
+mod encode;
+mod metrics;
+mod persist;
+mod registry;
+mod reload;
+mod retry;
+mod routes;
+
+use crate::{
+    encode::{RoutesEncoder, SystemReplicasEncoder, TrustedCertsEncoder, UpstreamEncoder},
+    metrics::{CheckMetricParams, CheckWithMetrics, MetricParams, WithMetrics},
+    persist::{LegacyPersister, Persister, WithDedup, WithEmpty, WithMultiple},
+    registry::{
+        CreateRegistryClient, CreateRegistryClientImpl, Snapshot, Snapshotter, WithMinimumVersion,
+    },
+    reload::{PidReloader, SystemdReloader, WithReload},
+    retry::WithRetry,
 };
 
-use fix_hidden_lifetime_bug::fix_hidden_lifetime_bug;
-use slog::{error, slog_o, trace, warn, Drain, Logger};
-use std::convert::TryInto;
+const SERVICE_NAME: &str = "control-plane";
 
-use std::{
-    collections::{HashMap, HashSet},
-    fs::{read_dir, remove_file, File},
-    io::{stdout, BufWriter, Write},
-    net::SocketAddr,
-    path::{Path, PathBuf},
-    pin::Pin,
-    process::exit,
-    sync::Arc,
-    time::Duration,
-};
-use tokio::{
-    net::{TcpListener, TcpStream},
-    spawn,
-    task::JoinHandle,
-    time::{sleep, timeout},
-    try_join,
-};
-use tokio_openssl::SslStream;
-use url::Url;
-
-const PROBE_TIMEOUT: Duration = Duration::from_secs(3);
-const STATUS_TIMEOUT: Duration = Duration::from_secs(5);
-const PROBE_BATCH_SIZE: usize = 32;
-const PROBE_SLEEP_SECONDS: u64 = 5;
+const SECOND: Duration = Duration::from_secs(1);
+const MINUTE: Duration = Duration::from_secs(60);
 
 lazy_static! {
-    pub static ref GET_STATUS_ERRORS: IntCounter =
-        register_int_counter!("get_status_errors", "Number of errors during get of status")
-            .unwrap();
-    pub static ref STATUS_CHANGES: IntCounter =
-        register_int_counter!("status_changes", "Number of times status has changed").unwrap();
-    pub static ref NODE_DOWN_EVENTS: IntCounter = register_int_counter!(
-        "node_down_events",
-        "Number of times a node has transitioned to down"
-    )
-    .unwrap();
-    pub static ref NODE_UP_EVENTS: IntCounter = register_int_counter!(
-        "node_up_events",
-        "Number of times a node has transitioned to up"
-    )
-    .unwrap();
-    pub static ref ROUTE_UPDATES: IntCounter =
-        register_int_counter!("route_updates", "Number of times routes have been updated").unwrap();
-    pub static ref NODES_UP: IntGauge =
-        register_int_gauge!("nodes_up", "Number of nodes which are considered up").unwrap();
-    pub static ref NODES_DOWN: IntGauge =
-        register_int_gauge!("nodes_down", "Number of nodes which are considered down").unwrap();
-    pub static ref STATUS: IntGauge =
-        register_int_gauge!("status_good", "Status: 1 == good, 0 == bad").unwrap();
-    pub static ref REGISTRY_POLL_FAILURES: IntCounter = register_int_counter!(
-        "registry_poll_failures",
-        "Number of times registry polling failed"
-    )
-    .unwrap();
+    static ref RE_NODE_ID: Regex = Regex::new(r#"\{.*node_id="([a-zA-Z0-9\\-]*)".*}"#).unwrap();
+    static ref RE_SUBNET_ID: Regex = Regex::new(r#"\{.*subnet_id="([a-zA-Z0-9\\-]*)".*}"#).unwrap();
 }
 
-gflags::define! {
-    --nns_urls: &str
-}
-gflags::define! {
-    --nns_public_key: &Path
-}
-gflags::define! {
-    --routes_dir: &Path
-}
-gflags::define! {
-    --metrics_port: u16
+#[derive(Parser)]
+#[clap(name = SERVICE_NAME)]
+#[clap(author = "Boundary Node Team <boundary-nodes@dfinity.org>")]
+struct Cli {
+    #[clap(long, default_value = "/tmp/store")]
+    local_store: PathBuf,
+
+    #[clap(long, default_value = "0")]
+    min_registry_version: u64,
+
+    /// Minimum required OK health checks
+    /// for a replica to be included in the routing table
+    #[clap(long, default_value = "1")]
+    min_ok_count: u8,
+
+    #[clap(long, default_value = "/tmp/legacy_routes")]
+    legacy_routes_dir: PathBuf,
+
+    #[clap(long, default_value = "/tmp/routes.js")]
+    routes_path: PathBuf,
+
+    #[clap(long, default_value = "/tmp/upstreams.conf")]
+    upstreams_path: PathBuf,
+
+    #[clap(long, default_value = "/tmp/trusted_certs.pem")]
+    trusted_certs_path: PathBuf,
+
+    #[clap(long, default_value = "/tmp/system_replicas.ruleset")]
+    nftables_system_replicas_path: PathBuf,
+
+    #[clap(long, default_value = "system_replica_ips")]
+    nftables_system_replicas_var: String,
+
+    #[clap(long, default_value = "/usr/bin/systemctl")]
+    systemctl_path: PathBuf,
+
+    #[clap(long, default_value = "/var/run/nginx.pid")]
+    pid_path: PathBuf,
+
+    #[clap(long, default_value = "127.0.0.1:9090")]
+    metrics_addr: SocketAddr,
 }
 
 #[tokio::main]
-async fn main() -> Result<()> {
-    let args = gflags::parse();
-    if !args.is_empty() {
-        eprintln!("error: extra arguments on the command line");
-        exit(1);
-    }
-    if !NNS_URLS.is_present() || NNS_URLS.flag.is_empty() {
-        eprintln!("error: nns_urls flag missing or empty");
-        exit(1);
-    }
-    if !ROUTES_DIR.is_present() {
-        eprintln!("error: routes_dir flag missing");
-        exit(1);
-    }
-    let plain = slog_term::PlainSyncDecorator::new(stdout());
-    let log = Logger::root(slog_term::FullFormat::new(plain).build().fuse(), slog_o!());
-    let _guard = slog_scope::set_global_logger(log.clone());
-    STATUS.set(0); // Set status to "bad" until it is "good".
+async fn main() -> Result<(), Error> {
+    let cli = Cli::parse();
 
-    let metrics_join_handle = if METRICS_PORT.is_present() {
-        // Start metrics server.
-        let (public_key, private_key) = generate_tls_key_pair();
-        let metrics_service = service_fn(move |_req| {
-            let metrics_registry = ic_metrics::MetricsRegistry::global();
-            let encoder = TextEncoder::new();
+    tracing::subscriber::set_global_default(
+        tracing_subscriber::fmt()
+            .json()
+            .flatten_event(true)
+            .finish(),
+    )
+    .expect("failed to set global subscriber");
 
-            async move {
-                let metric_families = metrics_registry.prometheus_registry().gather();
-                let mut buffer = vec![];
-                encoder.encode(&metric_families, &mut buffer).unwrap();
-                Ok::<_, hyper::Error>(Response::new(Body::from(buffer)))
-            }
-        });
-        let mut addr = "[::]:9090".parse::<SocketAddr>().unwrap();
-        addr.set_port(METRICS_PORT.flag);
-        let metrics_join_handle = spawn(async move {
-            let listener = match TcpListener::bind(addr).await {
-                Err(e) => {
-                    error!(log, "HTTP exporter server error: {}", e);
-                    return;
-                }
-                Ok(listener) => listener,
-            };
-            let http = Http::new();
-            loop {
-                let log = log.clone();
-                let http = http.clone();
-                let public_key = public_key.clone();
-                let private_key = private_key.clone();
-                if let Ok((stream, _)) = listener.accept().await {
-                    spawn(async move {
-                        let mut b = [0_u8; 1];
-                        if stream.peek(&mut b).await.is_ok() {
-                            if b[0] == 22 {
-                                // TLS
-                                match perform_tls_server_handshake(
-                                    stream,
-                                    &public_key,
-                                    &private_key,
-                                    Vec::new(),
-                                )
-                                .await
-                                {
-                                    Err(e) => warn!(log, "TLS error: {}", e),
-                                    Ok((stream, _peer_id)) => {
-                                        if let Err(e) =
-                                            http.serve_connection(stream, metrics_service).await
-                                        {
-                                            trace!(log, "Connection error: {}", e);
-                                        }
-                                    }
-                                };
-                            } else {
-                                // HTTP
-                                if let Err(e) = http.serve_connection(stream, metrics_service).await
-                                {
-                                    trace!(log, "Connection error: {}", e);
-                                }
-                            }
-                        }
-                    });
-                }
-            }
-        });
-        Some(metrics_join_handle)
-    } else {
-        None
-    };
-
-    let nns_public_key = if NNS_PUBLIC_KEY.is_present() {
-        Some(
-            parse_threshold_sig_key(&NNS_PUBLIC_KEY.flag.to_path_buf())
-                .expect("unable to parse NNS public key"),
+    let exporter = ExporterBuilder::new(
+        controllers::basic(
+            processors::factory(
+                selectors::simple::histogram([]),
+                aggregation::cumulative_temporality_selector(),
+            )
+            .with_memory(true),
         )
-    } else {
-        None
-    };
-    let nns_urls = NNS_URLS
-        .flag
-        .split_terminator(',')
-        .map(Url::parse)
-        .collect::<Result<Vec<Url>, _>>()
-        .expect("unable to parse nns url");
-    let data_provider = create_data_provider(
-        &DataProviderConfig::RegistryCanisterUrl(nns_urls.clone()),
-        nns_public_key,
+        .with_resource(Resource::new(vec![KeyValue::new("service", SERVICE_NAME)]))
+        .build(),
+    )
+    .init();
+
+    // Setup Checks
+    let checks: DashMap<(String, String), u8> = DashMap::new();
+    let checks = Arc::new(checks);
+
+    // Metrics
+    let meter = global::meter(SERVICE_NAME);
+
+    let metrics_handler = metrics_handler.layer(Extension(MetricsHandlerArgs {
+        exporter,
+        checks: Arc::clone(&checks),
+    }));
+
+    let metrics_router = Router::new().route("/metrics", get(metrics_handler));
+
+    // Control-Plane
+    let routing_table: Arc<Mutex<Option<RoutingTable>>> = Arc::new(Mutex::new(None));
+
+    let http_client = reqwest::Client::builder().timeout(10 * SECOND).build()?;
+
+    let local_store = Arc::new(ic_registry_local_store::LocalStoreImpl::new(
+        cli.local_store,
+    ));
+
+    let create_registry_client = CreateRegistryClientImpl::new(local_store);
+    let create_registry_client = WithMetrics(
+        create_registry_client,
+        MetricParams::new(&meter, SERVICE_NAME, "create_registry_client"),
     );
-    let client = make_https_client();
-    let dir = ROUTES_DIR.flag.to_path_buf();
-    let status = get_status(&nns_urls, &client, &dir).await;
-    eprintln!("got status from NNS");
-    let mut registry_client = Arc::new(RegistryClientImpl::new(data_provider.clone(), None));
-    loop {
-        while let Err(e) = registry_client.try_polling_latest_version(100) {
-            eprintln!("error: try_polling_latest_version failed: {}, retrying", e);
-            REGISTRY_POLL_FAILURES.inc();
-            sleep(Duration::from_secs(10)).await;
-        }
-        // At this point, before we start the background thread, we should have a
-        // reasonably recent registry version available in the registry client.
-        match registry_client.fetch_and_start_polling() {
-            Ok(_) => break,
-            Err(e) => {
-                eprintln!("error: fetch_and_start_polling failed: {}, retrying", e);
-                REGISTRY_POLL_FAILURES.inc();
-                registry_client = Arc::new(RegistryClientImpl::new(data_provider.clone(), None));
+    let create_registry_client = WithRetry(
+        create_registry_client,
+        10,         // max_attempts
+        1 * SECOND, // attempt_interval
+    );
+    let mut create_registry_client = create_registry_client;
+
+    let registry_client = create_registry_client
+        .create_registry_client()
+        .await
+        .context("failed to create registry client")?;
+
+    let snapshotter = Snapshotter::new(registry_client);
+    let snapshotter = WithMinimumVersion(snapshotter, cli.min_registry_version);
+    let snapshotter = WithMetrics(
+        snapshotter,
+        MetricParams::new(&meter, SERVICE_NAME, "snapshot"),
+    );
+
+    let snapshot_runner = SnapshotRunner::new(snapshotter, Arc::clone(&routing_table));
+    let snapshot_runner = WithMetrics(
+        snapshot_runner,
+        MetricParams::new(&meter, SERVICE_NAME, "run"),
+    );
+    let snapshot_runner = WithThrottle(snapshot_runner, ThrottleParams::new(1 * MINUTE));
+    let mut snapshot_runner = snapshot_runner;
+
+    let checker = Checker::new(http_client);
+    let checker = CheckWithMetrics(
+        checker,
+        CheckMetricParams::new(&meter, SERVICE_NAME, "check"),
+    );
+    let checker = WithRetry(
+        checker,
+        3,          // max_attempts
+        1 * SECOND, // attempt_interval
+    );
+    let checker = WithSemaphore::wrap(checker, 32);
+
+    // Service Reloads
+    let ngx_reloader = PidReloader::new(cli.pid_path, Signal::SIGHUP);
+    let ngx_reloader = WithMetrics(
+        ngx_reloader,
+        MetricParams::new(&meter, SERVICE_NAME, "ngx_reload"),
+    );
+
+    let nft_reloader = SystemdReloader::new(
+        cli.systemctl_path, // bin_path
+        "nftables",         // service
+        "restart",          // command
+    );
+    let nft_reloader = WithMetrics(
+        nft_reloader,
+        MetricParams::new(&meter, SERVICE_NAME, "nftables_reload"),
+    );
+
+    // Persistence
+    let persister = WithMultiple(vec![
+        Arc::new(WithReload(
+            WithMultiple(vec![
+                Arc::new(LegacyPersister::new(cli.legacy_routes_dir.clone())),
+                Arc::new(Persister::new(
+                    cli.routes_path.clone(),
+                    Arc::new(RoutesEncoder),
+                )),
+                Arc::new(Persister::new(
+                    cli.upstreams_path.clone(),
+                    Arc::new(UpstreamEncoder),
+                )),
+                Arc::new(Persister::new(
+                    cli.trusted_certs_path.clone(),
+                    Arc::new(TrustedCertsEncoder),
+                )),
+            ]),
+            ngx_reloader,
+        )),
+        Arc::new(WithReload(
+            WithMultiple(vec![Arc::new(Persister::new(
+                cli.nftables_system_replicas_path.clone(),
+                Arc::new(SystemReplicasEncoder(cli.nftables_system_replicas_var)),
+            ))]),
+            nft_reloader,
+        )),
+    ]);
+
+    let persister = WithDedup(persister, Arc::new(RwLock::new(None)));
+    let persister = WithEmpty(persister);
+    let persister = WithMetrics(
+        persister,
+        MetricParams::new(&meter, SERVICE_NAME, "persist"),
+    );
+
+    // Runner
+    let check_persist_runner = CheckPersistRunner::new(
+        Arc::clone(&routing_table), // routing_table
+        Arc::clone(&checks),        // checks
+        checker,                    // checker
+        persister,                  // persister
+        cli.min_ok_count,           // min_ok_count
+    );
+    let check_persist_runner = WithMetrics(
+        check_persist_runner,
+        MetricParams::new(&meter, SERVICE_NAME, "run"),
+    );
+    let check_persist_runner = WithThrottle(check_persist_runner, ThrottleParams::new(10 * SECOND));
+    let mut check_persist_runner = check_persist_runner;
+
+    info!(
+        msg = format!("starting {SERVICE_NAME}").as_str(),
+        legacy_routes_dir = cli.legacy_routes_dir.display().to_string().as_str(),
+        routes_path = cli.routes_path.display().to_string().as_str(),
+        upstreams_path = cli.upstreams_path.display().to_string().as_str(),
+        trusted_certs_path = cli.trusted_certs_path.display().to_string().as_str(),
+        metrics_addr = cli.metrics_addr.to_string().as_str(),
+    );
+
+    let _ = tokio::try_join!(
+        task::spawn(async move {
+            loop {
+                let _ = snapshot_runner.run().await;
             }
-        }
-        sleep(Duration::from_secs(10)).await;
-    }
-    STATUS.set(1); // Set status to "good".
-    let routes_join_handle = start_routes_export(
-        dir,
-        registry_client,
-        nns_urls,
-        status,
-        data_provider,
-        client,
-    );
-    if let Some(metrics_join_handle) = metrics_join_handle {
-        if let Err(error) = try_join!(routes_join_handle, metrics_join_handle) {
-            eprintln!("error: {}", error);
-        }
-    } else if let Err(error) = try_join!(routes_join_handle) {
-        eprintln!("error: {}", error);
-    }
+        }),
+        task::spawn(async move {
+            loop {
+                let _ = check_persist_runner.run().await;
+            }
+        }),
+        task::spawn(
+            axum::Server::bind(&cli.metrics_addr)
+                .serve(metrics_router.into_make_service())
+                .map_err(|err| anyhow!("server failed: {:?}", err))
+        )
+    )
+    .context(format!("{SERVICE_NAME} failed to run"))?;
+
     Ok(())
 }
 
-type HttpsClient = Client<HttpsConnector<HttpConnector>>;
-
-/// Setup HTTPS client which does not validate the self-signed certificate.
-fn make_https_client() -> HttpsClient {
-    let native_tls_connector = native_tls::TlsConnector::builder()
-        .danger_accept_invalid_certs(true)
-        .use_sni(false)
-        .build()
-        .expect("failed to build tls connector");
-    let mut http_connector = HttpConnector::new();
-    http_connector.enforce_http(false);
-    let https_connector = HttpsConnector::from((http_connector, native_tls_connector.into()));
-    Client::builder()
-        .pool_idle_timeout(Some(Duration::from_secs(600)))
-        .pool_max_idle_per_host(1)
-        .build::<_, hyper::Body>(https_connector)
+#[derive(Clone)]
+struct MetricsHandlerArgs {
+    exporter: PrometheusExporter,
+    checks: Arc<DashMap<(String, String), u8>>,
 }
 
-// This is required during the transition for checking healthiness of the
-// replica.
-async fn is_node_down(node: &str, client: &HttpsClient) -> bool {
-    let req = Request::builder()
-        .method(Method::GET)
-        .uri(format!("https://{}/api/v2/status", node))
-        .header(hyper::header::CONTENT_TYPE, "application/cbor")
-        .body(Body::from(""))
-        .unwrap();
-    // Any failures w.r.t. to getting a status response from replica implies the
-    // replica is down.
-    match timeout(PROBE_TIMEOUT, client.request(req)).await {
-        Err(_) => true,
-        Ok(Err(_)) => true,
-        Ok(Ok(response)) => {
-            // This should always succeed. Check the serialization tests below.
-            let cbor_response =
-                serde_cbor::from_slice(&hyper::body::to_bytes(response).await.unwrap().to_vec())
-                    .unwrap();
-            // This should always succeed. Check the serialization tests below.
-            if let Ok(status) = serde_cbor::value::from_value::<HttpStatusResponse>(cbor_response) {
-                return Some(ReplicaHealthStatus::Healthy) != status.replica_health_status;
-            } else {
-                eprintln!("unable to get deserialize status");
-            }
-            true
-        }
-    }
+async fn metrics_handler(
+    Extension(MetricsHandlerArgs { exporter, checks }): Extension<MetricsHandlerArgs>,
+    _: Request<Body>,
+) -> Response<Body> {
+    let metric_families = exporter.registry().gather();
+
+    let encoder = TextEncoder::new();
+
+    let mut metrics_text = Vec::new();
+    if encoder.encode(&metric_families, &mut metrics_text).is_err() {
+        return Response::builder()
+            .status(StatusCode::INTERNAL_SERVER_ERROR)
+            .body("Internal Server Error".into())
+            .unwrap();
+    };
+
+    // Remove lines with status of stale replicas
+    //
+    // When replicas are removed from the registry we no longer run health checks for them.
+    // When that happens, the last gauge value for those replicas never changes.
+    // This pollutes our metrics with stale data. Therefore we remove metric lines corresponding
+    // to replicas that are no longer being actively health-checked.
+    let metrics_text = remove_stale(checks, &metrics_text);
+
+    Response::builder()
+        .status(200)
+        .body(metrics_text.into())
+        .unwrap()
 }
 
-async fn get_status(nns_urls: &[Url], client: &HttpsClient, dir: &Path) -> Vec<u8> {
-    let mut first = true;
-    loop {
-        for nns_url in nns_urls {
-            let url = nns_url.join("api/v2/status");
-            let uri: Uri = url
-                .unwrap()
-                .to_string()
-                .parse::<Uri>()
-                .expect("unable to parse status URL");
-            match timeout(STATUS_TIMEOUT, client.get(uri)).await {
-                Err(_) => (),
-                Ok(Err(_)) => (),
-                Ok(Ok(response)) => {
-                    if response.status().is_success() {
-                        return response.into_body().data().await.unwrap().unwrap().to_vec();
+fn remove_stale(checks: Arc<DashMap<(String, String), u8>>, metrics_text: &[u8]) -> Vec<u8> {
+    metrics_text
+        .lines()
+        .flat_map(|ln| match ln {
+            Ok(ln) => {
+                // Skip lines that arent gauges
+                if !ln.starts_with("control_plane_check_status{") {
+                    return Vec::from(format!("{ln}\n"));
+                }
+
+                // The gauge line should have both subnet and node ID labels
+                let k = match extract_ids(&ln) {
+                    Some((subnet_id, node_id)) => (subnet_id, node_id),
+                    None => {
+                        return Vec::from(format!("{ln}\n"));
                     }
+                };
+
+                // Checks should only contain active replicas
+                match checks.get(&k) {
+                    Some(_) => Vec::from(format!("{ln}\n")),
+
+                    // Stale
+                    None => vec![],
                 }
             }
-        }
-        if first {
-            first = false;
-            eprintln!("unable to get status from NNS");
-            clear_routes_dir(dir);
-        }
-        GET_STATUS_ERRORS.inc();
-        sleep(STATUS_TIMEOUT).await;
-    }
-}
-
-fn clear_routes_dir(dir: &Path) {
-    for entry in read_dir(dir).expect("unable to read_dir() routes_dir") {
-        let entry = entry.expect("unable to access entry from read_dir");
-        let path = entry.path();
-        // Note: path.ends_with() does not work.
-        if path.is_dir() || !path.to_str().unwrap().ends_with(".routes") {
-            continue;
-        }
-        remove_file(path.clone()).unwrap_or_else(|_| panic!("unable to remove_file {:?}", path));
-    }
-}
-
-#[async_trait]
-trait HealthChecker: Send + Sync {
-    async fn is_node_down(&self, node: &str, client: &HttpsClient) -> bool;
-}
-
-struct Probe {}
-#[async_trait]
-impl HealthChecker for Probe {
-    async fn is_node_down(&self, node: &str, client: &HttpsClient) -> bool {
-        is_node_down(node, client).await
-    }
-}
-
-#[allow(clippy::manual_async_fn)]
-#[fix_hidden_lifetime_bug]
-async fn batched_probe(
-    nodes_down_map: &mut HashMap<String, bool>,
-    client: &HttpsClient,
-    health_checker: Box<dyn HealthChecker>,
-) -> bool {
-    let probe_chunks = nodes_down_map.keys().cloned().collect::<Vec<_>>();
-    let probe_chunks = probe_chunks.chunks(PROBE_BATCH_SIZE).collect::<Vec<_>>();
-    let mut is_down_results: Vec<bool> = Vec::with_capacity(nodes_down_map.len());
-    let mut down_changed = false;
-    for probe_chunk in probe_chunks {
-        let futs = probe_chunk
-            .iter()
-            .map(|s| (health_checker.is_node_down(s, client)))
-            .collect::<Vec<_>>();
-        is_down_results.append(&mut join_all(futs).await);
-    }
-
-    for ((node, old_state), new_state) in nodes_down_map
-        .iter_mut()
-        .zip(is_down_results.iter())
-        .filter(|((_, old_state), new_state)| old_state != new_state)
-    {
-        let state_str = match new_state {
-            true => {
-                NODE_DOWN_EVENTS.inc();
-                "down"
-            }
-            false => {
-                NODE_UP_EVENTS.inc();
-                "up"
-            }
-        };
-        eprintln!("{} is {}", node, state_str);
-        *old_state = *new_state;
-        down_changed = true;
-    }
-
-    let down = nodes_down_map.iter().filter(|(_, state)| **state).count();
-    let up = nodes_down_map.len() - down;
-    NODES_UP.set(up.try_into().unwrap_or_else(|_| NODES_UP.get()));
-    NODES_DOWN.set(down.try_into().unwrap_or_else(|_| NODES_DOWN.get()));
-    down_changed
-}
-
-fn start_routes_export(
-    dir: PathBuf,
-    mut registry_client: Arc<RegistryClientImpl>,
-    nns_urls: Vec<Url>,
-    mut status: Vec<u8>,
-    data_provider: Arc<dyn RegistryDataProvider>,
-    client: HttpsClient,
-) -> JoinHandle<()> {
-    clear_routes_dir(&dir);
-    spawn(async move {
-        let mut first = true;
-        let mut last_registry_version = registry_client.get_latest_version();
-        let mut down_changed = false;
-        // Map from node socket_addr to a bool: true == node is down.
-        let mut nodes_down = HashMap::new();
-        // Worklist of nodes to be probed.
-        loop {
-            let data_provider = data_provider.clone();
-            let new_status = get_status(&nns_urls, &client, &dir).await;
-            if status != new_status {
-                status = new_status;
-                eprintln!("status from NNS changed");
-                clear_routes_dir(&dir);
-                STATUS_CHANGES.inc();
-                registry_client = Arc::new(RegistryClientImpl::new(data_provider, None));
-                if let Err(e) = registry_client.fetch_and_start_polling() {
-                    panic!("fetch_and_start_polling failed: {}", e);
-                }
-            }
-            let registry_client = registry_client.clone();
-            let registry_version = registry_client.get_latest_version();
-            if first || down_changed || registry_version != last_registry_version {
-                first = false;
-                last_registry_version = registry_version;
-                ROUTE_UPDATES.inc();
-                let mut filepath = dir.clone();
-                filepath.push(format!("{:020}.routes", registry_version.get()));
-                let file = File::create(filepath.to_str().expect("missing routes filename"))
-                    .expect("unable to open routing_configuration file for write");
-                let mut writer = BufWriter::new(&file);
-                let routes = get_routes(registry_client, &mut nodes_down).unwrap();
-                let routes_json = serde_json::to_string(&routes).expect("failed json conversion");
-                writer
-                    .write_all(routes_json.as_bytes())
-                    .expect("write failure");
-            }
-
-            down_changed = batched_probe(&mut nodes_down, &client, Box::new(Probe {})).await;
-            sleep(Duration::from_secs(PROBE_SLEEP_SECONDS)).await;
-        }
-    })
-}
-
-// Get Routes from the registry, removing nodes which are 'down'.  Also, update
-// the 'down' map to remove nodes which are no longer part of the network and
-// adding any new nodes with an initial status of not-down.
-fn get_routes(
-    registry_client: Arc<dyn RegistryClient>,
-    down: &mut HashMap<String, bool>,
-) -> Result<Routes, String> {
-    let mut nodes = HashSet::new();
-    let mut routes = Routes::default();
-    let registry_version = registry_client.get_latest_version();
-    routes.registry_version = registry_version.get();
-    let nns_subnet_id = registry_client
-        .get_root_subnet_id(registry_version)
-        .map_err(|_| "unable to get root subnet id")?
-        .ok_or("bad subnet id, no nns")?;
-    routes.nns_subnet_id = nns_subnet_id.to_string();
-    let subnet_ids = registry_client
-        .get_subnet_ids(registry_version)
-        .map_err(|_| "unable to get subnet ids")?
-        .ok_or("bad subnet ids")?;
-    for subnet_id in subnet_ids {
-        let mut subnet_routes = SubnetRoute {
-            subnet_id: subnet_id.to_string(),
-            ..Default::default()
-        };
-        let node_ids = registry_client
-            .get_node_ids_on_subnet(subnet_id, registry_version)
-            .map_err(|_| "unable to get subnet node ids")?
-            .ok_or("bad subnet node ids")?;
-        for node_id in node_ids {
-            let mut node_route = NodeRoute::default();
-            let transport_info = registry_client
-                .get_transport_info(node_id, registry_version)
-                .map_err(|_| "unable to get transport info")?
-                .ok_or("bad transport info")?;
-            let http = transport_info.http.ok_or("missing http transport_info")?;
-            node_route.node_id = node_id.to_string();
-            if http.ip_addr.contains(':') && !http.ip_addr.contains('[') {
-                node_route.socket_addr =
-                    "[".to_string() + &http.ip_addr + "]" + ":" + &http.port.to_string();
-            } else {
-                node_route.socket_addr = http.ip_addr + ":" + &http.port.to_string();
-            }
-            nodes.insert(node_route.socket_addr.clone());
-            if !down.contains_key(&node_route.socket_addr) {
-                down.insert(node_route.socket_addr.clone(), false);
-            } else if *down.get(&node_route.socket_addr).unwrap() {
-                continue;
-            }
-            let cert = registry_client
-                .get_tls_certificate(node_id, registry_version)
-                .map_err(|_| "unable to get node tls certificate")?
-                .ok_or("bad node tls certificate")?;
-            let pem = der_to_pem(cert.certificate_der.as_slice(), "CERTIFICATE");
-            node_route.tls_certificate_pem = pem;
-            subnet_routes.nodes.push(node_route);
-        }
-        routes.subnets.push(subnet_routes);
-    }
-    let canister_routes = registry_client
-        .get_routing_table(registry_version)
-        .map_err(|_| "unable to get canister routing table")?
-        .ok_or("bad canister routing table")?;
-    routes.canister_routes = canister_routes
-        .iter()
-        .map(|(range, subnet_id)| CanisterRoute {
-            start_canister_id: range.start.to_string(),
-            end_canister_id: range.end.to_string(),
-            subnet_id: subnet_id.to_string(),
+            _ => vec![],
         })
-        .collect();
-    down.retain(|k, _v| nodes.contains(k));
-    Ok(routes)
+        .collect()
 }
 
-const MIN_PROTOCOL_VERSION: Option<SslVersion> = Some(SslVersion::TLS1_3);
-const ALLOWED_CIPHER_SUITES: &str = "TLS_AES_128_GCM_SHA256:TLS_AES_256_GCM_SHA384";
-const ALLOWED_SIGNATURE_ALGORITHMS: &str = "ed25519";
+fn extract_ids(s: &str) -> Option<(String, String)> {
+    // Capture node ID
+    if let Some(cptr) = RE_NODE_ID.captures(s) {
+        if let Some(node_id) = cptr.get(1) {
+            // Capture subnet ID
+            if let Some(cptr) = RE_SUBNET_ID.captures(s) {
+                if let Some(subnet_id) = cptr.get(1) {
+                    return Some((
+                        subnet_id.as_str().into(), // subnet_id
+                        node_id.as_str().into(),   // node_id
+                    ));
+                }
+            }
+        }
+    };
 
-pub fn tls_acceptor(
-    private_key: &PKey<Private>,
-    server_cert: &X509,
-    trusted_client_certs: Vec<X509>,
-) -> core::result::Result<SslAcceptor, openssl::ssl::Error> {
-    let mut builder = SslAcceptor::mozilla_modern_v5(SslMethod::tls_server())
-        .expect("Failed to initialize the acceptor.");
-    builder.set_min_proto_version(MIN_PROTOCOL_VERSION)?;
-    builder.set_ciphersuites(ALLOWED_CIPHER_SUITES)?;
-    builder.set_sigalgs_list(ALLOWED_SIGNATURE_ALGORITHMS)?;
-    builder.set_verify(SslVerifyMode::NONE);
-    builder.set_verify(SslVerifyMode::PEER);
-    builder.set_verify_cert_store(cert_store(trusted_client_certs)?)?;
-    builder.set_verify_depth(2);
-    builder.set_private_key(private_key)?;
-    builder.set_certificate(server_cert)?;
-    builder.check_private_key()?;
-    Ok(builder.build())
+    None
 }
 
-async fn perform_tls_server_handshake(
-    tcp_stream: TcpStream,
-    self_cert: &X509,
-    private_key: &PKey<Private>,
-    trusted_client_certs: Vec<X509>,
-) -> core::result::Result<(SslStream<TcpStream>, Option<X509>), String> {
-    let tls_acceptor = tls_acceptor(private_key, self_cert, trusted_client_certs.clone())
-        .map_err(|e| e.to_string())?;
-    let ssl = Ssl::new(tls_acceptor.context()).unwrap();
-    let mut tls_stream = SslStream::new(ssl, tcp_stream).unwrap();
-    Pin::new(&mut tls_stream).accept().await.unwrap();
-    let peer_cert = tls_stream.ssl().peer_certificate();
-    Ok((tls_stream, peer_cert))
+#[async_trait]
+trait Check: 'static + Send + Sync {
+    async fn check(&self, addr: &str) -> Result<(), Error>;
 }
 
-pub fn generate_tls_key_pair() -> (X509, PKey<Private>) {
-    let private_key = PKey::generate_ed25519().expect("failed to create Ed25519 key pair");
-    let mut name = X509Name::builder().unwrap();
-    name.append_entry_by_nid(Nid::COMMONNAME, "boundary-node-control-plane.dfinity.org")
-        .unwrap();
-    let name = name.build();
-    let mut builder = X509::builder().unwrap();
-    builder.set_version(2).unwrap();
-    builder.set_subject_name(&name).unwrap();
-    builder.set_issuer_name(&name).unwrap();
-    builder.set_pubkey(&private_key).unwrap();
-    builder.sign(&private_key, MessageDigest::null()).unwrap();
-    builder
-        .set_not_before(&Asn1Time::days_from_now(0).unwrap())
-        .unwrap();
-    let not_after =
-        Asn1Time::from_str_x509("99991231235959Z").expect("unable to parse not after as ASN1Time");
-    builder.set_not_after(&not_after).unwrap();
-    let certificate: X509 = builder.build();
-    (certificate, private_key)
+struct Checker {
+    http_client: reqwest::Client,
 }
 
-fn cert_store(certs: Vec<X509>) -> core::result::Result<X509Store, openssl::ssl::Error> {
-    let mut cert_store_builder =
-        X509StoreBuilder::new().expect("Failed to init X509 store builder.");
-    for cert in certs {
-        cert_store_builder.add_cert(cert.clone())?;
+impl Checker {
+    fn new(http_client: reqwest::Client) -> Self {
+        Self { http_client }
     }
-    Ok(cert_store_builder.build())
+}
+
+#[async_trait]
+impl Check for Checker {
+    async fn check(&self, addr: &str) -> Result<(), Error> {
+        let request = self
+            .http_client
+            .request(reqwest::Method::GET, format!("http://{addr}/api/v2/status"))
+            .build()
+            .context("failed to build request")?;
+
+        let response = self
+            .http_client
+            .execute(request)
+            .await
+            .context("request failed")?;
+
+        if response.status() != reqwest::StatusCode::OK {
+            return Err(anyhow!("request failed with status {}", response.status()));
+        }
+
+        let response_reader = response
+            .bytes()
+            .await
+            .context("failed to get response bytes")?
+            .reader();
+
+        let HttpStatusResponse {
+            replica_health_status,
+            ..
+        } = serde_cbor::from_reader(response_reader).context("failed to parse cbor response")?;
+
+        if replica_health_status != Some(ReplicaHealthStatus::Healthy) {
+            return Err(anyhow!("replica reported unhealthy status"));
+        }
+
+        Ok(())
+    }
+}
+
+#[async_trait]
+trait Run: Send + Sync {
+    async fn run(&mut self) -> Result<(), Error>;
+}
+
+struct SnapshotRunner<S: Snapshot> {
+    snapshotter: S,
+    routing_table: Arc<Mutex<Option<RoutingTable>>>,
+}
+
+impl<S: Snapshot> SnapshotRunner<S> {
+    fn new(snapshotter: S, routing_table: Arc<Mutex<Option<RoutingTable>>>) -> Self {
+        Self {
+            snapshotter,
+            routing_table,
+        }
+    }
+}
+
+#[async_trait]
+impl<S: Snapshot> Run for SnapshotRunner<S> {
+    async fn run(&mut self) -> Result<(), Error> {
+        let routing_table = self
+            .snapshotter
+            .snapshot()
+            .await
+            .context("failed to obtain registry snapshot")?;
+
+        let mut _routing_table = self.routing_table.lock().unwrap();
+        *_routing_table = Some(routing_table);
+
+        Ok(())
+    }
+}
+
+struct CheckPersistRunner<C: Check, P: Persist> {
+    // Dependencies
+    routing_table: Arc<Mutex<Option<RoutingTable>>>,
+    checks: Arc<DashMap<(String, String), u8>>,
+    checker: Arc<C>,
+    persister: P,
+
+    // Configuration
+    min_ok_count: u8,
+}
+
+impl<C: Check, P: Persist> CheckPersistRunner<C, P> {
+    fn new(
+        routing_table: Arc<Mutex<Option<RoutingTable>>>,
+        checks: Arc<DashMap<(String, String), u8>>,
+        checker: C,
+        persister: P,
+        min_ok_count: u8,
+    ) -> Self {
+        Self {
+            routing_table,
+            checks,
+            checker: Arc::new(checker),
+            persister,
+            min_ok_count,
+        }
+    }
+}
+
+#[async_trait]
+impl<C: Check, P: Persist> Run for CheckPersistRunner<C, P> {
+    async fn run(&mut self) -> Result<(), Error> {
+        let routing_table = {
+            let rt = self.routing_table.lock().unwrap();
+            rt.clone()
+                .ok_or_else(|| anyhow!("routing_table not available"))?
+        };
+
+        // Clean checks of targets that no longer exist
+        let (current_targets, stale_targets): (
+            DashSet<(String, String)>,
+            DashSet<(String, String)>,
+        ) = (DashSet::new(), DashSet::new());
+
+        for subnet in routing_table.clone().subnets {
+            for node in subnet.nodes {
+                current_targets.insert((
+                    subnet.subnet_id.clone(), // subnet_id
+                    node.node_id.clone(),     // node_id
+                ));
+            }
+        }
+
+        for c in self.checks.iter() {
+            let k = c.key();
+            if !current_targets.contains(k) {
+                stale_targets.insert(k.to_owned());
+            }
+        }
+
+        for k in stale_targets.iter() {
+            self.checks.remove(&k);
+        }
+
+        // Perform Health Checks
+        let futs = FuturesUnordered::new();
+
+        for subnet in routing_table.clone().subnets {
+            for node in subnet.nodes {
+                let checks = Arc::clone(&self.checks);
+                let checker = Arc::clone(&self.checker);
+                let min_ok_count = self.min_ok_count.to_owned();
+
+                let (subnet_id, node_id, socket_addr) = (
+                    subnet.subnet_id.clone(),
+                    node.node_id.clone(),
+                    node.socket_addr.clone(),
+                );
+
+                futs.push(task::spawn(async move {
+                    let _ctx = opentelemetry::Context::current_with_baggage(vec![
+                        KeyValue::new("subnet_id", subnet_id.to_string()),
+                        KeyValue::new("node_id", node_id.to_string()),
+                        KeyValue::new("socket_addr", socket_addr.to_string()),
+                    ]);
+
+                    let out = checker
+                        .check(&socket_addr)
+                        .with_context(_ctx.clone())
+                        .await
+                        .context("failed to check node");
+
+                    let k = (subnet_id, node_id);
+                    let ok_cnt = match checks.get(&k) {
+                        Some(c) => c.value().to_owned(),
+                        None => 0,
+                    };
+
+                    match out {
+                        Ok(_) => checks.insert(
+                            k,
+                            min(
+                                min_ok_count, // clamp to this value
+                                ok_cnt + 1,
+                            ),
+                        ),
+                        Err(_) => checks.insert(k, 0),
+                    };
+
+                    out
+                }));
+            }
+        }
+
+        for fut in futs {
+            let _ = fut.await?;
+        }
+
+        // Construct Effective Routing Table
+        let effective_routing_table = RoutingTable {
+            subnets: routing_table
+                .subnets
+                .into_iter()
+                .map(|subnet| Subnet {
+                    nodes: subnet
+                        .nodes
+                        .into_iter()
+                        .filter(|node| {
+                            let k = (
+                                subnet.subnet_id.clone(), // subnet_id
+                                node.node_id.clone(),     // node_id
+                            );
+
+                            let ok_cnt = match self.checks.get(&k) {
+                                Some(c) => c.value().to_owned(),
+                                None => 0,
+                            };
+
+                            ok_cnt >= self.min_ok_count
+                        })
+                        .collect(),
+                    ..subnet
+                })
+                .collect(),
+            ..routing_table
+        };
+
+        // Persist Effective Routing Table
+        self.persister
+            .persist(&effective_routing_table)
+            .await
+            .context("failed to persist routing table")?;
+
+        Ok(())
+    }
+}
+
+struct ThrottleParams {
+    throttle_duration: Duration,
+    next_time: Option<Instant>,
+}
+
+impl ThrottleParams {
+    fn new(throttle_duration: Duration) -> Self {
+        Self {
+            throttle_duration,
+            next_time: None,
+        }
+    }
+}
+
+struct WithThrottle<T>(T, ThrottleParams);
+
+#[async_trait]
+impl<T: Run + Send + Sync> Run for WithThrottle<T> {
+    async fn run(&mut self) -> Result<(), Error> {
+        let current_time = Instant::now();
+        let next_time = self.1.next_time.unwrap_or(current_time);
+
+        if next_time > current_time {
+            tokio::time::sleep(next_time - current_time).await;
+        }
+        self.1.next_time = Some(Instant::now() + self.1.throttle_duration);
+
+        self.0.run().await
+    }
+}
+
+struct WithSemaphore<T>(T, Semaphore);
+
+impl<T> WithSemaphore<T> {
+    fn wrap(t: T, permits: usize) -> Self {
+        Self(t, Semaphore::new(permits))
+    }
+}
+
+#[async_trait]
+impl<T: Check> Check for WithSemaphore<T> {
+    async fn check(&self, addr: &str) -> Result<(), Error> {
+        let _permit = self.1.acquire().await?;
+        self.0.check(addr).await
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use std::sync::atomic::{AtomicU32, Ordering};
-
     use super::*;
-    use ic_crypto_tls::generate_tls_keys;
-    use ic_protobuf::registry::routing_table::v1::RoutingTable as PbRoutingTable;
-    use ic_protobuf::types::v1::PrincipalId as PrincipalIdIdProto;
-    use ic_protobuf::types::v1::SubnetId as SubnetIdProto;
-    use ic_registry_keys::{
-        make_crypto_tls_cert_key, make_routing_table_record_key, ROOT_SUBNET_ID_KEY,
-    };
-    use ic_registry_routing_table::RoutingTable;
-    use ic_test_utilities::p2p::test_group_set_registry;
-    use ic_test_utilities::types::ids::{node_test_id, subnet_test_id};
 
-    use ic_types::messages::Blob;
-    use ic_types::{RegistryVersion, SubnetId};
+    #[test]
+    fn removes_stale() {
+        let checks: DashMap<(String, String), u8> = DashMap::new();
 
-    use serde::{Deserialize, Serialize};
+        checks.insert(
+            (
+                "5kdm2-62fc6-fwnja-hutkz-ycsnm-4z33i-woh43-4cenu-ev7mi-gii6t-4ae".into(),
+                "kywkz-eopg4-nn6md-cjb24-5ri6y-aq6au-vt57i-kg7gk-ch5pw-7er3w-7qe".into(),
+            ),
+            0,
+        );
 
-    use ic_test_utilities::types::ids::SUBNET_1;
-    pub const ROOT_SUBNET_ID: SubnetId = SUBNET_1;
-    const REG_V1: RegistryVersion = RegistryVersion::new(1);
-    const COMMON_NAME: &str = "common name";
-    const NOT_AFTER: &str = "20701231235959Z";
+        checks.insert(
+            (
+                "w4asl-4nmyj-qnr7c-6cqq4-tkwmt-o26di-iupkq-vx4kt-asbrx-jzuxh-4ae".into(),
+                "ze4ou-bfvbt-c5onv-3sxls-vqa4d-gwmt2-fr3zy-svzdq-ge2yd-oehb3-wqe".into(),
+            ),
+            0,
+        );
 
-    // Once the migration to the new healthiness check is done those tests can be
-    // removed.
-    #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-    #[serde(rename_all = "snake_case")]
-    pub struct OldHttpStatusResponse {
-        pub ic_api_version: String,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        pub root_key: Option<Blob>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        pub impl_version: Option<String>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        pub impl_hash: Option<String>,
+        // middle line is stale
+        let txt = [
+            r#"control_plane_check_status{addr="[::1]:8080",node_id="kywkz-eopg4-nn6md-cjb24-5ri6y-aq6au-vt57i-kg7gk-ch5pw-7er3w-7qe",service="control-plane",subnet_id="5kdm2-62fc6-fwnja-hutkz-ycsnm-4z33i-woh43-4cenu-ev7mi-gii6t-4ae"} 1"#,
+            r#"control_plane_check_status{addr="[::1]:8080",node_id="q6bis-oxwxg-eh76l-5i47b-nmcm7-wibd3-q5alp-j6hxy-puzh2-qgequ-bae",service="control-plane",subnet_id="x33ed-h457x-bsgyx-oqxqf-6pzwv-wkhzr-rm2j3-npodi-purzm-n66cg-gae"} 1"#,
+            r#"control_plane_check_status{addr="[::1]:8080",node_id="ze4ou-bfvbt-c5onv-3sxls-vqa4d-gwmt2-fr3zy-svzdq-ge2yd-oehb3-wqe",service="control-plane",subnet_id="w4asl-4nmyj-qnr7c-6cqq4-tkwmt-o26di-iupkq-vx4kt-asbrx-jzuxh-4ae"} 1"#,
+        ].join("\n");
+
+        let out = remove_stale(
+            Arc::new(checks), // checks
+            txt.as_bytes(),   // metrics_text
+        );
+
+        let out = String::from_utf8(out).expect("failed to convert output to string");
+
+        let txt = [
+            r#"control_plane_check_status{addr="[::1]:8080",node_id="kywkz-eopg4-nn6md-cjb24-5ri6y-aq6au-vt57i-kg7gk-ch5pw-7er3w-7qe",service="control-plane",subnet_id="5kdm2-62fc6-fwnja-hutkz-ycsnm-4z33i-woh43-4cenu-ev7mi-gii6t-4ae"} 1"#,
+            r#"control_plane_check_status{addr="[::1]:8080",node_id="ze4ou-bfvbt-c5onv-3sxls-vqa4d-gwmt2-fr3zy-svzdq-ge2yd-oehb3-wqe",service="control-plane",subnet_id="w4asl-4nmyj-qnr7c-6cqq4-tkwmt-o26di-iupkq-vx4kt-asbrx-jzuxh-4ae"} 1"#,
+        ].join("\n");
+
+        assert_eq!(out, txt + "\n");
     }
 
     #[test]
-    fn all_is_updated() {
-        let a = HttpStatusResponse {
-            ic_api_version: "2".to_string(),
-            root_key: None,
-            impl_version: None,
-            impl_hash: None,
-            replica_health_status: Some(ReplicaHealthStatus::Healthy),
-        };
-        let bin = serde_cbor::to_vec(&a).unwrap();
-        let b: HttpStatusResponse = serde_cbor::from_slice(&bin).unwrap();
-        assert_eq!(b.ic_api_version, "2");
-        assert_eq!(b.root_key, None);
-        assert_eq!(b.impl_version, None);
-        assert_eq!(b.impl_hash, None);
-        assert_eq!(b.replica_health_status, Some(ReplicaHealthStatus::Healthy));
+    fn extracts_ids_empty() {
+        assert_eq!(extract_ids(""), None);
     }
 
     #[test]
-    fn boundary_node_is_updated_first() {
-        let a = OldHttpStatusResponse {
-            ic_api_version: "2".to_string(),
-            root_key: None,
-            impl_version: None,
-            impl_hash: None,
-        };
-        let bin = serde_cbor::to_vec(&a).unwrap();
-        let b: HttpStatusResponse = serde_cbor::from_slice(&bin).unwrap();
-        assert_eq!(b.ic_api_version, "2");
-        assert_eq!(b.root_key, None);
-        assert_eq!(b.impl_version, None);
-        assert_eq!(b.impl_hash, None);
-        assert_eq!(b.replica_health_status, None);
+    fn extracts_ids_ok() {
+        assert_eq!(
+            extract_ids(r#"{subnet_id="subnet-1",node_id="node-1"}"#),
+            Some((String::from("subnet-1"), String::from("node-1"))),
+        );
     }
 
     #[test]
-    fn replica_is_updated_first() {
-        let a = HttpStatusResponse {
-            ic_api_version: "2".to_string(),
-            root_key: None,
-            impl_version: None,
-            impl_hash: None,
-            replica_health_status: Some(ReplicaHealthStatus::Healthy),
-        };
-
-        let bin = serde_cbor::to_vec(&a).unwrap();
-        let b: OldHttpStatusResponse = serde_cbor::from_slice(&bin).unwrap();
-        assert_eq!(b.ic_api_version, "2");
-        assert_eq!(b.root_key, None);
-        assert_eq!(b.impl_version, None);
-        assert_eq!(b.impl_hash, None);
-    }
-
-    struct TestNodeDown {}
-    #[async_trait]
-    impl HealthChecker for TestNodeDown {
-        async fn is_node_down(&self, node: &str, _: &HttpsClient) -> bool {
-            println!("PROBE: {} is down", node);
-            true
-        }
-    }
-
-    struct TestNodeUp {}
-    #[async_trait]
-    impl HealthChecker for TestNodeUp {
-        async fn is_node_down(&self, node: &str, _: &HttpsClient) -> bool {
-            println!("PROBE: {} is up", node);
-            false
-        }
-    }
-
-    struct TestOddNodeDown {
-        count: std::sync::atomic::AtomicU32,
-    }
-    #[async_trait]
-    impl HealthChecker for TestOddNodeDown {
-        async fn is_node_down(&self, node: &str, _: &HttpsClient) -> bool {
-            let seq = self.count.fetch_add(1, Ordering::SeqCst);
-            if seq % 2 != 0 {
-                println!("PROBE:{} is down", node);
-                true
-            } else {
-                println!("PROBE:{} is up", node);
-                false
-            }
-        }
-    }
-
-    const MAX_NODES: u16 = 100;
-    #[tokio::test]
-    async fn dead_node_detection() {
-        let registry_version = REG_V1;
-        // Set up a registry just enough info to call get_routes().
-        let node_port_allocation = Arc::new((0..MAX_NODES).collect::<Vec<_>>());
-        let mut nodes_down_map = HashMap::new();
-        let data_provider = test_group_set_registry(subnet_test_id(0), node_port_allocation);
-
-        let (tls_pubkey, _p_key) = generate_tls_keys(COMMON_NAME, NOT_AFTER);
-
-        // Use a single tls cert for all Nodes. This is a stress test
-        // and we don't want to generate thousands of unique certs
-        for node_id in (0..MAX_NODES as u64).map(node_test_id) {
-            data_provider
-                .add(
-                    &make_crypto_tls_cert_key(node_id),
-                    registry_version,
-                    Some(tls_pubkey.to_proto()),
-                )
-                .expect("failed to add TLS cert to registry");
-        }
-
-        let root_subnet_id = SubnetIdProto {
-            principal_id: Some(PrincipalIdIdProto {
-                raw: ROOT_SUBNET_ID.get_ref().to_vec(),
-            }),
-        };
-        data_provider
-            .add(ROOT_SUBNET_ID_KEY, REG_V1, Some(root_subnet_id))
-            .expect("failed to add root subnet ID to registry");
-
-        let routing_table_record = PbRoutingTable::from(RoutingTable::default());
-        data_provider
-            .add(
-                &make_routing_table_record_key(),
-                REG_V1,
-                Some(routing_table_record),
-            )
-            .expect("failed to add routing table to registry");
-
-        let registry_client = Arc::new(RegistryClientImpl::new(data_provider, None));
-        registry_client.fetch_and_start_polling().unwrap();
-
-        /* Check initial routes */
-        let routes = get_routes(registry_client.clone(), &mut nodes_down_map).unwrap();
-        assert!(routes.subnets[0].nodes.len() == MAX_NODES as usize);
-        assert!(nodes_down_map.len() == MAX_NODES as usize);
-
-        /* Detect all nodes are alive */
-        let down_changed = batched_probe(
-            &mut nodes_down_map,
-            &make_https_client(),
-            Box::new(TestNodeUp {}),
-        )
-        .await;
-        assert!(!down_changed);
-
-        /* detect all nodes are dead */
-        let down_changed = batched_probe(
-            &mut nodes_down_map,
-            &make_https_client(),
-            Box::new(TestNodeDown {}),
-        )
-        .await;
-        assert!(down_changed);
-        assert!(nodes_down_map.values().filter(|v| **v).count() == MAX_NODES as usize);
-
-        /* detect half  nodes as dead */
-        let down_changed = batched_probe(
-            &mut nodes_down_map,
-            &make_https_client(),
-            Box::new(TestOddNodeDown {
-                count: AtomicU32::new(0),
-            }),
-        )
-        .await;
-        assert!(down_changed);
-        assert!(nodes_down_map.values().filter(|v| **v).count() == (MAX_NODES as usize) / 2);
-
-        /* Check if routes to deads nodes are disabled. */
-        let routes = get_routes(registry_client, &mut nodes_down_map).unwrap();
-        assert!(routes.subnets[0].nodes.len() == (MAX_NODES as usize) / 2);
-        assert!(nodes_down_map.len() == MAX_NODES as usize);
+    fn extracts_ids_invalid() {
+        assert_eq!(extract_ids(r#"{subnet_id="subnet-1"}"#), None);
     }
 }

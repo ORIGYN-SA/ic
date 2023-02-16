@@ -11,6 +11,23 @@ pub(crate) fn ecdsa_conversion_function(pt: &EccPoint) -> ThresholdEcdsaResult<E
     EccScalar::from_bytes_wide(pt.curve_type(), &x_bytes)
 }
 
+fn convert_hash_to_integer(
+    hashed_message: &[u8],
+    curve_type: EccCurveType,
+) -> ThresholdEcdsaResult<EccScalar> {
+    // ECDSA has special rules for converting the hash to a scalar,
+    // when the hash is larger than the curve order. If this check is
+    // removed make sure these conversions are implemented, and not
+    // just doing a reduction mod order using from_bytes_wide
+    if hashed_message.len() != curve_type.scalar_bytes() {
+        return Err(ThresholdEcdsaError::InvalidScalar);
+    }
+
+    // Even though the same size, the integer representation of the
+    // message might be larger than the order, requiring a reduction.
+    EccScalar::from_bytes_wide(curve_type, hashed_message)
+}
+
 fn derive_rho(
     curve_type: EccCurveType,
     hashed_message: &[u8],
@@ -21,11 +38,11 @@ fn derive_rho(
 ) -> ThresholdEcdsaResult<(EccScalar, EccScalar, EccScalar, EccPoint)> {
     let pre_sig = match &presig_transcript.combined_commitment {
         CombinedCommitment::ByInterpolation(PolynomialCommitment::Simple(c)) => c.constant_term(),
-        _ => return Err(ThresholdEcdsaError::InconsistentCommitments),
+        _ => return Err(ThresholdEcdsaError::UnexpectedCommitmentType),
     };
 
     if pre_sig.curve_type() != curve_type {
-        return Err(ThresholdEcdsaError::InconsistentCommitments);
+        return Err(ThresholdEcdsaError::UnexpectedCommitmentType);
     }
 
     let (key_tweak, _chain_key) = derivation_path.derive_tweak(&key_transcript.constant_term())?;
@@ -39,7 +56,7 @@ fn derive_rho(
 
     // Rerandomize presignature
     let randomized_pre_sig =
-        pre_sig.add_points(&EccPoint::generator_g(curve_type)?.scalar_mul(&randomizer)?)?;
+        pre_sig.add_points(&EccPoint::generator_g(curve_type).scalar_mul(&randomizer)?)?;
 
     let rho = ecdsa_conversion_function(&randomized_pre_sig)?;
 
@@ -74,15 +91,15 @@ impl ThresholdEcdsaSigShareInternal {
             presig_transcript,
         )?;
 
-        // Compute the message represenative from the hash, which may require
+        // Compute the message representative from the hash, which may require
         // a reduction if int(hashed_message) >= group_order
-        let e = EccScalar::from_bytes_wide(curve_type, hashed_message)?;
+        let e = convert_hash_to_integer(hashed_message, curve_type)?;
 
         let theta = e.add(&rho.mul(&key_tweak)?)?;
 
         let (lambda_value, lambda_mask) = match lambda {
             CommitmentOpening::Pedersen(lambda_value, lambda_mask) => (lambda_value, lambda_mask),
-            _ => return Err(ThresholdEcdsaError::InconsistentCommitments),
+            _ => return Err(ThresholdEcdsaError::UnexpectedCommitmentType),
         };
 
         // Compute shares of sigma's numerator, i.e. openings of
@@ -93,7 +110,7 @@ impl ThresholdEcdsaSigShareInternal {
                 let nu_mask = theta.mul(lambda_mask)?.add(&rho.mul(mask)?)?;
                 CommitmentOpening::Pedersen(nu_value, nu_mask)
             }
-            _ => return Err(ThresholdEcdsaError::InconsistentCommitments),
+            _ => return Err(ThresholdEcdsaError::UnexpectedCommitmentType),
         };
 
         // Compute shares of sigma's denominator, i.e. openings of
@@ -104,7 +121,7 @@ impl ThresholdEcdsaSigShareInternal {
                 let mu_mask = randomizer.mul(lambda_mask)?.add(mask)?;
                 CommitmentOpening::Pedersen(mu_value, mu_mask)
             }
-            _ => return Err(ThresholdEcdsaError::InconsistentCommitments),
+            _ => return Err(ThresholdEcdsaError::UnexpectedCommitmentType),
         };
 
         Ok(Self {
@@ -133,7 +150,7 @@ impl ThresholdEcdsaSigShareInternal {
         kappa_times_lambda: &IDkgTranscriptInternal,
         key_times_lambda: &IDkgTranscriptInternal,
         curve_type: EccCurveType,
-    ) -> ThresholdEcdsaResult<bool> {
+    ) -> ThresholdEcdsaResult<()> {
         // Compute rho and tweak
         let (rho, key_tweak, randomizer, _presig) = derive_rho(
             curve_type,
@@ -145,7 +162,7 @@ impl ThresholdEcdsaSigShareInternal {
         )?;
 
         // Compute theta
-        let e = EccScalar::from_bytes_wide(curve_type, hashed_message)?;
+        let e = convert_hash_to_integer(hashed_message, curve_type)?;
 
         let theta = e.add(&rho.mul(&key_tweak)?)?;
 
@@ -162,25 +179,25 @@ impl ThresholdEcdsaSigShareInternal {
             .scalar_mul(&randomizer)?
             .add_points(&kappa_times_lambda_j)?;
 
-        match self.sigma_numerator {
+        match &self.sigma_numerator {
             CommitmentOpening::Pedersen(v, m) => {
-                if sigma_num != EccPoint::pedersen(&v, &m)? {
-                    return Ok(false);
+                if sigma_num != EccPoint::pedersen(v, m)? {
+                    return Err(ThresholdEcdsaError::InvalidCommitment);
                 }
             }
-            _ => return Err(ThresholdEcdsaError::InconsistentCommitments),
+            _ => return Err(ThresholdEcdsaError::UnexpectedCommitmentType),
         }
 
-        match self.sigma_denominator {
+        match &self.sigma_denominator {
             CommitmentOpening::Pedersen(v, m) => {
-                if sigma_den != EccPoint::pedersen(&v, &m)? {
-                    return Ok(false);
+                if sigma_den != EccPoint::pedersen(v, m)? {
+                    return Err(ThresholdEcdsaError::InvalidCommitment);
                 }
             }
-            _ => return Err(ThresholdEcdsaError::InconsistentCommitments),
+            _ => return Err(ThresholdEcdsaError::UnexpectedCommitmentType),
         }
 
-        Ok(true)
+        Ok(())
     }
 }
 
@@ -202,10 +219,7 @@ impl ThresholdEcdsaCombinedSigInternal {
         sig
     }
 
-    pub fn deserialize(
-        algorithm_id: ic_types::crypto::AlgorithmId,
-        bytes: &[u8],
-    ) -> ThresholdEcdsaResult<Self> {
+    pub fn deserialize(algorithm_id: AlgorithmId, bytes: &[u8]) -> ThresholdEcdsaResult<Self> {
         let curve_type = match algorithm_id {
             AlgorithmId::ThresholdEcdsaSecp256k1 => Ok(EccCurveType::K256),
             x => Err(ThresholdEcdsaError::SerializationError(format!(
@@ -264,16 +278,16 @@ impl ThresholdEcdsaCombinedSigInternal {
             x_values.push(*index);
             // Reconstruction of the signature share does not require recombining the
             // masking values.
-            if let CommitmentOpening::Pedersen(c, _) = sig_share.sigma_numerator {
-                numerator_samples.push(c);
+            if let CommitmentOpening::Pedersen(c, _) = &sig_share.sigma_numerator {
+                numerator_samples.push(c.clone());
             } else {
-                return Err(ThresholdEcdsaError::InconsistentCommitments);
+                return Err(ThresholdEcdsaError::UnexpectedCommitmentType);
             }
 
-            if let CommitmentOpening::Pedersen(c, _) = sig_share.sigma_denominator {
-                denominator_samples.push(c);
+            if let CommitmentOpening::Pedersen(c, _) = &sig_share.sigma_denominator {
+                denominator_samples.push(c.clone());
             } else {
-                return Err(ThresholdEcdsaError::InconsistentCommitments);
+                return Err(ThresholdEcdsaError::UnexpectedCommitmentType);
             }
         }
 
@@ -317,18 +331,12 @@ impl ThresholdEcdsaCombinedSigInternal {
         presig_transcript: &IDkgTranscriptInternal,
         key_transcript: &IDkgTranscriptInternal,
         curve_type: EccCurveType,
-    ) -> ThresholdEcdsaResult<bool> {
+    ) -> ThresholdEcdsaResult<()> {
         if self.r.is_zero() || self.s.is_zero() {
-            return Ok(false);
+            return Err(ThresholdEcdsaError::InvalidSignature);
         }
 
-        // ECDSA has special rules for converting the hash to a scalar,
-        // when the hash is larger than the curve order. If this check is
-        // removed make sure these conversions are implemented, and not
-        // just doing a reduction mod order using from_bytes_wide
-        if hashed_message.len() != curve_type.scalar_bytes() {
-            return Ok(false);
-        }
+        let msg = convert_hash_to_integer(hashed_message, curve_type)?;
 
         let (rho, key_tweak, _, pre_sig) = derive_rho(
             curve_type,
@@ -340,31 +348,27 @@ impl ThresholdEcdsaCombinedSigInternal {
         )?;
 
         if self.r != rho {
-            return Ok(false);
+            return Err(ThresholdEcdsaError::InvalidSignature);
         }
 
         // We require s normalization for all curves
         if self.s.is_high() {
-            return Ok(false);
+            return Err(ThresholdEcdsaError::InvalidSignature);
         }
 
         let master_public_key = key_transcript.constant_term();
         let tweak_g = EccPoint::mul_by_g(&key_tweak)?;
         let public_key = tweak_g.add_points(&master_public_key)?;
 
-        // Even though the same size, the integer represenatation of the
-        // message might be larger than the order, requiring a reduction.
-        let msg = EccScalar::from_bytes_wide(curve_type, hashed_message)?;
-
         let s_inv = self.s.invert()?;
 
         let u1 = msg.mul(&s_inv)?;
         let u2 = self.r.mul(&s_inv)?;
 
-        let rp = EccPoint::mul_points(&EccPoint::generator_g(curve_type)?, &u1, &public_key, &u2)?;
+        let rp = EccPoint::mul_2_points(&EccPoint::generator_g(curve_type), &u1, &public_key, &u2)?;
 
         if rp.is_infinity()? {
-            return Ok(false);
+            return Err(ThresholdEcdsaError::InvalidSignature);
         }
 
         /*
@@ -383,7 +387,12 @@ impl ThresholdEcdsaCombinedSigInternal {
         we only check the x coordinate.
         */
 
-        Ok(rp.affine_x()? == pre_sig.affine_x()?)
+        if rp.affine_x()? != pre_sig.affine_x()? {
+            return Err(ThresholdEcdsaError::InvalidSignature);
+        }
+
+        // accept:
+        Ok(())
     }
 }
 

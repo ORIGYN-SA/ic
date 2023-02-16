@@ -1,13 +1,13 @@
-use clap::{App, Arg, ArgMatches};
+use clap::{Arg, ArgMatches, Command};
 use ic_canister_sandbox_backend_lib::{
     canister_sandbox_main, RUN_AS_CANISTER_SANDBOX_FLAG, RUN_AS_SANDBOX_LAUNCHER_FLAG,
 };
 use ic_canister_sandbox_launcher::sandbox_launcher_main;
-use ic_config::{Config, ConfigSource};
+use ic_config::{flag_status::FlagStatus, Config, ConfigSource};
 use ic_drun::{run_drun, DrunOptions};
 use std::path::PathBuf;
 
-const DEFAULT_CONFIG_FILE: &str = "ic.toml";
+const DEFAULT_CONFIG_FILE: &str = "ic.json5";
 const DEFAULT_EXTRA_BATCHES: u64 = 0;
 const ARG_CONF: &str = "config";
 const ARG_LOG_FILE: &str = "log-file";
@@ -33,11 +33,17 @@ fn main() -> Result<(), String> {
 #[tokio::main]
 async fn drun_main() -> Result<(), String> {
     let matches = get_arg_matches();
-    Config::run_with_temp_config(|default_config| {
+    Config::run_with_temp_config(|mut default_config| {
         let source = matches
             .value_of(ARG_CONF)
             .map(|arg| ConfigSource::File(PathBuf::from(arg)))
             .unwrap_or(ConfigSource::Default);
+        // Enable composite queries in drun by default to allow local
+        // development and testing.
+        default_config.hypervisor.composite_queries = FlagStatus::Enabled;
+        default_config.hypervisor.rate_limiting_of_debug_prints = FlagStatus::Disabled;
+        default_config.hypervisor.rate_limiting_of_heap_delta = FlagStatus::Disabled;
+        default_config.hypervisor.rate_limiting_of_instructions = FlagStatus::Disabled;
         let cfg = Config::load_with_default(&source, default_config).unwrap_or_else(|err| {
             eprintln!("Failed to load config:\n  {}", err);
             std::process::exit(1);
@@ -65,38 +71,44 @@ async fn drun_main() -> Result<(), String> {
     })
 }
 
-fn get_arg_matches() -> ArgMatches<'static> {
-    App::new("ic standalone interface")
+fn get_arg_matches() -> ArgMatches {
+    Command::new("ic standalone interface")
         .about("Standalone interface for testing application canisters.")
         .arg(
-            Arg::with_name(ARG_EXTRA_BATCHES)
+            Arg::new(ARG_EXTRA_BATCHES)
                 .long("extra-batches")
                 .value_name("INT")
-                .help(&format!(
+                .help(
+                    format!(
                     "Extra batches to execute after each response has been received (default: {}).",
                     DEFAULT_EXTRA_BATCHES
-                ))
+                )
+                    .as_str(),
+                )
                 .takes_value(true),
         )
         .arg(
-            Arg::with_name(ARG_CONF)
-                .short("c")
+            Arg::new(ARG_CONF)
+                .short('c')
                 .long("config")
                 .value_name("config")
-                .help(&format!(
-                    "Main configuration of the node (default: {}).",
-                    DEFAULT_CONFIG_FILE
-                ))
+                .help(
+                    format!(
+                        "Main configuration of the node (default: {}).",
+                        DEFAULT_CONFIG_FILE
+                    )
+                    .as_str(),
+                )
                 .takes_value(true),
         )
         .arg(
-            Arg::with_name(ARG_MESSAGES)
+            Arg::new(ARG_MESSAGES)
                 .required(true)
                 .value_name("Query/Ingress Messages")
                 .help("Text file containing one message per line."),
         )
         .arg(
-            Arg::with_name(ARG_LOG_FILE)
+            Arg::new(ARG_LOG_FILE)
                 .long(ARG_LOG_FILE)
                 .value_name("log_file")
                 .help("Log file for the run (default: None).")

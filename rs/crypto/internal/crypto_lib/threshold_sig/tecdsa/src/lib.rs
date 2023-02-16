@@ -69,7 +69,7 @@
 //! * Generation and verification of signature shares
 //! * Generation and verification of combined signatures
 //!
-//! ## Protocol: MEGa Encryption
+//! ## Protocol: Multi-encryption gadget (MEGa)
 //!
 //! File: `mega.rs`
 //!
@@ -135,7 +135,7 @@
 //!
 //! ## Utility Functions: H2C and XMD
 //!
-//! Files: `hash2curve.rs` and `xmd.rs`
+//! Files: `hash2curve.rs`, and `xmd.rs` in `seed` crate
 //!
 //! An implementation of IETF standard hash2curve is implemented in
 //! `hash2curve.rs`. This is actually never called in production; we do
@@ -172,7 +172,7 @@
 //!
 //! ## Utility Functions: Seed
 //!
-//! File: `seed.rs`
+//! File: `lib.rs` in `seed` crate
 //!
 //! This crate is deterministic; all randomness is provided by the
 //! caller. We may require several different random inputs for various
@@ -204,12 +204,14 @@
 
 #![forbid(unsafe_code)]
 
+use ic_crypto_internal_seed::xmd::XmdError;
 use ic_types::crypto::canister_threshold_sig::{ExtendedDerivationPath, MasterEcdsaPublicKey};
 use ic_types::crypto::AlgorithmId;
 use ic_types::{NumberOfNodes, Randomness};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
+pub use ic_crypto_internal_seed::Seed;
 use ic_types::crypto::canister_threshold_sig::error::{
     IDkgLoadTranscriptError, IDkgVerifyComplaintError, IDkgVerifyDealingPrivateError,
     IDkgVerifyTranscriptError,
@@ -220,23 +222,26 @@ pub use ic_types::NodeIndex;
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum ThresholdEcdsaError {
     CurveMismatch,
-    InvalidRandomOracleInput,
     InconsistentCiphertext,
-    InconsistentCommitments,
+    InconsistentOpeningAndCommitment,
     InsufficientDealings,
-    InsufficientOpenings,
+    InsufficientOpenings(usize, usize),
     InterpolationError,
     InvalidArguments(String),
-    InvalidFieldElement,
+    InvalidCommitment,
     InvalidComplaint,
-    InvalidOpening,
+    InvalidFieldElement,
     InvalidPoint,
     InvalidProof,
+    InvalidRandomOracleInput,
     InvalidRecipients,
     InvalidScalar,
     InvalidSecretShare,
+    InvalidSignature,
+    InvalidSignatureShare,
     InvalidThreshold(usize, usize),
     SerializationError(String),
+    UnexpectedCommitmentType,
 }
 
 pub type ThresholdEcdsaResult<T> = std::result::Result<T, ThresholdEcdsaError>;
@@ -250,11 +255,9 @@ mod key_derivation;
 mod mega;
 mod poly;
 pub mod ro;
-mod seed;
 pub mod sign;
 pub mod test_utils;
 mod transcript;
-mod xmd;
 pub mod zk;
 
 pub use crate::complaints::IDkgComplaintInternal;
@@ -263,9 +266,7 @@ pub use crate::fe::*;
 pub use crate::group::*;
 pub use crate::mega::*;
 pub use crate::poly::*;
-pub use crate::seed::*;
 pub use crate::transcript::*;
-pub use crate::xmd::*;
 
 pub use crate::key_derivation::{DerivationIndex, DerivationPath};
 pub use sign::{ThresholdEcdsaCombinedSigInternal, ThresholdEcdsaSigShareInternal};
@@ -273,12 +274,10 @@ pub use sign::{ThresholdEcdsaCombinedSigInternal, ThresholdEcdsaSigShareInternal
 /// Create MEGa encryption keypair
 pub fn gen_keypair(
     curve_type: EccCurveType,
-    seed: Randomness,
+    seed: Seed,
 ) -> Result<(MEGaPublicKey, MEGaPrivateKey), ThresholdEcdsaError> {
-    use rand_core::SeedableRng;
-
-    let mut rng = rand_chacha::ChaCha20Rng::from_seed(seed.get());
-    let private_key = MEGaPrivateKey::generate(curve_type, &mut rng)?;
+    let mut rng = seed.into_rng();
+    let private_key = MEGaPrivateKey::generate(curve_type, &mut rng);
 
     let public_key = private_key.public_key()?;
 
@@ -314,14 +313,12 @@ pub fn create_dealing(
     threshold: NumberOfNodes,
     recipients: &[MEGaPublicKey],
     shares: &SecretShares,
-    randomness: Randomness,
+    seed: Seed,
 ) -> Result<IDkgDealingInternal, IdkgCreateDealingInternalError> {
     let curve = match algorithm_id {
         AlgorithmId::ThresholdEcdsaSecp256k1 => Ok(EccCurveType::K256),
         _ => Err(IdkgCreateDealingInternalError::UnsupportedAlgorithm),
     }?;
-
-    let seed = Seed::from_randomness(&randomness);
 
     IDkgDealingInternal::new(
         shares,
@@ -347,9 +344,17 @@ impl From<ThresholdEcdsaError> for IDkgCreateTranscriptInternalError {
     fn from(e: ThresholdEcdsaError) -> Self {
         match e {
             ThresholdEcdsaError::CurveMismatch => Self::InconsistentCommitments,
-            ThresholdEcdsaError::InconsistentCommitments => Self::InconsistentCommitments,
+            ThresholdEcdsaError::InvalidCommitment => Self::InconsistentCommitments,
             ThresholdEcdsaError::InsufficientDealings => Self::InsufficientDealings,
             x => Self::InternalError(format!("{:?}", x)),
+        }
+    }
+}
+
+impl From<XmdError> for ThresholdEcdsaError {
+    fn from(e: XmdError) -> Self {
+        match e {
+            XmdError::InvalidOutputLength(x) => Self::InvalidArguments(format!("{:?}", x)),
         }
     }
 }
@@ -426,26 +431,28 @@ pub fn verify_transcript(
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum IDkgComputeSecretSharesInternalError {
-    InconsistentCommitments,
-    InternalError(String),
-}
-
-impl From<ThresholdEcdsaError> for IDkgComputeSecretSharesInternalError {
-    fn from(e: ThresholdEcdsaError) -> Self {
-        match e {
-            ThresholdEcdsaError::CurveMismatch => Self::InconsistentCommitments,
-            ThresholdEcdsaError::InconsistentCommitments => Self::InconsistentCommitments,
-            x => Self::InternalError(format!("{:?}", x)),
-        }
-    }
+    ComplaintShouldBeIssued,
+    InsufficientOpenings(usize, usize),
+    InvalidCiphertext(String),
+    UnableToReconstruct(String),
+    UnableToCombineOpenings(String),
 }
 
 /// Computes secret shares (in the form of commitment openings) from
 /// the given dealings.
 ///
-/// # Errors
-/// * `InconsistentCommitments` if the commitments are inconsistent. This
-///   indicates that complaints can be created with [`generate_complaints`].
+/// # Arguments:
+/// * `verified_dealings`: dealings to be decrypted,
+/// * `transcript`: the combined commitment to the coefficients of the shared polynomial,
+/// * `context_data`: associated data used in encryption and the zero-knowledge proofs,
+/// * `receiver_index`: index of the receiver in this specific IDKG instance,
+/// * `secret_key`: MEGa secret decryption key of the receiver,
+/// * `public_key`: MEGa public encryption key associated to `secret_key`,
+///
+/// # Errors:
+/// * `ComplaintShouldBeIssued`: if a ciphertext decrypts to a share that does not match with the commitment.
+/// * `InvalidCiphertext`: if a ciphertext cannot be decrypted.
+/// * `UnableToCombineOpenings`: internal error denoting that the decrypted share cannot be combined.
 pub fn compute_secret_shares(
     verified_dealings: &BTreeMap<NodeIndex, IDkgDealingInternal>,
     transcript: &IDkgTranscriptInternal,
@@ -462,7 +469,6 @@ pub fn compute_secret_shares(
         secret_key,
         public_key,
     )
-    .map_err(IDkgComputeSecretSharesInternalError::from)
 }
 
 /// Computes secret shares (in the form of commitment openings) from
@@ -473,12 +479,21 @@ pub fn compute_secret_shares(
 /// * There are sufficient valid openings (at least `reconstruction_threshold`
 ///   many) for each corrupted dealing.
 ///
-/// # Errors
-/// * `InsufficientOpenings` if we require openings for a corrupted dealing but
-///   do not have sufficiently many openings for that dealing.
-/// * `InconsistentCommitments` if the commitments are inconsistent. This
-///   indicates that there is a corrupted dealing for which we have no openings
-///   at all.
+/// # Arguments:
+/// * `verified_dealings`: dealings to be decrypted,
+/// * `openings`: openings answering complaints against dealing that could not be decrypted correctly,
+/// * `transcript`: the combined commitment to the coefficients of the shared polynomial,
+/// * `context_data`: associated data used in encryption and the zero-knowledge proofs,
+/// * `receiver_index`: index of the receiver in this specific IDKG instance,
+/// * `secret_key`: MEGa secret decryption key of the receiver,
+/// * `public_key`: MEGa public encryption key associated to `secret_key`,
+///
+/// # Errors:
+/// * `ComplaintShouldBeIssued`: if a ciphertext decrypts to a share that does not match with the commitment.
+/// * `InsufficientOpenings`: if the number of openings answering a complaint is insufficient.
+/// * `InvalidCiphertext`: if a ciphertext cannot be decrypted.
+/// * `UnableToCombineOpenings`: internal error denoting that the decrypted share cannot be combined.
+/// * `UnableToReconstruct`: internal error denoting that the received openings cannot be used to recompute a share.
 pub fn compute_secret_shares_with_openings(
     verified_dealings: &BTreeMap<NodeIndex, IDkgDealingInternal>,
     openings: &BTreeMap<NodeIndex, BTreeMap<NodeIndex, CommitmentOpening>>,
@@ -497,7 +512,6 @@ pub fn compute_secret_shares_with_openings(
         secret_key,
         public_key,
     )
-    .map_err(|e| e.into())
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -513,7 +527,7 @@ impl From<ThresholdEcdsaError> for IDkgVerifyDealingInternalError {
     fn from(e: ThresholdEcdsaError) -> Self {
         match e {
             ThresholdEcdsaError::InvalidProof => Self::InvalidProof,
-            ThresholdEcdsaError::InconsistentCommitments => Self::InvalidCommitment,
+            ThresholdEcdsaError::InvalidCommitment => Self::InvalidCommitment,
             ThresholdEcdsaError::InvalidRecipients => Self::InvalidRecipients,
             x => Self::InternalError(format!("{:?}", x)),
         }
@@ -635,7 +649,7 @@ impl From<ThresholdEcdsaError> for ThresholdEcdsaGenerateSigShareInternalError {
     fn from(e: ThresholdEcdsaError) -> Self {
         match e {
             ThresholdEcdsaError::CurveMismatch => Self::InconsistentCommitments,
-            ThresholdEcdsaError::InconsistentCommitments => Self::InconsistentCommitments,
+            ThresholdEcdsaError::InvalidCommitment => Self::InconsistentCommitments,
             x => Self::InternalError(format!("{:?}", x)),
         }
     }
@@ -710,7 +724,8 @@ impl From<ThresholdEcdsaError> for ThresholdEcdsaVerifySigShareInternalError {
     fn from(e: ThresholdEcdsaError) -> Self {
         match e {
             ThresholdEcdsaError::CurveMismatch => Self::InconsistentCommitments,
-            ThresholdEcdsaError::InconsistentCommitments => Self::InconsistentCommitments,
+            ThresholdEcdsaError::InvalidCommitment => Self::InconsistentCommitments,
+            ThresholdEcdsaError::InvalidSignatureShare => Self::InvalidSignatureShare,
             x => Self::InternalError(format!("{:?}", x)),
         }
     }
@@ -741,24 +756,20 @@ pub fn verify_signature_share(
         return Err(ThresholdEcdsaVerifySigShareInternalError::UnsupportedAlgorithm);
     }
 
-    let accept = sig_share.verify(
-        derivation_path,
-        hashed_message,
-        randomness,
-        signer_index,
-        key_transcript,
-        presig_transcript,
-        lambda,
-        kappa_times_lambda,
-        key_times_lambda,
-        curve_type,
-    )?;
-
-    if !accept {
-        return Err(ThresholdEcdsaVerifySigShareInternalError::InvalidSignatureShare);
-    }
-
-    Ok(())
+    sig_share
+        .verify(
+            derivation_path,
+            hashed_message,
+            randomness,
+            signer_index,
+            key_transcript,
+            presig_transcript,
+            lambda,
+            kappa_times_lambda,
+            key_times_lambda,
+            curve_type,
+        )
+        .map_err(|e| e.into())
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -773,7 +784,7 @@ impl From<ThresholdEcdsaError> for ThresholdEcdsaCombineSigSharesInternalError {
     fn from(e: ThresholdEcdsaError) -> Self {
         match e {
             ThresholdEcdsaError::CurveMismatch => Self::InconsistentCommitments,
-            ThresholdEcdsaError::InconsistentCommitments => Self::InconsistentCommitments,
+            ThresholdEcdsaError::InvalidCommitment => Self::InconsistentCommitments,
             ThresholdEcdsaError::InsufficientDealings => Self::InsufficientShares,
             x => Self::InternalError(format!("{:?}", x)),
         }
@@ -825,7 +836,8 @@ impl From<ThresholdEcdsaError> for ThresholdEcdsaVerifySignatureInternalError {
     fn from(e: ThresholdEcdsaError) -> Self {
         match e {
             ThresholdEcdsaError::CurveMismatch => Self::InconsistentCommitments,
-            ThresholdEcdsaError::InconsistentCommitments => Self::InconsistentCommitments,
+            ThresholdEcdsaError::InvalidCommitment => Self::InconsistentCommitments,
+            ThresholdEcdsaError::InvalidSignature => Self::InvalidSignature,
             x => Self::InternalError(format!("{:?}", x)),
         }
     }
@@ -854,20 +866,16 @@ pub fn verify_threshold_signature(
         return Err(ThresholdEcdsaVerifySignatureInternalError::UnsupportedAlgorithm);
     }
 
-    let accept = signature.verify(
-        derivation_path,
-        hashed_message,
-        randomness,
-        presig_transcript,
-        key_transcript,
-        curve_type,
-    )?;
-
-    if !accept {
-        return Err(ThresholdEcdsaVerifySignatureInternalError::InvalidSignature);
-    }
-
-    Ok(())
+    signature
+        .verify(
+            derivation_path,
+            hashed_message,
+            randomness,
+            presig_transcript,
+            key_transcript,
+            curve_type,
+        )
+        .map_err(|e| e.into())
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -882,21 +890,24 @@ impl From<ThresholdEcdsaError> for ThresholdEcdsaDerivePublicKeyError {
             ThresholdEcdsaError::InvalidArguments(s) => Self::InvalidArgument(s),
             ThresholdEcdsaError::CurveMismatch
             | ThresholdEcdsaError::InconsistentCiphertext
-            | ThresholdEcdsaError::InconsistentCommitments
+            | ThresholdEcdsaError::InconsistentOpeningAndCommitment
             | ThresholdEcdsaError::InsufficientDealings
-            | ThresholdEcdsaError::InsufficientOpenings
+            | ThresholdEcdsaError::InsufficientOpenings(_, _)
             | ThresholdEcdsaError::InterpolationError
+            | ThresholdEcdsaError::InvalidCommitment
             | ThresholdEcdsaError::InvalidComplaint
             | ThresholdEcdsaError::InvalidFieldElement
-            | ThresholdEcdsaError::InvalidOpening
             | ThresholdEcdsaError::InvalidPoint
             | ThresholdEcdsaError::InvalidProof
+            | ThresholdEcdsaError::InvalidRandomOracleInput
             | ThresholdEcdsaError::InvalidRecipients
             | ThresholdEcdsaError::InvalidScalar
             | ThresholdEcdsaError::InvalidSecretShare
-            | ThresholdEcdsaError::InvalidRandomOracleInput
+            | ThresholdEcdsaError::InvalidSignature
+            | ThresholdEcdsaError::InvalidSignatureShare
             | ThresholdEcdsaError::InvalidThreshold(_, _)
-            | ThresholdEcdsaError::SerializationError(_) => Self::InternalError(e),
+            | ThresholdEcdsaError::SerializationError(_)
+            | ThresholdEcdsaError::UnexpectedCommitmentType => Self::InternalError(e),
         }
     }
 }
@@ -1062,14 +1073,15 @@ pub fn open_dealing(
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum ThresholdVerifyOpeningInternalError {
-    InconsistentCommitments,
+    InvalidOpening,
+    MismatchingType,
     InternalError(String),
 }
 
 impl From<ThresholdEcdsaError> for ThresholdVerifyOpeningInternalError {
     fn from(e: ThresholdEcdsaError) -> Self {
         match e {
-            ThresholdEcdsaError::InconsistentCommitments => Self::InconsistentCommitments,
+            ThresholdEcdsaError::InconsistentOpeningAndCommitment => Self::MismatchingType,
             x => Self::InternalError(format!("{:?}", x)),
         }
     }
@@ -1082,15 +1094,24 @@ impl From<ThresholdEcdsaError> for ThresholdVerifyOpeningInternalError {
 ///
 /// # Preconditions
 /// * The dealing has already been publically verified
+/// # Errors
+/// * `ThresholdVerifyOpeningInternalError::InvalidOpening` if the opening does
+/// not match with the polynomial commitment.
+/// * `ThresholdVerifyOpeningInternalError::MismatchingType` if the opening
+/// has a type that is inconsistent with the polynomial commitment.
+/// * `ThresholdVerifyOpeningInternalError::InternalError` if there is an
+/// unexpected internal error.
 pub fn verify_dealing_opening(
     verified_dealing: &IDkgDealingInternal,
     opener_index: NodeIndex,
     opening: &CommitmentOpening,
 ) -> Result<(), ThresholdVerifyOpeningInternalError> {
-    verified_dealing
+    let is_invalid = !verified_dealing
         .commitment
         .check_opening(opener_index, opening)?;
-
+    if is_invalid {
+        return Err(ThresholdVerifyOpeningInternalError::InvalidOpening);
+    }
     Ok(())
 }
 

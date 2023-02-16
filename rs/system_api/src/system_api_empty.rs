@@ -1,11 +1,12 @@
 use ic_interfaces::execution_environment::{
+    ExecutionComplexity,
     HypervisorError::{self},
-    HypervisorResult, SystemApi,
+    HypervisorResult, PerformanceCounterType, SystemApi,
 };
 use ic_registry_subnet_type::SubnetType;
 use ic_replicated_state::PageIndex;
 use ic_sys::PageBytes;
-use ic_types::{Cycles, NumBytes, NumInstructions, Time};
+use ic_types::{Cycles, NumBytes, NumInstructions, NumPages, Time};
 
 const MESSAGE_UNIMPLEMENTED: &str =
     "Empty System API should not be called. Only used by the embedder to create an ExecutionState instance";
@@ -15,6 +16,12 @@ const MESSAGE_UNIMPLEMENTED: &str =
 pub struct SystemApiEmpty;
 
 impl SystemApi for SystemApiEmpty {
+    fn set_execution_complexity(&mut self, _complexity: ExecutionComplexity) {
+        unimplemented!("{}", MESSAGE_UNIMPLEMENTED)
+    }
+    fn execution_complexity(&self) -> &ExecutionComplexity {
+        unimplemented!("{}", MESSAGE_UNIMPLEMENTED)
+    }
     fn set_execution_error(&mut self, _error: HypervisorError) {
         unimplemented!("{}", MESSAGE_UNIMPLEMENTED)
     }
@@ -33,7 +40,16 @@ impl SystemApi for SystemApiEmpty {
     fn subnet_type(&self) -> SubnetType {
         unimplemented!("{}", MESSAGE_UNIMPLEMENTED)
     }
+    fn message_instruction_limit(&self) -> NumInstructions {
+        unimplemented!("{}", MESSAGE_UNIMPLEMENTED)
+    }
+    fn message_instructions_executed(&self, _instruction_counter: i64) -> NumInstructions {
+        unimplemented!("{}", MESSAGE_UNIMPLEMENTED)
+    }
     fn slice_instruction_limit(&self) -> NumInstructions {
+        unimplemented!("{}", MESSAGE_UNIMPLEMENTED)
+    }
+    fn slice_instructions_executed(&self, _instruction_counter: i64) -> NumInstructions {
         unimplemented!("{}", MESSAGE_UNIMPLEMENTED)
     }
     fn ic0_msg_caller_copy(&self, _: u32, _: u32, _: u32, _: &mut [u8]) -> HypervisorResult<()> {
@@ -117,22 +133,6 @@ impl SystemApi for SystemApiEmpty {
     fn ic0_trap(&self, _: u32, _: u32, _: &[u8]) -> HypervisorResult<()> {
         unimplemented!("{}", MESSAGE_UNIMPLEMENTED)
     }
-    fn ic0_call_simple(
-        &mut self,
-        _: u32,
-        _: u32,
-        _: u32,
-        _: u32,
-        _: u32,
-        _: u32,
-        _: u32,
-        _: u32,
-        _: u32,
-        _: u32,
-        _: &[u8],
-    ) -> HypervisorResult<i32> {
-        unimplemented!("{}", MESSAGE_UNIMPLEMENTED)
-    }
     fn ic0_call_new(
         &mut self,
         _: u32,
@@ -189,19 +189,39 @@ impl SystemApi for SystemApiEmpty {
     fn ic0_time(&self) -> HypervisorResult<Time> {
         unimplemented!("{}", MESSAGE_UNIMPLEMENTED)
     }
-    fn out_of_instructions(
-        &self,
-        _num_instruction_left: NumInstructions,
-    ) -> Result<NumInstructions, HypervisorError> {
+    fn ic0_global_timer_set(&mut self, _time: Time) -> HypervisorResult<Time> {
         unimplemented!("{}", MESSAGE_UNIMPLEMENTED)
     }
-    fn update_available_memory(&mut self, _: i32, _: u32) -> HypervisorResult<i32> {
+    fn ic0_performance_counter(
+        &self,
+        _performance_counter_type: PerformanceCounterType,
+    ) -> HypervisorResult<u64> {
+        unimplemented!("{}", MESSAGE_UNIMPLEMENTED)
+    }
+    fn ic0_canister_version(&self) -> HypervisorResult<u64> {
+        unimplemented!("{}", MESSAGE_UNIMPLEMENTED)
+    }
+    fn out_of_instructions(&mut self, _instruction_counter: i64) -> Result<i64, HypervisorError> {
+        unimplemented!("{}", MESSAGE_UNIMPLEMENTED)
+    }
+    fn update_available_memory(&mut self, _: i64, _: u64) -> HypervisorResult<()> {
+        unimplemented!("{}", MESSAGE_UNIMPLEMENTED)
+    }
+    fn try_grow_stable_memory(
+        &mut self,
+        _: u64,
+        _: u64,
+        _: ic_interfaces::execution_environment::StableMemoryApi,
+    ) -> HypervisorResult<ic_interfaces::execution_environment::StableGrowOutcome> {
+        unimplemented!("{}", MESSAGE_UNIMPLEMENTED)
+    }
+    fn deallocate_pages(&mut self, _: u64) {
         unimplemented!("{}", MESSAGE_UNIMPLEMENTED)
     }
     fn ic0_canister_cycle_balance(&self) -> HypervisorResult<u64> {
         unimplemented!("{}", MESSAGE_UNIMPLEMENTED)
     }
-    fn ic0_canister_cycles_balance128(&self, _: u32, _: &mut [u8]) -> HypervisorResult<()> {
+    fn ic0_canister_cycle_balance128(&self, _: u32, _: &mut [u8]) -> HypervisorResult<()> {
         unimplemented!("{}", MESSAGE_UNIMPLEMENTED)
     }
     fn ic0_msg_cycles_available(&self) -> HypervisorResult<u64> {
@@ -249,6 +269,13 @@ impl SystemApi for SystemApiEmpty {
         unimplemented!("{}", MESSAGE_UNIMPLEMENTED)
     }
     fn ic0_mint_cycles(&mut self, _: u64) -> HypervisorResult<u64> {
+        unimplemented!("{}", MESSAGE_UNIMPLEMENTED)
+    }
+    fn dirty_pages_from_stable_write(
+        &self,
+        _: u64,
+        _: u64,
+    ) -> HypervisorResult<(NumPages, NumInstructions)> {
         unimplemented!("{}", MESSAGE_UNIMPLEMENTED)
     }
 }

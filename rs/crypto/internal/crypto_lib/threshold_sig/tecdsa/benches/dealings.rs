@@ -2,7 +2,6 @@ use criterion::*;
 use ic_crypto_internal_threshold_sig_ecdsa::*;
 use ic_types::crypto::AlgorithmId;
 use ic_types::*;
-use rand::Rng;
 
 fn create_random_dealing(
     threshold: u32,
@@ -16,15 +15,13 @@ fn create_random_dealing(
     let mut private_keys = Vec::with_capacity(recipients);
 
     for _i in 0..recipients {
-        private_keys.push(MEGaPrivateKey::generate(curve, &mut rng)?);
+        private_keys.push(MEGaPrivateKey::generate(curve, &mut rng));
     }
 
     let public_keys = private_keys
         .iter()
         .map(|k| k.public_key())
         .collect::<Result<Vec<_>, _>>()?;
-
-    let randomness = Randomness::from(rng.gen::<[u8; 32]>());
 
     let shares = SecretShares::Random;
 
@@ -35,7 +32,7 @@ fn create_random_dealing(
         NumberOfNodes::from(threshold),
         &public_keys,
         &shares,
-        randomness,
+        Seed::from_rng(&mut rng),
     )
 }
 

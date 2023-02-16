@@ -1,5 +1,3 @@
-use prost::Message;
-
 use candid::{candid_method, Decode};
 use dfn_candid::{candid, candid_one};
 use dfn_core::{
@@ -12,7 +10,8 @@ use ic_nervous_system_common::MethodAuthzChange;
 use ic_nns_common::{access_control::check_caller_is_root, pb::v1::CanisterAuthzInfo};
 use ic_nns_constants::{GOVERNANCE_CANISTER_ID, ROOT_CANISTER_ID};
 use ic_protobuf::registry::{
-    dc::v1::AddOrRemoveDataCentersProposalPayload,
+    dc::v1::{AddOrRemoveDataCentersProposalPayload, DataCenterRecord},
+    node_operator::v1::{NodeOperatorRecord, RemoveNodeOperatorsPayload},
     node_rewards::v2::UpdateNodeRewardsTableProposalPayload,
 };
 use ic_registry_transport::{
@@ -26,53 +25,52 @@ use ic_registry_transport::{
     serialize_atomic_mutate_response, serialize_get_changes_since_response,
     serialize_get_value_response,
 };
-use ic_types::messages::MAX_INTER_CANISTER_PAYLOAD_IN_BYTES_U64 as MAX_RESPONSE_SIZE;
+use ic_types::PrincipalId;
+use prost::Message;
 use registry_canister::{
     certification::{current_version_tree, hash_tree_to_proto},
     common::LOG_PREFIX,
     init::RegistryCanisterInitPayload,
     mutations::{
+        complete_canister_migration::CompleteCanisterMigrationPayload,
         do_add_node_operator::AddNodeOperatorPayload,
         do_add_nodes_to_subnet::AddNodesToSubnetPayload,
         do_bless_replica_version::BlessReplicaVersionPayload,
+        do_change_subnet_membership::ChangeSubnetMembershipPayload,
         do_create_subnet::CreateSubnetPayload,
         do_delete_subnet::DeleteSubnetPayload,
         do_recover_subnet::RecoverSubnetPayload,
         do_remove_nodes_from_subnet::RemoveNodesFromSubnetPayload,
+        do_retire_replica_version::RetireReplicaVersionPayload,
+        do_set_firewall_config::SetFirewallConfigPayload,
         do_update_node_directly::UpdateNodeDirectlyPayload,
         do_update_node_operator_config::UpdateNodeOperatorConfigPayload,
         do_update_node_operator_config_directly::UpdateNodeOperatorConfigDirectlyPayload,
         do_update_subnet::UpdateSubnetPayload,
         do_update_subnet_replica::UpdateSubnetReplicaVersionPayload,
         do_update_unassigned_nodes_config::UpdateUnassignedNodesConfigPayload,
-        node_management::{
-            do_remove_node_directly::RemoveNodeDirectlyPayload, do_remove_nodes::RemoveNodesPayload,
+        firewall::{
+            AddFirewallRulesPayload, RemoveFirewallRulesPayload, UpdateFirewallRulesPayload,
         },
-        reroute_canister_range::RerouteCanisterRangePayload,
+        node_management::{
+            do_add_node::AddNodePayload, do_remove_node_directly::RemoveNodeDirectlyPayload,
+            do_remove_nodes::RemoveNodesPayload,
+        },
+        prepare_canister_migration::PrepareCanisterMigrationPayload,
+        reroute_canister_ranges::RerouteCanisterRangesPayload,
     },
     pb::v1::{NodeProvidersMonthlyXdrRewards, RegistryCanisterStableStorage},
     proto_on_wire::protobuf,
-    registry::{EncodedVersion, Registry},
+    registry::{EncodedVersion, Registry, MAX_REGISTRY_DELTAS_SIZE},
     registry_lifecycle,
 };
 
 #[cfg(target_arch = "wasm32")]
 use dfn_core::println;
 
-use ic_protobuf::registry::node_operator::v1::RemoveNodeOperatorsPayload;
-use registry_canister::mutations::do_set_firewall_config::SetFirewallConfigPayload;
-use registry_canister::mutations::node_management::do_add_node::AddNodePayload;
-
-// Makes expose_build_metadata! available.
-#[macro_use]
-extern crate ic_nervous_system_common;
-
 static mut REGISTRY: Option<Registry> = None;
 
 const MAX_VERSIONS_PER_QUERY: usize = 1000;
-// The maximum size of deltas that the registry will attempt to send.
-// We reserve ⅓ of the response buffer capacity for encoding overhead.
-const MAX_REGISTRY_DELTAS_SIZE: usize = (MAX_RESPONSE_SIZE - MAX_RESPONSE_SIZE / 3) as usize;
 
 fn registry() -> &'static Registry {
     registry_mut()
@@ -170,7 +168,7 @@ fn canister_post_upgrade() {
     registry_lifecycle::canister_post_upgrade(registry, stable_storage.as_slice());
 }
 
-expose_build_metadata! {}
+ic_nervous_system_common_build_metadata::define_get_build_metadata_candid_method! {}
 
 #[export_name = "canister_update update_authz"]
 fn update_authz() {
@@ -387,6 +385,20 @@ fn bless_replica_version_(payload: BlessReplicaVersionPayload) {
     recertify_registry();
 }
 
+#[export_name = "canister_update retire_replica_version"]
+fn retire_replica_version() {
+    check_caller_is_governance_and_log("retire_replica_version");
+    over(candid_one, |payload: RetireReplicaVersionPayload| {
+        retire_replica_version_(payload)
+    });
+}
+
+#[candid_method(update, rename = "retire_replica_version")]
+fn retire_replica_version_(payload: RetireReplicaVersionPayload) {
+    registry_mut().do_retire_replica_version(payload);
+    recertify_registry();
+}
+
 #[export_name = "canister_update update_subnet_replica_version"]
 fn update_subnet_replica_version() {
     check_caller_is_governance_and_log("update_subnet_replica_version");
@@ -482,6 +494,20 @@ fn remove_nodes_from_subnet() {
 #[candid_method(update, rename = "remove_nodes_from_subnet")]
 fn remove_nodes_from_subnet_(payload: RemoveNodesFromSubnetPayload) {
     registry_mut().do_remove_nodes_from_subnet(payload);
+    recertify_registry();
+}
+
+#[export_name = "canister_update change_subnet_membership"]
+fn change_subnet_membership() {
+    check_caller_is_governance_and_log("change_subnet_membership");
+    over(candid_one, |payload: ChangeSubnetMembershipPayload| {
+        change_subnet_membership_(payload)
+    });
+}
+
+#[candid_method(update, rename = "change_subnet_membership")]
+fn change_subnet_membership_(payload: ChangeSubnetMembershipPayload) {
+    registry_mut().do_change_subnet_membership(payload);
     recertify_registry();
 }
 
@@ -589,6 +615,48 @@ fn set_firewal_config_(payload: SetFirewallConfigPayload) {
     recertify_registry();
 }
 
+#[export_name = "canister_update add_firewall_rules"]
+fn add_firewall_rules() {
+    check_caller_is_governance_and_log("add_firewall_rules");
+    over(candid_one, |payload: AddFirewallRulesPayload| {
+        add_firewall_rules_(payload)
+    });
+}
+
+#[candid_method(update, rename = "add_firewall_rules")]
+fn add_firewall_rules_(payload: AddFirewallRulesPayload) {
+    registry_mut().do_add_firewall_rules(payload);
+    recertify_registry();
+}
+
+#[export_name = "canister_update remove_firewall_rules"]
+fn remove_firewall_rules() {
+    check_caller_is_governance_and_log("remove_firewall_rules");
+    over(candid_one, |payload: RemoveFirewallRulesPayload| {
+        remove_firewall_rules_(payload)
+    });
+}
+
+#[candid_method(update, rename = "remove_firewall_rules")]
+fn remove_firewall_rules_(payload: RemoveFirewallRulesPayload) {
+    registry_mut().do_remove_firewall_rules(payload);
+    recertify_registry();
+}
+
+#[export_name = "canister_update update_firewall_rules"]
+fn update_firewall_rules() {
+    check_caller_is_governance_and_log("update_firewall_rules");
+    over(candid_one, |payload: UpdateFirewallRulesPayload| {
+        update_firewall_rules_(payload)
+    });
+}
+
+#[candid_method(update, rename = "update_firewall_rules")]
+fn update_firewall_rules_(payload: UpdateFirewallRulesPayload) {
+    registry_mut().do_update_firewall_rules(payload);
+    recertify_registry();
+}
+
 #[export_name = "canister_update update_node_rewards_table"]
 fn update_node_rewards_table() {
     check_caller_is_governance_and_log("update_node_rewards_table");
@@ -627,17 +695,53 @@ fn update_unassigned_nodes_config_(payload: UpdateUnassignedNodesConfigPayload) 
     recertify_registry();
 }
 
-#[export_name = "canister_update reroute_canister_range"]
-fn reroute_canister_range() {
-    check_caller_is_governance_and_log("reroute_canister_range");
-    over_may_reject(candid_one, |payload: RerouteCanisterRangePayload| {
-        reroute_canister_range_(payload)
+#[export_name = "canister_update prepare_canister_migration"]
+fn prepare_canister_migration() {
+    check_caller_is_governance_and_log("prepare_canister_migration");
+    over_may_reject(candid_one, |payload: PrepareCanisterMigrationPayload| {
+        prepare_canister_migration_(payload)
     });
 }
 
-#[candid_method(update, rename = "reroute_canister_range")]
-fn reroute_canister_range_(payload: RerouteCanisterRangePayload) -> Result<(), String> {
-    if let Err(msg) = registry_mut().reroute_canister_range(payload) {
+#[candid_method(update, rename = "prepare_canister_migration")]
+fn prepare_canister_migration_(payload: PrepareCanisterMigrationPayload) -> Result<(), String> {
+    if let Err(msg) = registry_mut().prepare_canister_migration(payload) {
+        println!("{} Reject: {}", LOG_PREFIX, msg);
+        return Err(msg);
+    }
+    recertify_registry();
+    Ok(())
+}
+
+#[export_name = "canister_update reroute_canister_ranges"]
+fn reroute_canister_ranges() {
+    check_caller_is_governance_and_log("reroute_canister_ranges");
+    over_may_reject(candid_one, |payload: RerouteCanisterRangesPayload| {
+        reroute_canister_ranges_(payload)
+    });
+}
+
+#[candid_method(update, rename = "reroute_canister_ranges")]
+fn reroute_canister_ranges_(payload: RerouteCanisterRangesPayload) -> Result<(), String> {
+    if let Err(msg) = registry_mut().reroute_canister_ranges(payload) {
+        println!("{} Reject: {}", LOG_PREFIX, msg);
+        return Err(msg);
+    }
+    recertify_registry();
+    Ok(())
+}
+
+#[export_name = "canister_update complete_canister_migration"]
+fn complete_canister_migration() {
+    check_caller_is_governance_and_log("complete_canister_migration");
+    over_may_reject(candid_one, |payload: CompleteCanisterMigrationPayload| {
+        complete_canister_migration_(payload)
+    });
+}
+
+#[candid_method(update, rename = "complete_canister_migration")]
+fn complete_canister_migration_(payload: CompleteCanisterMigrationPayload) -> Result<(), String> {
+    if let Err(msg) = registry_mut().complete_canister_migration(payload) {
         println!("{} Reject: {}", LOG_PREFIX, msg);
         return Err(msg);
     }
@@ -659,6 +763,23 @@ fn get_node_providers_monthly_xdr_rewards() {
 #[candid_method(query, rename = "get_node_providers_monthly_xdr_rewards")]
 fn get_node_providers_monthly_xdr_rewards_() -> Result<NodeProvidersMonthlyXdrRewards, String> {
     registry().get_node_providers_monthly_xdr_rewards()
+}
+
+#[export_name = "canister_query get_node_operators_and_dcs_of_node_provider"]
+fn get_node_operators_and_dcs_of_node_provider() {
+    over(
+        candid_one,
+        |node_provider: PrincipalId| -> Result<Vec<(DataCenterRecord, NodeOperatorRecord)>, String> {
+            get_node_operators_and_dcs_of_node_provider_(node_provider)
+        },
+    )
+}
+
+#[candid_method(query, rename = "get_node_operators_and_dcs_of_node_provider")]
+fn get_node_operators_and_dcs_of_node_provider_(
+    node_provider: PrincipalId,
+) -> Result<Vec<(DataCenterRecord, NodeOperatorRecord)>, String> {
+    registry().get_node_operators_and_dcs_of_node_provider(node_provider)
 }
 
 #[export_name = "canister_update add_node"]
@@ -729,6 +850,26 @@ fn certified_response(tree: HashTree<'_>) -> CertifiedResponse {
     }
 }
 
+fn encode_metrics(w: &mut ic_metrics_encoder::MetricsEncoder<Vec<u8>>) -> std::io::Result<()> {
+    w.encode_gauge(
+        "registry_stable_memory_size_bytes",
+        ic_nervous_system_common::stable_memory_size_bytes() as f64,
+        "Size of the stable memory allocated by this canister measured in bytes.",
+    )?;
+    w.encode_gauge(
+        "registry_total_memory_size_bytes",
+        ic_nervous_system_common::total_memory_size_bytes() as f64,
+        "Size of the total memory allocated by this canister measured in bytes.",
+    )?;
+
+    Ok(())
+}
+
+#[export_name = "canister_query http_request"]
+fn http_request() {
+    dfn_http_metrics::serve_metrics(encode_metrics);
+}
+
 // This makes this Candid service self-describing, so that for example Candid
 // UI, but also other tools, can seamlessly integrate with it.
 // The concrete interface (__get_candid_interface_tmp_hack) is provisional, but
@@ -764,7 +905,11 @@ fn main() {}
 
 #[test]
 fn check_did_file() {
-    let did = String::from_utf8(std::fs::read("canister/registry.did").unwrap()).unwrap();
+    let did_file_loc = format!(
+        "{}/canister/registry.did",
+        std::env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR not set")
+    );
+    let did = String::from_utf8(std::fs::read(did_file_loc).unwrap()).unwrap();
 
     // See comments in main above
     candid::export_service!();

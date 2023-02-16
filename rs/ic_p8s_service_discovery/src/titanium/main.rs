@@ -1,4 +1,5 @@
 use std::{
+    fs::OpenOptions,
     net::SocketAddr,
     path::PathBuf,
     sync::Arc,
@@ -6,26 +7,27 @@ use std::{
 };
 
 use anyhow::{bail, Result};
+use clap::Parser;
 use crossbeam::select;
 use crossbeam_channel::Receiver;
 use futures_util::FutureExt;
 use humantime::parse_duration;
 use ic_async_utils::shutdown_signal;
 use ic_config::metrics::{Config as MetricsConfig, Exporter};
+use ic_http_endpoints_metrics::MetricsHttpEndpoint;
 use ic_metrics::MetricsRegistry;
-use ic_metrics_exporter::MetricsRuntimeImpl;
 use ic_p8s_service_discovery::titanium::{
     file_sd::FileSd,
     ic_discovery::{IcServiceDiscovery, IcServiceDiscoveryImpl, JOB_NAMES},
+    log_scraper::scrape_logs,
     mainnet_registry::{create_local_store_from_changelog, get_mainnet_delta_6d_c1},
     metrics::Metrics,
     rest_api::start_http_server,
 };
 use slog::{info, o, warn, Drain, Logger};
-use structopt::StructOpt;
 
 fn main() -> Result<()> {
-    let cli_args = CliArgs::from_args().validate()?;
+    let cli_args = CliArgs::parse().validate()?;
     let rt = tokio::runtime::Runtime::new()?;
     let log = make_logger();
     let metrics_registry = MetricsRegistry::new();
@@ -79,7 +81,8 @@ fn main() -> Result<()> {
         let (stop_signal_sender, stop_signal_rcv) = crossbeam::channel::bounded::<()>(0);
         let poll_loop = make_poll_loop(
             log.clone(),
-            ic_discovery,
+            rt.handle().clone(),
+            ic_discovery.clone(),
             stop_signal_rcv,
             cli_args.poll_interval,
             Metrics::new(metrics_registry.clone()),
@@ -97,14 +100,32 @@ fn main() -> Result<()> {
         None
     };
 
+    let log_scrape_handle = if let Some(journal_file_path) = cli_args.gatewayd_logs_path {
+        let file = OpenOptions::new()
+            .append(true)
+            .create(true)
+            .open(journal_file_path)
+            .expect("Could not open file.");
+        Some(rt.spawn(scrape_logs(
+            log.clone(),
+            ic_discovery,
+            cli_args.gatewayd_logs_target_filter,
+            file,
+            shutdown_signal.clone(),
+        )))
+    } else {
+        None
+    };
+
     info!(
         log,
         "Metrics are exposed on {}.", cli_args.metrics_listen_addr
     );
     let exporter_config = MetricsConfig {
         exporter: Exporter::Http(cli_args.metrics_listen_addr),
+        ..Default::default()
     };
-    let metrics_runtime = MetricsRuntimeImpl::new_insecure(
+    let metrics_endpoint = MetricsHttpEndpoint::new_insecure(
         rt.handle().clone(),
         exporter_config,
         metrics_registry,
@@ -115,17 +136,23 @@ fn main() -> Result<()> {
     if let Some(http_handle) = http_handle {
         let _ = rt.block_on(http_handle)?;
     }
-    std::mem::drop(metrics_runtime);
+    if let Some(log_scrape_handle) = log_scrape_handle {
+        rt.block_on(log_scrape_handle)?;
+    }
+
+    std::mem::drop(metrics_endpoint);
 
     if let Some((stop_signal_handler, join_handle)) = scrape_handle {
         stop_signal_handler.send(())?;
         join_handle.join().expect("join() failed.");
     }
+
     Ok(())
 }
 
 fn make_poll_loop(
     log: slog::Logger,
+    rt: tokio::runtime::Handle,
     ic_discovery: Arc<IcServiceDiscoveryImpl>,
     stop_signal: Receiver<()>,
     poll_interval: Duration,
@@ -151,7 +178,7 @@ fn make_poll_loop(
             }
             info!(log, "Update registries");
             let timer = metrics.registries_update_latency_seconds.start_timer();
-            if let Err(e) = ic_discovery.update_registries() {
+            if let Err(e) = rt.block_on(ic_discovery.update_registries()) {
                 warn!(
                     log,
                     "Failed to sync registry @ interval {:?}: {:?}", tick, e
@@ -199,11 +226,12 @@ fn make_logger() -> Logger {
     slog::Logger::root(drain.fuse(), o!())
 }
 
-#[derive(StructOpt, Debug)]
+#[derive(Parser, Debug)]
+#[clap(about, version)]
 pub struct CliArgs {
-    #[structopt(
+    #[clap(
         long = "targets-dir",
-        about = r#"
+        help = r#"
 A writeable directory where the registries of the targeted Internet Computer
 instances are stored.
 
@@ -215,9 +243,9 @@ initialized with a hardcoded initial registry.
     )]
     targets_dir: PathBuf,
 
-    #[structopt(
+    #[clap(
         long = "no-mercury",
-        about = r#"
+        help = r#"
 Omit initializing the mercury (mainnet) registry if it is not present in the
 scraping directory.
 
@@ -225,9 +253,9 @@ scraping directory.
     )]
     no_mercury: bool,
 
-    #[structopt(
+    #[clap(
         long = "no-poll",
-        about = r#"
+        help = r#"
 Do not scrape the ICs (i.e. the content of the scraping directory and the served
 targets remains unchanged).
 
@@ -235,7 +263,7 @@ targets remains unchanged).
     )]
     no_poll: bool,
 
-    #[structopt(
+    #[clap(
     long = "poll-interval",
     default_value = "10s",
     parse(try_from_str = parse_duration),
@@ -246,7 +274,7 @@ The interval at which ICs are polled for updates.
     )]
     poll_interval: Duration,
 
-    #[structopt(
+    #[clap(
     long = "query-request-timeout",
     default_value = "5s",
     parse(try_from_str = parse_duration),
@@ -257,7 +285,7 @@ The HTTP-request timeout used when quering for registry updates.
     )]
     registry_query_timeout: Duration,
 
-    #[structopt(
+    #[clap(
         long = "listen-addr",
         help = r#"
 The listen address for service discovery.
@@ -266,7 +294,7 @@ The listen address for service discovery.
     )]
     listen_addr: Option<SocketAddr>,
 
-    #[structopt(
+    #[clap(
         long = "file-sd-base-path",
         help = r#"
 If specified, for each job, a json file containing the targets will be written
@@ -277,7 +305,7 @@ targets.
     )]
     file_sd_base_path: Option<PathBuf>,
 
-    #[structopt(
+    #[clap(
         long = "metrics-listen-addr",
         default_value = "[::]:9099",
         help = r#"
@@ -286,7 +314,37 @@ The listen address on which metrics for this service should be exposed.
 "#
     )]
     metrics_listen_addr: SocketAddr,
+
+    #[clap(
+        long = "logs-target-filter",
+        help = r#"
+A filter of the format `<key>=<value>`. If specified and --pull-gatewayd-logs is
+specified, the given filter is applied to the list of targets from which to pull
+logs.
+
+Example:
+  --gatewayd-logs-target-filter node_id=n76p6-epjz2-5ensc-gwvgv-niomg-4v3mb-rj4rr-nek67-g7hez-wlv6q-vqe
+
+  Filters the list of targets used for scraping logs.
+
+"#
+    )]
+    gatewayd_logs_target_filter: Option<String>,
+
+    #[clap(
+        long = "scrape-journal-gatewayd-logs",
+        help = r#"
+If specified, scrape logs from targets and write all logs to the given file. The
+logs are scraped from the endpoint exposed by the systemd-journal-gatewayd
+service.
+
+https://www.freedesktop.org/software/systemd/man/systemd-journal-gatewayd.service.html
+        
+"#
+    )]
+    gatewayd_logs_path: Option<PathBuf>,
 }
+
 impl CliArgs {
     fn validate(self) -> Result<Self> {
         if !self.targets_dir.exists() {
@@ -299,10 +357,51 @@ impl CliArgs {
 
         if let Some(file_sd_base_path) = &self.file_sd_base_path {
             if !file_sd_base_path.is_dir() {
-                bail!("Not a directory: {:?}", file_sd_base_path)
+                bail!("Not a directory: {:?}", file_sd_base_path);
             }
         }
 
+        if let Some(gatewayd_logs_path) = &self.gatewayd_logs_path {
+            let parent_dir = gatewayd_logs_path.parent().unwrap();
+            if !parent_dir.is_dir() {
+                bail!("Directory does not exist: {:?}", parent_dir);
+            }
+        }
+
+        if let Some(log_filter) = &self.gatewayd_logs_target_filter {
+            check_logs_filter_format(log_filter)?;
+        }
+
         Ok(self)
+    }
+}
+
+fn check_logs_filter_format(log_filter: &str) -> Result<()> {
+    let items = log_filter.split('=').collect::<Vec<_>>();
+    if items.len() != 2 {
+        bail!("Invalid filter {:?}", log_filter);
+    }
+
+    let key = items[0];
+    if !(key == "node_id" || key == "subnet_id") {
+        bail!(
+            "A filter must be of the form node_id=<> or subnet_id=<>: {:?}",
+            log_filter
+        );
+    }
+
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn correct_filter_is_accepted() {
+        check_logs_filter_format(
+            "node_id=25p5a-3yzir-ifqqt-5lggj-g4nxg-v2qe2-vxw57-qkxtd-wjohn-kfbfp-bqe",
+        )
+        .unwrap()
     }
 }

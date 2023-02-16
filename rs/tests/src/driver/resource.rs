@@ -2,17 +2,20 @@ use crate::driver::ic::{AmountOfMemoryKiB, InternetComputer, Node, NrOfVCPUs};
 use crate::driver::universal_vm::UniversalVm;
 use anyhow;
 use serde::{Deserialize, Serialize};
+use slog::warn;
 use std::collections::BTreeMap;
 use std::net::Ipv6Addr;
 use url::Url;
 
-use super::driver_setup::{IC_OS_IMG_SHA256, IC_OS_IMG_URL};
-use super::farm::CreateVmRequest;
-use super::farm::Farm;
 use super::farm::FarmResult;
 use super::farm::ImageLocation;
 use super::farm::ImageLocation::{IcOsImageViaUrl, ImageViaUrl};
-use super::test_env::TestEnv;
+use super::farm::{CreateVmRequest, HostFeature};
+use super::farm::{Farm, VmType};
+use super::ic::{ImageSizeGiB, VmAllocationStrategy, VmResources};
+use super::test_env::{TestEnv, TestEnvAttribute};
+use super::test_env_api::HasIcDependencies;
+use super::test_setup::GroupSetup;
 
 const DEFAULT_VCPUS_PER_VM: NrOfVCPUs = NrOfVCPUs::new(4);
 const DEFAULT_MEMORY_KIB_PER_VM: AmountOfMemoryKiB = AmountOfMemoryKiB::new(25165824); // 24GiB
@@ -80,15 +83,18 @@ impl ResourceRequest {
 }
 
 /// Virtual machine configuration as to be requested.
-/// At first, the set of possible configurations is just a singleton: We assume
-/// that there is only one possible VM configuration available.
+/// At first, the set of possible configurations is just a singleton:
+/// We assume that there is only one possible VM configuration available.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub struct VmSpec {
     pub name: String,
     pub vcpus: NrOfVCPUs,
     pub memory_kibibytes: AmountOfMemoryKiB,
     pub boot_image: BootImage,
+    pub boot_image_minimal_size_gibibytes: Option<ImageSizeGiB>,
     pub has_ipv4: bool,
+    pub vm_allocation: Option<VmAllocationStrategy>,
+    pub required_host_features: Vec<HostFeature>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -130,34 +136,52 @@ pub fn get_resource_request(
     test_env: &TestEnv,
     group_name: &str,
 ) -> anyhow::Result<ResourceRequest> {
-    let url = test_env.read_object(IC_OS_IMG_URL)?;
-    let primary_image_sha256 = test_env.read_object(IC_OS_IMG_SHA256)?;
-    let mut res_req = ResourceRequest::new(ImageType::IcOsImage, url, primary_image_sha256);
+    let (ic_os_img_sha256, ic_os_img_url) = {
+        if config.has_malicious_behaviours() {
+            warn!(
+                test_env.logger(),
+                "Using malicious guestos image for IC config."
+            );
+            (
+                test_env.get_malicious_ic_os_img_sha256()?,
+                test_env.get_malicious_ic_os_img_url()?,
+            )
+        } else {
+            (
+                test_env.get_ic_os_img_sha256()?,
+                test_env.get_ic_os_img_url()?,
+            )
+        }
+    };
+    let mut res_req = ResourceRequest::new(ImageType::IcOsImage, ic_os_img_url, ic_os_img_sha256);
+    let pot_setup = GroupSetup::read_attribute(test_env);
+    let default_vm_resources = pot_setup.default_vm_resources;
     res_req.group_name = group_name.to_string();
     for s in &config.subnets {
         for n in &s.nodes {
-            res_req.add_vm_request(vm_spec_from_node(n));
+            res_req.add_vm_request(vm_spec_from_node(n, default_vm_resources));
         }
     }
     for n in &config.unassigned_nodes {
-        res_req.add_vm_request(vm_spec_from_node(n));
+        res_req.add_vm_request(vm_spec_from_node(n, default_vm_resources));
     }
     Ok(res_req)
 }
 
 /// The SHA-256 hash of the Universal VM disk image.
 /// The latest hash can be retrieved by downloading the SHA256SUMS file from:
-/// https://hydra.dfinity.systems/job/dfinity-ci-build/infra/infra.farm.universal-vm.img.x86_64-linux/latest
+/// https://hydra.dfinity.systems/job/dfinity-ci-build/farm/universal-vm.img.x86_64-linux/latest
 const DEFAULT_UNIVERSAL_VM_IMG_SHA256: &str =
-    "58711b2e9f2760e90237ccf43fbcdc24caa2118220cdd33ea05fd4dcffa32aca";
+    "d7720f8a518aeeef65970d2f087756f86b00b928ccc41986db15fcb5bc8847f3";
 
 pub fn get_resource_request_for_universal_vm(
     universal_vm: &UniversalVm,
+    pot_setup: &GroupSetup,
     group_name: &str,
 ) -> anyhow::Result<ResourceRequest> {
-    let primary_image = universal_vm.primary_image.clone().unwrap_or(DiskImage {
+    let primary_image = universal_vm.primary_image.clone().unwrap_or_else(|| DiskImage {
         image_type: ImageType::RawImage,
-        url: Url::parse(&format!("https://download.dfinity.systems/farm/universal-vm/{DEFAULT_UNIVERSAL_VM_IMG_SHA256}/x86_64-linux/universal-vm.img.zst")).expect("should not fail!"),
+        url: Url::parse(&format!("http://download.proxy-global.dfinity.network:8080/farm/universal-vm/{DEFAULT_UNIVERSAL_VM_IMG_SHA256}/x86_64-linux/universal-vm.img.zst")).expect("should not fail!"),
         sha256: String::from(DEFAULT_UNIVERSAL_VM_IMG_SHA256),
     });
     let mut res_req = ResourceRequest::new(
@@ -169,12 +193,29 @@ pub fn get_resource_request_for_universal_vm(
     let vm_resources = universal_vm.vm_resources;
     res_req.add_vm_request(VmSpec {
         name: universal_vm.name.clone(),
-        vcpus: vm_resources.vcpus.unwrap_or(DEFAULT_VCPUS_PER_VM),
-        memory_kibibytes: vm_resources
-            .memory_kibibytes
-            .unwrap_or(DEFAULT_MEMORY_KIB_PER_VM),
+        vcpus: vm_resources.vcpus.unwrap_or_else(|| {
+            pot_setup
+                .default_vm_resources
+                .and_then(|vm_resources| vm_resources.vcpus)
+                .unwrap_or(DEFAULT_VCPUS_PER_VM)
+        }),
+        memory_kibibytes: vm_resources.memory_kibibytes.unwrap_or_else(|| {
+            pot_setup
+                .default_vm_resources
+                .and_then(|vm_resources| vm_resources.memory_kibibytes)
+                .unwrap_or(DEFAULT_MEMORY_KIB_PER_VM)
+        }),
         boot_image: BootImage::GroupDefault,
+        boot_image_minimal_size_gibibytes: vm_resources.boot_image_minimal_size_gibibytes.or_else(
+            || {
+                pot_setup
+                    .default_vm_resources
+                    .and_then(|vm_resources| vm_resources.boot_image_minimal_size_gibibytes)
+            },
+        ),
         has_ipv4: universal_vm.has_ipv4,
+        vm_allocation: universal_vm.vm_allocation.clone(),
+        required_host_features: universal_vm.required_host_features.clone(),
     });
     Ok(res_req)
 }
@@ -186,13 +227,18 @@ pub fn allocate_resources(farm: &Farm, req: &ResourceRequest) -> FarmResult<Reso
         let name = vm_config.name.clone();
         let create_vm_request = CreateVmRequest::new(
             name.clone(),
+            VmType::Production,
             vm_config.vcpus,
             vm_config.memory_kibibytes,
+            vec![],
             match &vm_config.boot_image {
                 BootImage::GroupDefault => From::from(req.primary_image.clone()),
                 BootImage::Image(disk_image) => From::from(disk_image.clone()),
             },
+            vm_config.boot_image_minimal_size_gibibytes,
             vm_config.has_ipv4,
+            vm_config.vm_allocation.clone(),
+            vm_config.required_host_features.clone(),
         );
 
         let created_vm = farm.create_vm(group_name, create_vm_request)?;
@@ -205,15 +251,29 @@ pub fn allocate_resources(farm: &Farm, req: &ResourceRequest) -> FarmResult<Reso
     Ok(res_group)
 }
 
-fn vm_spec_from_node(n: &Node) -> VmSpec {
+fn vm_spec_from_node(n: &Node, default_vm_resources: Option<VmResources>) -> VmSpec {
     let vm_resources = &n.vm_resources;
     VmSpec {
         name: n.id().to_string(),
-        vcpus: vm_resources.vcpus.unwrap_or(DEFAULT_VCPUS_PER_VM),
-        memory_kibibytes: vm_resources
-            .memory_kibibytes
-            .unwrap_or(DEFAULT_MEMORY_KIB_PER_VM),
+        vcpus: vm_resources.vcpus.unwrap_or_else(|| {
+            default_vm_resources
+                .and_then(|vm_resources| vm_resources.vcpus)
+                .unwrap_or(DEFAULT_VCPUS_PER_VM)
+        }),
+        memory_kibibytes: vm_resources.memory_kibibytes.unwrap_or_else(|| {
+            default_vm_resources
+                .and_then(|vm_resources| vm_resources.memory_kibibytes)
+                .unwrap_or(DEFAULT_MEMORY_KIB_PER_VM)
+        }),
         boot_image: BootImage::GroupDefault,
+        boot_image_minimal_size_gibibytes: vm_resources.boot_image_minimal_size_gibibytes.or_else(
+            || {
+                default_vm_resources
+                    .and_then(|vm_resources| vm_resources.boot_image_minimal_size_gibibytes)
+            },
+        ),
         has_ipv4: false,
+        vm_allocation: n.vm_allocation.clone(),
+        required_host_features: n.required_host_features.clone(),
     }
 }

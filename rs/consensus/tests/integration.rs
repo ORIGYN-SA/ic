@@ -2,8 +2,9 @@ mod framework;
 use crate::framework::{
     ConsensusDependencies, ConsensusInstance, ConsensusRunner, ConsensusRunnerConfig,
 };
-use ic_consensus::consensus::Membership;
-use ic_interfaces::{consensus_pool::ConsensusPool, registry::RegistryClient};
+use ic_consensus::consensus::{pool_reader::PoolReader, Membership};
+use ic_interfaces::consensus_pool::ConsensusPool;
+use ic_interfaces_registry::RegistryClient;
 use ic_test_utilities::{
     consensus::make_catch_up_package_with_empty_transcript,
     crypto::CryptoReturningOk,
@@ -58,7 +59,7 @@ fn run_n_rounds_and_collect_hashes(config: ConsensusRunnerConfig) -> Rc<RefCell<
         let reach_n_rounds = move |inst: &ConsensusInstance<'_>| {
             let pool = inst.driver.consensus_pool.write().unwrap();
             for nota in pool.validated().notarization().get_highest_iter() {
-                let hash = ic_crypto::crypto_hash(&nota);
+                let hash = ic_types::crypto::crypto_hash(&nota);
                 let hash = hash.get_ref();
                 if !hashes_clone.borrow().contains(hash) {
                     hashes_clone.borrow_mut().push(hash.clone());
@@ -128,6 +129,7 @@ fn run_n_rounds_and_collect_hashes(config: ConsensusRunnerConfig) -> Rc<RefCell<
                 crypto.clone(),
                 deps,
                 pool_config.clone(),
+                &PoolReader::new(&*deps.consensus_pool.read().unwrap()),
             );
         }
         assert!(framework.run_until(&reach_n_rounds));

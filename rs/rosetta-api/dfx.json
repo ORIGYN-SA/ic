@@ -3,32 +3,26 @@
   "canisters": {
     "ledger": {
       "type": "custom",
-      "candid": "ledger.did",
-      "wasm": "../target/wasm32-unknown-unknown/release/ledger-canister-min.wasm",
-      "build": "./build-ledger.sh"
+      "candid": "./icp_ledger/ledger.did",
+      "build": ["bazel build //rs/rosetta-api/icp_ledger/ledger:ledger-canister-wasm-notify-method"],
+      "wasm": "../../bazel-bin/rs/rosetta-api/icp_ledger/ledger/ledger-canister-wasm-notify-method.wasm"
+    },
+    "icrc1_ledger": {
+      "type":"custom",
+      "candid": "./icrc1/ledger/icrc1.did",
+      "build": ["bazel build //rs/rosetta-api/icrc1/ledger:ledger_canister"],
+      "wasm": "../../bazel-bin/rs/rosetta-api/icrc1/ledger/ledger_canister.wasm"
     }
   },
   "networks": {
-    "nnstestnet": {
-      "providers": [
-        "http://dcs-nns-8.dfinity.systems:8080"
+      "local": {
+        "bind": "127.0.0.1:8081"
+      },
+      "exchanges":{
+        "providers": [
+          "http://[2a00:fb01:400:42:5000:daff:fe8b:165b]:8080"
       ],
       "type": "persistent"
-    },
-      "local": {
-        "bind": "127.0.0.1:8080"
-      },
-      "ic": {
-          "providers": ["https://ic0.app"],
-          "type": "persistent"
-      },
-      "exchanges": {
-          "providers": ["https://exchanges.dfinity.network"],
-          "type": "persistent"
-      },
-      "mainnet-rosetta": {
-          "providers": ["https://rosetta-exchanges.ic0.app"],
-          "type": "persistent"
       }
   }
 }

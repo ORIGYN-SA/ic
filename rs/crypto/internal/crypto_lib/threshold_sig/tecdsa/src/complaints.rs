@@ -6,8 +6,8 @@ use std::convert::TryFrom;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct IDkgComplaintInternal {
-    proof: zk::ProofOfDLogEquivalence,
-    shared_secret: EccPoint,
+    pub(crate) proof: zk::ProofOfDLogEquivalence,
+    pub(crate) shared_secret: EccPoint,
 }
 
 impl IDkgComplaintInternal {
@@ -102,7 +102,7 @@ impl IDkgComplaintInternal {
         let proof = zk::ProofOfDLogEquivalence::create(
             seed,
             secret_key.secret_scalar(),
-            &EccPoint::generator_g(secret_key.secret_scalar().curve_type())?,
+            &EccPoint::generator_g(secret_key.secret_scalar().curve_type()),
             dealing.ciphertext.ephemeral_key(),
             &proof_assoc_data,
         )?;
@@ -139,7 +139,7 @@ impl IDkgComplaintInternal {
         )?;
 
         self.proof.verify(
-            &EccPoint::generator_g(self.shared_secret.curve_type())?,
+            &EccPoint::generator_g(self.shared_secret.curve_type()),
             dealing.ciphertext.ephemeral_key(),
             complainer_key.public_point(),
             &self.shared_secret,
@@ -170,7 +170,7 @@ impl IDkgComplaintInternal {
 
                 CommitmentOpening::Pedersen(opening.0, opening.1)
             }
-            (_, _) => return Err(ThresholdEcdsaError::InconsistentCommitments),
+            (_, _) => return Err(ThresholdEcdsaError::UnexpectedCommitmentType),
         };
 
         // Verify that the decrypted opening does *not* match the

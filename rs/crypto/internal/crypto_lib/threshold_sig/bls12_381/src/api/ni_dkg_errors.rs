@@ -47,10 +47,9 @@ impl From<MisnumberedReceiverError> for CspDkgVerifyDealingError {
 /// Creation of a forward-secure keypair during DKG failed.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum CspDkgCreateFsKeyError {
-    /// Precondition error: The AlgorithmId does not correspond to a NiDkg
-    /// variant.
-    UnsupportedAlgorithmId(AlgorithmId),
     InternalError(InternalError),
+    DuplicateKeyId(String),
+    TransientInternalError(String),
 }
 
 /// Verification of a DKG forward-secure key failed.
@@ -71,7 +70,11 @@ pub enum CspDkgUpdateFsEpochError {
     /// variant.
     UnsupportedAlgorithmId(AlgorithmId),
     FsKeyNotInSecretKeyStoreError(KeyNotFoundError),
-    InternalError(InternalError),
+    TransientInternalError(InternalError),
+    /// Precondition error: The encryption key was not found.
+    KeyNotFoundError(KeyNotFoundError),
+    /// The public key could not be parsed.
+    MalformedPublicKeyError(MalformedDataError),
 }
 
 /// Encrypting or zero-knowledge proving during DKG failed.
@@ -424,6 +427,13 @@ pub enum CspDkgCreateReshareTranscriptError {
     SizeError(SizeError),
 }
 
+/// A call to retain existing threshold keys failed.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum CspDkgRetainThresholdKeysError {
+    // An internal error, e.g. an RPC error.
+    TransientInternalError(InternalError),
+}
+
 impl From<CspDkgCreateTranscriptError> for CspDkgCreateReshareTranscriptError {
     fn from(error: CspDkgCreateTranscriptError) -> Self {
         match error {
@@ -470,8 +480,10 @@ pub enum CspDkgLoadPrivateKeyError {
         ciphertext_epoch: Epoch,
         secret_key_epoch: Epoch,
     },
-    // An internal error, e.g. an RPC error.
-    InternalError(InternalError),
+    // A transient internal error, e.g. an RPC error.
+    TransientInternalError(InternalError),
+    /// The public key could not be parsed.
+    MalformedPublicKeyError(MalformedDataError),
 }
 
 impl CspDkgVerifyReshareDealingError {

@@ -1,8 +1,8 @@
 //! Defines errors that may occur in the context of canister threshold
 //! signatures.
-use crate::crypto::{AlgorithmId, CryptoError, KeyId};
+use crate::crypto::{AlgorithmId, CryptoError};
 use crate::registry::RegistryClientError;
-use crate::{NodeId, RegistryVersion};
+use crate::{Height, NodeId, RegistryVersion};
 use ic_protobuf::registry::crypto::v1::AlgorithmId as AlgorithmIdProto;
 use serde::{Deserialize, Serialize};
 
@@ -16,19 +16,32 @@ macro_rules! impl_display_using_debug {
     };
 }
 
+pub(crate) use impl_display_using_debug;
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum IDkgTranscriptIdError {
+    DecreasedBlockHeight {
+        existing_height: Height,
+        updated_height: Height,
+    },
+}
+impl_display_using_debug!(IDkgTranscriptIdError);
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum PresignatureQuadrupleCreationError {
-    WrongTypes,
-    InconsistentAlgorithms,
+    InconsistentAlgorithmIds,
     InconsistentReceivers,
+    InvalidTranscriptOrigin(String),
 }
 impl_display_using_debug!(PresignatureQuadrupleCreationError);
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ThresholdEcdsaSigInputsCreationError {
-    NonmatchingTranscriptIds,
-    InconsistentAlgorithms,
+    InconsistentAlgorithmIds,
     InconsistentReceivers,
+    InvalidHashLength,
+    InvalidQuadrupleOrigin(String),
+    UnsupportedAlgorithm,
 }
 impl_display_using_debug!(ThresholdEcdsaSigInputsCreationError);
 
@@ -49,10 +62,12 @@ impl_display_using_debug!(IDkgParamsValidationError);
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum InitialIDkgDealingsValidationError {
     DealerNotAllowed { node_id: NodeId },
-    MismatchingDealing,
-    InvalidTranscriptOperation,
-    UnsatisfiedCollectionThreshold { threshold: u32, dealings_count: u32 },
     DeserializationError { error: String },
+    InvalidTranscriptOperation,
+    MismatchingDealing,
+    MultipleDealingsFromSameDealer { node_id: NodeId },
+    MultipleSupportSharesFromSameReceiver { node_id: NodeId },
+    UnsatisfiedCollectionThreshold { threshold: u32, dealings_count: u32 },
 }
 impl_display_using_debug!(InitialIDkgDealingsValidationError);
 
@@ -93,7 +108,7 @@ pub enum IDkgCreateTranscriptError {
         signature_count: usize,
         dealer_id: NodeId,
     },
-    InvalidMultisignature {
+    InvalidSignatureBatch {
         crypto_error: CryptoError,
     },
 }
@@ -102,7 +117,7 @@ impl_display_using_debug!(IDkgCreateTranscriptError);
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum IDkgVerifyTranscriptError {
     InvalidArgument(String),
-    InvalidDealingMultiSignature {
+    InvalidDealingSignatureBatch {
         error: String,
         crypto_error: CryptoError,
     },
@@ -113,11 +128,19 @@ impl_display_using_debug!(IDkgVerifyTranscriptError);
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum IDkgOpenTranscriptError {
-    PrivateKeyNotFound { key_id: KeyId },
+    PrivateKeyNotFound { key_id: String },
     MissingDealingInTranscript { dealer_id: NodeId },
     InternalError { internal_error: String },
 }
 impl_display_using_debug!(IDkgOpenTranscriptError);
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum IDkgRetainKeysError {
+    InternalError { internal_error: String },
+    SerializationError { internal_error: String },
+    TransientInternalError { internal_error: String },
+}
+impl_display_using_debug!(IDkgRetainKeysError);
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum IDkgLoadTranscriptError {
@@ -140,12 +163,16 @@ pub enum IDkgLoadTranscriptError {
     },
     MalformedPublicKey {
         node_id: NodeId,
+        #[serde(with = "serde_bytes")]
         key_bytes: Vec<u8>,
     },
     UnsupportedAlgorithm {
         algorithm_id: Option<AlgorithmIdProto>,
     },
     RegistryError(RegistryClientError),
+    TransientInternalError {
+        internal_error: String,
+    },
 }
 impl_display_using_debug!(IDkgLoadTranscriptError);
 
@@ -156,6 +183,7 @@ pub enum IDkgCreateDealingError {
     },
     MalformedPublicKey {
         node_id: NodeId,
+        #[serde(with = "serde_bytes")]
         key_bytes: Vec<u8>,
     },
     PublicKeyNotFound {
@@ -167,6 +195,9 @@ pub enum IDkgCreateDealingError {
     },
     RegistryError(RegistryClientError),
     SerializationError {
+        internal_error: String,
+    },
+    SignatureError {
         internal_error: String,
     },
     InternalError {
@@ -184,7 +215,13 @@ impl_display_using_debug!(IDkgCreateDealingError);
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum IDkgVerifyDealingPublicError {
     TranscriptIdMismatch,
-    InvalidDealing { reason: String },
+    InvalidDealing {
+        reason: String,
+    },
+    InvalidSignature {
+        error: String,
+        crypto_error: CryptoError,
+    },
 }
 impl_display_using_debug!(IDkgVerifyDealingPublicError);
 
@@ -201,6 +238,7 @@ pub enum IDkgVerifyDealingPrivateError {
     },
     MalformedPublicKey {
         node_id: NodeId,
+        #[serde(with = "serde_bytes")]
         key_bytes: Vec<u8>,
     },
     UnsupportedAlgorithm {
@@ -210,6 +248,16 @@ pub enum IDkgVerifyDealingPrivateError {
     CspVaultRpcError(String),
 }
 impl_display_using_debug!(IDkgVerifyDealingPrivateError);
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum IDkgVerifyInitialDealingsError {
+    MismatchingTranscriptParams,
+    PublicVerificationFailure {
+        error: String,
+        verify_dealing_public_error: IDkgVerifyDealingPublicError,
+    },
+}
+impl_display_using_debug!(IDkgVerifyInitialDealingsError);
 
 /// Occurs if verifying a complaint using `IDkgProtocol::verify_complaint` fails.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -231,6 +279,7 @@ pub enum IDkgVerifyComplaintError {
     },
     MalformedComplainerPublicKey {
         node_id: NodeId,
+        #[serde(with = "serde_bytes")]
         key_bytes: Vec<u8>,
     },
     UnsupportedComplainerPublicKeyAlgorithm {

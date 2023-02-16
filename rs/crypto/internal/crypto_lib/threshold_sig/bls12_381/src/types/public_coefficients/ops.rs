@@ -1,7 +1,7 @@
 //! Standard Rust operations on PublicCoefficients
 
 use super::*;
-use bls12_381::{G2Projective, Scalar};
+use ic_crypto_internal_bls12_381_type::{G2Projective, Scalar};
 use std::borrow::Borrow;
 use std::iter::Sum;
 use std::ops;
@@ -44,7 +44,7 @@ impl<B: Borrow<PublicCoefficients>> ops::Add<B> for PublicCoefficients {
 impl ops::MulAssign<Scalar> for PublicCoefficients {
     fn mul_assign(&mut self, rhs: Scalar) {
         for self_c in self.coefficients.iter_mut() {
-            self_c.0.mul_assign(rhs);
+            self_c.0.mul_assign(&rhs);
         }
         self.remove_zeros();
     }

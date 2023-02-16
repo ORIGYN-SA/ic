@@ -11,14 +11,16 @@
 use criterion::{criterion_group, criterion_main, Criterion};
 use ic_artifact_pool::ingress_pool::IngressPoolImpl;
 use ic_constants::MAX_INGRESS_TTL;
+use ic_ic00_types::IC_00;
 use ic_ingress_manager::IngressManager;
 use ic_interfaces::{
     artifact_pool::UnvalidatedArtifact,
     ingress_manager::IngressSelector,
     ingress_pool::{ChangeAction, ChangeSet, IngressPool, MutableIngressPool},
-    registry::RegistryClient,
     time_source::TimeSource,
 };
+use ic_interfaces_registry::RegistryClient;
+use ic_interfaces_state_manager_mocks::MockStateManager;
 use ic_logger::replica_logger::no_op_logger;
 use ic_metrics::MetricsRegistry;
 use ic_registry_client::client::RegistryClientImpl;
@@ -32,7 +34,6 @@ use ic_test_utilities::{
     cycles_account_manager::CyclesAccountManagerBuilder,
     history::MockIngressHistory,
     state::ReplicatedStateBuilder,
-    state_manager::MockStateManager,
     types::ids::{node_test_id, subnet_test_id},
     types::messages::SignedIngressBuilder,
     FastForwardTimeSource,
@@ -41,7 +42,6 @@ use ic_test_utilities_registry::test_subnet_record;
 use ic_types::{
     artifact::{IngressMessageAttribute, IngressMessageId},
     batch::ValidationContext,
-    ic00::IC_00,
     ingress::IngressStatus,
     malicious_flags::MaliciousFlags,
     Height, NumBytes, RegistryVersion, SubnetId, Time,
@@ -142,7 +142,7 @@ fn prepare(
         let message_id = IngressMessageId::from(&ingress);
         let attribute = IngressMessageAttribute::new(&ingress);
         let peer_id = (i % 10) as u64;
-        let integrity_hash = ic_crypto::crypto_hash(ingress.binary()).get();
+        let integrity_hash = ic_types::crypto::crypto_hash(ingress.binary()).get();
         pool.insert(UnvalidatedArtifact {
             message: ingress,
             peer_id: node_test_id(peer_id),

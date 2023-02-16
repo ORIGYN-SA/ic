@@ -1,21 +1,21 @@
+use crate::driver::test_env::TestEnv;
+use crate::driver::test_env_api::GetFirstHealthyNodeSnapshot;
+use crate::driver::test_env_api::HasPublicApiUrl;
 use crate::types::*;
 use crate::util::*;
 use assert_matches::assert_matches;
 use ic_agent::AgentError;
-use ic_fondue::ic_manager::IcHandle;
 use ic_universal_canister::{call_args, wasm};
 
-pub fn is_called_if_reply_traps(handle: IcHandle, ctx: &ic_fondue::pot::Context) {
-    let mut rng = ctx.rng.clone();
-    let rt = tokio::runtime::Runtime::new().expect("Could not create tokio runtime.");
-    rt.block_on({
+pub fn is_called_if_reply_traps(env: TestEnv) {
+    let logger = env.logger();
+    let node = env.get_first_healthy_node_snapshot();
+    let agent = node.build_default_agent();
+    block_on({
         async move {
-            let endpoint = get_random_node_endpoint(&handle, &mut rng);
-            endpoint.assert_ready(ctx).await;
-
-            let agent = assert_create_agent(endpoint.url.as_str()).await;
-
-            let canister = UniversalCanister::new(&agent).await;
+            let canister =
+                UniversalCanister::new_with_retries(&agent, node.effective_canister_id(), &logger)
+                    .await;
 
             assert_matches!(
                 canister
@@ -49,16 +49,15 @@ pub fn is_called_if_reply_traps(handle: IcHandle, ctx: &ic_fondue::pot::Context)
     });
 }
 
-pub fn is_called_if_reject_traps(handle: IcHandle, ctx: &ic_fondue::pot::Context) {
-    let mut rng = ctx.rng.clone();
-    let rt = tokio::runtime::Runtime::new().expect("Could not create tokio runtime.");
-    rt.block_on({
+pub fn is_called_if_reject_traps(env: TestEnv) {
+    let logger = env.logger();
+    let node = env.get_first_healthy_node_snapshot();
+    let agent = node.build_default_agent();
+    block_on({
         async move {
-            let endpoint = get_random_node_endpoint(&handle, &mut rng);
-            endpoint.assert_ready(ctx).await;
-
-            let agent = assert_create_agent(endpoint.url.as_str()).await;
-            let canister = UniversalCanister::new(&agent).await;
+            let canister =
+                UniversalCanister::new_with_retries(&agent, node.effective_canister_id(), &logger)
+                    .await;
 
             assert_reject(
                 canister
@@ -88,16 +87,15 @@ pub fn is_called_if_reject_traps(handle: IcHandle, ctx: &ic_fondue::pot::Context
     });
 }
 
-pub fn changes_are_discarded_if_trapped(handle: IcHandle, ctx: &ic_fondue::pot::Context) {
-    let mut rng = ctx.rng.clone();
-    let rt = tokio::runtime::Runtime::new().expect("Could not create tokio runtime.");
-    rt.block_on({
+pub fn changes_are_discarded_if_trapped(env: TestEnv) {
+    let logger = env.logger();
+    let node = env.get_first_healthy_node_snapshot();
+    let agent = node.build_default_agent();
+    block_on({
         async move {
-            let endpoint = get_random_node_endpoint(&handle, &mut rng);
-            endpoint.assert_ready(ctx).await;
-
-            let agent = assert_create_agent(endpoint.url.as_str()).await;
-            let canister = UniversalCanister::new(&agent).await;
+            let canister =
+                UniversalCanister::new_with_retries(&agent, node.effective_canister_id(), &logger)
+                    .await;
 
             assert_matches!(
                 canister
@@ -136,16 +134,15 @@ pub fn changes_are_discarded_if_trapped(handle: IcHandle, ctx: &ic_fondue::pot::
     });
 }
 
-pub fn changes_are_discarded_in_query(handle: IcHandle, ctx: &ic_fondue::pot::Context) {
-    let mut rng = ctx.rng.clone();
-    let rt = tokio::runtime::Runtime::new().expect("Could not create tokio runtime.");
-    rt.block_on({
+pub fn changes_are_discarded_in_query(env: TestEnv) {
+    let logger = env.logger();
+    let node = env.get_first_healthy_node_snapshot();
+    let agent = node.build_default_agent();
+    block_on({
         async move {
-            let endpoint = get_random_node_endpoint(&handle, &mut rng);
-            endpoint.assert_ready(ctx).await;
-
-            let agent = assert_create_agent(endpoint.url.as_str()).await;
-            let canister = UniversalCanister::new(&agent).await;
+            let canister =
+                UniversalCanister::new_with_retries(&agent, node.effective_canister_id(), &logger)
+                    .await;
 
             assert_reject(
                 canister
@@ -199,18 +196,18 @@ pub fn changes_are_discarded_in_query(handle: IcHandle, ctx: &ic_fondue::pot::Co
     });
 }
 
-pub fn is_called_in_query(handle: IcHandle, ctx: &ic_fondue::pot::Context) {
-    let mut rng = ctx.rng.clone();
-    let rt = tokio::runtime::Runtime::new().expect("Could not create tokio runtime.");
-    rt.block_on({
+pub fn is_called_in_query(env: TestEnv) {
+    let logger = env.logger();
+    let node = env.get_first_healthy_node_snapshot();
+    let agent = node.build_default_agent();
+    block_on({
         async move {
-            let endpoint = get_random_node_endpoint(&handle, &mut rng);
-            endpoint.assert_ready(ctx).await;
-
-            let agent = assert_create_agent(endpoint.url.as_str()).await;
-
-            let canister_a = UniversalCanister::new(&agent).await;
-            let canister_b = UniversalCanister::new(&agent).await;
+            let canister_a =
+                UniversalCanister::new_with_retries(&agent, node.effective_canister_id(), &logger)
+                    .await;
+            let canister_b =
+                UniversalCanister::new_with_retries(&agent, node.effective_canister_id(), &logger)
+                    .await;
 
             // In order to observe that `call_on_cleanup` has been called, two
             // queries are sent from A to B in parallel.
@@ -225,7 +222,7 @@ pub fn is_called_in_query(handle: IcHandle, ctx: &ic_fondue::pot::Context) {
                 .on_reply(
                     wasm()
                         .stable_read(0, 1)
-                        .trap_if_eq(&[0], "")
+                        .trap_if_eq([0], "")
                         .stable_read(0, 1)
                         .append_and_reply(),
                 )

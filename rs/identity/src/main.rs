@@ -9,19 +9,19 @@
 //! ```
 
 use anyhow::Result;
-use clap::Clap;
+use clap::Parser;
 use std::fs;
 use std::path::PathBuf;
 
 use ic_identity::generate_key;
 
-#[derive(Clap)]
+#[derive(Parser)]
 #[clap(version = "0.1.0", author = "DFINITY team <team@dfinity.org>")]
 struct Opts {
     #[clap(
         short = 'd',
         long,
-        about = "The path of the directory in which the keys will be stored.",
+        help = "The path of the directory in which the keys will be stored.",
         default_value = "."
     )]
     out_dir: PathBuf,
@@ -29,7 +29,7 @@ struct Opts {
     #[clap(
         short = 'n',
         long,
-        about = "The name of the key.",
+        help = "The name of the key.",
         default_value = "identity"
     )]
     name: String,
@@ -48,7 +48,7 @@ fn main() -> Result<()> {
     fs::write(&secret_pem_file, secret_pem.into_bytes())?;
 
     let public_der_file = opts.out_dir.join(format!("{}_public.der", opts.name));
-    fs::write(&public_der_file, public_der)?;
+    fs::write(public_der_file, public_der)?;
 
     let mut permissions = fs::metadata(&secret_pem_file)?.permissions();
     permissions.set_readonly(true);

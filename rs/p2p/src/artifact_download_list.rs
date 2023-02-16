@@ -25,17 +25,18 @@
 //!    expiry-instant. Note: This index may contain multiple downloads
 //!    expiring at a given expiry-instant.
 
-use core::ops::Deref;
 use ic_interfaces::artifact_manager::ArtifactManager;
-use ic_logger::replica_logger::ReplicaLogger;
-use ic_logger::warn;
+use ic_logger::{replica_logger::ReplicaLogger, warn};
 use ic_protobuf::registry::subnet::v1::GossipConfig;
 use ic_types::{
-    artifact::ArtifactId, chunkable::Chunkable, crypto::CryptoHash, p2p::GossipAdvert, NodeId,
+    artifact::ArtifactId,
+    chunkable::Chunkable,
+    crypto::CryptoHash,
+    p2p::{GossipAdvert, MAX_ARTIFACT_TIMEOUT},
+    NodeId,
 };
-use linked_hash_map::LinkedHashMap;
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, HashMap},
     time::{Duration, Instant},
 };
 
@@ -101,36 +102,48 @@ pub(crate) trait ArtifactDownloadList: Send + Sync {
 /// The artifact tracker.
 pub(crate) struct ArtifactTracker {
     /// Artifact ID
-    pub artifact_id: ArtifactId,
+    artifact_id: ArtifactId,
     /// Time limit for the artifact download.
     expiry_instant: Instant,
     /// The artifact, which implements the `Chunkable` interface.
     pub chunkable: Box<dyn Chunkable + Send + Sync>,
     /// The ID of the node whose quota is charged for this artifact.
     pub peer_id: NodeId,
+    // Stores the e2e duration of downloading the artifact.
+    duration: Instant,
+}
+
+impl ArtifactTracker {
+    pub fn new(
+        artifact_id: ArtifactId,
+        expiry_instant: Instant,
+        chunkable: Box<dyn Chunkable + Send + Sync>,
+        peer_id: NodeId,
+    ) -> Self {
+        ArtifactTracker {
+            artifact_id,
+            expiry_instant,
+            chunkable,
+            peer_id,
+            duration: Instant::now(),
+        }
+    }
+
+    pub fn get_duration_sec(&mut self) -> f64 {
+        self.duration.elapsed().as_secs_f64()
+    }
 }
 
 /// The implementation of the `ArtifactDownloadList` trait.
 pub(crate) struct ArtifactDownloadListImpl {
-    // A LinkedHashmap is used for the artifacts because it ensures fairness by ordering items by
-    // their download initiation time while providing constant lookup time complexity using the
-    // integrity hash.
+    /// A Hashmap is used for the artifacts because it provides constant lookup time complexity
+    /// using the integrity hash.
     /// Artifacts to be downloaded with their corresponding trackers.
-    artifacts: LinkedHashMap<CryptoHash, ArtifactTracker>,
+    artifacts: HashMap<CryptoHash, ArtifactTracker>,
     /// Expiry indices.
     expiry_index: BTreeMap<Instant, Vec<CryptoHash>>,
     /// The logger instance.
     log: ReplicaLogger,
-}
-
-/// The `Deref` trait is implemented to hide indexing complexities and allow the
-/// list to be manipulated using standard container APIs.
-impl Deref for ArtifactDownloadListImpl {
-    type Target = LinkedHashMap<CryptoHash, ArtifactTracker>;
-    /// The method returns the artifacts to be downloaded.
-    fn deref(&self) -> &Self::Target {
-        &self.artifacts
-    }
 }
 
 impl ArtifactDownloadListImpl {
@@ -170,21 +183,24 @@ impl ArtifactDownloadList for ArtifactDownloadListImpl {
                 // Calculate the worst-case time estimate for the artifact download, which
                 // assumes that all chunks for the artifact will time out for
                 // each peer that has advertised the artifact.
+                // In any case the worst-case estimate is bound to a constant.
                 //
                 // TODO: Revisit this in the context of subnets with many nodes: P2P-510
-                let download_eta_ms =
+                let download_eta_ms = std::cmp::min(
                     std::cmp::max(advert.size as u64 / gossip_config.max_chunk_size as u64, 1)
                         * max_advertizing_peer as u64
-                        * gossip_config.max_chunk_wait_ms as u64;
+                        * gossip_config.max_chunk_wait_ms as u64,
+                    MAX_ARTIFACT_TIMEOUT.as_millis() as u64,
+                );
                 let expiry_instant = requested_instant + Duration::from_millis(download_eta_ms);
                 self.artifacts.insert(
                     advert.integrity_hash.clone(),
-                    ArtifactTracker {
-                        artifact_id: artifact_id.clone(),
+                    ArtifactTracker::new(
+                        artifact_id.clone(),
                         expiry_instant,
-                        chunkable: chunk_tracker,
+                        chunk_tracker,
                         peer_id,
-                    },
+                    ),
                 );
                 self.expiry_index
                     .entry(expiry_instant)
@@ -280,7 +296,7 @@ mod tests {
         num_adverts: i32,
         gossip_config: &GossipConfig,
         artifact_manager: &dyn ArtifactManager,
-        artifact_download_list: &mut ArtifactDownloadListImpl,
+        artifact_download_list: &mut dyn ArtifactDownloadList,
     ) -> std::time::Instant {
         // Insert and remove artifacts.
         let mut max_expiry = std::time::Instant::now();
@@ -338,12 +354,12 @@ mod tests {
 
         let expired = artifact_download_list.prune_expired_downloads();
         assert_eq!(expired.len(), num_adverts as usize);
-        assert_eq!(artifact_download_list.len(), 0);
+        assert_eq!(artifact_download_list.artifacts.len(), 0);
 
         // Check that the expired artifact list is empty.
         let expired = artifact_download_list.prune_expired_downloads();
         assert_eq!(expired.len(), 0);
-        assert_eq!(artifact_download_list.len(), 0);
+        assert_eq!(artifact_download_list.artifacts.len(), 0);
     }
 
     /// The function tests that artifact trackers can be removed from the
@@ -372,6 +388,6 @@ mod tests {
             artifact_download_list.get_tracker(&integrity_hash).unwrap();
             artifact_download_list.remove_tracker(&integrity_hash);
         }
-        assert_eq!(artifact_download_list.len(), 0);
+        assert_eq!(artifact_download_list.artifacts.len(), 0);
     }
 }

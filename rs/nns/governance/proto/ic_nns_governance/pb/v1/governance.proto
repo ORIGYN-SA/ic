@@ -5,6 +5,7 @@ package ic_nns_governance.pb.v1;
 import "ic_nns_common/pb/v1/types.proto";
 import "ic_base_types/pb/v1/types.proto";
 import "ic_ledger/pb/v1/types.proto";
+import "ic_sns_swap/pb/v1/swap.proto";
 
 // The entity that owns the nodes that run the network.
 //
@@ -91,6 +92,19 @@ enum Topic {
   TOPIC_KYC = 9;
   // Topic for proposals to reward node providers.
   TOPIC_NODE_PROVIDER_REWARDS = 10;
+  // Superseded by SNS_COMMUNITY_FUND.
+  //
+  // TODO(NNS1-1787): Delete this. In addition to clients wiping this from their
+  // memory, I think we'll need Candid support in order to safely delete
+  // this. There is no rush to delete this though.
+  TOPIC_SNS_DECENTRALIZATION_SALE = 11;
+  // Proposals handling updates of a subnet's replica version.
+  // The only proposal in this topic is UpdateSubnetReplicaVersion.
+  TOPIC_SUBNET_REPLICA_VERSION_MANAGEMENT = 12;
+  // All proposals dealing with blessing and retirement of replica versions.
+  TOPIC_REPLICA_VERSION_MANAGEMENT = 13;
+  // Proposals related to SNS and Community Fund.
+  TOPIC_SNS_AND_COMMUNITY_FUND = 14;
 }
 
 // Every neuron is in one of three states.
@@ -137,6 +151,10 @@ enum NeuronState {
   // delay. If these incentives turn out to be insufficient, the NNS
   // may decide to impose further restrictions on dissolved neurons.
   NEURON_STATE_DISSOLVED = 3;
+
+  // The neuron is in spawning state, meaning it's maturity will be
+  // converted to ICP according to https://wiki.internetcomputer.org/wiki/Maturity_modulation.
+  NEURON_STATE_SPAWNING = 4;
 }
 
 // How did a neuron vote in the recent past? This data is used by
@@ -259,6 +277,11 @@ message Neuron {
   // this field for a dissolving neuron is `u64::MAX`.
   uint64 aging_since_timestamp_seconds = 8;
 
+  // The timestamp, in seconds from the Unix epoch, at which this
+  // neuron should be spawned and its maturity converted to ICP
+  // according to https://wiki.internetcomputer.org/wiki/Maturity_modulation.
+  optional uint64 spawn_at_timestamp_seconds = 19;
+
   // At any time, at most one of `when_dissolved` and
   // `dissolve_delay` are specified.
   //
@@ -312,12 +335,27 @@ message Neuron {
   // The record of the transfer that was made to create this neuron.
   NeuronStakeTransfer transfer = 14;
 
-  // The accumulated maturity of the neuron, in "e8s equivalent".
+  // The accumulated unstaked maturity of the neuron, in "e8s equivalent".
   //
   // The unit is "e8s equivalent" to insist that, while this quantity is on
   // the same scale as ICPs, maturity is not directly convertible to ICPs:
-  // conversion requires a minting event to spawn a new neuron.
+  // conversion requires a minting event and the conversion rate is variable.
   uint64 maturity_e8s_equivalent = 15;
+
+  // The accumulated staked maturity of the neuron, in "e8s equivalent" (see
+  // "maturity_e8s_equivalent"). Staked maturity becomes regular maturity once
+  // the neuron is dissolved.
+  //
+  // Contrary to `maturity_e8s_equivalent` this maturity is staked and thus
+  // locked until the neuron is dissolved and contributes to voting power
+  // and rewards. Once the neuron is dissolved, this maturity will be "moved"
+  // to 'maturity_e8s_equivalent' and will be able to be spawned (with maturity
+  // modulation).
+  optional uint64 staked_maturity_e8s_equivalent = 20;
+
+  // If set and true the maturity rewarded to this neuron for voting will be
+  // automatically staked and will contribute to the neuron's voting power.
+  optional bool auto_stake_maturity = 21;
 
   // Whether this neuron is "Not for profit", making it dissolvable
   // by voting.
@@ -418,8 +456,8 @@ enum NnsFunction {
   // versions. The upgrade is performed when the subnet creates the next
   // regular CUP.
   NNS_FUNCTION_UPDATE_SUBNET_REPLICA_VERSION = 11;
-  /// Clear the provisional whitelist.
-  /// The proposal changes the provisional whitelist to the empty list.
+  // Clear the provisional whitelist.
+  // The proposal changes the provisional whitelist to the empty list.
   NNS_FUNCTION_CLEAR_PROVISIONAL_WHITELIST = 12;
   // Removes a node from a subnet. The node must be currently assigned to a
   // subnet.
@@ -432,7 +470,7 @@ enum NnsFunction {
   // used to set the "default" list of subnetworks that principals
   // without special authorization are allowed to use.
   NNS_FUNCTION_SET_AUTHORIZED_SUBNETWORKS = 14;
-  // Change the Firewall configuration in the registry.
+  // Change the Firewall configuration in the registry. (TODO: Remove when IC-1026 is fully integrated)
   NNS_FUNCTION_SET_FIREWALL_CONFIG = 15;
   // Change a Node Operator's allowance in the registry.
   NNS_FUNCTION_UPDATE_NODE_OPERATOR_CONFIG = 16;
@@ -451,7 +489,41 @@ enum NnsFunction {
   // Remove Node Operator from the registry.
   NNS_FUNCTION_REMOVE_NODE_OPERATORS = 23;
   // Update the routing table in the registry.
-  NNS_FUNCTION_REROUTE_CANISTER_RANGE = 24;
+  NNS_FUNCTION_REROUTE_CANISTER_RANGES = 24;
+  // Add firewall rules in the registry
+  NNS_FUNCTION_ADD_FIREWALL_RULES = 25;
+  // Remove firewall rules in the registry
+  NNS_FUNCTION_REMOVE_FIREWALL_RULES = 26;
+  // Update firewall rules in the registry
+  NNS_FUNCTION_UPDATE_FIREWALL_RULES = 27;
+  // Insert or update `canister_migrations` entries.
+  NNS_FUNCTION_PREPARE_CANISTER_MIGRATION = 28;
+  // Remove `canister_migrations` entries.
+  NNS_FUNCTION_COMPLETE_CANISTER_MIGRATION = 29;
+  // Add a new SNS canister WASM
+  NNS_FUNCTION_ADD_SNS_WASM = 30;
+  // Change the subnet node membership. In a way, this function combines the separate
+  // functions for adding and removing nodes from the subnet record, but adds the property
+  // of atomic node replacement (node swap) on top.
+  //
+  // The nodes that are being added to the subnet must be currently unassigned.
+  // The nodes that are being removed from the subnet must be currently assigned to the subnet.
+  NNS_FUNCTION_CHANGE_SUBNET_MEMBERSHIP = 31;
+  // Updates the available subnet types in the cycles minting canister.
+  NNS_FUNCTION_UPDATE_SUBNET_TYPE = 32;
+  // Changes the assignment of subnets to subnet types in the cycles minting
+  // canister.
+  NNS_FUNCTION_CHANGE_SUBNET_TYPE_ASSIGNMENT = 33;
+  // Update the list of SNS subnet IDs that SNS WASM will deploy SNS instances to.
+  NNS_FUNCTION_UPDATE_SNS_WASM_SNS_SUBNET_IDS = 34;
+  // Update the SNS-wasm canister's list of allowed principals. This list guards which principals can deploy an SNS.
+  NNS_FUNCTION_UPDATE_ALLOWED_PRINCIPALS = 35;
+  // A proposal to retire previously elected and unused replica versions.
+  // The specified versions are removed from the registry and the "blessed versions" record.
+  // This ensures that the replica cannot upgrade to these versions anymore.
+  NNS_FUNCTION_RETIRE_REPLICA_VERSION = 36;
+  // Insert custom upgrade path entries into SNS-W for all SNSes, or for an SNS specified by its governance canister ID.
+  NNS_FUNCTION_INSERT_SNS_WASM_UPGRADE_PATH_ENTRIES = 37;
 }
 
 // Payload of a proposal that calls a function on another NNS
@@ -488,7 +560,7 @@ message AddOrRemoveNodeProvider {
 }
 
 // This proposal payload is used to reward a node provider by minting
-// ICPTs directly to the node provider's ledger account, or into a new
+// ICPs directly to the node provider's ledger account, or into a new
 // neuron created on behalf of the node provider.
 message RewardNodeProvider {
   // The NodeProvider to reward.
@@ -550,6 +622,16 @@ message RewardNodeProviders {
 // Topics (except ManageNeuron) must be provided on each proposal.
 message SetDefaultFollowees {
   map<int32, Neuron.Followees> default_followees = 1;
+}
+
+// Obsolete. Superceded by OpenSnsTokenSwap.
+message SetSnsTokenSwapOpenTimeWindow {
+  // The swap canister to send the request to.
+  ic_base_types.pb.v1.PrincipalId swap_canister_id = 1;
+
+  // Arguments that get sent to the swap canister when its set_open_time_window
+  // Candid method is called.
+  ic_sns_swap.pb.v1.SetOpenTimeWindowRequest request = 2;
 }
 
 // A proposal is the immutable input of a proposal submission. This contains
@@ -627,6 +709,10 @@ message Proposal {
     RewardNodeProviders reward_node_providers = 19;
     // Register Known Neuron
     KnownNeuron register_known_neuron = 21;
+    // Obsolete. Use open_sns_token_swap instead. Kept for Candid compatibility.
+    SetSnsTokenSwapOpenTimeWindow set_sns_token_swap_open_time_window = 22 [deprecated = true];
+    // Call the open method on an SNS swap canister.
+    OpenSnsTokenSwap open_sns_token_swap = 23;
   }
 }
 
@@ -682,9 +768,17 @@ message ManageNeuron {
     option (ic_base_types.pb.v1.tui_signed_message) = true;
     uint64 dissolve_timestamp_seconds = 1 [(ic_base_types.pb.v1.tui_signed_display_q2_2021) = true];
   }
-  // Join the Internet Computer's community fund with this neuron's
-  // entire stake. Caution: this operation is not reversible.
+  // Join the Internet Computer's community fund with this neuron's present and future maturity.
   message JoinCommunityFund {}
+  // Leave the Internet Computer's community fund.
+  message LeaveCommunityFund {}
+  // Changes auto-stake maturity for this Neuron. While on, auto-stake
+  // maturity will cause all the maturity generated by voting rewards
+  // to this neuron to be automatically staked and contribute to the
+  // voting power of the neuron.
+  message ChangeAutoStakeMaturity {
+    bool requested_setting_for_auto_stake_maturity = 1;
+  }
   // Commands that only configure a given neuron, but do not interact
   // with the outside world. They all require the caller to be the
   // controller of the neuron.
@@ -697,6 +791,8 @@ message ManageNeuron {
       RemoveHotKey remove_hot_key = 5;
       SetDissolveTimestamp set_dissolve_timestamp = 6;
       JoinCommunityFund join_community_fund = 7;
+      LeaveCommunityFund leave_community_fund = 8;
+      ChangeAutoStakeMaturity change_auto_stake_maturity = 9;
     }
   }
   // Disburse this neuron's stake: transfer the staked ICP to the
@@ -752,6 +848,15 @@ message ManageNeuron {
     option (ic_base_types.pb.v1.tui_signed_message) = true;
     // The percentage to merge, from 1 to 100 (inclusive).
     uint32 percentage_to_merge = 1 [(ic_base_types.pb.v1.tui_signed_display_q2_2021) = true];
+  }
+
+  // Stake the maturity of a neuron.
+  // The caller can choose a percentage of of the current maturity to stake.
+  // If 'percentage_to_stake' is not provided, all of the neuron's current
+  // maturity will be staked.
+  message StakeMaturity {
+    // The percentage of maturity to stake, from 1 to 100 (inclusive).
+    optional uint32 percentage_to_stake = 1;
   }
 
   // Disburse a portion of this neuron's stake into another neuron.
@@ -843,6 +948,7 @@ message ManageNeuron {
     ClaimOrRefresh claim_or_refresh = 10;
     MergeMaturity merge_maturity = 13;
     Merge merge = 14;
+    StakeMaturity stake_maturity = 15;
   }
 }
 
@@ -865,6 +971,11 @@ message ManageNeuronResponse {
   message MergeMaturityResponse {
     uint64 merged_maturity_e8s = 1;
     uint64 new_stake_e8s = 2;
+  }
+
+  message StakeMaturityResponse {
+    uint64 maturity_e8s = 1;
+    uint64 staked_maturity_e8s = 2;
   }
 
   message FollowResponse {}
@@ -905,6 +1016,7 @@ message ManageNeuronResponse {
     ClaimOrRefreshResponse claim_or_refresh = 10;
     MergeMaturityResponse merge_maturity = 11;
     MergeResponse merge = 12;
+    StakeMaturityResponse stake_maturity = 13;
   }
 }
 
@@ -964,6 +1076,8 @@ message GovernanceError {
      // The neuron attempted to join the community fund while already
      // a member.
      ERROR_TYPE_ALREADY_JOINED_COMMUNITY_FUND = 17;
+     // The neuron attempted to leave the community fund but is not a member.
+     ERROR_TYPE_NOT_IN_THE_COMMUNITY_FUND = 18;
   }
 
   ErrorType error_type = 1;
@@ -1098,6 +1212,115 @@ message ProposalData {
 
   // Wait-for-quiet state that needs to be saved in stable memory.
   WaitForQuietState wait_for_quiet_state = 16;
+
+  // SNS Token Swap-related fields
+  // -----------------------------
+
+  // This is populated when an OpenSnsTokenSwap proposal is first made.
+  optional uint64 original_total_community_fund_maturity_e8s_equivalent = 17;
+
+  // This is populated when OpenSnsTokenSwap is executed. It is used when our
+  // conclude_community_fund_participation Candid method is called to either
+  // mint ICP, or restore CF neuron maturity.
+  repeated ic_sns_swap.pb.v1.CfParticipant cf_participants = 18;
+
+  // This gets set to one of the terminal values (i.e. Committed or Aborted)
+  // when the swap canister calls our conclude_community_fund_participation
+  // Candid method. Initially, it is set to Open, because swap is supposed to
+  // enter that state when we call its open Candid method, which is the main
+  // operation in the execution of an OpenSnsTokenSwap proposal.
+  optional ic_sns_swap.pb.v1.Lifecycle sns_token_swap_lifecycle = 19;
+
+  DerivedProposalInformation derived_proposal_information = 20;
+}
+
+// This message has a couple of unusual features.
+//
+// 1. There is (currently) only one field. We expect that more fields will be
+//    (and possibly other clients) to be able to handle this information in a
+//    generic way, i.e. without having to change their code.
+//
+// 2. Fields that might be added later will probably be mutually exclusive with
+//    existing fields. Normally, this would be handled by putting all such
+//    fields into a oneof. However, Candid has a bug where variant is not
+//    handled correctly. Therefore, we refrain from using oneof until we believe
+//    that the fix is very imminent.
+message DerivedProposalInformation {
+  SwapBackgroundInformation swap_background_information = 1;
+}
+
+// Additional information about the SNS that's being "swapped".
+//
+// This data is fetched from other canisters. Currently, the swap canister
+// itself, and the root canister are queried, but additional canisters could be
+// queried later. In particular, the ID of the root canister is discovered via
+// the swap canister.
+//
+// (See Governance::fetch_swap_background_information for how this is compiled.)
+message SwapBackgroundInformation {
+
+  // Obsolete. Superceded by newer fields.
+
+  reserved "sns_root_canister_id"; reserved 1;
+  reserved "sns_governance_canister_id"; reserved 2;
+  reserved "sns_ledger_canister_id"; reserved 3;
+  reserved "sns_ledger_index_canister_id"; reserved 4;
+  reserved "sns_ledger_archive_canister_ids"; reserved 5;
+  reserved "dapp_canister_ids"; reserved 6;
+
+  // In case swap fails/aborts.
+
+  repeated ic_base_types.pb.v1.PrincipalId fallback_controller_principal_ids = 7;
+
+  // Primary Canisters
+
+  CanisterSummary root_canister_summary = 8;
+  CanisterSummary governance_canister_summary = 9;
+  CanisterSummary ledger_canister_summary = 10;
+  CanisterSummary swap_canister_summary = 11;
+
+  // Secondary Canisters
+
+  repeated CanisterSummary ledger_archive_canister_summaries = 12;
+  CanisterSummary ledger_index_canister_summary = 13;
+
+  // Non-SNS Canister(s)
+
+  repeated CanisterSummary dapp_canister_summaries = 14;
+
+  // Transcribed from sns/root.
+  message CanisterSummary {
+    ic_base_types.pb.v1.PrincipalId canister_id = 1;
+    CanisterStatusResultV2 status = 2;
+  }
+
+  message CanisterStatusResultV2 {
+    optional CanisterStatusType status = 1;
+    bytes module_hash = 2;
+
+    // no controller field, because that is obsolete and superseded by the
+    // controllers field within settings.
+
+    repeated ic_base_types.pb.v1.PrincipalId controllers = 3;
+
+    // Resources
+
+    optional uint64 memory_size = 4;
+    optional uint64 cycles = 5;
+    optional uint64 freezing_threshold = 6;
+    optional uint64 idle_cycles_burned_per_day = 7;
+  }
+
+  // A canister can be stopped by calling stop_canister. The effect of
+  // stop_canister can be undone by calling start_canister. Stopping is an
+  // intermediate state where new method calls are rejected, but in-flight
+  // method calls are allowed to be fully serviced.
+  enum CanisterStatusType {
+    CANISTER_STATUS_TYPE_UNSPECIFIED = 0;
+    CANISTER_STATUS_TYPE_RUNNING = 1;
+    CANISTER_STATUS_TYPE_STOPPING = 2;
+    CANISTER_STATUS_TYPE_STOPPED = 3;
+  }
 }
 
 // Stores data relevant to the "wait for quiet" implementation.
@@ -1125,25 +1348,25 @@ message ProposalInfo {
   // The timestamp, in seconds from the Unix epoch, when this proposal was made.
   uint64 proposal_timestamp_seconds = 5;
 
-  // See [PropopsalData::ballots].
+  // See [ProposalData::ballots].
   map<fixed64, Ballot> ballots = 6;
 
-  // See [PropopsalData::latest_tally].
+  // See [ProposalData::latest_tally].
   Tally latest_tally = 7;
 
-  // See [PropopsalData::decided_timestamp_seconds].
+  // See [ProposalData::decided_timestamp_seconds].
   uint64 decided_timestamp_seconds = 8;
 
-  // See [PropopsalData::executed_timestamp_seconds].
+  // See [ProposalData::executed_timestamp_seconds].
   uint64 executed_timestamp_seconds = 12;
 
-  // See [PropopsalData::failed_timestamp_seconds].
+  // See [ProposalData::failed_timestamp_seconds].
   uint64 failed_timestamp_seconds = 13;
 
   // See [ProposalData::failure_reason].
   GovernanceError failure_reason = 18;
 
-  // See [PropopsalData::reward_event_round].
+  // See [ProposalData::reward_event_round].
   uint64 reward_event_round = 14;
 
   // Derived - see [Topic] for more information
@@ -1156,6 +1379,8 @@ message ProposalInfo {
   ProposalRewardStatus reward_status = 17;
 
   optional uint64 deadline_timestamp_seconds = 19;
+
+  DerivedProposalInformation derived_proposal_information = 20;
 }
 
 // Network economics contains the parameters for several operations related
@@ -1259,6 +1484,20 @@ message KnownNeuronData {
   optional string description = 2;
 }
 
+// Proposal action to call the "open" method of an SNS token swap canister.
+message OpenSnsTokenSwap {
+  // The ID of the canister where the command will be sent (assuming that the
+  // proposal is adopted, of course).
+  ic_base_types.pb.v1.PrincipalId target_swap_canister_id = 1;
+
+  // Various limits on the swap.
+  ic_sns_swap.pb.v1.Params params = 2;
+
+  // The amount that the community fund will collectively spend in maturity on
+  // the swap.
+  optional uint64 community_fund_investment_e8s = 3;
+}
+
 // This represents the whole NNS governance system. It contains all
 // information about the NNS governance system that must be kept
 // across upgrades of the NNS governance system.
@@ -1292,16 +1531,27 @@ message Governance {
     uint64 timestamp = 1;
     reserved 6;
     reserved "claim_or_refresh";
+    reserved 4;
+
+    // A general place holder for sync commands. The neuron lock is
+    // never left holding a sync command (as it either suceeds to
+    // aquire the lock and releases it in the same call, or never
+    // acquires it in the first place), but it still must be acquired
+    // to prevent interleaving with another async command. Thus there's
+    // no value in actually storing the command itself, and this placeholder
+    // can generally be used in all sync cases.
+    message SyncCommand {}
 
     oneof command {
       ManageNeuron.Disburse disburse = 2;
       ManageNeuron.Split split = 3;
-      ManageNeuron.Spawn spawn = 4;
       ManageNeuron.DisburseToNeuron disburse_to_neuron = 5;
       ManageNeuron.MergeMaturity merge_maturity = 7;
       ManageNeuron.ClaimOrRefresh claim_or_refresh_neuron = 8;
       ManageNeuron.Configure configure = 9;
       ManageNeuron.Merge merge = 10;
+      ic_nns_common.pb.v1.NeuronId spawn = 20;
+      SyncCommand sync_command = 21;
     }
   }
 
@@ -1371,9 +1621,23 @@ message Governance {
     uint64 neurons_with_less_than_6_months_dissolve_delay_count = 14;
     uint64 neurons_with_less_than_6_months_dissolve_delay_e8s = 15;
     uint64 community_fund_total_staked_e8s = 16;
+    uint64 community_fund_total_maturity_e8s_equivalent = 17;
+    uint64 total_locked_e8s = 18;
   }
 
   GovernanceCachedMetrics metrics = 15;
+
+  MostRecentMonthlyNodeProviderRewards most_recent_monthly_node_provider_rewards = 16;
+
+  // Cached value for the maturity modulation as calculated each day.
+  optional int32 cached_daily_maturity_modulation_basis_points = 17;
+
+  // The last time that the maturity modulation value was updated.
+  optional uint64 maturity_modulation_last_updated_at_timestamp_seconds = 18;
+
+  // Whether the heartbeat function is currently spawning neurons, meaning
+  // that it should finish before being called again.
+  optional bool spawning_neurons = 19;
 
   reserved 6;
   reserved "authz";
@@ -1476,5 +1740,42 @@ message ClaimOrRefreshNeuronFromAccountResponse {
     GovernanceError error = 1;
     // The ID of the neuron that was created or empty in the case of error.
     ic_nns_common.pb.v1.NeuronId neuron_id = 2;
+  }
+}
+
+// The most recent monthly Node Provider rewards
+message MostRecentMonthlyNodeProviderRewards {
+  uint64 timestamp = 1;
+  repeated RewardNodeProvider rewards = 2;
+}
+
+// TODO(NNS1-1589): Until the Jira ticket gets solved, changes here need to be
+// manually propagated to (sns) swap.proto.
+message SettleCommunityFundParticipation {
+  // The caller's principal ID must match the value in the
+  // target_swap_canister_id field in the proposal (more precisely, in the
+  // OpenSnsTokenSwap).
+  optional uint64 open_sns_token_swap_proposal_id = 1;
+
+  // Each of the possibilities here corresponds to one of two ways that a swap
+  // can terminate. See also sns_swap_pb::Lifecycle::is_terminal.
+  oneof result {
+    Committed committed = 2;
+    Aborted aborted = 3;
+  }
+
+  // When this happens, ICP needs to be minted, and sent to the SNS governance
+  // canister's main account on the ICP Ledger. As with Aborted, the amount of
+  // ICP that needs to be minted can be deduced from the ProposalData's
+  // cf_participants field.
+  message Committed {
+    // This is where the minted ICP will be sent. In principal, this could be
+    // fetched using the swap canister's get_state method.
+    ic_base_types.pb.v1.PrincipalId sns_governance_canister_id = 1;
+  }
+
+  // When this happens, maturity needs to be restored to CF neurons. The amounts
+  // to be refunded can be found in the ProposalData's cf_participants field.
+  message Aborted {
   }
 }

@@ -31,33 +31,38 @@ Coverage::
 
 end::catalog[] */
 
+use std::time::Duration;
+
 use crate::driver::ic::{InternetComputer, Subnet};
+use crate::driver::prometheus_vm::{HasPrometheus, PrometheusVm};
+use crate::driver::test_env::TestEnv;
 use crate::driver::test_env_api::*;
-use crate::driver::{ic::VmAllocationStrategy, test_env::TestEnv};
 use crate::util::*; // to use the universal canister
+use anyhow::bail;
 use ic_registry_subnet_type::SubnetType;
-use slog::{info, Logger};
+use slog::info;
 
 pub fn config_single_host(env: TestEnv) {
+    env.ensure_group_setup_created();
+    PrometheusVm::default()
+        .start(&env)
+        .expect("failed to start prometheus VM");
     InternetComputer::new()
         .add_subnet(Subnet::new(SubnetType::System).add_nodes(4))
-        .add_subnet(Subnet::new(SubnetType::System).add_nodes(4))
+        .add_subnet(Subnet::new(SubnetType::Application).add_nodes(4))
         .setup_and_start(&env)
-        .expect("failed to setup IC under test")
-}
-
-pub fn config_multiple_hosts() -> InternetComputer {
-    InternetComputer::new()
-        .add_subnet(Subnet::new(SubnetType::System).add_nodes(4))
-        .add_subnet(Subnet::new(SubnetType::System).add_nodes(4))
-        .with_allocation_strategy(VmAllocationStrategy::DistributeAcrossDcs)
+        .expect("failed to setup IC under test");
+    env.sync_prometheus_config_with_topology();
 }
 
 const MSG: &[u8] = b"this beautiful prose should be persisted for future generations";
+const READ_RETRIES: u64 = 10;
+const RETRY_WAIT: Duration = Duration::from_secs(10);
 
 /// Here we define the test workflow, which should implement the Runbook given
 /// in the test catalog entry at the top of this file.
-pub fn basic_health_test(env: TestEnv, log: Logger) {
+pub fn test(env: TestEnv) {
+    let log = env.logger();
     // Assemble a list that contains one node per subnet.
     let nodes: Vec<_> = env
         .topology_snapshot()
@@ -75,8 +80,12 @@ pub fn basic_health_test(env: TestEnv, log: Logger) {
     let ucan_ids: Vec<_> = nodes
         .iter()
         .map(|node| {
-            node.with_default_agent(|agent| async move {
-                let ucan = UniversalCanister::new(&agent).await;
+            let inner_log = log.clone();
+            let effective_canister_id = node.effective_canister_id();
+            node.with_default_agent(move |agent| async move {
+                let ucan =
+                    UniversalCanister::new_with_retries(&agent, effective_canister_id, &inner_log)
+                        .await;
 
                 // send a query call to it
                 assert_eq!(ucan.try_read_stable(0, 0).await, Vec::<u8>::new());
@@ -131,8 +140,7 @@ pub fn basic_health_test(env: TestEnv, log: Logger) {
             info!(log, "Assert correct read message from canister...");
             // Verify the originating canister now has the expected content.
             assert_eq!(
-                ucan.try_read_stable_with_retries(&log, 0, expect.len() as u32, 10, 10)
-                    .await,
+                ucan.try_read_stable(0, expect.len() as u32).await,
                 expect.to_vec()
             );
         });
@@ -142,12 +150,27 @@ pub fn basic_health_test(env: TestEnv, log: Logger) {
     // Finally we query each of the canisters to ensure that the canister
     // memories have been updated as expected.
     for (node, ucan_id) in nodes.iter().zip(ucan_ids) {
+        let log = log.clone();
         node.with_default_agent(move |agent| async move {
             let ucan = UniversalCanister::from_canister_id(&agent, ucan_id);
-            assert_eq!(
-                ucan.try_read_stable(0, XNET_MSG.len() as u32).await,
-                XNET_MSG.to_vec()
-            );
+            // NOTE: retries are important here, 1/3 of the nodes might not observe changes immediately.
+            retry_async(&log, READY_WAIT_TIMEOUT, RETRY_BACKOFF, || async {
+                let current_msg = ucan
+                    .try_read_stable_with_retries(
+                        &log,
+                        0,
+                        XNET_MSG.len() as u32,
+                        READ_RETRIES,
+                        RETRY_WAIT,
+                    )
+                    .await;
+                if current_msg != XNET_MSG.to_vec() {
+                    bail!("Expected message not found!")
+                }
+                Ok(())
+            })
+            .await
+            .expect("Node not healthy");
         })
     }
 }

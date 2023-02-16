@@ -1,4 +1,5 @@
 use crate::*;
+use ic_crypto_internal_seed::xmd;
 use std::collections::BTreeMap;
 
 /// A Random Oracle (based on XMD)
@@ -72,7 +73,6 @@ impl RandomOracle {
         name: &str,
         input: &[u8],
         ty: RandomOracleInputType,
-        curve_tag: Option<u8>,
     ) -> ThresholdEcdsaResult<()> {
         if self.inputs.contains_key(name) {
             return Err(ThresholdEcdsaError::InvalidRandomOracleInput);
@@ -86,13 +86,9 @@ impl RandomOracle {
             return Err(ThresholdEcdsaError::InvalidRandomOracleInput);
         }
 
-        let curve_tag_len = if curve_tag.is_some() { 1 } else { 0 };
-        let mut encoded_input = Vec::with_capacity(1 + 4 + curve_tag_len + input.len());
+        let mut encoded_input = Vec::with_capacity(1 + 4 + input.len());
 
         encoded_input.extend_from_slice(&[ty.tag()]);
-        if let Some(curve_tag) = curve_tag {
-            encoded_input.extend_from_slice(&[curve_tag]);
-        }
         encoded_input.extend_from_slice(&(input.len() as u32).to_be_bytes());
         encoded_input.extend_from_slice(input);
 
@@ -107,12 +103,7 @@ impl RandomOracle {
     ///
     /// The name must be a unique identifier for this random oracle invocation
     pub fn add_point(&mut self, name: &'static str, pt: &EccPoint) -> ThresholdEcdsaResult<()> {
-        self.add_input(
-            name,
-            &pt.serialize(),
-            RandomOracleInputType::Point,
-            Some(pt.curve_type().tag()),
-        )
+        self.add_input(name, &pt.serialize_tagged(), RandomOracleInputType::Point)
     }
 
     /// Add several points to the input
@@ -122,9 +113,8 @@ impl RandomOracle {
         for (i, pt) in pts.iter().enumerate() {
             self.add_input(
                 &format!("{}[{}]", name, i),
-                &pt.serialize(),
+                &pt.serialize_tagged(),
                 RandomOracleInputType::Point,
-                Some(pt.curve_type().tag()),
             )?;
         }
 
@@ -135,12 +125,7 @@ impl RandomOracle {
     ///
     /// The name must be a unique identifier for this random oracle invocation
     pub fn add_scalar(&mut self, name: &'static str, s: &EccScalar) -> ThresholdEcdsaResult<()> {
-        self.add_input(
-            name,
-            &s.serialize(),
-            RandomOracleInputType::Scalar,
-            Some(s.curve_type().tag()),
-        )
+        self.add_input(name, &s.serialize_tagged(), RandomOracleInputType::Scalar)
     }
 
     /// Add a byte string to the input
@@ -148,14 +133,14 @@ impl RandomOracle {
     /// The name must be a unique identifier for this random oracle invocation
     /// The byte string can be at most 2**32-1 bytes
     pub fn add_bytestring(&mut self, name: &'static str, v: &[u8]) -> ThresholdEcdsaResult<()> {
-        self.add_input(name, v, RandomOracleInputType::Bytestring, None)
+        self.add_input(name, v, RandomOracleInputType::Bytestring)
     }
 
     /// Add an integer to the input
     ///
     /// The name must be a unique identifier for this random oracle invocation
     pub fn add_u64(&mut self, name: &'static str, i: u64) -> ThresholdEcdsaResult<()> {
-        self.add_input(name, &i.to_be_bytes(), RandomOracleInputType::Integer, None)
+        self.add_input(name, &i.to_be_bytes(), RandomOracleInputType::Integer)
     }
 
     /// Add an integer to the input
@@ -197,7 +182,11 @@ impl RandomOracle {
     pub fn output_bytestring(self, output_length: usize) -> ThresholdEcdsaResult<Vec<u8>> {
         let ro_input = self.form_ro_input()?;
 
-        xmd::expand_message_xmd(&ro_input, self.domain_separator.as_bytes(), output_length)
+        Ok(xmd::expand_message_xmd(
+            &ro_input,
+            self.domain_separator.as_bytes(),
+            output_length,
+        )?)
     }
 
     /// Consume the random oracle and generate a point as output
@@ -213,7 +202,7 @@ impl RandomOracle {
 
     /// Consume the random oracle and generate a scalar output
     pub fn output_scalar(self, curve_type: EccCurveType) -> ThresholdEcdsaResult<EccScalar> {
-        Ok(self.output_scalars(curve_type, 1)?[0])
+        Ok(self.output_scalars(curve_type, 1)?[0].clone())
     }
 
     /// Consume the random oracle and generate several scalar outputs

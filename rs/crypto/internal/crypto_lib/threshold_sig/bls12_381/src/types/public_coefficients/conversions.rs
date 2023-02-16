@@ -2,7 +2,7 @@
 
 use crate::crypto::public_key_from_secret_key;
 use crate::types::{Polynomial, PublicCoefficients, PublicKey};
-use bls12_381::G2Projective;
+use ic_crypto_internal_bls12_381_type::G2Projective;
 use ic_crypto_internal_types::sign::threshold_sig::ni_dkg::ni_dkg_groth20_bls12_381::PublicCoefficientsBytes;
 pub use ic_crypto_internal_types::sign::threshold_sig::public_coefficients::bls12_381::PublicCoefficientsBytes as InternalPublicCoefficients;
 use ic_crypto_internal_types::sign::threshold_sig::public_coefficients::CspPublicCoefficients;
@@ -55,7 +55,7 @@ pub fn try_number_of_nodes_from_csp_pub_coeffs(
 ) -> CryptoResult<NumberOfNodes> {
     match value {
         CspPublicCoefficients::Bls12_381(public_coefficients) => {
-            try_number_of_nodes_from_pub_coeff_bytes(public_coefficients).map_err(|e| e)
+            try_number_of_nodes_from_pub_coeff_bytes(public_coefficients)
         }
     }
 }
@@ -85,7 +85,7 @@ impl From<&PublicCoefficients> for PublicKey {
         public_coefficients
             .coefficients
             .get(0)
-            .copied()
+            .cloned()
             .unwrap_or_else(|| PublicKey(G2Projective::identity()))
     }
 }

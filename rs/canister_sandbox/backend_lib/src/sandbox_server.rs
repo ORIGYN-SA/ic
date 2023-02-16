@@ -33,8 +33,22 @@ impl SandboxService for SandboxServer {
     }
 
     fn open_wasm(&self, req: OpenWasmRequest) -> rpc::Call<OpenWasmReply> {
-        let result = self.manager.open_wasm(req.wasm_id, req.wasm_src);
+        let result = self
+            .manager
+            .open_wasm(req.wasm_id, req.wasm_src)
+            .map(|(_cache, result, serialized_module)| (result, serialized_module));
         rpc::Call::new_resolved(Ok(OpenWasmReply(result)))
+    }
+
+    fn open_wasm_serialized(
+        &self,
+        req: OpenWasmSerializedRequest,
+    ) -> rpc::Call<OpenWasmSerializedReply> {
+        let result = self
+            .manager
+            .open_wasm_serialized(req.wasm_id, &req.serialized_module)
+            .map(|_| ());
+        rpc::Call::new_resolved(Ok(OpenWasmSerializedReply(result)))
     }
 
     fn close_wasm(&self, req: CloseWasmRequest) -> rpc::Call<CloseWasmReply> {
@@ -73,6 +87,20 @@ impl SandboxService for SandboxServer {
         })
     }
 
+    fn resume_execution(&self, req: ResumeExecutionRequest) -> rpc::Call<ResumeExecutionReply> {
+        rpc::Call::new_resolved({
+            SandboxManager::resume_execution(&self.manager, req.exec_id);
+            Ok(ResumeExecutionReply { success: true })
+        })
+    }
+
+    fn abort_execution(&self, req: AbortExecutionRequest) -> rpc::Call<AbortExecutionReply> {
+        rpc::Call::new_resolved({
+            SandboxManager::abort_execution(&self.manager, req.exec_id);
+            Ok(AbortExecutionReply { success: true })
+        })
+    }
+
     fn create_execution_state(
         &self,
         req: CreateExecutionStateRequest,
@@ -83,8 +111,24 @@ impl SandboxService for SandboxServer {
             req.wasm_page_map,
             req.next_wasm_memory_id,
             req.canister_id,
+            req.stable_memory_page_map,
         );
         rpc::Call::new_resolved(Ok(CreateExecutionStateReply(result)))
+    }
+
+    fn create_execution_state_serialized(
+        &self,
+        req: CreateExecutionStateSerializedRequest,
+    ) -> rpc::Call<CreateExecutionStateSerializedReply> {
+        let result = self.manager.create_execution_state_serialized(
+            req.wasm_id,
+            req.serialized_module,
+            req.wasm_page_map,
+            req.next_wasm_memory_id,
+            req.canister_id,
+            req.stable_memory_page_map,
+        );
+        rpc::Call::new_resolved(Ok(CreateExecutionStateSerializedReply(result)))
     }
 }
 
@@ -102,17 +146,17 @@ mod tests {
             structs::SandboxExecInput,
         },
     };
-    use ic_config::embedders::Config as EmbeddersConfig;
-    use ic_config::subnet_config::CyclesAccountManagerConfig;
+    use ic_config::subnet_config::{CyclesAccountManagerConfig, SchedulerConfig};
+    use ic_config::{embedders::Config as EmbeddersConfig, flag_status::FlagStatus};
+    use ic_constants::SMALL_APP_SUBNET_MAX_SIZE;
     use ic_cycles_account_manager::CyclesAccountManager;
-    use ic_interfaces::execution_environment::{
-        AvailableMemory, ExecutionMode, ExecutionParameters,
-    };
+    use ic_interfaces::execution_environment::{ExecutionMode, SubnetAvailableMemory};
+    use ic_logger::replica_logger::no_op_logger;
     use ic_registry_subnet_type::SubnetType;
-    use ic_replicated_state::{Global, NetworkTopology, NumWasmPages, PageIndex, PageMap};
+    use ic_replicated_state::{Global, NumWasmPages, PageIndex, PageMap};
     use ic_system_api::{
         sandbox_safe_system_state::{CanisterStatusView, SandboxSafeSystemState},
-        ApiType,
+        ApiType, ExecutionParameters, InstructionLimits,
     };
     use ic_test_utilities::types::ids::{canister_test_id, subnet_test_id, user_test_id};
     use ic_types::{
@@ -120,20 +164,23 @@ mod tests {
         messages::CallContextId,
         methods::{FuncRef, WasmMethod},
         time::Time,
-        ComputeAllocation, Cycles, MemoryAllocation, NumBytes, NumInstructions, SubnetId,
+        CanisterTimer, ComputeAllocation, Cycles, MemoryAllocation, NumBytes, NumInstructions,
     };
     use mockall::*;
-    use std::collections::BTreeMap;
+    use std::collections::{BTreeMap, BTreeSet};
     use std::convert::TryFrom;
     use std::sync::{Arc, Condvar, Mutex};
-    use wabt::wat2wasm;
+
+    const INSTRUCTION_LIMIT: u64 = 100_000;
 
     fn execution_parameters() -> ExecutionParameters {
         ExecutionParameters {
-            total_instruction_limit: NumInstructions::new(1000),
-            slice_instruction_limit: NumInstructions::new(1000),
+            instruction_limits: InstructionLimits::new(
+                FlagStatus::Disabled,
+                NumInstructions::new(INSTRUCTION_LIMIT),
+                NumInstructions::new(INSTRUCTION_LIMIT),
+            ),
             canister_memory_limit: NumBytes::new(4 << 30),
-            subnet_available_memory: AvailableMemory::new(i64::MAX / 2, i64::MAX / 2).into(),
             compute_allocation: ComputeAllocation::default(),
             subnet_type: SubnetType::Application,
             execution_mode: ExecutionMode::Replicated,
@@ -141,13 +188,15 @@ mod tests {
     }
 
     fn sandbox_safe_system_state() -> SandboxSafeSystemState {
+        let mut ic00_aliases = BTreeSet::new();
+        ic00_aliases.insert(canister_test_id(0));
         SandboxSafeSystemState::new_internal(
             canister_test_id(0),
             user_test_id(0).get(),
             CanisterStatusView::Running,
             NumSeconds::from(3600),
             MemoryAllocation::BestEffort,
-            Cycles::from(1_000_000),
+            Cycles::new(1_000_000),
             BTreeMap::new(),
             CyclesAccountManager::new(
                 NumInstructions::from(1_000_000_000),
@@ -157,6 +206,12 @@ mod tests {
             ),
             Some(0),
             BTreeMap::new(),
+            0,
+            ic00_aliases,
+            SMALL_APP_SUBNET_MAX_SIZE,
+            SchedulerConfig::application_subnet().dirty_page_overhead,
+            CanisterTimer::Inactive,
+            0,
         )
     }
 
@@ -186,19 +241,17 @@ mod tests {
             api_type: ApiType::update(
                 Time::from_nanos_since_unix_epoch(0),
                 incoming_payload.to_vec(),
-                Cycles::from(0),
+                Cycles::zero(),
                 PrincipalId::try_from([0].as_ref()).unwrap(),
                 CallContextId::from(0),
-                SubnetId::from(PrincipalId::new_subnet_test_id(0)),
-                SubnetType::Application,
-                Arc::new(NetworkTopology::default()),
             ),
             globals,
             canister_current_memory_usage: NumBytes::from(0),
             execution_parameters: execution_parameters(),
+            subnet_available_memory: SubnetAvailableMemory::new(i64::MAX / 2, i64::MAX / 2),
             next_wasm_memory_id,
             next_stable_memory_id,
-            sandox_safe_system_state: sandbox_safe_system_state(),
+            sandbox_safe_system_state: sandbox_safe_system_state(),
             wasm_reserved_pages: NumWasmPages::from(0),
         }
     }
@@ -219,9 +272,10 @@ mod tests {
             globals,
             canister_current_memory_usage: NumBytes::from(0),
             execution_parameters: execution_parameters(),
+            subnet_available_memory: SubnetAvailableMemory::new(i64::MAX / 2, i64::MAX / 2),
             next_wasm_memory_id: MemoryId::new(),
             next_stable_memory_id: MemoryId::new(),
-            sandox_safe_system_state: sandbox_safe_system_state(),
+            sandbox_safe_system_state: sandbox_safe_system_state(),
             wasm_reserved_pages: NumWasmPages::from(0),
         }
     }
@@ -234,6 +288,10 @@ mod tests {
             fn execution_finished(
                 &self, req : protocol::ctlsvc::ExecutionFinishedRequest
             ) -> rpc::Call<protocol::ctlsvc::ExecutionFinishedReply>;
+
+            fn execution_paused(
+                &self, req : protocol::ctlsvc::ExecutionPausedRequest
+            ) -> rpc::Call<protocol::ctlsvc::ExecutionPausedReply>;
 
             fn log_via_replica(&self, log: protocol::logging::LogRequest) -> rpc::Call<()>;
         }
@@ -305,7 +363,7 @@ mod tests {
             )
             "#;
 
-        wat2wasm(wat_data).unwrap().as_slice().to_vec()
+        wat::parse_str(wat_data).unwrap().as_slice().to_vec()
     }
 
     fn make_memory_canister_wasm() -> Vec<u8> {
@@ -395,7 +453,52 @@ mod tests {
             )
             "#;
 
-        wat2wasm(wat_data).unwrap().as_slice().to_vec()
+        wat::parse_str(wat_data).unwrap().as_slice().to_vec()
+    }
+
+    fn make_long_running_canister_wasm() -> Vec<u8> {
+        // This canister supports a `run` method that takes 4 bytes
+        // representing an integer number of iterations to run as an argument.
+        // Each iteration executes 6 instructions.
+        let wat_data = r#"
+            (module
+              (import "ic0" "msg_arg_data_size"
+                (func $msg_arg_data_size (result i32)))
+              (import "ic0" "msg_arg_data_copy"
+                (func $msg_arg_data_copy (param i32 i32 i32)))
+              (import "ic0" "msg_reply" (func $msg_reply))
+              (import "ic0" "msg_reply_data_append"
+                (func $msg_reply_data_append (param i32) (param i32)))
+
+              (func $run
+                (local $i i32)
+                (local $limit i32)
+                (call $msg_arg_data_copy ;; copy entire messge ;;
+                  (i32.const 0) ;; dst ;;
+                  (i32.const 0) ;; offset ;;
+                  (call $msg_arg_data_size) ;; size ;;
+                )
+                (i32.load (i32.const 0))
+                (local.set $limit)
+                (loop $loop
+                    local.get $i
+                    i32.const 1
+                    i32.add
+                    local.tee $i
+                    local.get $limit
+                    i32.lt_s
+                    br_if $loop
+                )
+                (call $msg_reply)
+              )
+
+              (memory $memory 1)
+              (export "memory" (memory $memory))
+              (export "canister_update run" (func $run))
+            )
+            "#;
+
+        wat::parse_str(wat_data).unwrap().as_slice().to_vec()
     }
 
     /// Create a "mock" controller service that handles the IPC requests
@@ -453,6 +556,7 @@ mod tests {
         let srv = SandboxServer::new(SandboxManager::new(
             setup_mock_controller(exec_finished_sync.clone()),
             EmbeddersConfig::default(),
+            no_op_logger(),
         ));
 
         let wasm_id = WasmId::new();
@@ -465,9 +569,9 @@ mod tests {
             .unwrap();
         assert!(rep.0.is_ok());
 
-        let wasm_memory = PageMap::default();
+        let wasm_memory = PageMap::new_for_testing();
         let wasm_memory_id = open_memory(&srv, &wasm_memory, 0);
-        let stable_memory = PageMap::default();
+        let stable_memory = PageMap::new_for_testing();
         let stable_memory_id = open_memory(&srv, &stable_memory, 0);
 
         // First time around, issue an update to increase the counter.
@@ -481,7 +585,7 @@ mod tests {
                 exec_input: exec_input_for_update(
                     "write",
                     &[],
-                    vec![],
+                    vec![Global::I32(0), Global::I64(0)],
                     MemoryId::new(),
                     MemoryId::new(),
                 ),
@@ -491,7 +595,10 @@ mod tests {
         assert!(rep.success);
 
         let result = exec_finished_sync.get();
-        assert!(result.exec_output.wasm.num_instructions_left < NumInstructions::from(1000));
+        assert!(
+            result.exec_output.wasm.num_instructions_left
+                < NumInstructions::from(INSTRUCTION_LIMIT)
+        );
         let wasm_result = result.exec_output.wasm.wasm_result.unwrap().unwrap();
         let globals = result.exec_output.state.unwrap().globals;
         assert_eq!(WasmResult::Reply([1, 0, 0, 0].to_vec()), wasm_result);
@@ -512,7 +619,10 @@ mod tests {
         assert!(rep.success);
 
         let result = exec_finished_sync.get();
-        assert!(result.exec_output.wasm.num_instructions_left < NumInstructions::from(1000));
+        assert!(
+            result.exec_output.wasm.num_instructions_left
+                < NumInstructions::from(INSTRUCTION_LIMIT)
+        );
         let wasm_result = result.exec_output.wasm.wasm_result.unwrap().unwrap();
         assert_eq!(WasmResult::Reply([1, 0, 0, 0].to_vec()), wasm_result);
     }
@@ -527,6 +637,7 @@ mod tests {
         let srv = SandboxServer::new(SandboxManager::new(
             setup_mock_controller(exec_finished_sync.clone()),
             EmbeddersConfig::default(),
+            no_op_logger(),
         ));
 
         let wasm_id = WasmId::new();
@@ -539,9 +650,9 @@ mod tests {
             .unwrap();
         assert!(rep.0.is_ok());
 
-        let mut wasm_memory = PageMap::default();
+        let mut wasm_memory = PageMap::new_for_testing();
         let wasm_memory_id = open_memory(&srv, &wasm_memory, 0);
-        let stable_memory = PageMap::default();
+        let stable_memory = PageMap::new_for_testing();
         let stable_memory_id = open_memory(&srv, &stable_memory, 0);
 
         // Issue a write of bytes [1, 2, 3, 4] at address 16.
@@ -555,7 +666,7 @@ mod tests {
                 exec_input: exec_input_for_update(
                     "write",
                     &[16, 0, 0, 0, 1, 2, 3, 4],
-                    vec![],
+                    vec![Global::I64(0)],
                     MemoryId::new(),
                     MemoryId::new(),
                 ),
@@ -586,6 +697,7 @@ mod tests {
         let srv = SandboxServer::new(SandboxManager::new(
             setup_mock_controller(exec_finished_sync.clone()),
             EmbeddersConfig::default(),
+            no_op_logger(),
         ));
 
         let wasm_id = WasmId::new();
@@ -598,9 +710,9 @@ mod tests {
             .unwrap();
         assert!(rep.0.is_ok());
 
-        let wasm_memory = PageMap::default();
+        let wasm_memory = PageMap::new_for_testing();
         let wasm_memory_id = open_memory(&srv, &wasm_memory, 0);
-        let stable_memory = PageMap::default();
+        let stable_memory = PageMap::new_for_testing();
         let stable_memory_id = open_memory(&srv, &stable_memory, 0);
 
         let next_wasm_memory_id = MemoryId::new();
@@ -617,7 +729,7 @@ mod tests {
                 exec_input: exec_input_for_update(
                     "write",
                     &[16, 0, 0, 0, 1, 2, 3, 4],
-                    vec![],
+                    vec![Global::I64(0)],
                     next_wasm_memory_id,
                     next_stable_memory_id,
                 ),
@@ -635,7 +747,11 @@ mod tests {
                 wasm_id,
                 wasm_memory_id: next_wasm_memory_id,
                 stable_memory_id: next_stable_memory_id,
-                exec_input: exec_input_for_query("read", &[16, 0, 0, 0, 4, 0, 0, 0], vec![]),
+                exec_input: exec_input_for_query(
+                    "read",
+                    &[16, 0, 0, 0, 4, 0, 0, 0],
+                    vec![Global::I64(0)],
+                ),
             })
             .sync()
             .unwrap();
@@ -648,9 +764,7 @@ mod tests {
 
     /// Verifies that we can create a simple canister and run multiple
     /// queries with the same Wasm cache.
-    /// TODO: INF-1653 This code triggers EINVAL from lmdb fairly consistently.
     #[test]
-    #[ignore]
     fn test_simple_canister_wasm_cache() {
         let exec_finished_sync =
             Arc::new(SyncCell::<protocol::ctlsvc::ExecutionFinishedRequest>::new());
@@ -669,7 +783,11 @@ mod tests {
 
         let controller = Arc::new(controller);
 
-        let srv = SandboxServer::new(SandboxManager::new(controller, EmbeddersConfig::default()));
+        let srv = SandboxServer::new(SandboxManager::new(
+            controller,
+            EmbeddersConfig::default(),
+            no_op_logger(),
+        ));
 
         let wasm_id = WasmId::new();
         let rep = srv
@@ -681,9 +799,9 @@ mod tests {
             .unwrap();
         assert!(rep.0.is_ok());
 
-        let wasm_memory = PageMap::default();
+        let wasm_memory = PageMap::new_for_testing();
         let wasm_memory_id = open_memory(&srv, &wasm_memory, 0);
-        let stable_memory = PageMap::default();
+        let stable_memory = PageMap::new_for_testing();
         let stable_memory_id = open_memory(&srv, &stable_memory, 0);
 
         // First time around, issue an update to increase the counter.
@@ -697,7 +815,7 @@ mod tests {
                 exec_input: exec_input_for_update(
                     "write",
                     &[],
-                    vec![],
+                    vec![Global::I32(0), Global::I64(0)],
                     MemoryId::new(),
                     MemoryId::new(),
                 ),
@@ -707,11 +825,14 @@ mod tests {
         assert!(rep.success);
 
         let result = exec_finished_sync.get();
-        assert!(result.exec_output.wasm.num_instructions_left < NumInstructions::from(1000));
+        assert!(
+            result.exec_output.wasm.num_instructions_left
+                < NumInstructions::from(INSTRUCTION_LIMIT)
+        );
         let wasm_result = result.exec_output.wasm.wasm_result.unwrap().unwrap();
         let globals = result.exec_output.state.unwrap().globals;
         assert_eq!(WasmResult::Reply([1, 0, 0, 0].to_vec()), wasm_result);
-        assert_eq!([Global::I32(1), Global::I64(988)].to_vec(), globals);
+        assert_eq!(Global::I32(1), globals[0]);
 
         // Ensure we close Wasm and stable memory.
         close_memory(&srv, wasm_memory_id);
@@ -719,9 +840,9 @@ mod tests {
 
         // Now re-issue the same call but with the previous cache on.
 
-        let wasm_memory = PageMap::default();
+        let wasm_memory = PageMap::new_for_testing();
         let wasm_memory_id = open_memory(&srv, &wasm_memory, 0);
-        let stable_memory = PageMap::default();
+        let stable_memory = PageMap::new_for_testing();
         let stable_memory_id = open_memory(&srv, &stable_memory, 0);
 
         // First time around, issue an update to increase the counter.
@@ -744,10 +865,13 @@ mod tests {
         assert!(rep.success);
 
         let result = exec_finished_sync.get();
-        assert!(result.exec_output.wasm.num_instructions_left < NumInstructions::from(1000));
+        assert!(
+            result.exec_output.wasm.num_instructions_left
+                < NumInstructions::from(INSTRUCTION_LIMIT)
+        );
         let wasm_result = result.exec_output.wasm.wasm_result.unwrap().unwrap();
         let globals = result.exec_output.state.unwrap().globals;
-        assert_eq!(WasmResult::Reply([1, 0, 0, 0].to_vec()), wasm_result);
+        assert_eq!(WasmResult::Reply([2, 0, 0, 0].to_vec()), wasm_result);
 
         // Second time around, issue a query to read the counter. We
         // expect to be able to read back the modified counter value
@@ -765,9 +889,11 @@ mod tests {
         assert!(rep.success);
 
         let result = exec_finished_sync.get();
-        assert!(result.exec_output.wasm.num_instructions_left < NumInstructions::from(500));
+        let instructions_used = NumInstructions::from(INSTRUCTION_LIMIT)
+            - result.exec_output.wasm.num_instructions_left;
+        assert!(instructions_used.get() > 0);
         let wasm_result = result.exec_output.wasm.wasm_result.unwrap().unwrap();
-        assert_eq!(WasmResult::Reply([1, 0, 0, 0].to_vec()), wasm_result);
+        assert_eq!(WasmResult::Reply([2, 0, 0, 0].to_vec()), wasm_result);
     }
 
     /// Verify that stable memory writes result in correct page being marked
@@ -780,6 +906,7 @@ mod tests {
         let srv = SandboxServer::new(SandboxManager::new(
             setup_mock_controller(exec_finished_sync.clone()),
             EmbeddersConfig::default(),
+            no_op_logger(),
         ));
 
         let wasm_id = WasmId::new();
@@ -792,9 +919,9 @@ mod tests {
             .unwrap();
         assert!(rep.0.is_ok());
 
-        let wasm_memory = PageMap::default();
+        let wasm_memory = PageMap::new_for_testing();
         let wasm_memory_id = open_memory(&srv, &wasm_memory, 0);
-        let mut stable_memory = PageMap::default();
+        let mut stable_memory = PageMap::new_for_testing();
         let stable_memory_id = open_memory(&srv, &stable_memory, 1);
 
         // Issue a write of bytes [1, 2, 3, 4] at address 16 in stable memory.
@@ -808,7 +935,7 @@ mod tests {
                 exec_input: exec_input_for_update(
                     "write_stable",
                     &[16, 0, 0, 0, 1, 2, 3, 4],
-                    vec![],
+                    vec![Global::I64(0)],
                     MemoryId::new(),
                     MemoryId::new(),
                 ),
@@ -839,6 +966,7 @@ mod tests {
         let srv = SandboxServer::new(SandboxManager::new(
             setup_mock_controller(exec_finished_sync.clone()),
             EmbeddersConfig::default(),
+            no_op_logger(),
         ));
 
         let wasm_id = WasmId::new();
@@ -851,9 +979,9 @@ mod tests {
             .unwrap();
         assert!(rep.0.is_ok());
 
-        let wasm_memory = PageMap::default();
+        let wasm_memory = PageMap::new_for_testing();
         let wasm_memory_id = open_memory(&srv, &wasm_memory, 0);
-        let stable_memory = PageMap::default();
+        let stable_memory = PageMap::new_for_testing();
         let stable_memory_id = open_memory(&srv, &stable_memory, 1);
 
         let next_wasm_memory_id = MemoryId::new();
@@ -870,7 +998,7 @@ mod tests {
                 exec_input: exec_input_for_update(
                     "write_stable",
                     &[16, 0, 0, 0, 1, 2, 3, 4],
-                    vec![],
+                    vec![Global::I64(0)],
                     next_wasm_memory_id,
                     next_stable_memory_id,
                 ),
@@ -888,7 +1016,11 @@ mod tests {
                 wasm_id,
                 wasm_memory_id: next_wasm_memory_id,
                 stable_memory_id: next_stable_memory_id,
-                exec_input: exec_input_for_query("read_stable", &[16, 0, 0, 0, 4, 0, 0, 0], vec![]),
+                exec_input: exec_input_for_query(
+                    "read_stable",
+                    &[16, 0, 0, 0, 4, 0, 0, 0],
+                    vec![Global::I64(0)],
+                ),
             })
             .sync()
             .unwrap();
@@ -907,6 +1039,7 @@ mod tests {
         let srv = SandboxServer::new(SandboxManager::new(
             setup_mock_controller(exec_finished_sync.clone()),
             EmbeddersConfig::default(),
+            no_op_logger(),
         ));
 
         let wasm_id = WasmId::new();
@@ -919,9 +1052,9 @@ mod tests {
             .unwrap();
         assert!(rep.0.is_ok());
 
-        let mut wasm_memory = PageMap::default();
+        let mut wasm_memory = PageMap::new_for_testing();
         let parent_wasm_memory_id = open_memory(&srv, &wasm_memory, 1);
-        let stable_memory = PageMap::default();
+        let stable_memory = PageMap::new_for_testing();
         let parent_stable_memory_id = open_memory(&srv, &stable_memory, 0);
 
         let child_wasm_memory_id = MemoryId::new();
@@ -938,7 +1071,7 @@ mod tests {
                 exec_input: exec_input_for_update(
                     "write",
                     &[16, 0, 0, 0, 1, 2, 3, 4],
-                    vec![],
+                    vec![Global::I64(0)],
                     child_wasm_memory_id,
                     child_stable_memory_id,
                 ),
@@ -969,7 +1102,7 @@ mod tests {
                 exec_input: exec_input_for_update(
                     "write",
                     &[32, 0, 0, 0, 5, 6, 7, 8],
-                    vec![],
+                    vec![Global::I64(0)],
                     MemoryId::new(),
                     MemoryId::new(),
                 ),
@@ -1007,6 +1140,7 @@ mod tests {
         let srv = SandboxServer::new(SandboxManager::new(
             setup_mock_controller(exec_finished_sync.clone()),
             EmbeddersConfig::default(),
+            no_op_logger(),
         ));
 
         let wasm_id = WasmId::new();
@@ -1019,9 +1153,9 @@ mod tests {
             .unwrap();
         assert!(rep.0.is_ok());
 
-        let wasm_memory = PageMap::default();
+        let wasm_memory = PageMap::new_for_testing();
         let parent_wasm_memory_id = open_memory(&srv, &wasm_memory, 0);
-        let mut stable_memory = PageMap::default();
+        let mut stable_memory = PageMap::new_for_testing();
         let parent_stable_memory_id = open_memory(&srv, &stable_memory, 1);
 
         let child_wasm_memory_id = MemoryId::new();
@@ -1038,7 +1172,7 @@ mod tests {
                 exec_input: exec_input_for_update(
                     "write_stable",
                     &[16, 0, 0, 0, 1, 2, 3, 4],
-                    vec![],
+                    vec![Global::I64(0)],
                     child_wasm_memory_id,
                     child_stable_memory_id,
                 ),
@@ -1069,7 +1203,7 @@ mod tests {
                 exec_input: exec_input_for_update(
                     "write_stable",
                     &[32, 0, 0, 0, 5, 6, 7, 8],
-                    vec![],
+                    vec![Global::I64(0)],
                     MemoryId::new(),
                     MemoryId::new(),
                 ),
@@ -1097,5 +1231,227 @@ mod tests {
         close_memory(&srv, parent_stable_memory_id);
         close_memory(&srv, child_wasm_memory_id);
         close_memory(&srv, child_stable_memory_id);
+    }
+
+    #[test]
+    fn test_pause_resume() {
+        // The result of a single slice of execution.
+        #[allow(clippy::large_enum_variant)]
+        enum Completion {
+            Paused(protocol::ctlsvc::ExecutionPausedRequest),
+            Finished(protocol::ctlsvc::ExecutionFinishedRequest),
+        }
+
+        // Set up a mock service that puts the result of execution slice into this `SyncCell`.
+        let exec_sync_rx = Arc::new(SyncCell::<Completion>::new());
+        let mut controller = MockControllerService::new();
+        let exec_sync_tx = Arc::clone(&exec_sync_rx);
+        controller.expect_execution_paused().returning(move |req| {
+            (*exec_sync_tx).put(Completion::Paused(req));
+            rpc::Call::new_resolved(Ok(protocol::ctlsvc::ExecutionPausedReply {}))
+        });
+        let exec_sync_tx = Arc::clone(&exec_sync_rx);
+        controller
+            .expect_execution_finished()
+            .returning(move |req| {
+                (*exec_sync_tx).put(Completion::Finished(req));
+                rpc::Call::new_resolved(Ok(protocol::ctlsvc::ExecutionFinishedReply {}))
+            });
+        controller
+            .expect_log_via_replica()
+            .returning(move |_req| rpc::Call::new_resolved(Ok(())));
+
+        // Set up a sandbox server.
+        let srv = SandboxServer::new(SandboxManager::new(
+            Arc::new(controller),
+            EmbeddersConfig::default(),
+            no_op_logger(),
+        ));
+
+        // Compile the wasm code.
+        let wasm_id = WasmId::new();
+        let rep = srv
+            .open_wasm(OpenWasmRequest {
+                wasm_id,
+                wasm_src: make_long_running_canister_wasm(),
+            })
+            .sync()
+            .unwrap();
+        assert!(rep.0.is_ok(), "{:?}", rep);
+
+        let wasm_memory = PageMap::new_for_testing();
+        let wasm_memory_id = open_memory(&srv, &wasm_memory, 1);
+        let stable_memory = PageMap::new_for_testing();
+        let stable_memory_id = open_memory(&srv, &stable_memory, 1);
+
+        let child_wasm_memory_id = MemoryId::new();
+        let child_stable_memory_id = MemoryId::new();
+
+        // Prepare the input such that the total execution requires 600+ instructions.
+        let exec_id = ExecId::new();
+        let mut exec_input = exec_input_for_update(
+            "run",
+            &[100, 0, 0, 0],
+            vec![Global::I64(0)],
+            child_wasm_memory_id,
+            child_stable_memory_id,
+        );
+        exec_input.execution_parameters.instruction_limits = InstructionLimits::new(
+            FlagStatus::Enabled,
+            NumInstructions::new(1000),
+            NumInstructions::new(70),
+        );
+
+        // Execute the first slice.
+        let rep = srv
+            .start_execution(protocol::sbxsvc::StartExecutionRequest {
+                exec_id,
+                wasm_id,
+                wasm_memory_id,
+                stable_memory_id,
+                exec_input,
+            })
+            .sync()
+            .unwrap();
+        assert!(rep.success);
+
+        // Resume execution 10 times.
+        for i in 0..10 {
+            let completion = exec_sync_rx.get();
+            match completion {
+                Completion::Paused(paused) => assert_eq!(paused.exec_id, exec_id),
+                Completion::Finished(finished) => {
+                    unreachable!(
+                        "Expected the execution to pause, but it finished after {} iterations: {:?}",
+                        i, finished.exec_output.wasm
+                    )
+                }
+            };
+
+            let rep = srv
+                .resume_execution(protocol::sbxsvc::ResumeExecutionRequest { exec_id })
+                .sync()
+                .unwrap();
+            assert!(rep.success);
+        }
+
+        // After 11 slices execution must complete.
+        let completion = exec_sync_rx.get();
+        let result = match completion {
+            Completion::Paused(_) => {
+                unreachable!("Expected the execution to finish, but it was paused")
+            }
+            Completion::Finished(result) => result,
+        };
+        let wasm_result = result.exec_output.wasm.wasm_result.unwrap().unwrap();
+        assert_eq!(WasmResult::Reply([].to_vec()), wasm_result);
+
+        close_memory(&srv, wasm_memory_id);
+        close_memory(&srv, stable_memory_id);
+        close_memory(&srv, child_wasm_memory_id);
+        close_memory(&srv, child_stable_memory_id);
+    }
+
+    #[test]
+    fn test_pause_abort() {
+        // The result of a single slice of execution.
+        #[allow(clippy::large_enum_variant)]
+        enum Completion {
+            Paused(protocol::ctlsvc::ExecutionPausedRequest),
+            Finished(protocol::ctlsvc::ExecutionFinishedRequest),
+        }
+
+        // Set up a mock service that puts the result of execution slice into this `SyncCell`.
+        let exec_sync_rx = Arc::new(SyncCell::<Completion>::new());
+        let mut controller = MockControllerService::new();
+        let exec_sync_tx = Arc::clone(&exec_sync_rx);
+        controller.expect_execution_paused().returning(move |req| {
+            (*exec_sync_tx).put(Completion::Paused(req));
+            rpc::Call::new_resolved(Ok(protocol::ctlsvc::ExecutionPausedReply {}))
+        });
+        let exec_sync_tx = Arc::clone(&exec_sync_rx);
+        controller
+            .expect_execution_finished()
+            .returning(move |req| {
+                (*exec_sync_tx).put(Completion::Finished(req));
+                rpc::Call::new_resolved(Ok(protocol::ctlsvc::ExecutionFinishedReply {}))
+            });
+        controller
+            .expect_log_via_replica()
+            .returning(move |_req| rpc::Call::new_resolved(Ok(())));
+
+        // Set up a sandbox server.
+        let srv = SandboxServer::new(SandboxManager::new(
+            Arc::new(controller),
+            EmbeddersConfig::default(),
+            no_op_logger(),
+        ));
+
+        // Compile the wasm code.
+        let wasm_id = WasmId::new();
+        let rep = srv
+            .open_wasm(OpenWasmRequest {
+                wasm_id,
+                wasm_src: make_long_running_canister_wasm(),
+            })
+            .sync()
+            .unwrap();
+        assert!(rep.0.is_ok());
+
+        let wasm_memory = PageMap::new_for_testing();
+        let wasm_memory_id = open_memory(&srv, &wasm_memory, 1);
+        let stable_memory = PageMap::new_for_testing();
+        let stable_memory_id = open_memory(&srv, &stable_memory, 1);
+
+        let child_wasm_memory_id = MemoryId::new();
+        let child_stable_memory_id = MemoryId::new();
+
+        // Prepare the input such that the total execution requires 600+ instructions.
+        let exec_id = ExecId::new();
+        let mut exec_input = exec_input_for_update(
+            "run",
+            &[100, 0, 0, 0],
+            vec![Global::I64(0)],
+            child_wasm_memory_id,
+            child_stable_memory_id,
+        );
+        exec_input.execution_parameters.instruction_limits = InstructionLimits::new(
+            FlagStatus::Enabled,
+            NumInstructions::new(1000),
+            NumInstructions::new(70),
+        );
+
+        // Execute the first slice.
+        let rep = srv
+            .start_execution(protocol::sbxsvc::StartExecutionRequest {
+                exec_id,
+                wasm_id,
+                wasm_memory_id,
+                stable_memory_id,
+                exec_input,
+            })
+            .sync()
+            .unwrap();
+        assert!(rep.success);
+
+        let completion = exec_sync_rx.get();
+        match completion {
+            Completion::Paused(paused) => assert_eq!(paused.exec_id, exec_id),
+            Completion::Finished(finished) => {
+                unreachable!(
+                    "Expected the execution to pause, but it finished: {:?}",
+                    finished.exec_output.wasm
+                )
+            }
+        };
+
+        let rep = srv
+            .abort_execution(protocol::sbxsvc::AbortExecutionRequest { exec_id })
+            .sync()
+            .unwrap();
+        assert!(rep.success);
+
+        close_memory(&srv, wasm_memory_id);
+        close_memory(&srv, stable_memory_id);
     }
 }

@@ -1,9 +1,10 @@
-use crate::models::{OperationIdentifier, OperationType};
-
 use super::*;
+use crate::models::amount::signed_amount;
+use crate::models::operation::{OperationIdentifier, OperationType};
+use crate::request_types::Stake;
 use crate::DEFAULT_TOKEN_SYMBOL;
-use ledger_canister::AccountIdentifier;
-use ledger_canister::Operation as LedgerOperation;
+use icp_ledger::AccountIdentifier;
+use icp_ledger::Operation as LedgerOperation;
 
 struct OperationBuilder(Operation);
 impl OperationBuilder {

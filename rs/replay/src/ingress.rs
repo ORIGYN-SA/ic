@@ -1,8 +1,8 @@
 use crate::cmd::{
-    AddAndBlessReplicaVersionCmd, AddRegistryContentCmd, SetRecoveryCupCmd, WithLedgerAccountCmd,
-    WithNeuronCmd, WithTrustedNeuronsFollowingNeuronCmd,
+    AddAndBlessReplicaVersionCmd, AddRegistryContentCmd, WithLedgerAccountCmd, WithNeuronCmd,
+    WithTrustedNeuronsFollowingNeuronCmd,
 };
-use candid::Encode;
+use candid::{decode_one, Encode};
 use ic_canister_client::{Agent, Sender};
 use ic_nervous_system_common::ledger;
 use ic_nns_common::pb::v1::NeuronId;
@@ -10,56 +10,43 @@ use ic_nns_constants::{GOVERNANCE_CANISTER_ID, LEDGER_CANISTER_ID, REGISTRY_CANI
 use ic_nns_governance::pb::v1::{
     manage_neuron::{
         claim_or_refresh::{By, MemoAndController},
-        ClaimOrRefresh, Command, Follow, NeuronIdOrSubaccount,
+        configure::Operation,
+        ClaimOrRefresh, Command, Configure, Follow, IncreaseDissolveDelay, NeuronIdOrSubaccount,
     },
-    ManageNeuron, Topic,
+    manage_neuron_response, ManageNeuron, ManageNeuronResponse, Topic,
 };
 use ic_protobuf::registry::{
     replica_version::v1::ReplicaVersionRecord,
-    subnet::v1::{CatchUpPackageContents, RegistryStoreUri, SubnetRecord, SubnetType},
+    subnet::v1::{SubnetRecord, SubnetType},
 };
 use ic_registry_client_helpers::subnet::get_node_ids_from_subnet_record;
 use ic_registry_keys::{
-    make_blessed_replica_version_key, make_catch_up_package_contents_key, make_replica_version_key,
-    make_subnet_record_key,
+    make_blessed_replica_version_key, make_replica_version_key, make_subnet_record_key,
 };
 use ic_registry_transport::{
     pb::v1::{registry_mutation, Precondition, RegistryMutation},
     serialize_atomic_mutate_request,
 };
 use ic_types::{messages::SignedIngress, CanisterId, PrincipalId, SubnetId, Time};
-use ledger_canister::{AccountIdentifier, Memo, SendArgs, Tokens};
+use icp_ledger::{AccountIdentifier, Memo, SendArgs, Tokens};
 use prost::Message;
 use std::convert::TryFrom;
 use std::str::FromStr;
 use std::time::Duration;
 
-static TRUSTED_NEURONS: &[(&str, u64)] = &[
-    (
-        "pkjng-fnb6a-zzirr-kykal-ghbjs-ndmj2-tfoma-bzski-wtbsl-2fgbu-hae",
-        16,
-    ),
-    (
-        "ilqei-ofqjz-v7jbw-usmzf-jtdss-6mvzv-puesh-3kfga-nhr3v-zmgig-eqe",
-        15,
-    ),
-    (
-        "2q5kv-5vcol-eh2je-udy6s-j74gx-djqza-siucy-2jxyq-u5kw6-imugq-uae",
-        18,
-    ),
-    (
-        "wyzjx-3pde2-wzr4k-fblse-7hzgm-v2kkx-lcuhl-dftmv-5ywr7-gsszf-6ae",
-        1_947_868_782_075_274_250,
-    ),
-    (
-        "j2xaq-c6ph5-e4oa7-nleph-joz7b-nvv4r-if4ol-ilz7w-mzetf-jof6l-mae",
-        5_091_612_375_828_828_066,
-    ),
-    (
-        "2yjpj-uumzi-wnefi-5tum7-qt6yq-7gtxo-i4jt5-enll5-pma6q-2gild-mqe",
-        12_262_067_573_992_506_876,
-    ),
-];
+pub struct IngressWithPrinter {
+    pub ingress: SignedIngress,
+    pub print: Option<fn(Vec<u8>)>,
+}
+
+impl From<SignedIngress> for IngressWithPrinter {
+    fn from(ingress: SignedIngress) -> IngressWithPrinter {
+        IngressWithPrinter {
+            ingress,
+            print: None,
+        }
+    }
+}
 
 fn make_signed_ingress(
     agent: &Agent,
@@ -85,7 +72,7 @@ fn agent_with_principal_as_sender(principal: &PrincipalId) -> Agent {
     )
 }
 
-pub fn cmd_add_neuron(time: Time, cmd: &WithNeuronCmd) -> Result<Vec<SignedIngress>, String> {
+pub fn cmd_add_neuron(time: Time, cmd: &WithNeuronCmd) -> Result<Vec<IngressWithPrinter>, String> {
     let mut msgs = vec![];
 
     let controller = cmd.neuron_controller;
@@ -105,8 +92,8 @@ pub fn cmd_add_neuron(time: Time, cmd: &WithNeuronCmd) -> Result<Vec<SignedIngre
     .expect("Couldn't candid-encode ledger transfer");
 
     let governance_agent = agent_with_principal_as_sender(&GOVERNANCE_CANISTER_ID.get());
-    msgs.push(
-        make_signed_ingress(
+    msgs.push(IngressWithPrinter {
+        ingress: make_signed_ingress(
             &governance_agent,
             LEDGER_CANISTER_ID,
             "send_dfx",
@@ -114,7 +101,8 @@ pub fn cmd_add_neuron(time: Time, cmd: &WithNeuronCmd) -> Result<Vec<SignedIngre
             time,
         )
         .expect("Couldn't create message to mint tokens to neuron account"),
-    );
+        print: None,
+    });
 
     let payload = Encode!(&ManageNeuron {
         id: None,
@@ -129,8 +117,8 @@ pub fn cmd_add_neuron(time: Time, cmd: &WithNeuronCmd) -> Result<Vec<SignedIngre
     .expect("Couldn't candid-encode neuron claim");
 
     let user_agent = &agent_with_principal_as_sender(&cmd.neuron_controller);
-    msgs.push(
-        make_signed_ingress(
+    msgs.push(IngressWithPrinter {
+        ingress: make_signed_ingress(
             user_agent,
             GOVERNANCE_CANISTER_ID,
             "manage_neuron",
@@ -138,7 +126,21 @@ pub fn cmd_add_neuron(time: Time, cmd: &WithNeuronCmd) -> Result<Vec<SignedIngre
             time,
         )
         .expect("Couldn't create messages to claim neuron"),
-    );
+        print: Some(|response: Vec<u8>| {
+            let v: ManageNeuronResponse =
+                decode_one(&response).expect("couldn't decode canister response");
+            match v.command {
+                Some(manage_neuron_response::Command::ClaimOrRefresh(
+                    manage_neuron_response::ClaimOrRefreshResponse {
+                        refreshed_neuron_id: Some(NeuronId { id }),
+                    },
+                )) => {
+                    println!("neuron_id={:?}", id)
+                }
+                val => unreachable!("unexpected response: {:?}", val),
+            }
+        }),
+    });
 
     Ok(msgs)
 }
@@ -149,9 +151,36 @@ pub fn cmd_make_trusted_neurons_follow_neuron(
 ) -> Result<Vec<SignedIngress>, String> {
     let mut msgs = Vec::new();
 
-    for (principal, neuron_id) in TRUSTED_NEURONS {
-        let principal = PrincipalId::from_str(*principal).expect("Invalid principal");
-        let payload = Encode!(&ManageNeuron {
+    let trusted_neurons: &[(&str, u64)] = &[
+        (
+            "pkjng-fnb6a-zzirr-kykal-ghbjs-ndmj2-tfoma-bzski-wtbsl-2fgbu-hae",
+            16,
+        ),
+        (
+            "ilqei-ofqjz-v7jbw-usmzf-jtdss-6mvzv-puesh-3kfga-nhr3v-zmgig-eqe",
+            15,
+        ),
+        (
+            "2q5kv-5vcol-eh2je-udy6s-j74gx-djqza-siucy-2jxyq-u5kw6-imugq-uae",
+            18,
+        ),
+        (
+            "wyzjx-3pde2-wzr4k-fblse-7hzgm-v2kkx-lcuhl-dftmv-5ywr7-gsszf-6ae",
+            1_947_868_782_075_274_250,
+        ),
+        (
+            "j2xaq-c6ph5-e4oa7-nleph-joz7b-nvv4r-if4ol-ilz7w-mzetf-jof6l-mae",
+            5_091_612_375_828_828_066,
+        ),
+        (
+            "2yjpj-uumzi-wnefi-5tum7-qt6yq-7gtxo-i4jt5-enll5-pma6q-2gild-mqe",
+            12_262_067_573_992_506_876,
+        ),
+    ];
+
+    for (principal, neuron_id) in trusted_neurons {
+        let principal = PrincipalId::from_str(principal).expect("Invalid principal");
+        let follow_payload = Encode!(&ManageNeuron {
             id: None,
             neuron_id_or_subaccount: Some(NeuronIdOrSubaccount::NeuronId(NeuronId {
                 id: *neuron_id,
@@ -168,12 +197,35 @@ pub fn cmd_make_trusted_neurons_follow_neuron(
                 user_agent,
                 GOVERNANCE_CANISTER_ID,
                 "manage_neuron",
-                payload,
+                follow_payload,
                 time,
             )
             .expect("Couldn't create message to make trusted neurons follow test neuron"),
         );
     }
+
+    // Increase the neuron's delay
+    let user_agent = &agent_with_principal_as_sender(&cmd.neuron_controller);
+    let delay_payload = Encode!(&ManageNeuron {
+        id: Some(NeuronId { id: cmd.neuron_id }),
+        neuron_id_or_subaccount: None,
+        command: Some(Command::Configure(Configure {
+            operation: Some(Operation::IncreaseDissolveDelay(IncreaseDissolveDelay {
+                additional_dissolve_delay_seconds: 31560000 // one year
+            }))
+        })),
+    })
+    .expect("Couldn't encode payload for manage neuron command");
+    msgs.push(
+        make_signed_ingress(
+            user_agent,
+            GOVERNANCE_CANISTER_ID,
+            "manage_neuron",
+            delay_payload,
+            time,
+        )
+        .expect("Couldn't create message to make trusted neurons follow test neuron"),
+    );
     Ok(msgs)
 }
 
@@ -205,52 +257,6 @@ pub fn cmd_add_ledger_account(
     .expect(
         "Couldn't create message to mint tokens to neuron account",
     )])
-}
-
-/// Creates a recovery CUP by using the latest CUP and overriding the height and
-/// the state hash.
-pub fn cmd_set_recovery_cup(
-    agent: &Agent,
-    player: &crate::player::Player,
-    cmd: &SetRecoveryCupCmd,
-    context_time: Time,
-) -> Result<SignedIngress, String> {
-    use ic_crypto::utils::ni_dkg::initial_ni_dkg_transcript_record_from_transcript;
-    use ic_types::crypto::threshold_sig::ni_dkg::NiDkgTag;
-
-    let time = context_time + Duration::from_secs(60);
-    let state_hash = hex::decode(&cmd.state_hash).map_err(|err| format!("{}", err))?;
-    let cup = player.get_highest_catch_up_package();
-    let payload = cup.content.block.as_ref().payload.as_ref();
-    let summary = payload.as_summary();
-    let low_threshold_transcript = summary
-        .dkg
-        .current_transcript(&NiDkgTag::LowThreshold)
-        .clone();
-    let high_threshold_transcript = summary
-        .dkg
-        .current_transcript(&NiDkgTag::HighThreshold)
-        .clone();
-    let initial_ni_dkg_transcript_low_threshold = Some(
-        initial_ni_dkg_transcript_record_from_transcript(low_threshold_transcript),
-    );
-    let initial_ni_dkg_transcript_high_threshold = Some(
-        initial_ni_dkg_transcript_record_from_transcript(high_threshold_transcript),
-    );
-    let cup_contents = CatchUpPackageContents {
-        initial_ni_dkg_transcript_low_threshold,
-        initial_ni_dkg_transcript_high_threshold,
-        height: cmd.height,
-        time: time.as_nanos_since_unix_epoch(),
-        state_hash,
-        registry_store_uri: Some(RegistryStoreUri {
-            uri: cmd.registry_store_uri.clone().unwrap_or_default(),
-            hash: cmd.registry_store_sha256.clone().unwrap_or_default(),
-            registry_version: player.get_latest_registry_version(context_time)?.get(),
-        }),
-    };
-
-    update_catch_up_package_contents(agent, player.subnet_id, cup_contents, context_time)
 }
 
 /// Creates signed ingress messages to add a new blessed replica version and
@@ -403,31 +409,6 @@ pub fn atomic_mutate(
         .map_err(|err| format!("Error preparing update message: {:?}", err))?;
     SignedIngress::try_from(http_body)
         .map_err(|err| format!("Error converting to SignedIngress: {:?}", err))
-}
-
-/// Add a new catch up content by mutating the registry canister.
-pub fn update_catch_up_package_contents(
-    agent: &Agent,
-    subnet_id: SubnetId,
-    cup_contents: CatchUpPackageContents,
-    context_time: Time,
-) -> Result<SignedIngress, String> {
-    let mut mutation = RegistryMutation::default();
-    mutation.set_mutation_type(registry_mutation::Type::Update);
-    mutation.key = make_catch_up_package_contents_key(subnet_id).into_bytes();
-
-    let mut buf = Vec::new();
-    match cup_contents.encode(&mut buf) {
-        Ok(_) => mutation.value = buf,
-        Err(error) => panic!("Error encoding the value to protobuf: {:?}", error),
-    }
-    atomic_mutate(
-        agent,
-        REGISTRY_CANISTER_ID,
-        vec![mutation],
-        vec![],
-        context_time + Duration::from_secs(60),
-    )
 }
 
 /// Bless a new replica version by mutating the registry canister.

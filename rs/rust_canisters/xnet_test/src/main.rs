@@ -120,7 +120,7 @@ fn time_nanos() -> u64 {
 fn on_reply(_env: *mut ()) {
     let (reply, _) =
         candid::Decode!(&api::arg_data()[..], Reply, Vec<u8>).expect("failed to decode response");
-    let elapsed = Duration::from_nanos((time_nanos() - reply.time_nanos) as u64);
+    let elapsed = Duration::from_nanos(time_nanos() - reply.time_nanos);
     METRICS.with(|m| m.borrow_mut().latency_distribution.observe(elapsed));
 }
 
@@ -208,7 +208,7 @@ fn fanout() {
         }
 
         for _ in 0..PER_SUBNET_RATE.with(|r| *r.borrow()) {
-            let idx = RNG.with(|rng| rng.borrow_mut().gen_range(0, canisters.len()));
+            let idx = RNG.with(|rng| rng.borrow_mut().gen_range(0..canisters.len()));
             let canister = canisters[idx].clone();
 
             let seq_no = STATE.with(|s| s.borrow_mut().next_out_seq_no(canister.clone()));

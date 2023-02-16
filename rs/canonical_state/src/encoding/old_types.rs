@@ -3,7 +3,10 @@
 //! Whenever a canonical type is modified, a copy of the "old" type should be
 //! made here.
 
-use std::convert::{TryFrom, TryInto};
+use std::{
+    convert::{TryFrom, TryInto},
+    sync::Arc,
+};
 
 use crate::CertificationVersion;
 
@@ -126,12 +129,12 @@ impl From<(&ic_types::messages::RequestOrResponse, CertificationVersion)> for Re
     ) -> Self {
         match message {
             RequestOrResponse::Request(req) => RequestOrResponseV3 {
-                request: Some(RequestV3::from((req, certification_version))),
+                request: Some(RequestV3::from((req.as_ref(), certification_version))),
                 response: None,
             },
             RequestOrResponse::Response(resp) => RequestOrResponseV3 {
                 request: None,
-                response: Some(ResponseV3::from((resp, certification_version))),
+                response: Some(ResponseV3::from((resp.as_ref(), certification_version))),
             },
         }
     }
@@ -145,11 +148,11 @@ impl TryFrom<RequestOrResponseV3> for ic_types::messages::RequestOrResponse {
             RequestOrResponseV3 {
                 request: Some(request),
                 response: None,
-            } => Ok(Self::Request(request.try_into()?)),
+            } => Ok(Self::Request(Arc::new(request.try_into()?))),
             RequestOrResponseV3 {
                 request: None,
                 response: Some(response),
-            } => Ok(Self::Response(response.try_into()?)),
+            } => Ok(Self::Response(Arc::new(response.try_into()?))),
             other => Err(ProxyDecodeError::Other(format!(
                 "RequestOrResponseV3: expected exactly one of `request` or `response` to be `Some(_)`, got `{:?}`",
                 other
@@ -185,6 +188,38 @@ impl From<StreamHeaderV6> for StreamHeader {
             end: header.end.into(),
             signals_end: header.signals_end.into(),
             reject_signals: Default::default(),
+        }
+    }
+}
+
+/// Canonical representation of state metadata leaf, before dropping `id_counter`.
+#[derive(Debug, Serialize)]
+pub struct SystemMetadataV9 {
+    /// The counter used to allocate canister ids.
+    pub id_counter: u64,
+    /// Hash bytes of the previous (partial) canonical state.
+    pub prev_state_hash: Option<Vec<u8>>,
+}
+
+impl
+    From<(
+        &ic_replicated_state::metadata_state::SystemMetadata,
+        CertificationVersion,
+    )> for SystemMetadataV9
+{
+    fn from(
+        (metadata, _certification_version): (
+            &ic_replicated_state::metadata_state::SystemMetadata,
+            CertificationVersion,
+        ),
+    ) -> Self {
+        Self {
+            // `SystemMetadata::generated_id_counter` was removed, set this to its default value.
+            id_counter: 0,
+            prev_state_hash: metadata
+                .prev_state_hash
+                .as_ref()
+                .map(|h| h.get_ref().0.clone()),
         }
     }
 }

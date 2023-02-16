@@ -4,8 +4,8 @@ use super::super::arbitrary::arbitrary_public_coefficient_bytes;
 use super::*;
 use ic_crypto_internal_types::sign::threshold_sig::public_coefficients::bls12_381::PublicCoefficientsBytes;
 use proptest::prelude::*;
+use rand::SeedableRng;
 use rand_chacha::ChaChaRng;
-use rand_core::SeedableRng;
 
 /// Demonstrates that size error conversion works without panicking
 #[test]
@@ -24,13 +24,13 @@ fn public_coefficients_size_should_be_correct() {
     let mut public_keys = Vec::new();
     for size in 0_u32..10 {
         let public_coefficients = PublicCoefficients {
-            coefficients: public_keys.iter().map(|key| PublicKey(*key)).collect(),
+            coefficients: public_keys.clone(),
         };
         assert_eq!(
             NumberOfNodes::try_from(&public_coefficients).expect("Invalid size"),
             NumberOfNodes::from(size)
         );
-        public_keys.push(G2Projective::generator());
+        public_keys.push(PublicKey(G2Projective::generator().clone()));
     }
 }
 

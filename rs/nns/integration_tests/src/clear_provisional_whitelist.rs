@@ -1,17 +1,20 @@
 use dfn_candid::candid;
 use ic_base_types::PrincipalId;
-use ic_canister_client::Sender;
+use ic_canister_client_sender::Sender;
+use ic_nervous_system_common_test_keys::{
+    TEST_NEURON_1_OWNER_KEYPAIR, TEST_NEURON_2_OWNER_KEYPAIR,
+};
 use ic_nns_common::{
     registry::encode_or_panic,
     types::{NeuronId, ProposalId},
 };
 use ic_nns_governance::pb::v1::{ManageNeuronResponse, NnsFunction, ProposalStatus, Vote};
-use ic_nns_test_keys::{TEST_NEURON_1_OWNER_KEYPAIR, TEST_NEURON_2_OWNER_KEYPAIR};
 use ic_nns_test_utils::{
+    common::NnsInitPayloadsBuilder,
     governance::{get_pending_proposals, submit_external_update_proposal, wait_for_final_state},
     ids::{TEST_NEURON_1_ID, TEST_NEURON_2_ID},
-    itest_helpers::{local_test_on_nns_subnet, NnsCanisters, NnsInitPayloadsBuilder},
-    registry::get_value,
+    itest_helpers::{local_test_on_nns_subnet, NnsCanisters},
+    registry::get_value_or_panic,
 };
 use ic_protobuf::registry::provisional_whitelist::v1::ProvisionalWhitelist;
 use ic_registry_keys::make_provisional_whitelist_record_key;
@@ -36,7 +39,7 @@ fn test_submit_and_accept_clear_provisional_whitelist_proposal() {
             .with_test_neurons()
             .with_initial_mutations(vec![RegistryAtomicMutateRequest {
                 mutations: vec![insert(
-                    key.as_bytes().to_vec(),
+                    key.as_bytes(),
                     encode_or_panic(&initial_provisional_whitelist),
                 )],
                 preconditions: vec![],
@@ -45,7 +48,7 @@ fn test_submit_and_accept_clear_provisional_whitelist_proposal() {
         let nns_canisters = NnsCanisters::set_up(&runtime, nns_init_payload).await;
 
         let provisional_whitelist_after_setup: ProvisionalWhitelist =
-            get_value(&nns_canisters.registry, key.as_bytes()).await;
+            get_value_or_panic(&nns_canisters.registry, key.as_bytes()).await;
 
         assert_eq!(
             provisional_whitelist_after_setup,
@@ -94,7 +97,7 @@ fn test_submit_and_accept_clear_provisional_whitelist_proposal() {
         assert_eq!(pending_proposals, vec![]);
 
         let provisional_whitelist_after_update: ProvisionalWhitelist =
-            get_value(&nns_canisters.registry, key.as_bytes()).await;
+            get_value_or_panic(&nns_canisters.registry, key.as_bytes()).await;
 
         assert_eq!(
             provisional_whitelist_after_update,

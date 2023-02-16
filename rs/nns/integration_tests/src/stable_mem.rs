@@ -1,4 +1,4 @@
-//! Tests `ic_nns_integration_tests::stable_mem_utils` using a canister
+//! Tests `ic_nervous_system_common::stable_mem_utils` using a canister
 
 use canister_test::{local_test_with_config_e, Canister};
 use dfn_candid::candid;
@@ -55,12 +55,5 @@ fn chunked_stable_mem_ser_deser_roundtrip() {
 }
 
 async fn install_mem_utils_test_canister(canister: &mut Canister<'_>) {
-    install_rust_canister(
-        canister,
-        "nns/integration_tests",
-        "mem-utils-test-canister",
-        &[],
-        None,
-    )
-    .await;
+    install_rust_canister(canister, "mem-utils-test-canister", &[], None).await;
 }

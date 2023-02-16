@@ -1,6 +1,6 @@
 //! The tokio thread based implementation of `ArtifactProcessor`
 
-use crate::{artifact::*, clients};
+use crate::clients;
 use crossbeam_channel::{Receiver, RecvTimeoutError, Sender};
 use ic_interfaces::{
     artifact_manager::{ArtifactProcessor, ProcessingResult},
@@ -21,6 +21,7 @@ use ic_logger::{debug, warn, ReplicaLogger};
 use ic_metrics::MetricsRegistry;
 use ic_types::{
     artifact::*,
+    artifact_kind::*,
     consensus::{certification::CertificationMessage, dkg, ConsensusMessage},
     malicious_flags::MaliciousFlags,
     messages::SignedIngress,
@@ -28,41 +29,12 @@ use ic_types::{
 };
 use ic_types::{canister_http::CanisterHttpResponseShare, consensus::HasRank};
 use prometheus::{histogram_opts, labels, Histogram, IntCounter};
-use std::sync::atomic::{AtomicBool, Ordering::SeqCst};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{
+    atomic::{AtomicBool, Ordering::SeqCst},
+    Arc, RwLock,
+};
 use std::thread::{Builder as ThreadBuilder, JoinHandle};
-
-#[derive(Debug, PartialEq, Eq)]
-enum AdvertSource {
-    /// The artifact was produced by this peer
-    Produced,
-
-    /// Artifact was downloaded from another peer and being relayed
-    Relayed,
-}
-
-/// A client may be either wrapped in `Box` or `Arc`.
-pub enum BoxOrArcClient<Artifact: ArtifactKind> {
-    /// The client wrapped in `Box`.
-    BoxClient(Box<dyn ArtifactProcessor<Artifact>>),
-    /// The client wrapped in `Arc`.
-    ArcClient(Arc<dyn ArtifactProcessor<Artifact> + Sync + 'static>),
-}
-
-impl<Artifact: ArtifactKind> BoxOrArcClient<Artifact> {
-    /// The method calls the corresponding client's `process_changes` with the
-    /// given time source and artifacts.
-    fn process_changes(
-        &self,
-        time_source: &dyn TimeSource,
-        artifacts: Vec<UnvalidatedArtifact<Artifact::Message>>,
-    ) -> (Vec<AdvertSendRequest<Artifact>>, ProcessingResult) {
-        match self {
-            BoxOrArcClient::BoxClient(client) => client.process_changes(time_source, artifacts),
-            BoxOrArcClient::ArcClient(client) => client.process_changes(time_source, artifacts),
-        }
-    }
-}
+use std::time::Duration;
 
 /// Metrics for a client artifact processor.
 struct ArtifactProcessorMetrics {
@@ -119,16 +91,11 @@ impl ArtifactProcessorMetrics {
     }
 }
 
-/// Pokes the thread to run on_state_change()
-struct ProcessRequest;
-
 /// Manages the life cycle of the client specific artifact processor thread.
 /// Also serves as the front end to enqueue requests to the processor thread.
 pub struct ArtifactProcessorManager<Artifact: ArtifactKind + 'static> {
-    /// The list of unvalidated artifacts.
-    pending_artifacts: Arc<Mutex<Vec<UnvalidatedArtifact<Artifact::Message>>>>,
     /// To send the process requests
-    sender: Sender<ProcessRequest>,
+    sender: Sender<UnvalidatedArtifact<Artifact::Message>>,
     /// Handle for the processing thread
     handle: Option<JoinHandle<()>>,
     /// To signal processing thread to exit.
@@ -140,29 +107,24 @@ impl<Artifact: ArtifactKind + 'static> ArtifactProcessorManager<Artifact> {
     pub fn new<S: Fn(AdvertSendRequest<Artifact>) + Send + 'static>(
         time_source: Arc<SysTimeSource>,
         metrics_registry: MetricsRegistry,
-        client: BoxOrArcClient<Artifact>,
+        client: Box<dyn ArtifactProcessor<Artifact>>,
         send_advert: S,
     ) -> Self
     where
         <Artifact as ic_types::artifact::ArtifactKind>::Message: Send,
     {
-        let pending_artifacts = Arc::new(Mutex::new(Vec::new()));
         let (sender, receiver) = crossbeam_channel::unbounded();
         let shutdown = Arc::new(AtomicBool::new(false));
 
         // Spawn the processor thread
-        let sender_cl = sender.clone();
-        let pending_artifacts_cl = pending_artifacts.clone();
         let shutdown_cl = shutdown.clone();
         let handle = ThreadBuilder::new()
-            .name("ArtifactProcessorThread".to_string())
+            .name(format!("{}_Processor", Artifact::TAG))
             .spawn(move || {
                 Self::process_messages(
-                    pending_artifacts_cl,
                     time_source,
                     client,
                     Box::new(send_advert),
-                    sender_cl,
                     receiver,
                     ArtifactProcessorMetrics::new(metrics_registry, Artifact::TAG.to_string()),
                     shutdown_cl,
@@ -171,7 +133,6 @@ impl<Artifact: ArtifactKind + 'static> ArtifactProcessorManager<Artifact> {
             .unwrap();
 
         Self {
-            pending_artifacts,
             sender,
             handle: Some(handle),
             shutdown,
@@ -179,57 +140,48 @@ impl<Artifact: ArtifactKind + 'static> ArtifactProcessorManager<Artifact> {
     }
 
     pub fn on_artifact(&self, artifact: UnvalidatedArtifact<Artifact::Message>) {
-        let mut pending_artifacts = self.pending_artifacts.lock().unwrap();
-        pending_artifacts.push(artifact);
         self.sender
-            .send(ProcessRequest)
+            .send(artifact)
             .unwrap_or_else(|err| panic!("Failed to send request: {:?}", err));
     }
 
     // The artifact processor thread loop
     #[allow(clippy::too_many_arguments)]
     fn process_messages<S: Fn(AdvertSendRequest<Artifact>) + Send + 'static>(
-        pending_artifacts: Arc<Mutex<Vec<UnvalidatedArtifact<Artifact::Message>>>>,
         time_source: Arc<SysTimeSource>,
-        client: BoxOrArcClient<Artifact>,
+        client: Box<dyn ArtifactProcessor<Artifact>>,
         send_advert: Box<S>,
-        sender: Sender<ProcessRequest>,
-        receiver: Receiver<ProcessRequest>,
+        receiver: Receiver<UnvalidatedArtifact<Artifact::Message>>,
         mut metrics: ArtifactProcessorMetrics,
         shutdown: Arc<AtomicBool>,
     ) {
-        let recv_timeout = std::time::Duration::from_millis(ARTIFACT_MANAGER_TIMER_DURATION_MSEC);
-        loop {
-            let ret = receiver.recv_timeout(recv_timeout);
-            if shutdown.load(SeqCst) {
-                return;
-            }
-
-            match ret {
-                Ok(_) | Err(RecvTimeoutError::Timeout) => {
-                    time_source.update_time().ok();
-
-                    let artifacts = {
-                        let mut artifacts = Vec::new();
-                        let mut received_artifacts = pending_artifacts.lock().unwrap();
-                        std::mem::swap(&mut artifacts, &mut received_artifacts);
-                        artifacts
-                    };
-
-                    let (adverts, result) = metrics
-                        .with_metrics(|| client.process_changes(time_source.as_ref(), artifacts));
-
-                    if let ProcessingResult::StateChanged = result {
-                        // TODO: assess impact of continued processing in same
-                        // iteration if StateChanged, get rid of sending self messages
-                        sender
-                            .send(ProcessRequest)
-                            .unwrap_or_else(|err| panic!("Failed to send request: {:?}", err));
-                    }
-                    adverts.into_iter().for_each(&send_advert);
+        let mut last_on_state_change_result = ProcessingResult::StateUnchanged;
+        while !shutdown.load(SeqCst) {
+            // TODO: assess impact of continued processing in same
+            // iteration if StateChanged
+            let recv_timeout = match last_on_state_change_result {
+                ProcessingResult::StateChanged => Duration::from_millis(0),
+                ProcessingResult::StateUnchanged => {
+                    Duration::from_millis(ARTIFACT_MANAGER_TIMER_DURATION_MSEC)
                 }
+            };
+            let recv_artifact = receiver.recv_timeout(recv_timeout);
+            let batched_artifacts = match recv_artifact {
+                Ok(artifact) => {
+                    let mut artifacts = vec![artifact];
+                    while let Ok(artifact) = receiver.try_recv() {
+                        artifacts.push(artifact);
+                    }
+                    artifacts
+                }
+                Err(RecvTimeoutError::Timeout) => vec![],
                 Err(RecvTimeoutError::Disconnected) => return,
-            }
+            };
+            time_source.update_time().ok();
+            let (adverts, on_state_change_result) = metrics
+                .with_metrics(|| client.process_changes(time_source.as_ref(), batched_artifacts));
+            adverts.into_iter().for_each(&send_advert);
+            last_on_state_change_result = on_state_change_result;
         }
     }
 }
@@ -291,19 +243,13 @@ impl<PoolConsensus: MutableConsensusPool + Send + Sync + 'static>
         let manager = ArtifactProcessorManager::new(
             time_source,
             metrics_registry,
-            BoxOrArcClient::BoxClient(Box::new(client)),
+            Box::new(client),
             send_advert,
         );
         (
             clients::ConsensusClient::new(consensus_pool, consensus_gossip),
             manager,
         )
-    }
-
-    fn advert_class(&self, _msg: &ConsensusMessage, _source: AdvertSource) -> AdvertClass {
-        // Send to all peers until we can go back to using BestEffort for shares,
-        // after more experimentation.
-        AdvertClass::Critical
     }
 }
 
@@ -350,7 +296,7 @@ impl<PoolConsensus: MutableConsensusPool + Send + Sync + 'static>
                 ConsensusAction::AddToValidated(to_add) => {
                     adverts.push(ConsensusArtifact::message_to_advert_send_request(
                         to_add,
-                        self.advert_class(to_add, AdvertSource::Produced),
+                        ArtifactDestination::AllPeersInSubnet,
                     ));
                     if let ConsensusMessage::BlockProposal(p) = to_add {
                         let rank = p.clone().content.decompose().1.rank();
@@ -363,7 +309,7 @@ impl<PoolConsensus: MutableConsensusPool + Send + Sync + 'static>
                 ConsensusAction::MoveToValidated(to_move) => {
                     adverts.push(ConsensusArtifact::message_to_advert_send_request(
                         to_move,
-                        self.advert_class(to_move, AdvertSource::Relayed),
+                        ArtifactDestination::AllPeersInSubnet,
                     ));
                     if let ConsensusMessage::BlockProposal(p) = to_move {
                         let rank = p.clone().content.decompose().1.rank();
@@ -433,22 +379,13 @@ impl<Pool: MutableIngressPool + Send + Sync + 'static> IngressProcessor<Pool> {
         let manager = ArtifactProcessorManager::new(
             time_source.clone(),
             metrics_registry,
-            BoxOrArcClient::BoxClient(Box::new(client)),
+            Box::new(client),
             send_advert,
         );
         (
             clients::IngressClient::new(time_source, ingress_pool, log, malicious_flags),
             manager,
         )
-    }
-
-    fn advert_class(&self, source: AdvertSource) -> AdvertClass {
-        // 1. Notify all peers for ingress messages received directly by us
-        // 2. For relayed ingress messages: don't notify any peers
-        match source {
-            AdvertSource::Produced => AdvertClass::Critical,
-            AdvertSource::Relayed => AdvertClass::None,
-        }
     }
 }
 
@@ -482,20 +419,17 @@ impl<Pool: MutableIngressPool + Send + Sync + 'static> ArtifactProcessor<Ingress
                     attribute,
                     integrity_hash,
                 )) => {
-                    let advert_source = if *source_node_id == self.node_id {
-                        AdvertSource::Produced
-                    } else {
-                        AdvertSource::Relayed
-                    };
-                    adverts.push(AdvertSendRequest {
-                        advert: Advert {
-                            size: *size,
-                            id: message_id.clone(),
-                            attribute: attribute.clone(),
-                            integrity_hash: integrity_hash.clone(),
-                        },
-                        advert_class: self.advert_class(advert_source),
-                    });
+                    if *source_node_id == self.node_id {
+                        adverts.push(AdvertSendRequest {
+                            advert: Advert {
+                                size: *size,
+                                id: message_id.clone(),
+                                attribute: attribute.clone(),
+                                integrity_hash: integrity_hash.clone(),
+                            },
+                            dest: ArtifactDestination::AllPeersInSubnet,
+                        });
+                    }
                 }
                 IngressAction::RemoveFromUnvalidated(_)
                 | IngressAction::RemoveFromValidated(_)
@@ -559,7 +493,7 @@ impl<PoolCertification: MutableCertificationPool + Send + Sync + 'static>
         let manager = ArtifactProcessorManager::new(
             time_source,
             metrics_registry,
-            BoxOrArcClient::BoxClient(Box::new(client)),
+            Box::new(client),
             send_advert,
         );
         (
@@ -607,13 +541,13 @@ impl<PoolCertification: MutableCertificationPool + Send + Sync + 'static>
                 certification::ChangeAction::AddToValidated(msg) => {
                     adverts.push(CertificationArtifact::message_to_advert_send_request(
                         msg,
-                        AdvertClass::Critical,
+                        ArtifactDestination::AllPeersInSubnet,
                     ))
                 }
                 certification::ChangeAction::MoveToValidated(msg) => {
                     adverts.push(CertificationArtifact::message_to_advert_send_request(
                         msg,
-                        AdvertClass::Critical,
+                        ArtifactDestination::AllPeersInSubnet,
                     ))
                 }
                 certification::ChangeAction::HandleInvalid(msg, reason) => {
@@ -678,7 +612,7 @@ impl<PoolDkg: MutableDkgPool + Send + Sync + 'static> DkgProcessor<PoolDkg> {
         let manager = ArtifactProcessorManager::new(
             time_source,
             metrics_registry,
-            BoxOrArcClient::BoxClient(Box::new(client)),
+            Box::new(client),
             send_advert,
         );
         (clients::DkgClient::new(dkg_pool, dkg_gossip), manager)
@@ -706,12 +640,18 @@ impl<PoolDkg: MutableDkgPool + Send + Sync + 'static> ArtifactProcessor<DkgArtif
             let change_set = self.client.on_state_change(&*dkg_pool);
             for change_action in change_set.iter() {
                 match change_action {
-                    DkgChangeAction::AddToValidated(to_add) => adverts.push(
-                        DkgArtifact::message_to_advert_send_request(to_add, AdvertClass::Critical),
-                    ),
-                    DkgChangeAction::MoveToValidated(message) => adverts.push(
-                        DkgArtifact::message_to_advert_send_request(message, AdvertClass::Critical),
-                    ),
+                    DkgChangeAction::AddToValidated(to_add) => {
+                        adverts.push(DkgArtifact::message_to_advert_send_request(
+                            to_add,
+                            ArtifactDestination::AllPeersInSubnet,
+                        ))
+                    }
+                    DkgChangeAction::MoveToValidated(message) => {
+                        adverts.push(DkgArtifact::message_to_advert_send_request(
+                            message,
+                            ArtifactDestination::AllPeersInSubnet,
+                        ))
+                    }
                     DkgChangeAction::HandleInvalid(msg, reason) => {
                         self.invalidated_artifacts.inc();
                         warn!(self.log, "Invalid DKG message ({:?}): {:?}", reason, msg);
@@ -736,6 +676,7 @@ impl<PoolDkg: MutableDkgPool + Send + Sync + 'static> ArtifactProcessor<DkgArtif
 pub struct EcdsaProcessor<PoolEcdsa> {
     ecdsa_pool: Arc<RwLock<PoolEcdsa>>,
     client: Box<dyn Ecdsa>,
+    ecdsa_pool_update_duration: Histogram,
     log: ReplicaLogger,
 }
 
@@ -757,16 +698,29 @@ impl<PoolEcdsa: MutableEcdsaPool + Send + Sync + 'static> EcdsaProcessor<PoolEcd
         clients::EcdsaClient<PoolEcdsa>,
         ArtifactProcessorManager<EcdsaArtifact>,
     ) {
+        let ecdsa_pool_update_duration = metrics_registry.register(
+            Histogram::with_opts(histogram_opts!(
+                "ecdsa_pool_update_duration_seconds",
+                "Time to apply changes to ECDSA artifact pool, in seconds",
+                vec![
+                    0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.8, 1.0, 1.2, 1.5, 2.0, 2.2, 2.5, 5.0, 8.0,
+                    10.0, 15.0, 20.0, 50.0,
+                ]
+            ))
+            .unwrap(),
+        );
+
         let (ecdsa, ecdsa_gossip) = setup();
         let client = Self {
             ecdsa_pool: ecdsa_pool.clone(),
             client: Box::new(ecdsa),
+            ecdsa_pool_update_duration,
             log,
         };
         let manager = ArtifactProcessorManager::new(
             time_source,
             metrics_registry,
-            BoxOrArcClient::BoxClient(Box::new(client)),
+            Box::new(client),
             send_advert,
         );
         (clients::EcdsaClient::new(ecdsa_pool, ecdsa_gossip), manager)
@@ -795,15 +749,24 @@ impl<PoolEcdsa: MutableEcdsaPool + Send + Sync + 'static> ArtifactProcessor<Ecds
 
             for change_action in change_set.iter() {
                 match change_action {
-                    EcdsaChangeAction::AddToValidated(msg) => adverts.push(
-                        EcdsaArtifact::message_to_advert_send_request(msg, AdvertClass::Critical),
-                    ),
+                    // 1. Notify all peers for ecdsa messages received directly by us
+                    // 2. For relayed ecdsa support messages: don't notify any peers.
+                    // 3. For other relayed messages: still notify peers.
+                    EcdsaChangeAction::AddToValidated(msg) => {
+                        adverts.push(EcdsaArtifact::message_to_advert_send_request(
+                            msg,
+                            ArtifactDestination::AllPeersInSubnet,
+                        ))
+                    }
                     EcdsaChangeAction::MoveToValidated(msg_id) => {
                         if let Some(msg) = ecdsa_pool.unvalidated().get(msg_id) {
-                            adverts.push(EcdsaArtifact::message_to_advert_send_request(
-                                &msg,
-                                AdvertClass::Critical,
-                            ))
+                            match msg {
+                                EcdsaMessage::EcdsaDealingSupport(_) => (),
+                                _ => adverts.push(EcdsaArtifact::message_to_advert_send_request(
+                                    &msg,
+                                    ArtifactDestination::AllPeersInSubnet,
+                                )),
+                            }
                         } else {
                             warn!(
                                 self.log,
@@ -826,6 +789,7 @@ impl<PoolEcdsa: MutableEcdsaPool + Send + Sync + 'static> ArtifactProcessor<Ecds
             ProcessingResult::StateUnchanged
         };
 
+        let _timer = self.ecdsa_pool_update_duration.start_timer();
         self.ecdsa_pool.write().unwrap().apply_changes(change_set);
         (adverts, changed)
     }
@@ -834,7 +798,7 @@ impl<PoolEcdsa: MutableEcdsaPool + Send + Sync + 'static> ArtifactProcessor<Ecds
 pub struct CanisterHttpProcessor<PoolCanisterHttp> {
     consensus_pool_cache: Arc<dyn ConsensusPoolCache>,
     canister_http_pool: Arc<RwLock<PoolCanisterHttp>>,
-    client: Box<dyn CanisterHttpPoolManager>,
+    client: Arc<RwLock<dyn CanisterHttpPoolManager + Sync + 'static>>,
     log: ReplicaLogger,
 }
 
@@ -843,7 +807,7 @@ impl<
     > CanisterHttpProcessor<PoolCanisterHttp>
 {
     pub fn build<
-        C: CanisterHttpPoolManager + 'static,
+        C: CanisterHttpPoolManager + Sync + 'static,
         G: CanisterHttpGossip + Send + Sync + 'static,
         S: Fn(AdvertSendRequest<CanisterHttpArtifact>) + Send + 'static,
         F: FnOnce() -> (C, G),
@@ -863,13 +827,13 @@ impl<
         let client = Self {
             consensus_pool_cache: consensus_pool_cache.clone(),
             canister_http_pool: canister_http_pool.clone(),
-            client: Box::new(pool_manager),
+            client: Arc::new(RwLock::new(pool_manager)),
             log,
         };
         let manager = ArtifactProcessorManager::new(
             time_source,
             metrics_registry,
-            BoxOrArcClient::BoxClient(Box::new(client)),
+            Box::new(client),
             send_advert,
         );
         (
@@ -902,6 +866,8 @@ impl<PoolCanisterHttp: MutableCanisterHttpPool + Send + Sync + 'static>
             let canister_http_pool = self.canister_http_pool.read().unwrap();
             let change_set = self
                 .client
+                .write()
+                .unwrap()
                 .on_state_change(self.consensus_pool_cache.as_ref(), &*canister_http_pool);
 
             for change_action in change_set.iter() {
@@ -909,14 +875,14 @@ impl<PoolCanisterHttp: MutableCanisterHttpPool + Send + Sync + 'static>
                     CanisterHttpChangeAction::AddToValidated(share, _) => {
                         adverts.push(CanisterHttpArtifact::message_to_advert_send_request(
                             share,
-                            AdvertClass::Critical,
+                            ArtifactDestination::AllPeersInSubnet,
                         ))
                     }
                     CanisterHttpChangeAction::MoveToValidated(msg_id) => {
                         if let Some(msg) = canister_http_pool.lookup_unvalidated(msg_id) {
                             adverts.push(CanisterHttpArtifact::message_to_advert_send_request(
                                 &msg,
-                                AdvertClass::Critical,
+                                ArtifactDestination::AllPeersInSubnet,
                             ))
                         } else {
                             warn!(
@@ -926,6 +892,7 @@ impl<PoolCanisterHttp: MutableCanisterHttpPool + Send + Sync + 'static>
                             );
                         }
                     }
+                    CanisterHttpChangeAction::RemoveContent(_) => {}
                     CanisterHttpChangeAction::RemoveValidated(_) => {}
                     CanisterHttpChangeAction::RemoveUnvalidated(_) => {}
                     CanisterHttpChangeAction::HandleInvalid(_, _) => {}
@@ -939,6 +906,11 @@ impl<PoolCanisterHttp: MutableCanisterHttpPool + Send + Sync + 'static>
         } else {
             ProcessingResult::StateUnchanged
         };
+
+        self.canister_http_pool
+            .write()
+            .unwrap()
+            .apply_changes(change_set);
         (adverts, changed)
     }
 }

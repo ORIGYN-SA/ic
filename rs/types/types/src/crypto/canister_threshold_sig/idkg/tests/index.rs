@@ -1,20 +1,20 @@
-use crate::consensus::ecdsa::EcdsaDealing;
 use crate::crypto::canister_threshold_sig::idkg::{
-    IDkgDealing, IDkgMaskedTranscriptOrigin, IDkgMultiSignedDealing, IDkgReceivers, IDkgTranscript,
-    IDkgTranscriptId, IDkgTranscriptType,
+    BatchSignedIDkgDealing, IDkgDealing, IDkgMaskedTranscriptOrigin, IDkgReceivers, IDkgTranscript,
+    IDkgTranscriptId, IDkgTranscriptType, SignedIDkgDealing,
 };
-use crate::crypto::{AlgorithmId, CombinedMultiSig, CombinedMultiSigOf};
+use crate::crypto::{AlgorithmId, BasicSig, BasicSigOf};
+use crate::signature::{BasicSignature, BasicSignatureBatch};
 use crate::{Height, NodeId, PrincipalId, RegistryVersion, SubnetId};
 use maplit::{btreemap, btreeset};
-use std::collections::BTreeSet;
+use std::collections::BTreeMap;
 
 #[test]
 fn should_return_correct_dealer_id_for_index() {
     let transcript = IDkgTranscript {
         verified_dealings: btreemap! {
-            0 => multi_signed_dealing(node_id(42)),
-            1 => multi_signed_dealing(node_id(43)),
-            3 => multi_signed_dealing(node_id(45))
+            0 => batch_signed_dealing(node_id(42)),
+            1 => batch_signed_dealing(node_id(43)),
+            3 => batch_signed_dealing(node_id(45))
         },
         transcript_id: dummy_transcript_id(),
         receivers: dummy_receivers(),
@@ -35,9 +35,9 @@ fn should_return_correct_dealer_id_for_index() {
 fn should_return_correct_index_for_dealer_id() {
     let transcript = IDkgTranscript {
         verified_dealings: btreemap! {
-            0 => multi_signed_dealing(node_id(42)),
-            1 => multi_signed_dealing(node_id(43)),
-            3 => multi_signed_dealing(node_id(45))
+            0 => batch_signed_dealing(node_id(42)),
+            1 => batch_signed_dealing(node_id(43)),
+            3 => batch_signed_dealing(node_id(45))
         },
         transcript_id: dummy_transcript_id(),
         receivers: dummy_receivers(),
@@ -80,28 +80,31 @@ fn should_return_correct_index_for_signer_id() {
     assert_eq!(transcript.index_for_signer_id(node_id(128)), Some(3));
 }
 
-fn multi_signed_dealing(dealer_id: NodeId) -> IDkgMultiSignedDealing {
-    let ecdsa_dealing = EcdsaDealing {
-        requested_height: dummy_height(),
-        idkg_dealing: IDkgDealing {
-            transcript_id: dummy_transcript_id(),
-            dealer_id,
-            internal_dealing_raw: dummy_internal_dealing_raw(),
+fn batch_signed_dealing(dealer_id: NodeId) -> BatchSignedIDkgDealing {
+    let dealing = IDkgDealing {
+        transcript_id: dummy_transcript_id(),
+        internal_dealing_raw: dummy_internal_dealing_raw(),
+    };
+    let signed_dealing = SignedIDkgDealing {
+        content: dealing,
+        signature: BasicSignature {
+            signature: BasicSigOf::new(BasicSig(vec![1, 2, 3])),
+            signer: dealer_id,
         },
     };
-
-    IDkgMultiSignedDealing {
-        signature: CombinedMultiSigOf::new(CombinedMultiSig(vec![])),
-        signers: BTreeSet::new(),
-        dealing: ecdsa_dealing,
+    BatchSignedIDkgDealing {
+        content: signed_dealing,
+        signature: BasicSignatureBatch {
+            signatures_map: BTreeMap::new(),
+        },
     }
 }
 
 fn dummy_transcript_id() -> IDkgTranscriptId {
-    IDkgTranscriptId::new(subnet_id(0), 0)
+    IDkgTranscriptId::new(subnet_id(0), 0, Height::new(0))
 }
 
-fn dummy_dealings() -> std::collections::BTreeMap<crate::NodeIndex, IDkgMultiSignedDealing> {
+fn dummy_dealings() -> std::collections::BTreeMap<crate::NodeIndex, BatchSignedIDkgDealing> {
     std::collections::BTreeMap::new()
 }
 
@@ -131,10 +134,6 @@ fn dummy_internal_transcript_raw() -> Vec<u8> {
 
 fn dummy_internal_dealing_raw() -> Vec<u8> {
     vec![]
-}
-
-fn dummy_height() -> Height {
-    Height::new(0)
 }
 
 fn node_id(id: u64) -> NodeId {

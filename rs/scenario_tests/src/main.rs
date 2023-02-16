@@ -20,7 +20,10 @@ struct Config {
     cycles_per_subnet: Option<u64>,
     canisters_to_cleanup: Option<Vec<String>>,
     skip_cleanup: bool,
+    delete_canister_retries: Option<u64>,
     all_to_one: bool,
+    canisters_per_subnet: Option<u64>,
+    canister_to_subnet_rate: Option<u64>,
 }
 
 pub fn main() {
@@ -139,8 +142,32 @@ pub fn main() {
             "--skip_cleanup" => {
                 config.skip_cleanup = true;
             }
+            "--delete_canister_retries" => {
+                config.delete_canister_retries = Some(
+                    args.next()
+                        .expect("Missing value for delete_canister_retries")
+                        .parse()
+                        .expect("Invalid delete_canister_retries, expected u64 value"),
+                )
+            }
             "--all_to_one" => {
                 config.all_to_one = true;
+            }
+            "--canisters_per_subnet" => {
+                config.canisters_per_subnet = Some(
+                    args.next()
+                        .expect("Missing value for canisters_per_subnet")
+                        .parse()
+                        .expect("Invalid canisters_per_subnet, expected u64 value"),
+                )
+            }
+            "--canister_to_subnet_rate" => {
+                config.canister_to_subnet_rate = Some(
+                    args.next()
+                        .expect("Missing value for canister_to_subnet_rate")
+                        .parse()
+                        .expect("Invalid canister_to_subnet_rate, expected u64 value"),
+                )
             }
             // Remaining arguments will be passed to `runner()`.
             "--" => break,
@@ -178,7 +205,10 @@ pub fn main() {
                     config.cycles_per_subnet,
                     config.canisters_to_cleanup,
                     config.skip_cleanup,
+                    config.delete_canister_retries,
                     config.all_to_one,
+                    config.canisters_per_subnet,
+                    config.canister_to_subnet_rate,
                 )
             };
             runner(

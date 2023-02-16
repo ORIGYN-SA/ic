@@ -5,12 +5,13 @@ use ic_crypto::{
     CryptoComponent,
 };
 use ic_crypto_internal_test_vectors::test_data;
-use ic_interfaces::crypto::{BasicSigVerifierByPublicKey, SignableMock};
+use ic_interfaces::crypto::BasicSigVerifierByPublicKey;
+use ic_interfaces::time_source::SysTimeSource;
 use ic_logger::replica_logger::no_op_logger;
 use ic_registry_client_fake::FakeRegistryClient;
 use ic_registry_proto_data_provider::ProtoRegistryDataProvider;
-use ic_test_utilities::types::ids::node_test_id;
-use ic_types::crypto::{BasicSigOf, UserPublicKey};
+use ic_types::crypto::{BasicSigOf, SignableMock, UserPublicKey};
+use ic_types_test_utils::ids::node_test_id;
 use std::sync::Arc;
 
 #[test]
@@ -151,8 +152,10 @@ fn crypto_component(config: &CryptoConfig) -> CryptoComponent {
     let dummy_registry = FakeRegistryClient::new(Arc::new(ProtoRegistryDataProvider::new()));
     CryptoComponent::new_with_fake_node_id(
         config,
+        None,
         Arc::new(dummy_registry),
         node_test_id(42),
         no_op_logger(),
+        Arc::new(SysTimeSource::new()),
     )
 }

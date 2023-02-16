@@ -1,6 +1,4 @@
 use dfn_core::api::{call, call_with_funds, CanisterId, Funds};
-#[cfg(target_arch = "wasm32")]
-use dfn_core::println;
 use ic_ic00_types::{CanisterInstallMode::Install, InstallCodeArgs};
 use ic_nervous_system_root::{
     start_canister, stop_canister, AddCanisterProposal, CanisterAction, CanisterIdRecord,
@@ -128,6 +126,7 @@ async fn try_to_create_and_install_canister(
         compute_allocation: proposal.compute_allocation,
         memory_allocation: proposal.memory_allocation,
         query_allocation: proposal.query_allocation,
+        sender_canister_version: Some(dfn_core::api::canister_version()),
     };
     let install_res: Result<(), (Option<i32>, String)> = call(
         CanisterId::ic_00(),

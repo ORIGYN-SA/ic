@@ -1,17 +1,18 @@
 use candid::Nat;
 use dfn_candid::candid_one;
-use ic_canister_client::Sender;
+use ic_canister_client_sender::Sender;
+use ic_nervous_system_common_test_keys::TEST_NEURON_1_OWNER_KEYPAIR;
 use ic_nervous_system_root::{
     AddCanisterProposal, CanisterIdRecord, CanisterStatusResult, CanisterStatusType::Running,
 };
 use ic_nns_common::types::NeuronId;
 use ic_nns_governance::pb::v1::{NnsFunction, ProposalStatus};
-use ic_nns_test_keys::TEST_NEURON_1_OWNER_KEYPAIR;
-use ic_nns_test_utils::ids::TEST_NEURON_1_ID;
 use ic_nns_test_utils::{
+    common::NnsInitPayloadsBuilder,
     governance::{get_pending_proposals, submit_external_update_proposal, wait_for_final_state},
-    itest_helpers::{NnsCanisters, NnsInitPayloadsBuilder},
-    registry::get_value,
+    ids::TEST_NEURON_1_ID,
+    itest_helpers::NnsCanisters,
+    registry::get_value_or_panic,
 };
 use ic_protobuf::registry::nns::v1::NnsCanisterRecords;
 use ic_registry_keys::make_nns_canister_records_key;
@@ -38,7 +39,7 @@ fn add_nns_canister_via_governance_proposal() {
             wasm_module: UNIVERSAL_CANISTER_WASM.to_vec(),
             arg: vec![],
             query_allocation: Some(Nat::from(34)),
-            memory_allocation: Some(Nat::from(1234567)),
+            memory_allocation: Some(Nat::from(12345678)),
             compute_allocation: Some(Nat::from(12)),
             initial_cycles: 1 << 45,
             authz_changes: Vec::new(),
@@ -70,7 +71,7 @@ fn add_nns_canister_via_governance_proposal() {
         assert!(pending_proposals.is_empty());
 
         // Now check whether the callback mutated the registry.
-        let nns_canister_records: NnsCanisterRecords = get_value(
+        let nns_canister_records: NnsCanisterRecords = get_value_or_panic(
             &nns_canisters.registry,
             make_nns_canister_records_key().as_bytes(),
         )

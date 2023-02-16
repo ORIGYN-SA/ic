@@ -10,11 +10,13 @@ use std::{
     net::{SocketAddr, SocketAddrV4},
     path::{Path, PathBuf},
     str::FromStr,
+    time::Duration,
 };
 
 use anyhow::{bail, Context, Result};
+use clap::Parser;
+use reqwest::blocking::ClientBuilder;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
-use structopt::StructOpt;
 use thiserror::Error;
 use url::Url;
 
@@ -29,121 +31,178 @@ use ic_types::{
     registry::connection_endpoint::ConnectionEndpoint, Height, PrincipalId, ReplicaVersion,
 };
 
-#[derive(StructOpt)]
-#[structopt(name = "ic-prep")]
+/// the filename of the update disk image, as published on the cdn
+const UPD_IMG_FILENAME: &str = "update-img.tar.gz";
+/// in case the replica version id is specified on the command line, but not the
+/// release package url and hash, the following url-template will be used to
+/// fetch the sha256 of the corresponding image.
+const UPD_IMG_DEFAULT_SHA256_URL: &str =
+    "https://download.dfinity.systems/ic/<REPLICA_VERSION>/guest-os/update-img/SHA256SUMS";
+/// in case the replica version id is specified on the command line, but not the
+/// release package url and hash, the following url-template will be used to
+/// specify the update image.
+const UPD_IMG_DEFAULT_URL: &str =
+    "https://download.dfinity.systems/ic/<REPLICA_VERSION>/guest-os/update-img/update-img.tar.gz";
+const CDN_HTTP_ATTEMPTS: usize = 3;
+const RETRY_BACKOFF: Duration = Duration::from_secs(5);
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(12);
+
+#[derive(Parser)]
+#[clap(name = "ic-prep")]
 /// Prepare initial files for an Internet Computer instance.
 ///
 /// See the README.adoc file for more details.
 struct CliArgs {
     /// The version of the Replica being run
-    #[structopt(long, parse(try_from_str = ReplicaVersion::try_from))]
+    #[clap(long, parse(try_from_str = ReplicaVersion::try_from))]
     pub replica_version: Option<ReplicaVersion>,
 
     /// URL from which to download the replica binary
-    #[structopt(long, parse(try_from_str = url::Url::parse))]
+    ///
+    /// deprecated.
+    #[clap(long, parse(try_from_str = url::Url::parse))]
     pub replica_download_url: Option<Url>,
 
     /// sha256-hash of the replica binary in hex.
-    #[structopt(long)]
+    ///
+    /// deprecated.
+    #[clap(long)]
     pub replica_hash: Option<String>,
 
     /// URL from which to download the orchestrator binary
-    #[structopt(long, parse(try_from_str = url::Url::parse))]
+    ///
+    /// deprecated.
+    #[clap(long, parse(try_from_str = url::Url::parse))]
     pub orchestrator_download_url: Option<Url>,
 
     /// sha256-hash of the orchestrator binary in hex.
-    #[structopt(long)]
+    ///
+    /// deprecated.
+    #[clap(long)]
     pub orchestrator_hash: Option<String>,
 
     /// The URL against which a HTTP GET request will return a release
     /// package that corresponds to this version.
-    #[structopt(long, parse(try_from_str = url::Url::parse))]
+    ///
+    /// If replica-version is specified and both release-package-download-url
+    /// and release-package-sha256-hex are unspecified, the
+    /// release-package-download-url will default to
+    /// https://download.dfinity.systems/ic/<REPLICA_VERSION>/guest-os/update-img/update-img.tar.gz
+    #[clap(long, parse(try_from_str = url::Url::parse))]
     pub release_package_download_url: Option<Url>,
 
     /// The hex-formatted SHA-256 hash of the archive served by
     /// 'release_package_url'. Must be present if release_package_url is
     /// present.
-    #[structopt(long)]
+    ///
+    /// If replica-version is specified and both release-package-download-url
+    /// and release-package-sha256-hex are unspecified, the
+    /// release-package-download-url will downloaded from
+    /// https://download.dfinity.systems/ic/<REPLICA_VERSION>/guest-os/update-img/SHA256SUMS
+    #[clap(long)]
     pub release_package_sha256_hex: Option<String>,
 
     /// List of tuples describing the nodes
-    #[structopt(long, parse(try_from_str = parse_nodes_deprecated), group = "node_spec")]
+    #[clap(long, parse(try_from_str = parse_nodes_deprecated), group = "node_spec", multiple_values(true))]
     pub nodes: Vec<Node>,
 
     /// JSON5 node definition
-    #[structopt(long, group = "node_spec")]
+    #[clap(long, group = "node_spec", multiple_values(true))]
     pub node: Vec<Node>,
 
     /// Path to working directory for node states.
-    #[structopt(long, parse(from_os_str))]
+    #[clap(long, parse(from_os_str))]
     pub working_dir: PathBuf,
 
     /// Flows per node.
-    #[structopt(long, parse(try_from_str = parse_flows))]
+    #[clap(long, parse(try_from_str = parse_flows))]
     pub p2p_flows: FlowConfig,
 
     /// Skip generating subnet records
-    #[structopt(long)]
+    #[clap(long)]
     pub no_subnet_records: bool,
 
     /// The index of the subnet that should act as NNS subnet, if any.
-    #[structopt(long)]
+    #[clap(long)]
     pub nns_subnet_index: Option<u64>,
 
     /// Reads a directory containing datacenter's DER keys and a "meta.json"
     /// file containing metainformation for each datacenter.
-    #[structopt(long, parse(from_os_str))]
+    #[clap(long, parse(from_os_str))]
     pub dc_pk_path: Option<PathBuf>,
 
     /// Indicate whether each node operator entry is required to specify a file
     /// that contains the node provider public key of the corresponding node
     /// provider.
-    #[structopt(long)]
+    #[clap(long)]
     pub require_node_provider_key: bool,
 
     /// DKG interval length
     /// Negative integer means the default should be used.
-    #[structopt(long, allow_hyphen_values = true)]
+    #[clap(long, allow_hyphen_values = true)]
     pub dkg_interval_length: Option<i64>,
 
     /// A json-file containing a list of whitelisted principal IDs. A
     /// whitelisted principal is allowed to create canisters on any subnet on
     /// the IC.
-    #[structopt(long, parse(from_os_str))]
+    #[clap(long, parse(from_os_str))]
     pub provisional_whitelist: Option<PathBuf>,
 
     /// The Principal Id of the node operator that is used for all nodes created
     /// in the initial (!) registry. Note that this is unrelated to the node
     /// operators that are specified via the `dc-pk-path`-option. The latter are
     /// used to add new node _after_ the IC has been initialized/bootstrapped.
-    #[structopt(long)]
+    #[clap(long)]
     pub initial_node_operator: Option<PrincipalId>,
 
     /// If an initial node operator is provided, this is the Principal Id that
     /// is set as the node provider of that node operator.
-    #[structopt(long)]
+    #[clap(long)]
     pub initial_node_provider: Option<PrincipalId>,
 
     /// The path to the file which contains the initial set of SSH public keys
     /// to populate the registry with, to give "readonly" access to all the
     /// nodes.
-    #[structopt(long, parse(from_os_str))]
+    #[clap(long, parse(from_os_str))]
     pub ssh_readonly_access_file: Option<PathBuf>,
 
     /// The path to the file which contains the initial set of SSH public keys
     /// to populate the registry with, to give "backup" access to all the
     /// nodes.
-    #[structopt(long, parse(from_os_str))]
+    #[clap(long, parse(from_os_str))]
     pub ssh_backup_access_file: Option<PathBuf>,
 
     /// Maximum size of ingress message in bytes.
     /// Negative integer means the default should be used.
-    #[structopt(long, allow_hyphen_values = true)]
+    #[clap(long, allow_hyphen_values = true)]
     pub max_ingress_bytes_per_message: Option<i64>,
+
+    /// if release-package-download-url is not specified and this option is
+    /// specified, the corresponding update image field in the blessed replica
+    /// version record is left empty.
+    #[clap(long)]
+    pub allow_empty_update_image: bool,
+
+    /// The hex-formatted SHA-256 hash measurement of the SEV guest launch context.
+    #[clap(long)]
+    pub guest_launch_measurement_sha256_hex: Option<String>,
 }
 
 fn main() -> Result<()> {
-    let valid_args = CliArgs::from_args().validate()?;
+    let mut valid_args = CliArgs::parse().validate()?;
+
+    // set replica update image if necessary
+    if let Some(ref replica_version_id) = valid_args.replica_version_id {
+        if !valid_args.allow_empty_update_image && valid_args.release_package_download_url.is_none()
+        {
+            let url = Url::parse(
+                &UPD_IMG_DEFAULT_URL.replace("<REPLICA_VERSION>", replica_version_id.as_ref()),
+            )?;
+            valid_args.release_package_download_url = Some(url);
+            valid_args.release_package_sha256_hex =
+                Some(fetch_replica_version_sha256(replica_version_id.clone())?);
+        }
+    }
 
     let root_subnet_idx = valid_args.nns_subnet_index.unwrap_or(0);
     let mut topology_config = TopologyConfig::default();
@@ -171,6 +230,7 @@ fn main() -> Result<()> {
             None,
             None,
             None,
+            None,
             valid_args.ssh_readonly_access.clone(),
             valid_args.ssh_backup_access.clone(),
         );
@@ -191,6 +251,7 @@ fn main() -> Result<()> {
         valid_args.initial_node_operator,
         valid_args.initial_node_provider,
         valid_args.ssh_readonly_access,
+        valid_args.guest_launch_measurement_sha256_hex,
     );
 
     let ic_config = match valid_args.dc_pk_dir {
@@ -201,7 +262,7 @@ fn main() -> Result<()> {
         None => ic_config0,
     };
 
-    ic_config.initialize()?;
+    let _ = ic_config.initialize()?;
     Ok(())
 }
 
@@ -228,6 +289,8 @@ struct ValidatedArgs {
     pub ssh_readonly_access: Vec<String>,
     pub ssh_backup_access: Vec<String>,
     pub max_ingress_bytes_per_message: Option<u64>,
+    pub allow_empty_update_image: bool,
+    pub guest_launch_measurement_sha256_hex: Option<String>,
 }
 
 /// Structured definition of a flow provided by the `--p2p-flows` flag.
@@ -319,8 +382,6 @@ fn parse_nodes_deprecated(src: &str) -> Result<Node> {
         node_index,
         subnet_index,
         config: NodeConfiguration {
-            p2p_num_flows: 0,
-            p2p_start_flow_tag: 0,
             xnet_api: vec![ConnectionEndpoint::from(xnet_addr)],
             public_api: vec![ConnectionEndpoint::from(http_addr)],
             // TODO(O4-41): Empty, because the replica does not distinguish
@@ -329,7 +390,6 @@ fn parse_nodes_deprecated(src: &str) -> Result<Node> {
             prometheus_metrics: vec![ConnectionEndpoint::from(metrics_addr)],
             p2p_addr: ConnectionEndpoint::try_from(p2p_addr)?,
             node_operator_principal_id: None,
-            no_idkg_key: false,
             secret_key_store: None,
         },
     })
@@ -348,9 +408,7 @@ struct NodeFlag {
     pub private_api: Option<Vec<ConnectionEndpoint>>,
     pub prometheus_metrics: Option<Vec<ConnectionEndpoint>>,
 
-    /// The initial endpoint that P2P uses. The complete list of endpoints
-    /// is generated by creating `p2p_num_flows` endpoints, and incrementing
-    /// the port number by one for each.
+    /// The initial endpoint that P2P uses.
     pub p2p_addr: Option<ConnectionEndpoint>,
 }
 
@@ -420,10 +478,7 @@ impl TryFrom<NodeFlag> for Node {
                 private_api,
                 prometheus_metrics,
                 p2p_addr,
-                p2p_num_flows: 0,
-                p2p_start_flow_tag: 0,
                 node_operator_principal_id: None,
-                no_idkg_key: false,
                 secret_key_store: None,
             },
         })
@@ -532,9 +587,7 @@ impl CliArgs {
             if !node_idx_set.insert(node_index) {
                 bail!("the {}'th entry repeats the node index {}", i, node_index);
             }
-            let mut config = config.clone();
-            config.p2p_num_flows = self.p2p_flows.num_flows;
-            config.p2p_start_flow_tag = self.p2p_flows.start_tag;
+            let config = config.clone();
 
             if let Some(subnet_index) = subnet_index {
                 subnets
@@ -561,7 +614,10 @@ impl CliArgs {
         let dc_pk_path = match self.dc_pk_path {
             Some(dir) => {
                 if !dir.is_dir() {
-                    bail!("directory {} for DC configuration doesn't exist");
+                    bail!(
+                        "directory {} for DC configuration doesn't exist",
+                        dir.display()
+                    );
                 }
                 Some(dir)
             }
@@ -661,6 +717,8 @@ impl CliArgs {
                     None
                 }
             }),
+            allow_empty_update_image: self.allow_empty_update_image,
+            guest_launch_measurement_sha256_hex: self.guest_launch_measurement_sha256_hex,
         })
     }
 }
@@ -695,6 +753,40 @@ fn load_json<T: DeserializeOwned, P: AsRef<Path> + Copy>(path: P) -> Result<T> {
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 struct ProvisionalWhitelistFile {
     pub provisional_whitelist: Vec<String>,
+}
+
+fn fetch_replica_version_sha256(version_id: ReplicaVersion) -> Result<String> {
+    let url = UPD_IMG_DEFAULT_SHA256_URL.replace("<REPLICA_VERSION>", version_id.as_ref());
+    let url = Url::parse(&url)?;
+    let c = ClientBuilder::new().timeout(REQUEST_TIMEOUT).build()?;
+
+    let send_req = || c.get(url.clone()).send();
+
+    let mut attempts = CDN_HTTP_ATTEMPTS;
+    let resp = loop {
+        match send_req() {
+            Ok(resp) => break resp,
+            Err(e) if attempts < 1 => {
+                bail!(
+                    "timed out fetching SHA256 value for version id: {}. error: {:?}",
+                    version_id,
+                    e
+                )
+            }
+            _ => std::thread::sleep(RETRY_BACKOFF),
+        }
+        attempts -= 1;
+    };
+
+    let contents = resp.text()?;
+    for line in contents.lines() {
+        let words: Vec<&str> = line.split(char::is_whitespace).collect();
+        if words.len() == 2 && words[1].ends_with(UPD_IMG_FILENAME) {
+            return Ok(words[0].to_string());
+        }
+    }
+
+    bail!("SHA256 hash is not found at: {}. Make sure the file is downloadable and contains an entry for {}", url, UPD_IMG_FILENAME);
 }
 
 #[cfg(test)]
@@ -744,10 +836,7 @@ mod test_flag_nodes_parser_deprecated {
                 private_api: vec![],
                 prometheus_metrics: vec!["http://0.0.0.0:82".parse().unwrap()],
                 p2p_addr: "org.internetcomputer.p2p1://1.2.3.4:80".parse().unwrap(),
-                p2p_num_flows: 0,
-                p2p_start_flow_tag: 0,
                 node_operator_principal_id: None,
-                no_idkg_key: false,
                 secret_key_store: None,
             },
         };
@@ -769,10 +858,7 @@ mod test_flag_nodes_parser_deprecated {
                 private_api: vec![],
                 p2p_addr: "org.internetcomputer.p2p1://1.2.3.4:80".parse().unwrap(),
                 prometheus_metrics: vec!["http://0.0.0.0:82".parse().unwrap()],
-                p2p_num_flows: 0,
-                p2p_start_flow_tag: 0,
                 node_operator_principal_id: None,
-                no_idkg_key: false,
                 secret_key_store: None,
             },
         };
@@ -802,10 +888,7 @@ mod test_flag_node_parser {
                 private_api: vec!["http://3.4.5.6:83".parse().unwrap()],
                 p2p_addr: "org.internetcomputer.p2p1://1.2.3.4:80".parse().unwrap(),
                 prometheus_metrics: vec!["http://5.6.7.8:9090".parse().unwrap()],
-                p2p_num_flows: 0,
-                p2p_start_flow_tag: 0,
                 node_operator_principal_id: None,
-                no_idkg_key: false,
                 secret_key_store: None,
             },
         };
@@ -856,5 +939,16 @@ mod test_flag_node_parser {
         let new_node: Node = node_flag.parse().unwrap();
 
         assert_eq!(node, new_node);
+    }
+
+    #[test]
+    #[ignore] // side-effectful unit tests are ignored
+    fn can_fetch_sha256() {
+        let version_id =
+            ReplicaVersion::try_from("963c47c0179fb302cb02b1e4712f51b14ea738b6").unwrap();
+        assert_eq!(
+            fetch_replica_version_sha256(version_id).unwrap(),
+            "d081ffe20488380b4cf90069f3fc23e2fa4a904e4103d6f175c85ea87b2634b5"
+        );
     }
 }

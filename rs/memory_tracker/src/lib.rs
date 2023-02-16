@@ -9,6 +9,7 @@ use nix::sys::mman::{mmap, mprotect, MapFlags, ProtFlags};
 use std::{
     cell::{Cell, RefCell},
     ops::Range,
+    sync::atomic::{AtomicUsize, Ordering},
 };
 
 // The upper bound on the number of pages that are memory mapped from the
@@ -24,7 +25,7 @@ const MAX_PAGES_TO_COPY: usize = 64;
 // The new signal handler requires `AccessKind` which currently available only
 // on Linux without WSL.
 fn new_signal_handler_available() -> bool {
-    cfg!(target_os = "linux") && !*ic_sys::IS_WSL
+    cfg!(target_os = "linux") && cfg!(target_arch = "x86_64") && !*ic_sys::IS_WSL
 }
 
 // Represents a memory area: address + size. Address must be page-aligned and
@@ -53,7 +54,7 @@ impl MemoryArea {
 
     #[inline]
     pub fn addr(&self) -> usize {
-        self.addr as usize
+        self.addr
     }
 
     #[inline]
@@ -79,7 +80,8 @@ pub enum AccessKind {
     Write,
 }
 
-struct PageBitmap {
+/// Bitmap tracking which pages on the memory were accessed during an execution.
+pub struct PageBitmap {
     pages: BitVec,
     marked_count: usize,
 }
@@ -100,7 +102,8 @@ impl PageBitmap {
         self.marked_count
     }
 
-    fn is_marked(&self, page: PageIndex) -> bool {
+    /// Indicates if the given page was accessed.
+    pub fn is_marked(&self, page: PageIndex) -> bool {
         self.pages.get(page.get() as usize).unwrap_or(false)
     }
 
@@ -190,6 +193,11 @@ impl PageBitmap {
     }
 }
 
+struct ReadBeforeWriteStats {
+    read_before_write_count: AtomicUsize,
+    direct_write_count: AtomicUsize,
+}
+
 pub struct SigsegvMemoryTracker {
     memory_area: MemoryArea,
     accessed_bitmap: RefCell<PageBitmap>,
@@ -201,6 +209,7 @@ pub struct SigsegvMemoryTracker {
     use_new_signal_handler: bool,
     #[cfg(feature = "sigsegv_handler_checksum")]
     checksum: RefCell<checksum::SigsegChecksum>,
+    read_before_write_stats: ReadBeforeWriteStats,
 }
 
 impl SigsegvMemoryTracker {
@@ -236,6 +245,10 @@ impl SigsegvMemoryTracker {
             use_new_signal_handler,
             #[cfg(feature = "sigsegv_handler_checksum")]
             checksum: RefCell::new(checksum::SigsegChecksum::default()),
+            read_before_write_stats: ReadBeforeWriteStats {
+                read_before_write_count: AtomicUsize::new(0),
+                direct_write_count: AtomicUsize::new(0),
+            },
         };
 
         // Map the memory and make the range inaccessible to track it with SIGSEGV.
@@ -318,7 +331,7 @@ impl SigsegvMemoryTracker {
     }
 
     fn page_index_from(&self, addr: *mut libc::c_void) -> PageIndex {
-        let page_start_mask = !(PAGE_SIZE as usize - 1);
+        let page_start_mask = !(PAGE_SIZE - 1);
         let page_start_addr = (addr as usize) & page_start_mask;
 
         let page_index = (page_start_addr - self.memory_area.addr()) / PAGE_SIZE;
@@ -350,6 +363,29 @@ impl SigsegvMemoryTracker {
             }
         }
     }
+
+    pub fn page_map(&self) -> &PageMap {
+        &self.page_map
+    }
+
+    pub fn accessed_pages(&self) -> &RefCell<PageBitmap> {
+        &self.accessed_bitmap
+    }
+
+    /// The number of pages that first had a read access and then a write
+    /// access.
+    pub fn read_before_write_count(&self) -> usize {
+        self.read_before_write_stats
+            .read_before_write_count
+            .load(Ordering::SeqCst)
+    }
+
+    /// The number of pages that had an initial write access.
+    pub fn direct_write_count(&self) -> usize {
+        self.read_before_write_stats
+            .direct_write_count
+            .load(Ordering::SeqCst)
+    }
 }
 
 /// This is the old (unoptimized) signal handler. We keep it for use on MacOS
@@ -362,7 +398,7 @@ pub fn sigsegv_fault_handler_old(
 ) -> bool {
     // We need to handle page faults in units of pages(!). So, round faulting
     // address down to page boundary
-    let fault_address_page_boundary = fault_address as usize & !(PAGE_SIZE as usize - 1);
+    let fault_address_page_boundary = fault_address as usize & !(PAGE_SIZE - 1);
 
     let page_num = (fault_address_page_boundary - tracker.memory_area.addr()) / PAGE_SIZE;
 
@@ -559,6 +595,10 @@ pub fn sigsegv_fault_handler_new(
             // Ensure that we don't overwrite an already dirty page.
             let prefetch_range = dirty_bitmap.restrict_range_to_unmarked(prefetch_range);
             if accessed_bitmap.is_marked(faulting_page) {
+                tracker
+                    .read_before_write_stats
+                    .read_before_write_count
+                    .fetch_add(1, Ordering::SeqCst);
                 // Ensure that all pages in the range have already been accessed because we are
                 // going to simply `mprotect` the range.
                 let prefetch_range = accessed_bitmap.restrict_range_to_marked(prefetch_range);
@@ -576,6 +616,10 @@ pub fn sigsegv_fault_handler_new(
                 dirty_bitmap.mark_range(&prefetch_range);
                 tracker.add_dirty_pages(faulting_page, prefetch_range);
             } else {
+                tracker
+                    .read_before_write_stats
+                    .direct_write_count
+                    .fetch_add(1, Ordering::SeqCst);
                 // The first access to the page is a write access. This is a good case because
                 // it allows us to set up read/write mapping right away.
                 // Ensure that all pages in the range have not been accessed yet because we are

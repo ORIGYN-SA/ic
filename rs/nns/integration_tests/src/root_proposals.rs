@@ -1,17 +1,17 @@
 use canister_test::{Canister, Project};
 use ic_base_types::PrincipalId;
-use ic_canister_client::Sender;
+use ic_canister_client_sender::Sender;
 use ic_ic00_types::CanisterInstallMode;
-use ic_nervous_system_root::{CanisterIdRecord, CanisterStatusResult, ChangeCanisterProposal};
-use ic_nns_constants::GOVERNANCE_CANISTER_ID;
-use ic_nns_handler_root::root_proposals::{GovernanceUpgradeRootProposal, RootProposalBallot};
-use ic_nns_test_keys::{
+use ic_nervous_system_common_test_keys::{
     TEST_NEURON_1_OWNER_KEYPAIR, TEST_USER1_KEYPAIR, TEST_USER1_PRINCIPAL, TEST_USER2_KEYPAIR,
     TEST_USER2_PRINCIPAL, TEST_USER3_KEYPAIR, TEST_USER4_KEYPAIR, TEST_USER5_KEYPAIR,
     TEST_USER6_KEYPAIR,
 };
+use ic_nervous_system_root::{CanisterIdRecord, CanisterStatusResult, ChangeCanisterProposal};
+use ic_nns_constants::GOVERNANCE_CANISTER_ID;
+use ic_nns_handler_root::root_proposals::{GovernanceUpgradeRootProposal, RootProposalBallot};
 use ic_nns_test_utils::{
-    itest_helpers::{NnsCanisters, NnsInitPayloadsBuilder},
+    common::NnsInitPayloadsBuilder, itest_helpers::NnsCanisters,
     registry::initial_mutations_for_a_multinode_nns_subnet,
 };
 use ic_registry_transport::pb::v1::RegistryAtomicMutateRequest;
@@ -63,12 +63,8 @@ async fn vote_on_root_proposal_from_multiple_voters(
 }
 
 fn governance_canister_sha() -> [u8; 32] {
-    let governance_canister_wasm_bytes = Project::cargo_bin_maybe_use_path_relative_to_rs(
-        "nns/governance",
-        "governance-canister",
-        &["test"],
-    )
-    .bytes();
+    let governance_canister_wasm_bytes =
+        Project::cargo_bin_maybe_from_env("governance-canister", &["test"]).bytes();
     ic_crypto_sha::Sha256::hash(&governance_canister_wasm_bytes)
 }
 
@@ -126,7 +122,7 @@ fn test_upgrade_governance_through_root_proposal() {
         vote_on_root_proposal(
             &voter,
             &proposer_pid,
-            &empty_wasm_sha.to_vec(),
+            empty_wasm_sha.as_ref(),
             &nns_canisters.root,
             RootProposalBallot::Yes,
         )
@@ -146,7 +142,7 @@ fn test_upgrade_governance_through_root_proposal() {
                 Sender::from_keypair(&TEST_USER5_KEYPAIR),
             ],
             &proposer_pid,
-            &empty_wasm_sha.to_vec(),
+            empty_wasm_sha.as_ref(),
             &nns_canisters.root,
             RootProposalBallot::Yes,
         )
@@ -310,7 +306,7 @@ fn test_enough_no_votes_rejects_the_proposal() {
                 Sender::from_keypair(&TEST_USER4_KEYPAIR),
             ],
             &proposer_pid,
-            &empty_wasm_sha.to_vec(),
+            empty_wasm_sha.as_ref(),
             &nns_canisters.root,
             RootProposalBallot::No,
         )
@@ -423,7 +419,7 @@ fn test_changing_the_sha_invalidates_the_proposal() {
                 Sender::from_keypair(&TEST_USER6_KEYPAIR),
             ],
             &proposer2_pid,
-            &empty_wasm_sha.to_vec(),
+            empty_wasm_sha.as_ref(),
             &nns_canisters.root,
             RootProposalBallot::Yes,
         )
@@ -440,7 +436,7 @@ fn test_changing_the_sha_invalidates_the_proposal() {
                 Sender::from_keypair(&TEST_USER5_KEYPAIR),
             ],
             &proposer1_pid,
-            &empty_wasm_sha.to_vec(),
+            empty_wasm_sha.as_ref(),
             &nns_canisters.root,
             RootProposalBallot::Yes,
         )

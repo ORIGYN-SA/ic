@@ -1,13 +1,15 @@
 mod framework;
 
 use crate::framework::ConsensusDriver;
-use ic_artifact_pool::{canister_http_pool, consensus_pool, dkg_pool, ecdsa_pool};
+use ic_artifact_pool::{consensus_pool, dkg_pool, ecdsa_pool};
 use ic_consensus::consensus::dkg_key_manager::DkgKeyManager;
+use ic_consensus::consensus::pool_reader::PoolReader;
 use ic_consensus::{certification::CertifierImpl, consensus::ConsensusImpl, dkg};
-use ic_interfaces::time_source::TimeSource;
 use ic_interfaces_state_manager::Labeled;
+use ic_interfaces_state_manager_mocks::MockStateManager;
 use ic_logger::replica_logger::no_op_logger;
 use ic_metrics::MetricsRegistry;
+use ic_test_utilities::canister_http::FakeCanisterHttpPayloadBuilder;
 use ic_test_utilities::{
     consensus::make_genesis,
     crypto::CryptoReturningOk,
@@ -15,7 +17,6 @@ use ic_test_utilities::{
     message_routing::FakeMessageRouting,
     self_validating_payload_builder::FakeSelfValidatingPayloadBuilder,
     state::get_initial_state,
-    state_manager::MockStateManager,
     types::ids::{node_test_id, subnet_test_id},
     types::messages::SignedIngressBuilder,
     xnet_payload_builder::FakeXNetPayloadBuilder,
@@ -44,8 +45,13 @@ fn consensus_produces_expected_batches() {
 
         let xnet_payload_builder = FakeXNetPayloadBuilder::new();
         let xnet_payload_builder = Arc::new(xnet_payload_builder);
+
         let self_validating_payload_builder = FakeSelfValidatingPayloadBuilder::new();
         let self_validating_payload_builder = Arc::new(self_validating_payload_builder);
+
+        let canister_http_payload_builder = FakeCanisterHttpPayloadBuilder::new();
+        let canister_http_payload_builder = Arc::new(canister_http_payload_builder);
+
         let mut state_manager = MockStateManager::new();
         state_manager.expect_remove_states_below().return_const(());
         state_manager
@@ -89,25 +95,18 @@ fn consensus_produces_expected_batches() {
             no_op_logger(),
             metrics_registry.clone(),
         )));
-        let canister_http_pool = Arc::new(RwLock::new(
-            canister_http_pool::CanisterHttpPoolImpl::new(metrics_registry.clone()),
-        ));
 
         let registry_client = setup_registry(
             replica_config.subnet_id,
             vec![(1, SubnetRecordBuilder::from(&[node_test_id(0)]).build())],
         );
-        let summary = ic_consensus::dkg::make_genesis_summary(
-            &*registry_client,
-            replica_config.subnet_id,
-            None,
-        );
+        let summary = dkg::make_genesis_summary(&*registry_client, replica_config.subnet_id, None);
         let consensus_pool = Arc::new(RwLock::new(
             consensus_pool::ConsensusPoolImpl::new_from_cup_without_bytes(
                 subnet_id,
                 make_genesis(summary),
                 pool_config.clone(),
-                ic_metrics::MetricsRegistry::new(),
+                MetricsRegistry::new(),
                 no_op_logger(),
             ),
         ));
@@ -122,6 +121,7 @@ fn consensus_produces_expected_batches() {
             metrics_registry.clone(),
             Arc::clone(&fake_crypto) as Arc<_>,
             no_op_logger(),
+            &PoolReader::new(&*consensus_pool.read().unwrap()),
         )));
 
         let consensus = ConsensusImpl::new(
@@ -133,9 +133,9 @@ fn consensus_produces_expected_batches() {
             Arc::clone(&ingress_selector) as Arc<_>,
             Arc::clone(&xnet_payload_builder) as Arc<_>,
             Arc::clone(&self_validating_payload_builder) as Arc<_>,
+            Arc::clone(&canister_http_payload_builder) as Arc<_>,
             Arc::clone(&dkg_pool) as Arc<_>,
             Arc::clone(&ecdsa_pool) as Arc<_>,
-            Arc::clone(&canister_http_pool) as Arc<_>,
             dkg_key_manager.clone(),
             Arc::clone(&router) as Arc<_>,
             Arc::clone(&state_manager) as Arc<_>,
@@ -174,11 +174,9 @@ fn consensus_produces_expected_batches() {
             metrics_registry,
         );
         driver.step(time.as_ref()); // this stops before notary timeout expires after making 1st block
-        time.set_time(time.get_relative_time() + Duration::from_millis(2000))
-            .unwrap();
+        time.advance_time(Duration::from_millis(2000));
         driver.step(time.as_ref()); // this stops before notary timeout expires after making 2nd block
-        time.set_time(time.get_relative_time() + Duration::from_millis(2000))
-            .unwrap();
+        time.advance_time(Duration::from_millis(2000));
         driver.step(time.as_ref()); // this stops before notary timeout expires after making 3rd block
         let batches = router.batches.read().unwrap().clone();
         *router.batches.write().unwrap() = Vec::new();

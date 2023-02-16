@@ -9,8 +9,8 @@ fn test_random_oracle_stability() -> ThresholdEcdsaResult<()> {
 
     let mut ro = ro::RandomOracle::new("ic-test-domain-sep");
 
-    let s1 = EccScalar::random(curve_type, &mut rng)?;
-    let pt1 = EccPoint::generator_g(curve_type)?.scalar_mul(&s1)?;
+    let s1 = EccScalar::random(curve_type, &mut rng);
+    let pt1 = EccPoint::generator_g(curve_type).scalar_mul(&s1)?;
     ro.add_point("pt1", &pt1)?;
     assert!(ro.add_point("pt1", &pt1).is_err()); // duplicate name
 
@@ -23,11 +23,11 @@ fn test_random_oracle_stability() -> ThresholdEcdsaResult<()> {
 
     assert_eq!(
         hex::encode(c1[0].serialize()),
-        "c344fc1d9d24d591082e6c5f2732aa00e2c79983ff5081fcee38654a0df4c76f"
+        "e1cc3546518665d7321cd5b5aa7cbae2ae9d8bad3a2f28b495ac3d3af139b460"
     );
     assert_eq!(
         hex::encode(c1[1].serialize()),
-        "0c5c8f16c63135712f393cd57b9b54cea612990eed20ebf18afc9d650152d0b6"
+        "d46b5ef6fafdaf2a1e50f7b979f1fd31e058e9c2ab69115c4f2c15077ae94969"
     );
 
     // Test random oracle chaining:
@@ -40,7 +40,7 @@ fn test_random_oracle_stability() -> ThresholdEcdsaResult<()> {
 
     assert_eq!(
         hex::encode(c2.serialize()),
-        "ddc1982f681ca10a7633c0651d712ed25f2a1903f9c4a2e5efa0f1b706cbc56f"
+        "f35e7f0a649f8c8e92084d04d40cd13cb82e9e2ebc3aabb5bd88c04ce2f5ebe9"
     );
 
     let mut ro = ro::RandomOracle::new("ic-test-domain-sep-3");
@@ -52,7 +52,7 @@ fn test_random_oracle_stability() -> ThresholdEcdsaResult<()> {
 
     assert_eq!(
         hex::encode(&byte_output),
-        "899305380c54a613fea73e19346086115f7019a65eec7d9f91d9131d7ad1fbb5464992f08ac3c7e8a6d6"
+        "c569bf3e900df5d5e61fdf3b9d798d3089bf9dfd875e8735cb99aef2e5a865f2eb44fb6f363730a4b2dc"
     );
 
     let mut ro = ro::RandomOracle::new("ic-test-domain-sep-4");
@@ -64,7 +64,7 @@ fn test_random_oracle_stability() -> ThresholdEcdsaResult<()> {
 
     assert_eq!(
         hex::encode(pt.serialize()),
-        "03509940144796c03cf4bd2b3da5a93fe95b758fc4d4ce5b214d6a5f7c1c8230a1"
+        "020585e68447c2697248df1fbceceb56858c23ff982ee9dbcded85e92860dd618b"
     );
 
     Ok(())

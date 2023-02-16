@@ -4,7 +4,65 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [1.6.0] - Unreleased
+## Unreleased
+### Fixes
+### Added
+### Changed
+
+## [1.8.0] - 2023-01-16
+### Fixes
+- Validate the tip of the chain when blocks are downloaded.
+- Handle duplicate transaction hashes
+### Added
+- Rosetta supports the stake_maturity functionality
+- Rosetta supports Secp256k1 keys
+### Changed
+- The boundary node of the default exchanges testnet that Rosetta connects now now only supports IPv6 instead of IPv4
+- Changed the log destination of the blocks synchronizer. It now logs in the same file as the rosetta-api.
+- Changed the in-memory transaction table to a persistent SQLite table.
+
+## [1.7.2] - 2022-10-18
+### Fixed
+- Invalid Docker image configuration.
+
+### Changed
+- The dfinity/rosetta-api docker image is now based on a
+  [distroless](https://github.com/GoogleContainerTools/distroless)
+  container that contains only the rosetta binary and direct runtime dependencies.
+  As a consequence, you will not be able to enter shell on this image.
+
+## [1.7.1] - 2022-10-12
+### Fixed
+- A bug in absence proof check, see
+  https://github.com/dfinity/ic/commit/028b97f15783140dac7902b1a3b1b97a8196409c.
+
+## [1.7.0] - 2022-09-20
+### Fixed
+- The Rosetta node can now correctly handle absence proofs
+  (see https://internetcomputer.org/docs/current/references/ic-interface-spec/#example).
+  All Rosetta node operators are advised to update to this release.
+
+## [1.6.1] - 2022-08-26
+### Added
+- `blockchain` command line flag that overrides the blockchain name in the network identifier.
+### Changed
+- `NEURON_INFO` restricted data now contains followees and hotkeys.
+- `log_config.yml` now contains a specific appender for the ledger blocks synchronizer.
+
+## [1.6.0] - 2022-05-30
+### Fixed
+- Allow delegations when checking canister certificates.
+  This enables certificate validation for custom ledgers.
+
+### Changed
+- Controller format (principal or public key) for Spawn operation.
+
+## [1.5.1] - 2022-04-29
+### Fixed
+- Issue with FOLLOW and NEURON_INFO operations while using hotkeys.
+
+### Changed
+- Controller format (principal or public key) now explicit in operations used with a hotkey.
 
 ## [1.5.0] - 2022-04-06
 ### Added

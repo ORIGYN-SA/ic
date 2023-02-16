@@ -1,9 +1,9 @@
 //! Consensus utility functions
 use crate::consensus::{membership::Membership, pool_reader::PoolReader, prelude::*};
-use ic_interfaces::{
-    consensus_pool::ConsensusPoolCache, crypto::CryptoHashable, registry::RegistryClient,
-    time_source::TimeSource,
-};
+use ic_interfaces::consensus::{PayloadTransientError, PayloadValidationError};
+use ic_interfaces::validation::ValidationError;
+use ic_interfaces::{consensus_pool::ConsensusPoolCache, time_source::TimeSource};
+use ic_interfaces_registry::RegistryClient;
 use ic_interfaces_state_manager::StateManager;
 use ic_logger::{error, warn, ReplicaLogger};
 use ic_protobuf::registry::subnet::v1::SubnetRecord;
@@ -12,7 +12,10 @@ use ic_replicated_state::ReplicatedState;
 use ic_types::replica_config::ReplicaConfig;
 use ic_types::{
     consensus::Rank,
-    crypto::threshold_sig::ni_dkg::{NiDkgTag, NiDkgTranscript},
+    crypto::{
+        threshold_sig::ni_dkg::{NiDkgTag, NiDkgTranscript},
+        CryptoHashable,
+    },
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
@@ -58,7 +61,7 @@ impl RoundRobin {
 
 /// Convert a CryptoHashable into a 32 bytes which can be used to seed a RNG
 pub fn crypto_hashable_to_seed<T: CryptoHashable>(hashable: &T) -> [u8; 32] {
-    let hash = ic_crypto::crypto_hash(hashable);
+    let hash = ic_types::crypto::crypto_hash(hashable);
     let CryptoHash(hash_bytes) = hash.get();
     let mut seed = [0; 32]; // zero padded if digest is less than 32 bytes
     let n = hash_bytes.len().min(32);
@@ -282,6 +285,7 @@ pub fn get_notarization_delay_settings(
 ///
 /// * `artifact_shares` - A vector of artifact shares, e.g.
 ///   `Vec<&RandomBeaconShare>`
+#[allow(clippy::type_complexity)]
 pub fn aggregate<
     Message: Eq + Ord + Clone + std::fmt::Debug + HasHeight + HasCommittee,
     CryptoMessage,
@@ -332,7 +336,7 @@ pub fn aggregate<
 
 // Return a mapping from the unique content contained in `shares` to the
 // shares that contain this content
-fn group_shares<C: Eq + Ord, S: Ord, Shares: Iterator<Item = Signed<C, S>>>(
+pub(crate) fn group_shares<C: Eq + Ord, S: Ord, Shares: Iterator<Item = Signed<C, S>>>(
     shares: Shares,
 ) -> BTreeMap<C, BTreeSet<S>> {
     shares.fold(BTreeMap::new(), |mut grouped_shares, share| {
@@ -352,7 +356,7 @@ fn group_shares<C: Eq + Ord, S: Ord, Shares: Iterator<Item = Signed<C, S>>>(
 
 /// Return the hash of a block as a string.
 pub fn get_block_hash_string(block: &Block) -> String {
-    hex::encode(ic_crypto::crypto_hash(block).get().0)
+    hex::encode(ic_types::crypto::crypto_hash(block).get().0)
 }
 
 /// Helper function to lookup replica version, and log errors if any.
@@ -524,20 +528,22 @@ pub(crate) fn get_subnet_record(
     subnet_id: SubnetId,
     registry_version: RegistryVersion,
     logger: &ReplicaLogger,
-) -> Option<SubnetRecord> {
-    registry_client
-        .get_subnet_record(subnet_id, registry_version)
-        .map_err(|err| warn!(logger, "Registry error: {:?}", err))
-        .ok()?
-        .or_else(|| {
-            warn!(
-                logger,
-                "No subnet record found for registry version={:?} and subnet_id={:?}",
-                subnet_id,
-                registry_version
-            );
-            None
-        })
+) -> Result<SubnetRecord, PayloadValidationError> {
+    match registry_client.get_subnet_record(subnet_id, registry_version) {
+        Ok(Some(record)) => Ok(record),
+        Ok(None) => {
+            warn!(logger, "Subnet id {:?} not found in registry", subnet_id);
+            Err(ValidationError::Transient(
+                PayloadTransientError::SubnetNotFound(subnet_id),
+            ))
+        }
+        Err(err) => {
+            warn!(logger, "Failed to get subnet record in block_maker");
+            Err(ValidationError::Transient(
+                PayloadTransientError::RegistryUnavailable(err),
+            ))
+        }
+    }
 }
 
 #[cfg(test)]

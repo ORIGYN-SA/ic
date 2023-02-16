@@ -1,6 +1,7 @@
 use super::super::types::{CspPop, CspPublicKey, CspSignature};
+use crate::key_id::KeyId;
+use ic_types::crypto::AlgorithmId;
 use ic_types::crypto::CryptoResult;
-use ic_types::crypto::{AlgorithmId, KeyId};
 
 /// A trait that can generate and verify public key signatures
 pub trait CspSigner {
@@ -107,6 +108,32 @@ pub trait CspSigner {
         &self,
         signers: Vec<CspPublicKey>,
         signature: CspSignature,
+        msg: &[u8],
+        algorithm_id: AlgorithmId,
+    ) -> CryptoResult<()>;
+}
+
+pub trait CspSigVerifier {
+    /// Verifies a batch of signatures under different public keys for the same message.
+    /// # Arguments
+    /// * `key_signature_pairs` pairs of public keys and signatures to be verified
+    /// * `msg` the message data to be verified
+    /// * `algorithm_id` the signature algorithm
+    /// # Errors
+    /// * [`CryptoError::InternalError`] in case of internal CSP error, e.g., if
+    ///   the CSP failed to generate the required randomness.
+    /// * [`CryptoError::SignatureVerification`] if the signature algorithm used
+    ///   is not supported by the trait implementation, or if the signature was
+    ///   checked and found to be invalid.
+    /// * [`CryptoError::MalformedPublicKey`] if the public key seems to be
+    ///   invalid or malformed
+    /// * [`CryptoError::MalformedSignature`] if the signature seems to be invalid
+    ///   or malformed
+    /// # Returns
+    /// `Ok(())` if the signature is valid or an `Err` otherwise
+    fn verify_batch_vartime(
+        &self,
+        key_signature_pairs: &[(CspPublicKey, CspSignature)],
         msg: &[u8],
         algorithm_id: AlgorithmId,
     ) -> CryptoResult<()>;

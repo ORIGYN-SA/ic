@@ -3,6 +3,7 @@
 use super::*;
 use crate::common::test_utils::mockall_csp::MockAllCryptoServiceProvider;
 use crate::sign::tests::KEY_ID;
+use crate::sign::tests::KEY_ID_STRING;
 use crate::sign::threshold_sig::ThresholdSigDataStore;
 use ic_crypto_internal_csp::types::{CspPublicCoefficients, ThresBls12_381_Signature};
 use ic_crypto_internal_threshold_sig_bls12381::types::{
@@ -11,15 +12,15 @@ use ic_crypto_internal_threshold_sig_bls12381::types::{
 use ic_crypto_internal_types::sign::threshold_sig::ni_dkg::ni_dkg_groth20_bls12_381::PublicCoefficientsBytes;
 use ic_crypto_internal_types::sign::threshold_sig::public_key::bls12_381::PublicKeyBytes;
 use ic_crypto_internal_types::sign::threshold_sig::public_key::CspThresholdSigPublicKey;
-use ic_interfaces::crypto::SignableMock;
-use ic_test_utilities::types::ids::{NODE_1, SUBNET_0, SUBNET_1};
+use ic_crypto_test_utils::dkg::empty_ni_dkg_transcripts;
+use ic_protobuf::registry::subnet::v1::InitialNiDkgTranscriptRecord;
 use ic_types::crypto::threshold_sig::ni_dkg::{
     NiDkgId, NiDkgTag, NiDkgTargetId, NiDkgTargetSubnet,
 };
-use ic_types::crypto::ThresholdSigShare;
-use ic_types::crypto::{CombinedThresholdSig, KeyId};
+use ic_types::crypto::{CombinedThresholdSig, SignableMock, ThresholdSigShare};
 use ic_types::Height;
 use ic_types::SubnetId;
+use ic_types_test_utils::ids::{NODE_1, SUBNET_0, SUBNET_1};
 
 pub const NODE_ID: NodeId = NODE_1;
 
@@ -39,6 +40,7 @@ pub const NI_DKG_ID_2: NiDkgId = NiDkgId {
 
 mod sign_threshold {
     use super::*;
+    use ic_crypto_internal_csp::key_id::KeyId;
 
     #[test]
     fn should_call_csp_with_correct_parameters() {
@@ -155,7 +157,7 @@ mod sign_threshold {
             Err(ThresholdSignError::SecretKeyNotFound {
                 dkg_id: DkgId::NiDkgId(NI_DKG_ID_1),
                 algorithm: AlgorithmId::Placeholder,
-                key_id: KeyId::from(KEY_ID),
+                key_id: KEY_ID_STRING.to_string(),
             })
         )
     }
@@ -673,7 +675,7 @@ mod verify_threshold_sig_share {
 
 mod combine_threshold_sig_shares {
     use super::*;
-    use ic_test_utilities::types::ids::{NODE_1, NODE_2, NODE_3};
+    use ic_types_test_utils::ids::{NODE_1, NODE_2, NODE_3};
 
     #[test]
     fn should_call_csp_with_correct_algorithm_id_and_pub_coeffs() {
@@ -960,8 +962,7 @@ mod combine_threshold_sig_shares {
     }
 
     #[test]
-    #[should_panic(expected = "Illegal state: unexpected error from the CSP")]
-    fn should_panic_if_csp_returns_unexpected_error() {
+    fn should_return_internal_error_if_csp_returns_unexpected_error() {
         let indices = indices(vec![(NODE_1, 0_u32)]);
         let shares = shares(vec![(
             NODE_1,
@@ -971,12 +972,20 @@ mod combine_threshold_sig_shares {
         let threshold_sig_data_store =
             threshold_sig_data_store_with(DkgId::NiDkgId(NI_DKG_ID_1), pub_coeffs(), indices);
 
-        let _panic = ThresholdSigVerifierInternal::combine_threshold_sig_shares(
+        let result = ThresholdSigVerifierInternal::combine_threshold_sig_shares(
             &threshold_sig_data_store,
             &csp,
             shares,
             DkgId::NiDkgId(NI_DKG_ID_1),
         );
+
+        let expected_error = CryptoError::InternalError {
+            internal_error: format!(
+                "Unexpected error from the CSP: {}",
+                sig_verification_error()
+            ),
+        };
+        assert_eq!(result.unwrap_err(), expected_error);
     }
 
     fn csp_with_combine_sigs_returning_once(
@@ -1130,49 +1139,52 @@ mod verify_threshold_sig_combined {
     }
 
     #[test]
-    #[should_panic(expected = "Illegal state: unsupported algorithm")]
-    fn should_panic_if_csp_returns_invalid_argument_error() {
+    fn should_forward_error_if_csp_returns_invalid_argument_error() {
         let (combined_sig, message) = (combined_sig(), signable_mock());
         let csp = csp_with_verify_combined_returning_once(Err(invalid_argument()));
 
-        let _panic = ThresholdSigVerifierInternal::verify_threshold_sig_combined(
+        let result = ThresholdSigVerifierInternal::verify_threshold_sig_combined(
             &default_threshold_sig_data_store(),
             &csp,
             &combined_sig,
             &message,
             DkgId::NiDkgId(NI_DKG_ID_1),
         );
+        assert_eq!(result.unwrap_err(), invalid_argument());
     }
 
     #[test]
-    #[should_panic(expected = "Illegal state: the public key computed from the public \
-    coefficients is malformed")]
-    fn should_panic_if_csp_returns_malformed_public_key_error() {
+    fn should_forward_error_if_csp_returns_malformed_public_key_error() {
         let (combined_sig, message) = (combined_sig(), signable_mock());
         let csp = csp_with_verify_combined_returning_once(Err(malformed_public_key()));
 
-        let _panic = ThresholdSigVerifierInternal::verify_threshold_sig_combined(
+        let result = ThresholdSigVerifierInternal::verify_threshold_sig_combined(
             &default_threshold_sig_data_store(),
             &csp,
             &combined_sig,
             &message,
             DkgId::NiDkgId(NI_DKG_ID_1),
         );
+        assert_eq!(result.unwrap_err(), malformed_public_key());
     }
 
     #[test]
-    #[should_panic(expected = "Illegal state: unexpected error from the CSP")]
-    fn should_panic_if_csp_returns_unexpected_error() {
+    fn should_return_internal_error_if_csp_returns_unexpected_error() {
         let (combined_sig, message) = (combined_sig(), signable_mock());
         let csp = csp_with_verify_combined_returning_once(Err(secret_key_not_found()));
 
-        let _panic = ThresholdSigVerifierInternal::verify_threshold_sig_combined(
+        let result = ThresholdSigVerifierInternal::verify_threshold_sig_combined(
             &default_threshold_sig_data_store(),
             &csp,
             &combined_sig,
             &message,
             DkgId::NiDkgId(NI_DKG_ID_1),
         );
+
+        let expected_error = CryptoError::InternalError {
+            internal_error: format!("Unexpected error from the CSP: {}", secret_key_not_found()),
+        };
+        assert_eq!(result.unwrap_err(), expected_error);
     }
 
     fn csp_with_verify_combined_returning_once(
@@ -1188,16 +1200,15 @@ mod verify_threshold_sig_combined {
 
 mod verify_combined_threshold_sig_by_public_key {
     use super::*;
-    use crate::common::utils::ni_dkg::initial_ni_dkg_transcript_record_from_transcript;
     use crate::sign::tests::{registry_returning_none, REG_V1, SUBNET_ID};
     use ic_crypto_internal_types::sign::threshold_sig::ni_dkg::{
         ni_dkg_groth20_bls12_381, CspNiDkgTranscript,
     };
+    use ic_crypto_test_utils::set_of;
     use ic_protobuf::registry::subnet::v1::CatchUpPackageContents;
     use ic_registry_client_fake::FakeRegistryClient;
     use ic_registry_keys::make_catch_up_package_contents_key;
     use ic_registry_proto_data_provider::ProtoRegistryDataProvider;
-    use ic_test_utilities::crypto::{basic_utilities::set_of, empty_ni_dkg_transcripts};
     use ic_types::crypto::threshold_sig::ni_dkg::config::receivers::NiDkgReceivers;
     use ic_types::crypto::threshold_sig::ni_dkg::config::NiDkgThreshold;
     use ic_types::NumberOfNodes;
@@ -1215,7 +1226,7 @@ mod verify_combined_threshold_sig_by_public_key {
 
         let _ = ThresholdSigVerifierInternal::verify_combined_threshold_sig_by_public_key(
             &csp,
-            registry,
+            registry.as_ref(),
             &combined_sig,
             &message,
             SUBNET_ID,
@@ -1251,7 +1262,7 @@ mod verify_combined_threshold_sig_by_public_key {
 
         let _ = ThresholdSigVerifierInternal::verify_combined_threshold_sig_by_public_key(
             &csp_1,
-            registry,
+            registry.as_ref(),
             &combined_sig,
             &message,
             SUBNET_ID,
@@ -1274,7 +1285,7 @@ mod verify_combined_threshold_sig_by_public_key {
 
         let result = ThresholdSigVerifierInternal::verify_combined_threshold_sig_by_public_key(
             &csp,
-            registry,
+            registry.as_ref(),
             &combined_sig,
             &message,
             SUBNET_ID,
@@ -1292,7 +1303,7 @@ mod verify_combined_threshold_sig_by_public_key {
 
         let result = ThresholdSigVerifierInternal::verify_combined_threshold_sig_by_public_key(
             &csp,
-            registry_returning_none(),
+            registry_returning_none().as_ref(),
             &combined_sig,
             &message,
             SUBNET_ID,
@@ -1316,7 +1327,7 @@ mod verify_combined_threshold_sig_by_public_key {
 
         let result = ThresholdSigVerifierInternal::verify_combined_threshold_sig_by_public_key(
             &csp,
-            registry_returning_none(),
+            registry_returning_none().as_ref(),
             &invalid_sig,
             &message,
             SUBNET_ID,
@@ -1335,7 +1346,7 @@ mod verify_combined_threshold_sig_by_public_key {
 
         let result = ThresholdSigVerifierInternal::verify_combined_threshold_sig_by_public_key(
             &csp,
-            registry,
+            registry.as_ref(),
             &combined_sig,
             &message,
             SUBNET_ID,
@@ -1354,7 +1365,7 @@ mod verify_combined_threshold_sig_by_public_key {
 
         let result = ThresholdSigVerifierInternal::verify_combined_threshold_sig_by_public_key(
             &csp,
-            registry,
+            registry.as_ref(),
             &combined_sig,
             &message,
             SUBNET_ID,
@@ -1365,55 +1376,58 @@ mod verify_combined_threshold_sig_by_public_key {
     }
 
     #[test]
-    #[should_panic(expected = "Illegal state: unsupported algorithm")]
-    fn should_panic_if_csp_returns_invalid_argument_error() {
+    fn should_forward_error_if_csp_returns_invalid_argument_error() {
         let (combined_sig, message, pub_coeffs) = (combined_sig(), signable_mock(), pub_coeffs());
         let csp = csp_with_verify_combined_returning_once(Err(invalid_argument()));
         let registry = registry_with_dkg_transcript(transcript_with(pub_coeffs), SUBNET_ID, REG_V1);
 
-        let _panic = ThresholdSigVerifierInternal::verify_combined_threshold_sig_by_public_key(
+        let result = ThresholdSigVerifierInternal::verify_combined_threshold_sig_by_public_key(
             &csp,
-            registry,
+            registry.as_ref(),
             &combined_sig,
             &message,
             SUBNET_ID,
             REG_V1,
         );
+        assert_eq!(result.unwrap_err(), invalid_argument());
     }
 
     #[test]
-    #[should_panic(expected = "Illegal state: the public key computed from \
-                               the public coefficients is malformed")]
-    fn should_panic_if_csp_returns_malformed_public_key_error() {
+    fn should_forward_error_if_csp_returns_malformed_public_key_error() {
         let (combined_sig, message, pub_coeffs) = (combined_sig(), signable_mock(), pub_coeffs());
         let csp = csp_with_verify_combined_returning_once(Err(malformed_public_key()));
         let registry = registry_with_dkg_transcript(transcript_with(pub_coeffs), SUBNET_ID, REG_V1);
 
-        let _panic = ThresholdSigVerifierInternal::verify_combined_threshold_sig_by_public_key(
+        let result = ThresholdSigVerifierInternal::verify_combined_threshold_sig_by_public_key(
             &csp,
-            registry,
+            registry.as_ref(),
             &combined_sig,
             &message,
             SUBNET_ID,
             REG_V1,
         );
+        assert_eq!(result.unwrap_err(), malformed_public_key());
     }
 
     #[test]
-    #[should_panic(expected = "Illegal state: unexpected error from the CSP")]
-    fn should_panic_if_csp_returns_unexpected_error() {
+    fn should_return_internal_error_csp_returns_unexpected_error() {
         let (combined_sig, message, pub_coeffs) = (combined_sig(), signable_mock(), pub_coeffs());
         let csp = csp_with_verify_combined_returning_once(Err(secret_key_not_found()));
         let registry = registry_with_dkg_transcript(transcript_with(pub_coeffs), SUBNET_ID, REG_V1);
 
-        let _panic = ThresholdSigVerifierInternal::verify_combined_threshold_sig_by_public_key(
+        let result = ThresholdSigVerifierInternal::verify_combined_threshold_sig_by_public_key(
             &csp,
-            registry,
+            registry.as_ref(),
             &combined_sig,
             &message,
             SUBNET_ID,
             REG_V1,
         );
+
+        let expected_error = CryptoError::InternalError {
+            internal_error: format!("Unexpected error from the CSP: {}", secret_key_not_found()),
+        };
+        assert_eq!(result.unwrap_err(), expected_error);
     }
 
     fn csp_with_verify_combined_returning_once(
@@ -1433,16 +1447,14 @@ mod verify_combined_threshold_sig_by_public_key {
     ) -> Arc<dyn RegistryClient> {
         let cup_contents = CatchUpPackageContents {
             // We store both transcripts as in production scenario.
-            initial_ni_dkg_transcript_low_threshold: Some(
-                initial_ni_dkg_transcript_record_from_transcript(
-                    empty_ni_dkg_transcripts()
-                        .remove(&NiDkgTag::LowThreshold)
-                        .unwrap(),
-                ),
-            ),
-            initial_ni_dkg_transcript_high_threshold: Some(
-                initial_ni_dkg_transcript_record_from_transcript(transcript),
-            ),
+            initial_ni_dkg_transcript_low_threshold: Some(InitialNiDkgTranscriptRecord::from(
+                empty_ni_dkg_transcripts()
+                    .remove(&NiDkgTag::LowThreshold)
+                    .unwrap(),
+            )),
+            initial_ni_dkg_transcript_high_threshold: Some(InitialNiDkgTranscriptRecord::from(
+                transcript,
+            )),
             ..Default::default()
         };
         let data_provider = Arc::new(ProtoRegistryDataProvider::new());
@@ -1501,7 +1513,7 @@ fn combined_csp_threshold_sig(bytes: [u8; CombinedSignatureBytes::SIZE]) -> CspS
 fn secret_key_not_found() -> CryptoError {
     CryptoError::SecretKeyNotFound {
         algorithm: AlgorithmId::Placeholder,
-        key_id: KeyId::from(KEY_ID),
+        key_id: KEY_ID_STRING.to_string(),
     }
 }
 

@@ -9,6 +9,7 @@ use crate::{
     CertificationVersion, MAX_SUPPORTED_CERTIFICATION_VERSION,
 };
 use ic_crypto_tree_hash::Label;
+use ic_error_types::ErrorCode;
 use ic_error_types::RejectCode;
 use ic_registry_routing_table::RoutingTable;
 use ic_replicated_state::{
@@ -18,13 +19,14 @@ use ic_replicated_state::{
     ExecutionState, ReplicatedState,
 };
 use ic_types::{
-    ingress::{IngressStatus, WasmResult},
+    ingress::{IngressState, IngressStatus, WasmResult},
     messages::{MessageId, EXPECTED_MESSAGE_ID_LENGTH},
     xnet::{StreamHeader, StreamIndex, StreamIndexedQueue},
     CanisterId, PrincipalId, SubnetId,
 };
 use std::collections::BTreeMap;
 use std::convert::{AsRef, TryFrom, TryInto};
+use std::iter::once;
 use std::sync::Arc;
 use LazyTree::Blob;
 
@@ -37,7 +39,7 @@ impl<'a> FiniteMap<'a> {
     pub fn with<B, T>(mut self, blob: B, func: T) -> Self
     where
         B: AsRef<[u8]>,
-        T: Fn() -> LazyTree<'a> + 'a,
+        T: Fn() -> LazyTree<'a> + 'a + Send + Sync,
     {
         self.0.insert(Label::from(blob), Lazy::Func(Arc::new(func)));
         self
@@ -71,6 +73,14 @@ impl<'a> LazyFork<'a> for FiniteMap<'a> {
 
     fn labels(&self) -> Box<dyn Iterator<Item = Label> + '_> {
         Box::new(self.0.keys().cloned())
+    }
+
+    fn children(&self) -> Box<dyn Iterator<Item = (Label, LazyTree<'a>)> + '_> {
+        Box::new(self.0.iter().map(|(l, lazy)| (l.clone(), lazy.force())))
+    }
+
+    fn len(&self) -> usize {
+        self.0.len()
     }
 }
 
@@ -156,8 +166,9 @@ where
 
 impl<'a, K, V, F> LazyFork<'a> for MapTransformFork<'a, K, V, F>
 where
-    K: Ord + LabelLike,
-    F: Fn(K, &'a V, CertificationVersion) -> LazyTree<'a>,
+    K: Ord + LabelLike + Clone + Send + Sync,
+    F: Fn(K, &'a V, CertificationVersion) -> LazyTree<'a> + Send + Sync,
+    V: Send + Sync,
 {
     fn edge(&self, label: &Label) -> Option<LazyTree<'a>> {
         let k = K::from_label(label.as_bytes())?;
@@ -169,17 +180,33 @@ where
     fn labels(&self) -> Box<dyn Iterator<Item = Label> + '_> {
         Box::new(self.map.keys().map(|l| l.to_label()))
     }
+
+    fn children(&self) -> Box<dyn Iterator<Item = (Label, LazyTree<'a>)> + '_> {
+        Box::new(self.map.iter().map(move |(k, v)| {
+            (
+                k.to_label(),
+                (self.mk_tree)(k.clone(), v, self.certification_version),
+            )
+        }))
+    }
+
+    fn len(&self) -> usize {
+        self.map.len()
+    }
 }
 
 /// A special type of fork that describes a stream-indexed queue.
 #[derive(Clone)]
-struct StreamQueueFork<'a, T> {
+struct StreamQueueFork<'a, T>
+where
+    T: Send + Sync,
+{
     queue: &'a StreamIndexedQueue<T>,
     certification_version: CertificationVersion,
     mk_tree: fn(StreamIndex, &'a T, CertificationVersion) -> LazyTree<'a>,
 }
 
-impl<'a, T> LazyFork<'a> for StreamQueueFork<'a, T> {
+impl<'a, T: Send + Sync> LazyFork<'a> for StreamQueueFork<'a, T> {
     fn edge(&self, label: &Label) -> Option<LazyTree<'a>> {
         let idx = StreamIndex::from_label(label.as_bytes())?;
         self.queue
@@ -189,6 +216,19 @@ impl<'a, T> LazyFork<'a> for StreamQueueFork<'a, T> {
 
     fn labels(&self) -> Box<dyn Iterator<Item = Label> + '_> {
         Box::new((self.queue.begin().get()..self.queue.end().get()).map(|i| i.to_label()))
+    }
+
+    fn children(&self) -> Box<dyn Iterator<Item = (Label, LazyTree<'a>)> + '_> {
+        Box::new(self.queue.iter().map(move |(idx, v)| {
+            (
+                idx.to_label(),
+                (self.mk_tree)(idx, v, self.certification_version),
+            )
+        }))
+    }
+
+    fn len(&self) -> usize {
+        self.queue.len()
     }
 }
 
@@ -213,14 +253,7 @@ fn invert_routing_table(
 
 /// Converts replicated state into a lazy tree.
 fn state_as_tree(state: &ReplicatedState) -> LazyTree<'_> {
-    let certification_version =
-        CertificationVersion::try_from(state.metadata.certification_version).unwrap_or_else(|e| {
-            panic!(
-                "bug: this replica does not understand the current certification version: {}",
-                e
-            )
-        });
-
+    let certification_version = state.metadata.certification_version;
     assert!(
         certification_version <= MAX_SUPPORTED_CERTIFICATION_VERSION,
         "Unable to certify state with version {:?}. Maximum supported certification version is {:?}",
@@ -230,7 +263,9 @@ fn state_as_tree(state: &ReplicatedState) -> LazyTree<'_> {
 
     fork(
         FiniteMap::default()
-            .with("metadata", move || system_metadata_as_tree(&state.metadata))
+            .with("metadata", move || {
+                system_metadata_as_tree(&state.metadata, certification_version)
+            })
             .with("streams", move || {
                 streams_as_tree(state.streams(), certification_version)
             })
@@ -239,7 +274,10 @@ fn state_as_tree(state: &ReplicatedState) -> LazyTree<'_> {
             })
             .with_tree(
                 "request_status",
-                fork(IngressHistoryFork(&state.metadata.ingress_history)),
+                fork(IngressHistoryFork(
+                    &state.metadata.ingress_history,
+                    certification_version,
+                )),
             )
             .with("subnet", move || {
                 let inverted_routing_table = Arc::new(invert_routing_table(
@@ -290,48 +328,282 @@ fn streams_as_tree(
     })
 }
 
-fn system_metadata_as_tree(m: &SystemMetadata) -> LazyTree<'_> {
-    blob(move || encode_metadata(m))
+fn system_metadata_as_tree(
+    m: &SystemMetadata,
+    certification_version: CertificationVersion,
+) -> LazyTree<'_> {
+    blob(move || encode_metadata(m, certification_version))
 }
 
-struct IngressHistoryFork<'a>(&'a IngressHistoryState);
+struct IngressHistoryFork<'a>(&'a IngressHistoryState, CertificationVersion);
 
 impl<'a> LazyFork<'a> for IngressHistoryFork<'a> {
     fn edge(&self, label: &Label) -> Option<LazyTree<'a>> {
         let byte_array: [u8; EXPECTED_MESSAGE_ID_LENGTH] = label.as_bytes().try_into().ok()?;
         let id = MessageId::from(byte_array);
-        self.0.get(&id).map(status_to_tree)
+        self.0.get(&id).map(|status| status_to_tree(status, self.1))
     }
 
     fn labels(&self) -> Box<dyn Iterator<Item = Label> + '_> {
         Box::new(self.0.statuses().map(|(id, _)| Label::from(id.as_bytes())))
     }
+
+    fn children(&self) -> Box<dyn Iterator<Item = (Label, LazyTree<'a>)> + '_> {
+        Box::new(
+            self.0
+                .statuses()
+                .map(|(id, status)| (Label::from(id.as_bytes()), status_to_tree(status, self.1))),
+        )
+    }
+
+    fn len(&self) -> usize {
+        self.0.len()
+    }
 }
 
-fn status_to_tree<'a>(status: &'a IngressStatus) -> LazyTree<'a> {
-    let t = FiniteMap::default().with_tree("status", string(status.as_str()));
+const ERROR_CODE_LABEL: &[u8] = b"error_code";
+const REJECT_CODE_LABEL: &[u8] = b"reject_code";
+const REJECT_MESSAGE_LABEL: &[u8] = b"reject_message";
+const REPLY_LABEL: &[u8] = b"reply";
+const STATUS_LABEL: &[u8] = b"status";
 
-    let t = match status {
-        IngressStatus::Completed {
-            result: WasmResult::Reply(b),
-            ..
-        } => t.with_tree("reply", Blob(&b[..])),
-        IngressStatus::Completed {
-            result: WasmResult::Reject(s),
-            ..
-        } => t
-            .with_tree("reject_code", num::<'a>(RejectCode::CanisterReject as u64))
-            .with_tree("reject_message", string(&s[..])),
-        IngressStatus::Failed { error, .. } => t
-            .with_tree("reject_code", num::<'a>(error.reject_code() as u64))
-            .with_tree("reject_message", string(error.description())),
-        IngressStatus::Processing { .. }
-        | IngressStatus::Received { .. }
-        | IngressStatus::Done { .. }
-        | IngressStatus::Unknown => t,
-    };
+struct OnlyStatus<'a>(&'a str);
 
-    fork(t)
+impl<'a> LazyFork<'a> for OnlyStatus<'a> {
+    fn edge(&self, label: &Label) -> Option<LazyTree<'a>> {
+        (label.as_bytes() == STATUS_LABEL).then_some(string(self.0))
+    }
+
+    fn labels(&self) -> Box<dyn Iterator<Item = Label> + 'a> {
+        Box::new(once(Label::from(STATUS_LABEL)))
+    }
+
+    fn children(&self) -> Box<dyn Iterator<Item = (Label, LazyTree<'a>)> + 'a> {
+        Box::new(once((Label::from(STATUS_LABEL), string(self.0))))
+    }
+
+    fn len(&self) -> usize {
+        1
+    }
+}
+
+const REPLY_STATUS_LABELS: [&[u8]; 2] = [REPLY_LABEL, STATUS_LABEL];
+
+#[derive(Clone)]
+struct ReplyStatus<'a>(&'a [u8]);
+
+impl<'a> LazyFork<'a> for ReplyStatus<'a> {
+    fn edge(&self, label: &Label) -> Option<LazyTree<'a>> {
+        match label.as_bytes() {
+            STATUS_LABEL => Some(string("replied")),
+            REPLY_LABEL => Some(Blob(self.0, None)),
+            _ => None,
+        }
+    }
+
+    fn labels(&self) -> Box<dyn Iterator<Item = Label> + 'a> {
+        Box::new(REPLY_STATUS_LABELS.iter().map(|label| Label::from(label)))
+    }
+
+    fn children(&self) -> Box<dyn Iterator<Item = (Label, LazyTree<'a>)> + 'a> {
+        let status = self.clone();
+        Box::new(REPLY_STATUS_LABELS.iter().filter_map(move |label| {
+            let label = Label::from(label);
+            let fork = status.edge(&label)?;
+            Some((label, fork))
+        }))
+    }
+
+    fn len(&self) -> usize {
+        REPLY_STATUS_LABELS.len()
+    }
+}
+
+const REJECT_STATUS_LABELS: [(&[u8], CertificationVersion); 4] = [
+    (ERROR_CODE_LABEL, CertificationVersion::V11),
+    (REJECT_CODE_LABEL, CertificationVersion::V0),
+    (REJECT_MESSAGE_LABEL, CertificationVersion::V0),
+    (STATUS_LABEL, CertificationVersion::V0),
+];
+
+#[derive(Clone)]
+struct RejectStatus<'a> {
+    reject_code: u64,
+    error_code: Option<ErrorCode>,
+    message: &'a str,
+    version: CertificationVersion,
+}
+
+impl<'a> LazyFork<'a> for RejectStatus<'a> {
+    fn edge(&self, label: &Label) -> Option<LazyTree<'a>> {
+        match label.as_bytes() {
+            ERROR_CODE_LABEL => self
+                .error_code
+                .map(|code| blob(move || code.to_string().into_bytes())),
+            REJECT_CODE_LABEL => Some(num::<'a>(self.reject_code)),
+            REJECT_MESSAGE_LABEL => Some(string(self.message)),
+            STATUS_LABEL => Some(string("rejected")),
+            _ => None,
+        }
+    }
+
+    fn labels(&self) -> Box<dyn Iterator<Item = Label> + 'a> {
+        let version = self.version;
+        Box::new(
+            REJECT_STATUS_LABELS
+                .iter()
+                .filter_map(move |(label, v)| (*v <= version).then_some(Label::from(label))),
+        )
+    }
+
+    fn children(&self) -> Box<dyn Iterator<Item = (Label, LazyTree<'a>)> + 'a> {
+        let status = self.clone();
+        Box::new(REJECT_STATUS_LABELS.iter().filter_map(move |(label, v)| {
+            if *v > status.version {
+                return None;
+            }
+            let label = Label::from(label);
+            let fork = status.edge(&label)?;
+            Some((label, fork))
+        }))
+    }
+
+    fn len(&self) -> usize {
+        REJECT_STATUS_LABELS
+            .iter()
+            .filter(|(_, v)| *v <= self.version)
+            .count()
+    }
+}
+
+fn status_to_tree(status: &IngressStatus, version: CertificationVersion) -> LazyTree<'_> {
+    match status {
+        IngressStatus::Known { state, .. } => match state {
+            IngressState::Completed(WasmResult::Reply(b)) => fork(ReplyStatus(b)),
+            IngressState::Completed(WasmResult::Reject(s)) => fork(RejectStatus {
+                reject_code: RejectCode::CanisterReject as u64,
+                error_code: (version >= CertificationVersion::V11)
+                    .then_some(ErrorCode::CanisterRejectedMessage),
+                message: s,
+                version,
+            }),
+            IngressState::Failed(error) => fork(RejectStatus {
+                reject_code: error.reject_code() as u64,
+                error_code: (version >= CertificationVersion::V11).then_some(error.code()),
+                message: error.description(),
+                version,
+            }),
+            IngressState::Processing | IngressState::Received | IngressState::Done => {
+                fork(OnlyStatus(status.as_str()))
+            }
+        },
+        IngressStatus::Unknown => fork(OnlyStatus(status.as_str())),
+    }
+}
+
+const CERTIFIED_DATA_LABEL: &[u8] = b"certified_data";
+const CONTROLLER_LABEL: &[u8] = b"controller";
+const CONTROLLERS_LABEL: &[u8] = b"controllers";
+const METADATA_LABEL: &[u8] = b"metadata";
+const MODULE_HASH_LABEL: &[u8] = b"module_hash";
+
+const CANISTER_LABELS: [(&[u8], CertificationVersion); 5] = [
+    (CERTIFIED_DATA_LABEL, CertificationVersion::V0),
+    (CONTROLLER_LABEL, CertificationVersion::V1),
+    (CONTROLLERS_LABEL, CertificationVersion::V2),
+    (METADATA_LABEL, CertificationVersion::V6),
+    (MODULE_HASH_LABEL, CertificationVersion::V1),
+];
+
+const CANISTER_NO_MODULE_LABELS: [(&[u8], CertificationVersion); 2] = [
+    (CONTROLLER_LABEL, CertificationVersion::V1),
+    (CONTROLLERS_LABEL, CertificationVersion::V2),
+];
+
+#[derive(Clone)]
+struct CanisterFork<'a> {
+    canister: &'a CanisterState,
+    version: CertificationVersion,
+}
+
+impl<'a> CanisterFork<'a> {
+    /// Like `edge`, but skips the version check on every call.
+    fn edge_no_checks(&self, label: &[u8]) -> Option<LazyTree<'a>> {
+        let canister = self.canister;
+        match canister.execution_state.as_ref() {
+            Some(execution_state) => match label {
+                CERTIFIED_DATA_LABEL => Some(Blob(&canister.system_state.certified_data[..], None)),
+                CONTROLLER_LABEL => Some(Blob(canister.system_state.controller().as_slice(), None)),
+                CONTROLLERS_LABEL => Some(blob(move || {
+                    encode_controllers(&canister.system_state.controllers)
+                })),
+                METADATA_LABEL => Some(canister_metadata_as_tree(execution_state, self.version)),
+                MODULE_HASH_LABEL => Some(blob(move || {
+                    execution_state.wasm_binary.binary.module_hash().to_vec()
+                })),
+                _ => None,
+            },
+            None => match label {
+                CONTROLLER_LABEL => Some(Blob(canister.system_state.controller().as_slice(), None)),
+                CONTROLLERS_LABEL => Some(blob(move || {
+                    encode_controllers(&canister.system_state.controllers)
+                })),
+                _ => None,
+            },
+        }
+    }
+}
+
+impl<'a> LazyFork<'a> for CanisterFork<'a> {
+    fn edge(&self, label: &Label) -> Option<LazyTree<'a>> {
+        CANISTER_LABELS
+            .iter()
+            .find(|(l, v)| l == &label.as_bytes() && *v <= self.version)?;
+
+        self.edge_no_checks(label.as_bytes())
+    }
+
+    fn labels(&self) -> Box<dyn Iterator<Item = Label> + 'a> {
+        let version = self.version;
+        if self.canister.execution_state.is_some() {
+            Box::new(
+                CANISTER_LABELS
+                    .iter()
+                    .filter_map(move |(label, v)| (*v <= version).then_some(Label::from(label))),
+            )
+        } else {
+            Box::new(
+                CANISTER_NO_MODULE_LABELS
+                    .iter()
+                    .filter_map(move |(label, v)| (*v <= version).then_some(Label::from(label))),
+            )
+        }
+    }
+
+    fn children(&self) -> Box<dyn Iterator<Item = (Label, LazyTree<'a>)> + 'a> {
+        let canister = self.clone();
+        Box::new(CANISTER_LABELS.iter().filter_map(move |(label, v)| {
+            if *v > canister.version {
+                return None;
+            }
+            Some((Label::from(label), canister.edge_no_checks(label)?))
+        }))
+    }
+
+    fn len(&self) -> usize {
+        let version = self.version;
+        if self.canister.execution_state.is_some() {
+            CANISTER_LABELS
+                .iter()
+                .filter(move |(_, v)| *v <= version)
+                .count()
+        } else {
+            CANISTER_NO_MODULE_LABELS
+                .iter()
+                .filter(move |(_, v)| *v <= version)
+                .count()
+        }
+    }
 }
 
 fn canisters_as_tree(
@@ -341,47 +613,11 @@ fn canisters_as_tree(
     fork(MapTransformFork {
         map: canisters,
         certification_version,
-        mk_tree: |_canister_id, canister, certification_version| match &canister.execution_state {
-            Some(execution_state) => fork(
-                FiniteMap::default()
-                    .with_tree(
-                        "certified_data",
-                        Blob(&canister.system_state.certified_data[..]),
-                    )
-                    .with_tree_if(
-                        certification_version > CertificationVersion::V0,
-                        "controller",
-                        Blob(canister.system_state.controller().as_slice()),
-                    )
-                    .with_tree_if(
-                        certification_version > CertificationVersion::V0,
-                        "module_hash",
-                        blob(move || execution_state.wasm_binary.binary.module_hash().to_vec()),
-                    )
-                    .with_tree_if(
-                        certification_version > CertificationVersion::V1,
-                        "controllers",
-                        blob(move || encode_controllers(&canister.system_state.controllers)),
-                    )
-                    .with_tree_if(
-                        certification_version > CertificationVersion::V5,
-                        "metadata",
-                        canister_metadata_as_tree(execution_state, certification_version),
-                    ),
-            ),
-            None => fork(
-                FiniteMap::default()
-                    .with_tree_if(
-                        certification_version > CertificationVersion::V0,
-                        "controller",
-                        Blob(canister.system_state.controller().as_slice()),
-                    )
-                    .with_tree_if(
-                        certification_version > CertificationVersion::V1,
-                        "controllers",
-                        blob(move || encode_controllers(&canister.system_state.controllers)),
-                    ),
-            ),
+        mk_tree: |_canister_id, canister, certification_version| {
+            fork(CanisterFork {
+                canister,
+                version: certification_version,
+            })
         },
     })
 }
@@ -397,7 +633,7 @@ fn subnets_as_tree(
         mk_tree: move |subnet_id, subnet_topology, certification_version| {
             fork(
                 FiniteMap::default()
-                    .with_tree("public_key", Blob(&subnet_topology.public_key[..]))
+                    .with_tree("public_key", Blob(&subnet_topology.public_key[..], None))
                     .with_tree_if(
                         certification_version > CertificationVersion::V2,
                         "canister_ranges",
@@ -422,6 +658,6 @@ fn canister_metadata_as_tree(
     fork(MapTransformFork {
         map: execution_state.metadata.custom_sections(),
         certification_version,
-        mk_tree: |_name, section, _version| Blob(section.content.as_slice()),
+        mk_tree: |_name, section, _version| Blob(section.content(), Some(section.hash())),
     })
 }

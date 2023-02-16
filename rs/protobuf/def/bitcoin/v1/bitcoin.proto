@@ -63,6 +63,11 @@ message SendTransactionRequest {
   bytes transaction = 1;
 }
 
+message CanisterSendTransactionRequest {
+  Network network = 1;
+  bytes transaction = 2;
+}
+
 message SendTransactionResponse {};
 
 // Wraps the different types of requests to the Bitcoin Adapter.
@@ -70,6 +75,8 @@ message BitcoinAdapterRequestWrapper {
   oneof r {
     GetSuccessorsRequest get_successors_request = 1;
     SendTransactionRequest send_transaction_request = 2;
+    CanisterGetSuccessorsRequestInitial canister_get_successors_request = 3;
+    CanisterSendTransactionRequest canister_send_transaction_request = 4;
   }
 }
 
@@ -78,6 +85,8 @@ message BitcoinAdapterResponseWrapper {
   oneof r {
     GetSuccessorsResponse get_successors_response = 1;
     SendTransactionResponse send_transaction_response = 2;
+    CanisterGetSuccessorsResponseComplete canister_get_successors_response = 3;
+    SendTransactionResponse canister_send_transaction_response = 4;
   }
 }
 
@@ -113,9 +122,59 @@ message AdapterQueues {
   uint32 requests_queue_capacity = 4;
 }
 
-// Represents the Bitcoin state of the subnet.
-message BitcoinState {
+message UnstableBlocks {
+  uint32 stability_threshold = 1;
+  BlockTree tree = 2;
+}
+
+message BlockTree {
+  Block root = 1;
+  repeated BlockTree children = 2;
+}
+
+message Utxo {
+  OutPoint outpoint = 1;
+  TxOut txout = 2;
+  uint32 height = 3;
+}
+
+enum Network {
+  NETWORK_UNSPECIFIED = 0;
+  NETWORK_TESTNET = 1;
+  NETWORK_MAINNET = 2;
+  NETWORK_REGTEST = 3;
+}
+
+// A request to retrieve new blocks from the specified Bitcoin network.
+// NOTE: This request is specific to the Bitcoin wasm canister. It supersedes the
+// `GetSuccessorsRequest` above, which will be deleted once the  Bitcoin replica canister is
+// phased out.
+message CanisterGetSuccessorsRequestInitial {
+  Network network = 1;
+  repeated bytes processed_block_hashes = 2;
+  bytes anchor = 3;
+}
+
+// A response containing new successor blocks from the Bitcoin network.
+// NOTE: This response is specific to the Bitcoin wasm canister. It supersedes the
+// `GetSuccessorsResponse` above, which will be deleted once the  Bitcoin replica canister is
+// phased out.
+message CanisterGetSuccessorsResponseComplete {
+  repeated bytes blocks = 1;
+  repeated bytes next = 2;
+}
+
+// Represents the Bitcoin state that isn't stored in PageMaps.
+message BitcoinStateBits {
   // The queues that maintain the requests to and responses from the Bitcoin
   // Adapter.
   AdapterQueues adapter_queues = 1;
+
+  UnstableBlocks unstable_blocks = 2;
+
+  uint32 stable_height = 3;
+
+  Network network = 4;
+
+  repeated Utxo utxos_large = 5;
 }

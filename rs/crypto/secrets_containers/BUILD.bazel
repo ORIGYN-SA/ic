@@ -1,0 +1,23 @@
+load("@rules_rust//rust:defs.bzl", "rust_library", "rust_test")
+
+package(default_visibility = ["//visibility:public"])
+
+rust_library(
+    name = "secrets_containers",
+    srcs = glob(["src/**"]),
+    crate_name = "ic_crypto_secrets_containers",
+    version = "0.8.0",
+    deps = [
+        "@crate_index//:serde",
+        "@crate_index//:zeroize",
+    ],
+)
+
+rust_test(
+    name = "secrets_containers_test",
+    crate = ":secrets_containers",
+    deps = [
+        "@crate_index//:serde_bytes",
+        "@crate_index//:serde_cbor",
+    ],
+)

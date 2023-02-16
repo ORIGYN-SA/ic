@@ -1,8 +1,7 @@
 use crate::common::crypto_for;
-use ic_config::crypto::CryptoConfig;
-use ic_crypto::utils::TempCryptoComponent;
 use ic_crypto_internal_types::NodeIndex;
-use ic_interfaces::crypto::{NiDkgAlgorithm, Signable, ThresholdSigner};
+use ic_crypto_temp_crypto::{NodeKeysToGenerate, TempCryptoComponent};
+use ic_interfaces::crypto::{KeyManager, NiDkgAlgorithm, ThresholdSigner};
 use ic_registry_client_fake::FakeRegistryClient;
 use ic_registry_keys::make_crypto_node_key;
 use ic_registry_proto_data_provider::ProtoRegistryDataProvider;
@@ -11,7 +10,7 @@ use ic_types::crypto::threshold_sig::ni_dkg::config::{NiDkgConfig, NiDkgConfigDa
 use ic_types::crypto::threshold_sig::ni_dkg::{
     DkgId, NiDkgDealing, NiDkgId, NiDkgTag, NiDkgTargetId, NiDkgTargetSubnet, NiDkgTranscript,
 };
-use ic_types::crypto::{KeyPurpose, ThresholdSigShareOf};
+use ic_types::crypto::{KeyPurpose, Signable, ThresholdSigShareOf};
 use ic_types::{Height, NodeId, NumberOfNodes, PrincipalId, RegistryVersion, SubnetId};
 use rand::prelude::*;
 use std::cmp;
@@ -215,14 +214,14 @@ impl RandomNiDkgConfigBuilder {
         // margin that allows for increasing it again sufficiently during tests.
         let registry_version = self.registry_version.unwrap_or_else(|| {
             let rng = &mut thread_rng();
-            RegistryVersion::new(rng.gen_range(1, u32::MAX - 10_000) as u64)
+            RegistryVersion::new(rng.gen_range(1..u32::MAX - 10_000) as u64)
         });
 
         let dealer_count = self.dealer_count.unwrap_or_else(|| {
             let rng = &mut thread_rng();
             let threshold = dkg_tag.threshold_for_subnet_of_size(subnet_size);
             let required_dealer_count = threshold;
-            let dealer_surplus = rng.gen_range(0, 3);
+            let dealer_surplus = rng.gen_range(0..3);
             required_dealer_count + dealer_surplus
         });
 
@@ -284,7 +283,7 @@ impl RandomNiDkgConfig {
                 // The first DKG is always done by NNS for another (remote) subnet
                 target_subnet: NiDkgTargetSubnet::Remote(NiDkgTargetId::new(random())),
             },
-            max_corrupt_dealers: Self::number_of_nodes_from_usize(rng.gen_range(0, dealers.len())),
+            max_corrupt_dealers: Self::number_of_nodes_from_usize(rng.gen_range(0..dealers.len())),
             dealers,
             max_corrupt_receivers: {
                 Self::number_of_nodes_from_usize(get_faults_tolerated(subnet_size))
@@ -314,7 +313,7 @@ impl RandomNiDkgConfig {
         let threshold = dkg_tag.threshold_for_subnet_of_size(subnet_size);
         let dealers = {
             let required_dealer_count = threshold;
-            let dealer_surplus = rng.gen_range(0, 3);
+            let dealer_surplus = rng.gen_range(0..3);
             // Exclude receivers from being dealers because initial DKG is done by NNS for
             // another (remote) subnet, which means the dealers and receivers are disjoint.
             Self::random_node_ids_excluding(&receivers, required_dealer_count + dealer_surplus)
@@ -327,7 +326,7 @@ impl RandomNiDkgConfig {
                 dkg_tag,
                 target_subnet: self.0.dkg_id().target_subnet,
             },
-            max_corrupt_dealers: Self::number_of_nodes_from_usize(rng.gen_range(0, dealers.len())),
+            max_corrupt_dealers: Self::number_of_nodes_from_usize(rng.gen_range(0..dealers.len())),
             dealers,
             max_corrupt_receivers: {
                 Self::number_of_nodes_from_usize(get_faults_tolerated(subnet_size))
@@ -365,7 +364,7 @@ impl RandomNiDkgConfig {
                 transcript.threshold.get().get(), // Ensures #dealers >= resharing threshold
             );
             let lower_bound = usize::try_from(lower_bound_u32).expect("conversion error");
-            let dealer_count = rng.gen_range(lower_bound, transcript.committee.get().len() + 1);
+            let dealer_count = rng.gen_range(lower_bound..=transcript.committee.get().len());
             let dealers_vec = transcript
                 .committee
                 .get()
@@ -379,7 +378,7 @@ impl RandomNiDkgConfig {
                 isize::try_from(transcript.committee.get().len()).expect("conversion error");
 
             let change_in_subnet_size =
-                rng.gen_range(subnet_size_change.start(), subnet_size_change.end() + 1);
+                rng.gen_range(*subnet_size_change.start()..=*subnet_size_change.end());
 
             let new_subnet_size_isize =
                 cmp::max(1, transcript_committee_len_isize + change_in_subnet_size);
@@ -543,10 +542,7 @@ impl NiDkgTestEnvironment {
     /// a new `NiDkgTestEnvironment` using the `new_from_dir` function.
     pub fn save_to_dir(&self, toplevel_path: &Path) {
         for (node_id, crypto_component) in self.crypto_components.iter() {
-            Self::copy_crypto_root(
-                crypto_component.temp_dir_path(),
-                &toplevel_path.join(node_id.to_string()),
-            );
+            crypto_component.copy_crypto_root_to(&toplevel_path.join(node_id.to_string()));
         }
 
         self.registry_data
@@ -587,39 +583,17 @@ impl NiDkgTestEnvironment {
             registry,
         };
         for (node_id, crypto_root) in node_ids_from_dir_names(toplevel_path) {
-            let (config, temp_dir) = CryptoConfig::new_in_temp_dir();
-            Self::copy_crypto_root(&crypto_root, temp_dir.path());
-            let registry = Arc::clone(&ret.registry) as Arc<_>;
-            let crypto_component =
-                TempCryptoComponent::new_with(registry, node_id, &config, temp_dir);
+            let crypto_component = TempCryptoComponent::builder()
+                .with_temp_dir_source(crypto_root)
+                .with_registry(Arc::clone(&ret.registry) as Arc<_>)
+                .with_node_id(node_id)
+                .build();
             ret.crypto_components.insert(node_id, crypto_component);
         }
 
         ret.registry.update_to_latest_version();
 
         ret
-    }
-
-    /// Copies the given source directory into a newly-created directory.
-    ///
-    /// Note: The copy is only of files and only one level deep (all that's
-    /// required for a CryptoComponent).
-    fn copy_crypto_root(src: &Path, dest: &Path) {
-        std::fs::create_dir_all(dest).unwrap_or_else(|err| {
-            panic!(
-                "Failed to create crypto root directory {}: {}",
-                dest.display(),
-                err
-            )
-        });
-        for entry in std::fs::read_dir(src).expect("src directory doesn't exist") {
-            let path = entry.expect("failed to get path in src dir").path();
-            if path.is_file() {
-                let filename = path.file_name().expect("failed to get src path");
-                let dest_path = dest.join(filename);
-                std::fs::copy(&path, &dest_path).expect("failed to copy file");
-            }
-        }
     }
 
     /// Determines the config's node IDs that are not in the environment
@@ -637,11 +611,16 @@ impl NiDkgTestEnvironment {
         node_id: NodeId,
     ) {
         // Insert TempCryptoComponent
-        let registry = Arc::clone(&self.registry) as Arc<_>;
-        let (temp_crypto, dkg_dealing_encryption_pubkey) =
-            TempCryptoComponent::new_with_ni_dkg_dealing_encryption_key_generation(
-                registry, node_id,
-            );
+        let temp_crypto = TempCryptoComponent::builder()
+            .with_registry(Arc::clone(&self.registry) as Arc<_>)
+            .with_node_id(node_id)
+            .with_keys(NodeKeysToGenerate::only_dkg_dealing_encryption_key())
+            .build();
+        let dkg_dealing_encryption_pubkey = temp_crypto
+            .current_node_public_keys()
+            .expect("Failed to retrieve node public keys")
+            .dkg_dealing_encryption_public_key
+            .expect("missing dkg_dealing_encryption_pk");
         self.crypto_components.insert(node_id, temp_crypto);
 
         // Insert DKG dealing encryption public key into registry

@@ -2,16 +2,14 @@
 
 use crate::common::test_utils::CryptoRegistryRecord;
 use crate::sign::tests::{dealing_encryption_pk_record_with, REG_V1, REG_V2};
-use ic_crypto_internal_types::curves::bls12_381::G1;
+use ic_crypto_internal_types::curves::bls12_381::G1Bytes;
 use ic_crypto_internal_types::sign::threshold_sig::ni_dkg::ni_dkg_groth20_bls12_381::{
     FsEncryptionPublicKey, PublicCoefficientsBytes,
 };
 use ic_crypto_internal_types::sign::threshold_sig::ni_dkg::{
     ni_dkg_groth20_bls12_381, CspFsEncryptionPublicKey, CspNiDkgDealing, CspNiDkgTranscript,
 };
-use ic_test_utilities::crypto::basic_utilities::set_of;
-use ic_test_utilities::crypto::ni_dkg_csp_dealing;
-use ic_test_utilities::types::ids::{NODE_1, NODE_2, NODE_3, SUBNET_1};
+use ic_crypto_test_utils::{dkg::ni_dkg_csp_dealing, set_of};
 use ic_types::crypto::threshold_sig::ni_dkg::config::receivers::NiDkgReceivers;
 use ic_types::crypto::threshold_sig::ni_dkg::config::{
     NiDkgConfig, NiDkgConfigData, NiDkgThreshold,
@@ -20,6 +18,7 @@ use ic_types::crypto::threshold_sig::ni_dkg::{
     NiDkgId, NiDkgTag, NiDkgTargetSubnet, NiDkgTranscript,
 };
 use ic_types::{Height, NodeId, NumberOfNodes, RegistryVersion};
+use ic_types_test_utils::ids::{NODE_1, NODE_2, NODE_3, SUBNET_1};
 use std::collections::{BTreeMap, BTreeSet};
 
 // We use threshold 1 in these tests to get a valid DkgConfig in a simple way.
@@ -123,7 +122,9 @@ pub fn dealing_enc_pk_record(
 }
 
 pub fn csp_fs_enc_pk(data: u8) -> CspFsEncryptionPublicKey {
-    CspFsEncryptionPublicKey::Groth20_Bls12_381(FsEncryptionPublicKey(G1([data; G1::SIZE])))
+    CspFsEncryptionPublicKey::Groth20_Bls12_381(FsEncryptionPublicKey(G1Bytes(
+        [data; G1Bytes::SIZE],
+    )))
 }
 
 pub fn map_of<K: Ord, V>(entries: Vec<(K, V)>) -> BTreeMap<K, V> {

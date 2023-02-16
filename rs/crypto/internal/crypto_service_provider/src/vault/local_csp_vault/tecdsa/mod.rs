@@ -1,8 +1,10 @@
+use crate::public_key_store::PublicKeyStore;
 use crate::secret_key_store::SecretKeyStore;
 use crate::types::CspSecretKey;
 use crate::vault::api::ThresholdEcdsaSignerCspVault;
-use crate::vault::local_csp_vault::idkg::commitment_key_id;
 use crate::vault::local_csp_vault::LocalCspVault;
+use crate::KeyId;
+use ic_crypto_internal_logmon::metrics::{MetricsDomain, MetricsResult, MetricsScope};
 use ic_crypto_internal_threshold_sig_ecdsa::{
     sign_share as tecdsa_sign_share, CombinedCommitment, CommitmentOpening, IDkgTranscriptInternal,
     ThresholdEcdsaSigShareInternal,
@@ -14,10 +16,70 @@ use ic_types::Randomness;
 use rand::{CryptoRng, Rng};
 use std::convert::TryFrom;
 
-impl<R: Rng + CryptoRng + Send + Sync, S: SecretKeyStore, C: SecretKeyStore>
-    ThresholdEcdsaSignerCspVault for LocalCspVault<R, S, C>
+impl<R: Rng + CryptoRng, S: SecretKeyStore, C: SecretKeyStore, P: PublicKeyStore>
+    ThresholdEcdsaSignerCspVault for LocalCspVault<R, S, C, P>
 {
     fn ecdsa_sign_share(
+        &self,
+        derivation_path: &ExtendedDerivationPath,
+        hashed_message: &[u8],
+        nonce: &Randomness,
+        key: &IDkgTranscriptInternal,
+        kappa_unmasked: &IDkgTranscriptInternal,
+        lambda_masked: &IDkgTranscriptInternal,
+        kappa_times_lambda: &IDkgTranscriptInternal,
+        key_times_lambda: &IDkgTranscriptInternal,
+        algorithm_id: AlgorithmId,
+    ) -> Result<ThresholdEcdsaSigShareInternal, ThresholdEcdsaSignShareError> {
+        let start_time = self.metrics.now();
+        let result = self.ecdsa_sign_share_internal(
+            derivation_path,
+            hashed_message,
+            nonce,
+            key,
+            kappa_unmasked,
+            lambda_masked,
+            kappa_times_lambda,
+            key_times_lambda,
+            algorithm_id,
+        );
+        self.metrics.observe_duration_seconds(
+            MetricsDomain::ThresholdEcdsa,
+            MetricsScope::Local,
+            "ecdsa_sign_share",
+            MetricsResult::from(&result),
+            start_time,
+        );
+        result
+    }
+}
+
+impl<R: Rng + CryptoRng, S: SecretKeyStore, C: SecretKeyStore, P: PublicKeyStore>
+    LocalCspVault<R, S, C, P>
+{
+    fn combined_commitment_opening_from_sks(
+        &self,
+        combined_commitment: &CombinedCommitment,
+    ) -> Result<CommitmentOpening, ThresholdEcdsaSignShareError> {
+        let commitment = match combined_commitment {
+            CombinedCommitment::BySummation(commitment)
+            | CombinedCommitment::ByInterpolation(commitment) => commitment,
+        };
+
+        let key_id = KeyId::from(commitment);
+        let opening = self.canister_sks_read_lock().get(&key_id);
+        match &opening {
+            Some(CspSecretKey::IDkgCommitmentOpening(bytes)) => CommitmentOpening::try_from(bytes)
+                .map_err(|e| ThresholdEcdsaSignShareError::InternalError {
+                    internal_error: format!("{:?}", e),
+                }),
+            _ => Err(ThresholdEcdsaSignShareError::SecretSharesNotFound {
+                commitment_string: format!("{:?}", commitment),
+            }),
+        }
+    }
+
+    fn ecdsa_sign_share_internal(
         &self,
         derivation_path: &ExtendedDerivationPath,
         hashed_message: &[u8],
@@ -50,31 +112,5 @@ impl<R: Rng + CryptoRng + Send + Sync, S: SecretKeyStore, C: SecretKeyStore>
         .map_err(|e| ThresholdEcdsaSignShareError::InternalError {
             internal_error: format!("{:?}", e),
         })
-    }
-}
-
-impl<R: Rng + CryptoRng + Send + Sync, S: SecretKeyStore, C: SecretKeyStore>
-    LocalCspVault<R, S, C>
-{
-    fn combined_commitment_opening_from_sks(
-        &self,
-        combined_commitment: &CombinedCommitment,
-    ) -> Result<CommitmentOpening, ThresholdEcdsaSignShareError> {
-        let commitment = match combined_commitment {
-            CombinedCommitment::BySummation(commitment)
-            | CombinedCommitment::ByInterpolation(commitment) => commitment,
-        };
-
-        let key_id = commitment_key_id(commitment);
-        let opening = self.canister_sks_read_lock().get(&key_id);
-        match &opening {
-            Some(CspSecretKey::IDkgCommitmentOpening(bytes)) => CommitmentOpening::try_from(bytes)
-                .map_err(|e| ThresholdEcdsaSignShareError::InternalError {
-                    internal_error: format!("{:?}", e),
-                }),
-            _ => Err(ThresholdEcdsaSignShareError::SecretSharesNotFound {
-                commitment_string: format!("{:?}", commitment),
-            }),
-        }
     }
 }

@@ -6,11 +6,11 @@ use ic_config::{subnet_config::SubnetConfigs, Config};
 use ic_cycles_account_manager::CyclesAccountManager;
 use ic_error_types::{ErrorCode, UserError};
 use ic_execution_environment::ExecutionServices;
+use ic_http_endpoints_metrics::MetricsHttpEndpoint;
 use ic_interfaces::{execution_environment::IngressHistoryReader, messaging::MessageRouting};
 use ic_interfaces_state_manager::StateReader;
 use ic_messaging::MessageRoutingImpl;
 use ic_metrics::MetricsRegistry;
-use ic_metrics_exporter::MetricsRuntimeImpl;
 use ic_protobuf::registry::{
     provisional_whitelist::v1::ProvisionalWhitelist as PbProvisionalWhitelist,
     routing_table::v1::RoutingTable as PbRoutingTable,
@@ -30,15 +30,17 @@ use ic_test_utilities::consensus::fake::FakeVerifier;
 use ic_test_utilities_registry::{
     add_subnet_record, insert_initial_dkg_transcript, SubnetRecordBuilder,
 };
+use ic_types::malicious_flags::MaliciousFlags;
 use ic_types::{
-    batch::{Batch, BatchPayload, IngressPayload, SelfValidatingPayload, XNetPayload},
-    ingress::{IngressStatus, WasmResult},
+    batch::{Batch, BatchPayload, IngressPayload},
+    ingress::{IngressState, IngressStatus, WasmResult},
     messages::{MessageId, SignedIngress},
     replica_config::ReplicaConfig,
-    time::UNIX_EPOCH,
-    CanisterId, NodeId, PrincipalId, Randomness, RegistryVersion, SubnetId,
+    time, CanisterId, NodeId, PrincipalId, Randomness, RegistryVersion, SubnetId,
 };
+use rand::distributions::{Distribution, Uniform};
 use slog::{Drain, Logger};
+use std::collections::BTreeMap;
 use std::fs::OpenOptions;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -207,10 +209,11 @@ pub fn run_drun(uo: DrunOptions) -> Result<(), String> {
             cfg.hypervisor.clone(),
             Arc::clone(&cycles_account_manager),
             Arc::clone(&state_manager) as Arc<_>,
+            state_manager.get_fd_factory(),
         )
         .into_parts();
 
-    let _metrics_runtime = MetricsRuntimeImpl::new_insecure(
+    let _metrics_endpoint = MetricsHttpEndpoint::new_insecure(
         tokio::runtime::Handle::current(),
         cfg.metrics,
         metrics_registry.clone(),
@@ -228,6 +231,7 @@ pub fn run_drun(uo: DrunOptions) -> Result<(), String> {
         &metrics_registry,
         log.clone().into(),
         Arc::clone(&registry) as _,
+        MaliciousFlags::default(),
     );
 
     msg_stream.try_for_each(|parse_result| {
@@ -286,11 +290,17 @@ fn print_ingress_result(message_id: &MessageId, ingress_hist_reader: &dyn Ingres
     let status = (ingress_hist_reader.get_latest_status())(message_id);
     print!("ingress ");
     match status {
-        IngressStatus::Completed { result, .. } => {
+        IngressStatus::Known {
+            state: IngressState::Completed(result),
+            ..
+        } => {
             print!("Completed: ");
             print_wasm_result(result)
         }
-        IngressStatus::Failed { error, .. } => println!("Err: {}", error),
+        IngressStatus::Known {
+            state: IngressState::Failed(error),
+            ..
+        } => println!("Err: {}", error),
         _ => panic!("Ingress message has not finished processing."),
     };
 }
@@ -302,21 +312,25 @@ fn print_wasm_result(wasm_result: WasmResult) {
     }
 }
 
+fn get_random_seed() -> [u8; 32] {
+    let step = Uniform::new(0, u8::MAX);
+    let mut rng = rand::thread_rng();
+    let seed: Vec<u8> = step.sample_iter(&mut rng).take(32).collect();
+    seed.try_into().unwrap()
+}
+
 fn build_batch(message_routing: &dyn MessageRouting, msgs: Vec<SignedIngress>) -> Batch {
     Batch {
         batch_number: message_routing.expected_batch_height(),
         requires_full_state_hash: !msgs.is_empty(),
         payload: BatchPayload {
             ingress: IngressPayload::from(msgs),
-            xnet: XNetPayload {
-                stream_slices: Default::default(),
-            },
-            self_validating: SelfValidatingPayload::default(),
+            ..BatchPayload::default()
         },
-        randomness: Randomness::from([0; 32]),
-        ecdsa_subnet_public_key: None,
+        randomness: Randomness::from(get_random_seed()),
+        ecdsa_subnet_public_keys: BTreeMap::new(),
         registry_version: RegistryVersion::from(1),
-        time: UNIX_EPOCH,
+        time: time::current_time(),
         consensus_responses: vec![],
     }
 }
@@ -347,17 +361,18 @@ fn execute_ingress_message(
 
         let ingress_result = (ingress_history.get_latest_status())(msg_id);
         match ingress_result {
-            IngressStatus::Completed { result, .. } => return Ok(result),
-            IngressStatus::Failed { error, .. } => return Err(error),
-            IngressStatus::Done { .. } => {
-                return Err(UserError::new(
-                    ErrorCode::SubnetOversubscribed,
-                    "The call has completed but the reply/reject data has been pruned.",
-                ))
-            }
-            IngressStatus::Received { .. }
-            | IngressStatus::Processing { .. }
-            | IngressStatus::Unknown => (),
+            IngressStatus::Known { state, .. } => match state {
+                IngressState::Completed(result) => return Ok(result),
+                IngressState::Failed(error) => return Err(error),
+                IngressState::Done => {
+                    return Err(UserError::new(
+                        ErrorCode::SubnetOversubscribed,
+                        "The call has completed but the reply/reject data has been pruned.",
+                    ))
+                }
+                IngressState::Received | IngressState::Processing => (),
+            },
+            IngressStatus::Unknown => (),
         }
     }
     panic!(
@@ -396,5 +411,23 @@ fn wait_extra_batches(message_routing: &dyn MessageRouting, extra_batches: u64) 
                 break;
             };
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn test_get_random_seed() {
+        let seed_1 = get_random_seed();
+        let seed_2 = get_random_seed();
+        let len = seed_1.len();
+        let mut equal = 0;
+        for i in 0..len {
+            if seed_1[i] == seed_2[i] {
+                equal += 1;
+            }
+        }
+        assert_ne!(equal, len);
     }
 }

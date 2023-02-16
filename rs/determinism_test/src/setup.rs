@@ -7,7 +7,6 @@ use ic_execution_environment::ExecutionServices;
 use ic_interfaces::execution_environment::IngressHistoryReader;
 use ic_messaging::MessageRoutingImpl;
 use ic_metrics::MetricsRegistry;
-use ic_metrics_exporter::MetricsRuntimeImpl;
 use ic_protobuf::registry::{
     provisional_whitelist::v1::ProvisionalWhitelist as PbProvisionalWhitelist,
     routing_table::v1::RoutingTable as PbRoutingTable,
@@ -27,7 +26,10 @@ use ic_test_utilities::{consensus::fake::FakeVerifier, types::ids::subnet_test_i
 use ic_test_utilities_registry::{
     add_subnet_record, insert_initial_dkg_transcript, SubnetRecordBuilder,
 };
-use ic_types::{replica_config::ReplicaConfig, NodeId, PrincipalId, RegistryVersion, SubnetId};
+use ic_types::{
+    malicious_flags::MaliciousFlags, replica_config::ReplicaConfig, NodeId, PrincipalId,
+    RegistryVersion, SubnetId,
+};
 use std::sync::Arc;
 
 fn get_registry(
@@ -139,12 +141,7 @@ pub(crate) fn setup() -> (
         config.hypervisor.clone(),
         Arc::clone(&cycles_account_manager),
         Arc::clone(&state_manager) as Arc<_>,
-    );
-    let _metrics_runtime = MetricsRuntimeImpl::new_insecure(
-        tokio::runtime::Handle::current(),
-        config.metrics.clone(),
-        metrics_registry.clone(),
-        &log,
+        Arc::clone(&state_manager.get_fd_factory()),
     );
 
     let message_routing = MessageRoutingImpl::new(
@@ -158,6 +155,7 @@ pub(crate) fn setup() -> (
         &metrics_registry,
         log.clone().into(),
         Arc::clone(&registry) as _,
+        MaliciousFlags::default(),
     );
 
     (

@@ -1,10 +1,10 @@
 use crate::*;
 use core::fmt::{self, Debug};
 use ic_types::crypto::canister_threshold_sig::idkg::IDkgOpening;
-use rand_core::{CryptoRng, RngCore};
+use rand::{CryptoRng, RngCore};
 use serde::{Deserialize, Serialize};
 use std::convert::TryFrom;
-use zeroize::Zeroize;
+use zeroize::{Zeroize, ZeroizeOnDrop};
 
 /// A Polynomial whose coefficients are scalars in an elliptic curve group
 ///
@@ -67,20 +67,28 @@ impl Polynomial {
         curve: EccCurveType,
         num_coefficients: usize,
         rng: &mut R,
-    ) -> ThresholdEcdsaResult<Self> {
+    ) -> Self {
         let mut coefficients = Vec::with_capacity(num_coefficients);
 
         for _ in 0..num_coefficients {
-            coefficients.push(EccScalar::random(curve, rng)?)
+            coefficients.push(EccScalar::random(curve, rng))
         }
 
-        Self::new(curve, coefficients)
+        // We avoid Self::new here since that can fail, but only in the event
+        // that the coefficients are on different curves. That cannot happen
+        // here, but to avoid an explicit unreachable! or unwrap call here we
+        // instead create the struct directly, which allows this function to
+        // be infallible.
+        Self {
+            curve,
+            coefficients,
+        }
     }
 
     /// Creates a random polynomial with the specified number of coefficients,
     /// one of which is the specified constant
     pub fn random_with_constant<R: CryptoRng + RngCore>(
-        constant: EccScalar,
+        constant: &EccScalar,
         num_coefficients: usize,
         rng: &mut R,
     ) -> ThresholdEcdsaResult<Self> {
@@ -93,10 +101,10 @@ impl Polynomial {
         let curve = constant.curve_type();
         let mut coefficients = Vec::with_capacity(num_coefficients);
 
-        coefficients.push(constant);
+        coefficients.push(constant.clone());
 
         for _ in 1..num_coefficients {
-            coefficients.push(EccScalar::random(curve, rng)?)
+            coefficients.push(EccScalar::random(curve, rng))
         }
 
         Self::new(curve, coefficients)
@@ -109,36 +117,9 @@ impl Polynomial {
 
     fn coeff(&self, idx: usize) -> EccScalar {
         match self.coefficients.get(idx) {
-            Some(s) => *s,
+            Some(s) => s.clone(),
             None => EccScalar::zero(self.curve_type()),
         }
-    }
-
-    /// Return the coefficients resized to the desired size
-    ///
-    /// The return value is zero-padded on the high coefficients as
-    /// necessary. It is ensured that no coefficients are truncated.
-    pub fn get_coefficients(
-        &self,
-        num_coefficients: usize,
-    ) -> ThresholdEcdsaResult<Vec<EccScalar>> {
-        if self.coefficients.len() > num_coefficients {
-            for c in &self.coefficients[num_coefficients..] {
-                if !c.is_zero() {
-                    return Err(ThresholdEcdsaError::InvalidArguments(
-                        "Too many coefficients".to_string(),
-                    ));
-                }
-            }
-        }
-
-        let mut coeff = Vec::with_capacity(num_coefficients);
-
-        for i in 0..num_coefficients {
-            coeff.push(self.coeff(i));
-        }
-
-        Ok(coeff)
     }
 
     /// Return the count of non-zero coefficients
@@ -184,6 +165,7 @@ impl Polynomial {
 
         let lhs_coeffs = self.coefficients.len();
         let rhs_coeffs = rhs.coefficients.len();
+        // Slightly over-estimates the size when one of the poly is empty
         let n_coeffs = std::cmp::max(lhs_coeffs + rhs_coeffs, 1) - 1;
 
         let zero = EccScalar::zero(curve_type);
@@ -228,9 +210,10 @@ impl Polynomial {
 
         // Could this instead be done using fold or reduce?
         let mut coefficients = self.coefficients.iter().rev();
-        let mut ans = *coefficients
+        let mut ans = coefficients
             .next()
-            .expect("Iterator was unexpectedly empty");
+            .expect("Iterator was unexpectedly empty")
+            .clone();
 
         for coeff in coefficients {
             ans = ans.mul(x)?;
@@ -251,12 +234,12 @@ impl Polynomial {
         let one = EccScalar::one(curve);
 
         // Constant polynomial interpolating the first sample `(x_0,y_0)`.
-        let mut poly = Polynomial::new(curve, vec![samples[0].1])?;
-        let mut minus_s0 = samples[0].0;
+        let mut poly = Polynomial::new(curve, vec![samples[0].1.clone()])?;
+        let mut minus_s0 = samples[0].0.clone();
         minus_s0 = minus_s0.negate();
         // Is zero on the first `i` samples.
         // Degree 1 polynomial evaluating to 0 in the first evaluation point `x_0`.
-        let mut base = Polynomial::new(curve, vec![minus_s0, one])?;
+        let mut base = Polynomial::new(curve, vec![minus_s0, one.clone()])?;
 
         // We update `base` so that it is always zero on all previous samples, and
         // `poly` so that it has the correct values on the previous samples.
@@ -274,23 +257,25 @@ impl Polynomial {
             // `1/base(x_i)`.
             let inv = base.evaluate_at(x)?.invert()?;
 
-            if !inv.is_zero() {
-                // Scaling factor for the base polynomial: `(y_i-poly(x_i))/base(x_i)`
-                diff = diff.mul(&inv)?;
-                // Scale `base` so that the result:
-                // * Its value at `x_i` is the difference between `y_i` and `poly`'s current
-                //   value at `x_i`,
-                // * Its value is 0 at all previous evaluation points `x_j` for `j<i`.
-                // `base(x) = base(x)(y_i-poly(x_i))/base(x_i)`
-                base = base.mul_scalar(&diff)?;
-                // Shift `poly` by `base` so that it has same degree of base and value `y_j` at
-                // `x_j` for all j in 0..=i: `poly(x)=poly(x)+base(x)`
-                poly = poly.add(&base)?;
-
-                // Update `base` to a degree `i+1` polynomial that evaluates to 0 for all points
-                // `x_j` for j in 0..=i: `base(x) = base(x)(x-x_i)`
-                base = base.mul(&Polynomial::new(curve, vec![x.negate(), one])?)?;
+            if inv.is_zero() {
+                return Err(ThresholdEcdsaError::InterpolationError);
             }
+
+            // Scaling factor for the base polynomial: `(y_i-poly(x_i))/base(x_i)`
+            diff = diff.mul(&inv)?;
+            // Scale `base` so that the result:
+            // * Its value at `x_i` is the difference between `y_i` and `poly`'s current
+            //   value at `x_i`,
+            // * Its value is 0 at all previous evaluation points `x_j` for `j<i`.
+            // `base(x) = base(x)(y_i-poly(x_i))/base(x_i)`
+            base = base.mul_scalar(&diff)?;
+            // Shift `poly` by `base` so that it has same degree of base and value `y_j` at
+            // `x_j` for all j in 0..=i: `poly(x)=poly(x)+base(x)`
+            poly = poly.add(&base)?;
+
+            // Update `base` to a degree `i+1` polynomial that evaluates to 0 for all points
+            // `x_j` for j in 0..=i: `base(x) = base(x)(x-x_i)`
+            base = base.mul(&Polynomial::new(curve, vec![x.negate(), one.clone()])?)?;
         }
         Ok(poly)
     }
@@ -381,8 +366,7 @@ impl TryFrom<&IDkgOpening> for CommitmentOpening {
     }
 }
 
-#[derive(Clone, Eq, PartialEq, Zeroize, Serialize, Deserialize)]
-#[zeroize(drop)]
+#[derive(Clone, Eq, PartialEq, Serialize, Deserialize, Zeroize, ZeroizeOnDrop)]
 pub enum CommitmentOpeningBytes {
     Simple(EccScalarBytes),
     Pedersen(EccScalarBytes, EccScalarBytes),
@@ -427,17 +411,23 @@ impl SimpleCommitment {
     }
 
     pub fn constant_term(&self) -> EccPoint {
-        self.points[0]
+        self.points[0].clone()
     }
 
     /// Create a new simple commitment
     ///
     /// The polynomial must have at most num_coefficients coefficients
     pub fn create(poly: &Polynomial, num_coefficients: usize) -> ThresholdEcdsaResult<Self> {
+        if poly.non_zero_coefficients() > num_coefficients {
+            return Err(ThresholdEcdsaError::InvalidArguments(
+                "Polynomial has more coefficients than expected".to_string(),
+            ));
+        }
+
         let mut points = Vec::with_capacity(num_coefficients);
 
-        for coeff in poly.get_coefficients(num_coefficients)? {
-            points.push(EccPoint::mul_by_g(&coeff)?);
+        for i in 0..num_coefficients {
+            points.push(EccPoint::mul_by_g(&poly.coeff(i))?);
         }
 
         Ok(Self::new(points))
@@ -469,7 +459,7 @@ impl PedersenCommitment {
     }
 
     pub fn constant_term(&self) -> EccPoint {
-        self.points[0]
+        self.points[0].clone()
     }
 
     /// Create a new Pedersen commitment
@@ -486,14 +476,19 @@ impl PedersenCommitment {
             return Err(ThresholdEcdsaError::CurveMismatch);
         }
 
-        let coeffs_values = p_values.get_coefficients(num_coefficients)?;
-        let coeffs_masking = p_masking.get_coefficients(num_coefficients)?;
+        if p_values.non_zero_coefficients() > num_coefficients
+            || p_masking.non_zero_coefficients() > num_coefficients
+        {
+            return Err(ThresholdEcdsaError::InvalidArguments(
+                "Polynomial has more coefficients than expected".to_string(),
+            ));
+        }
 
         let mut points = Vec::with_capacity(num_coefficients);
 
-        for (coeff_values, coeff_masking) in coeffs_values.iter().zip(coeffs_masking) {
+        for i in 0..num_coefficients {
             // compute c = g*a + h*b
-            let c = EccPoint::pedersen(coeff_values, &coeff_masking)?;
+            let c = EccPoint::pedersen(&p_values.coeff(i), &p_masking.coeff(i))?;
             points.push(c);
         }
 
@@ -552,6 +547,32 @@ impl PolynomialCommitment {
             .map_err(|e| ThresholdEcdsaError::SerializationError(format!("{}", e)))
     }
 
+    /// This returns a stable serialization of the commitment
+    ///
+    /// This encoding is incompatible with the CBOR serialization used
+    /// by serialize. It is used to compute key IDs for the SKS so no
+    /// equivalent deserialization function is provided. For this
+    /// reason the encoding *must never change* in the future as this
+    /// would prevent looking up existing openings in the SKS
+    pub fn stable_representation(&self) -> Vec<u8> {
+        let curve_type = self.curve_type();
+        let mut r = Vec::with_capacity(2 + self.len() * curve_type.point_bytes());
+
+        let commitment_tag = match self.ctype() {
+            PolynomialCommitmentType::Simple => b'S',
+            PolynomialCommitmentType::Pedersen => b'P',
+        };
+
+        r.push(commitment_tag);
+        r.push(curve_type.tag());
+
+        for point in self.points() {
+            r.extend_from_slice(&point.serialize());
+        }
+
+        r
+    }
+
     pub(crate) fn ctype(&self) -> PolynomialCommitmentType {
         match self {
             Self::Simple(_) => PolynomialCommitmentType::Simple,
@@ -575,7 +596,7 @@ impl PolynomialCommitment {
     }
 
     pub fn constant_term(&self) -> EccPoint {
-        self.points()[0]
+        self.points()[0].clone()
     }
 
     pub fn curve_type(&self) -> EccCurveType {
@@ -590,7 +611,7 @@ impl PolynomialCommitment {
         if self.check_opening(index, opening)? {
             Ok(opening.clone())
         } else {
-            Err(ThresholdEcdsaError::InconsistentCommitments)
+            Err(ThresholdEcdsaError::InvalidCommitment)
         }
     }
 
@@ -604,7 +625,7 @@ impl PolynomialCommitment {
         }
 
         if self.ctype() != ctype {
-            return Err(ThresholdEcdsaError::InconsistentCommitments);
+            return Err(ThresholdEcdsaError::UnexpectedCommitmentType);
         }
 
         Ok(())
@@ -624,7 +645,7 @@ impl PolynomialCommitment {
                 c.check_opening(eval_point, value, mask)
             }
 
-            _ => Err(ThresholdEcdsaError::InvalidOpening),
+            _ => Err(ThresholdEcdsaError::InconsistentOpeningAndCommitment),
         }
     }
 }
@@ -634,7 +655,7 @@ pub struct LagrangeCoefficients {
 }
 
 impl LagrangeCoefficients {
-    fn new(coefficients: Vec<EccScalar>) -> ThresholdEcdsaResult<Self> {
+    pub fn new(coefficients: Vec<EccScalar>) -> ThresholdEcdsaResult<Self> {
         if coefficients.is_empty() {
             return Err(ThresholdEcdsaError::InterpolationError);
         }
@@ -654,11 +675,12 @@ impl LagrangeCoefficients {
         if y.len() != self.coefficients.len() {
             return Err(ThresholdEcdsaError::InterpolationError);
         }
-        let curve_type = self.coefficients[0].curve_type();
-        let mut result = EccPoint::identity(curve_type);
-        for (coefficient, sample) in self.coefficients.iter().zip(y) {
-            result = result.add_points(&sample.scalar_mul(coefficient)?)?;
-        }
+        let point_scalar_refs: Vec<(&EccPoint, &EccScalar)> =
+            y.iter().zip(self.coefficients.iter()).collect();
+        // The coefficents are public (being derived from the node indexes)
+        // and so it is safe to use a variable-time multiplication algorithm.
+        let result = EccPoint::mul_n_points_vartime(&point_scalar_refs[..])?;
+
         Ok(result)
     }
 
@@ -736,10 +758,10 @@ impl LagrangeCoefficients {
 
         let mut numerator = Vec::with_capacity(samples.len());
         let mut tmp = EccScalar::one(curve_type);
-        numerator.push(tmp);
+        numerator.push(tmp.clone());
         for x in samples.iter().take(samples.len() - 1) {
             tmp = tmp.mul(&x.sub(value)?)?;
-            numerator.push(tmp);
+            numerator.push(tmp.clone());
         }
 
         tmp = EccScalar::one(curve_type);

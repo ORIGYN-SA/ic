@@ -1,27 +1,32 @@
 //! Implementations of IDkgProtocol related to dealings
 
+use crate::sign::basic_sig::{BasicSigVerifierInternal, BasicSignerInternal};
 use crate::sign::canister_threshold_sig::idkg::utils::{
     get_mega_pubkey, idkg_encryption_keys_from_registry, MegaKeyFromRegistryError,
 };
-use ic_crypto_internal_csp::api::CspIDkgProtocol;
+use ic_base_types::RegistryVersion;
+use ic_crypto_internal_csp::api::{CspIDkgProtocol, CspSigner};
 use ic_crypto_internal_threshold_sig_ecdsa::{
     IDkgDealingInternal, IDkgTranscriptOperationInternal,
 };
-use ic_interfaces::registry::RegistryClient;
+use ic_interfaces_registry::RegistryClient;
 use ic_types::crypto::canister_threshold_sig::error::{
     IDkgCreateDealingError, IDkgVerifyDealingPrivateError, IDkgVerifyDealingPublicError,
+    IDkgVerifyInitialDealingsError,
 };
-use ic_types::crypto::canister_threshold_sig::idkg::{IDkgDealing, IDkgTranscriptParams};
+use ic_types::crypto::canister_threshold_sig::idkg::{
+    IDkgDealing, IDkgTranscriptParams, InitialIDkgDealings, SignedIDkgDealing,
+};
+use ic_types::signature::BasicSignature;
 use ic_types::NodeId;
 use std::convert::TryFrom;
-use std::sync::Arc;
 
-pub fn create_dealing<C: CspIDkgProtocol>(
+pub fn create_dealing<C: CspIDkgProtocol + CspSigner>(
     csp_client: &C,
     self_node_id: &NodeId,
-    registry: &Arc<dyn RegistryClient>,
+    registry: &dyn RegistryClient,
     params: &IDkgTranscriptParams,
-) -> Result<IDkgDealing, IDkgCreateDealingError> {
+) -> Result<SignedIDkgDealing, IDkgCreateDealingError> {
     let self_index =
         params
             .dealer_index(*self_node_id)
@@ -34,7 +39,7 @@ pub fn create_dealing<C: CspIDkgProtocol>(
         registry,
         params.registry_version(),
     )?;
-    let receiver_keys_vec = receiver_keys.iter().map(|(_, k)| *k).collect::<Vec<_>>();
+    let receiver_keys_vec = receiver_keys.values().cloned().collect::<Vec<_>>();
 
     let csp_operation_type = IDkgTranscriptOperationInternal::try_from(params.operation_type())
         .map_err(|e| IDkgCreateDealingError::SerializationError {
@@ -57,41 +62,67 @@ pub fn create_dealing<C: CspIDkgProtocol>(
                 internal_error: format!("{:?}", e),
             })?;
 
-    Ok(IDkgDealing {
+    let unsigned_dealing = IDkgDealing {
         transcript_id: params.transcript_id(),
-        dealer_id: *self_node_id,
         internal_dealing_raw,
-    })
+    };
+
+    sign_dealing(
+        csp_client,
+        registry,
+        unsigned_dealing,
+        *self_node_id,
+        params.registry_version(),
+    )
+}
+
+fn sign_dealing<S: CspSigner>(
+    csp_signer: &S,
+    registry: &dyn RegistryClient,
+    dealing: IDkgDealing,
+    signer: NodeId,
+    registry_version: RegistryVersion,
+) -> Result<SignedIDkgDealing, IDkgCreateDealingError> {
+    BasicSignerInternal::sign_basic(csp_signer, registry, &dealing, signer, registry_version)
+        .map(|signature| SignedIDkgDealing {
+            signature: BasicSignature { signature, signer },
+            content: dealing,
+        })
+        .map_err(|crypto_error| IDkgCreateDealingError::SignatureError {
+            internal_error: format!("{}", crypto_error),
+        })
 }
 
 pub fn verify_dealing_private<C: CspIDkgProtocol>(
     csp_client: &C,
     self_node_id: &NodeId,
-    registry: &Arc<dyn RegistryClient>,
+    registry: &dyn RegistryClient,
     params: &IDkgTranscriptParams,
-    dealer_id: NodeId,
-    dealing: &IDkgDealing,
+    signed_dealing: &SignedIDkgDealing,
 ) -> Result<(), IDkgVerifyDealingPrivateError> {
-    if dealing.transcript_id != params.transcript_id() {
+    if signed_dealing.idkg_dealing().transcript_id != params.transcript_id() {
         return Err(IDkgVerifyDealingPrivateError::InvalidArgument(format!(
             "mismatching transcript IDs in dealing ({:?}) and params ({:?})",
-            dealing.transcript_id,
+            signed_dealing.idkg_dealing().transcript_id,
             params.transcript_id(),
         )));
     }
-    let internal_dealing = IDkgDealingInternal::deserialize(&dealing.internal_dealing_raw)
-        .map_err(|e| {
+    let internal_dealing =
+        IDkgDealingInternal::deserialize(&signed_dealing.idkg_dealing().internal_dealing_raw)
+            .map_err(|e| {
+                IDkgVerifyDealingPrivateError::InvalidArgument(format!(
+                    "failed to deserialize internal dealing: {:?}",
+                    e
+                ))
+            })?;
+    let dealer_index = params
+        .dealer_index(signed_dealing.dealer_id())
+        .ok_or_else(|| {
             IDkgVerifyDealingPrivateError::InvalidArgument(format!(
-                "failed to deserialize internal dealing: {:?}",
-                e
+                "failed to determine dealer index: node {:?} is not a dealer",
+                signed_dealing.dealer_id()
             ))
         })?;
-    let dealer_index = params.dealer_index(dealer_id).ok_or_else(|| {
-        IDkgVerifyDealingPrivateError::InvalidArgument(format!(
-            "failed to determine dealer index: node {:?} is not a dealer",
-            dealer_id
-        ))
-    })?;
     let self_receiver_index = params
         .receiver_index(*self_node_id)
         .ok_or(IDkgVerifyDealingPrivateError::NotAReceiver)?;
@@ -130,21 +161,41 @@ impl From<MegaKeyFromRegistryError> for IDkgVerifyDealingPrivateError {
     }
 }
 
-pub fn verify_dealing_public<C: CspIDkgProtocol>(
+pub fn verify_dealing_public<C: CspIDkgProtocol + CspSigner>(
     csp_client: &C,
+    registry: &dyn RegistryClient,
     params: &IDkgTranscriptParams,
-    dealer_id: NodeId,
-    dealing: &IDkgDealing,
+    signed_dealing: &SignedIDkgDealing,
 ) -> Result<(), IDkgVerifyDealingPublicError> {
     // Check the dealing is for the correct transcript ID
-    if params.transcript_id() != dealing.transcript_id {
+    if params.transcript_id() != signed_dealing.idkg_dealing().transcript_id {
         return Err(IDkgVerifyDealingPublicError::TranscriptIdMismatch);
     }
 
-    let internal_dealing = IDkgDealingInternal::deserialize(&dealing.internal_dealing_raw)
-        .map_err(|e| IDkgVerifyDealingPublicError::InvalidDealing {
-            reason: format!("{:?}", e),
-        })?;
+    let dealer_id = signed_dealing.dealer_id();
+    BasicSigVerifierInternal::verify_basic_sig(
+        csp_client,
+        registry,
+        &signed_dealing.signature.signature,
+        signed_dealing.idkg_dealing(),
+        dealer_id,
+        params.registry_version(),
+    )
+    .map_err(
+        |crypto_error| IDkgVerifyDealingPublicError::InvalidSignature {
+            error: format!(
+                "Invalid basic signature on signed iDKG dealing \
+                 from signer {dealer_id}",
+            ),
+            crypto_error,
+        },
+    )?;
+
+    let internal_dealing =
+        IDkgDealingInternal::deserialize(&signed_dealing.idkg_dealing().internal_dealing_raw)
+            .map_err(|e| IDkgVerifyDealingPublicError::InvalidDealing {
+                reason: format!("{:?}", e),
+            })?;
 
     // Compute CSP operation. Same of IDKM operation type, but wrapping the polynomial commitment from the transcripts.
 
@@ -171,4 +222,34 @@ pub fn verify_dealing_public<C: CspIDkgProtocol>(
         number_of_receivers,
         &params.context_data(),
     )
+}
+
+pub fn verify_initial_dealings<C: CspIDkgProtocol + CspSigner>(
+    csp_client: &C,
+    registry: &dyn RegistryClient,
+    params: &IDkgTranscriptParams,
+    initial_dealings: &InitialIDkgDealings,
+) -> Result<(), IDkgVerifyInitialDealingsError> {
+    if params != initial_dealings.params() {
+        return Err(IDkgVerifyInitialDealingsError::MismatchingTranscriptParams);
+    };
+    for (i, signed_dealing) in initial_dealings.dealings().iter().enumerate() {
+        verify_dealing_public(
+            csp_client,
+            registry,
+            initial_dealings.params(),
+            signed_dealing,
+        )
+        .map_err(|verify_dealing_public_error| {
+            let signer = signed_dealing.signature.signer;
+            IDkgVerifyInitialDealingsError::PublicVerificationFailure {
+                error: format!(
+                    "Failed to publicly verify signed iDKG dealing with index \
+                    {i} from signer {signer}: {verify_dealing_public_error}",
+                ),
+                verify_dealing_public_error,
+            }
+        })?;
+    }
+    Ok(())
 }

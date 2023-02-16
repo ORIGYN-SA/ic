@@ -6,22 +6,20 @@ use crate::invariants::{
     subnet::get_subnet_records_map,
 };
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use prost::Message;
 
 use ic_base_types::{subnet_id_try_from_protobuf, NodeId};
 use ic_crypto_node_key_validation::ValidNodePublicKeys;
 use ic_nns_common::registry::decode_or_panic;
-use ic_protobuf::{
-    crypto::v1::NodePublicKeys,
-    registry::crypto::v1::{PublicKey, X509PublicKeyCert},
-};
+use ic_protobuf::registry::crypto::v1::{PublicKey, X509PublicKeyCert};
 use ic_registry_keys::{
-    make_subnet_record_key, maybe_parse_crypto_node_key, maybe_parse_crypto_tls_cert_key,
-    CRYPTO_RECORD_KEY_PREFIX, CRYPTO_TLS_CERT_KEY_PREFIX,
+    get_ecdsa_key_id_from_signing_subnet_list_key, make_node_record_key, make_subnet_record_key,
+    maybe_parse_crypto_node_key, maybe_parse_crypto_tls_cert_key, CRYPTO_RECORD_KEY_PREFIX,
+    CRYPTO_TLS_CERT_KEY_PREFIX, NODE_RECORD_KEY_PREFIX,
 };
-use ic_types::crypto::KeyPurpose;
+use ic_types::crypto::{CurrentNodePublicKeys, KeyPurpose};
 
 // All crypto public keys found for the nodes or for the subnets in the
 // registry.
@@ -37,6 +35,8 @@ type AllTlsCertificates = BTreeMap<NodeId, X509PublicKeyCert>;
 //     - committee signing public key
 //     - DKG dealing encryption public key
 //     - TLS certificate
+//     - interactive DKG encryption public key
+//  * All public keys and TLS certificates have a corresponding node
 //  * every node's id (node_id) is correctly derived from its node signing
 //    public key
 //  * all the public keys and all the TLS certificates belonging to the all the
@@ -64,6 +64,8 @@ pub(crate) fn check_node_crypto_keys_invariants(
             check_tls_certs_are_unique(&valid_node_pks, &mut unique_certs)?;
         }
     }
+
+    check_no_orphaned_node_crypto_records(snapshot)?;
 
     check_ecdsa_signing_subnet_lists(snapshot)
 }
@@ -105,40 +107,35 @@ fn check_node_keys(
     pks: &mut AllPublicKeys,
     certs: &mut AllTlsCertificates,
 ) -> Result<ValidNodePublicKeys, InvariantCheckError> {
-    let idkg_dealing_encryption_pk = pks.remove(&(*node_id, KeyPurpose::IDkgMEGaEncryption));
-    let npk = NodePublicKeys {
-        version: match idkg_dealing_encryption_pk {
-            Some(_) => 1,
-            None => 0,
-        },
-        node_signing_pk: pks.remove(&(*node_id, KeyPurpose::NodeSigning)),
-        committee_signing_pk: pks.remove(&(*node_id, KeyPurpose::CommitteeSigning)),
-        dkg_dealing_encryption_pk: pks.remove(&(*node_id, KeyPurpose::DkgDealingEncryption)),
+    let node_public_keys = CurrentNodePublicKeys {
+        node_signing_public_key: pks.remove(&(*node_id, KeyPurpose::NodeSigning)),
+        committee_signing_public_key: pks.remove(&(*node_id, KeyPurpose::CommitteeSigning)),
+        dkg_dealing_encryption_public_key: pks
+            .remove(&(*node_id, KeyPurpose::DkgDealingEncryption)),
         tls_certificate: certs.remove(node_id),
-        idkg_dealing_encryption_pk,
+        idkg_dealing_encryption_public_key: pks.remove(&(*node_id, KeyPurpose::IDkgMEGaEncryption)),
     };
-    let vnpk = ValidNodePublicKeys::try_from(&npk, *node_id).map_err(|e| InvariantCheckError {
-        msg: format!(
-            "crypto key validation for node {} failed with {}",
-            node_id, e
-        ),
-        source: None,
-    })?;
-    Ok(vnpk)
+    let valid_node_public_keys = ValidNodePublicKeys::try_from(node_public_keys, *node_id)
+        .map_err(|e| InvariantCheckError {
+            msg: format!(
+                "crypto key validation for node {} failed with {}",
+                node_id, e
+            ),
+            source: None,
+        })?;
+    Ok(valid_node_public_keys)
 }
 
 fn check_node_keys_are_unique(
     node_pks: &ValidNodePublicKeys,
     unique_pks: &mut BTreeMap<Vec<u8>, NodeId>,
 ) -> Result<(), InvariantCheckError> {
-    let mut pubkeys = vec![
+    let pubkeys = vec![
         node_pks.node_signing_key(),
         node_pks.committee_signing_key(),
         node_pks.dkg_dealing_encryption_key(),
+        node_pks.idkg_dealing_encryption_key(),
     ];
-    if let Some(idkg) = node_pks.idkg_dealing_encryption_key() {
-        pubkeys.push(idkg);
-    }
     for pk in pubkeys {
         let mut pk_bytes: Vec<u8> = vec![];
         pk.encode(&mut pk_bytes).expect("encode cannot fail.");
@@ -206,6 +203,20 @@ fn check_ecdsa_signing_subnet_lists(
                 });
             }
 
+            let ecdsa_key_id =  match get_ecdsa_key_id_from_signing_subnet_list_key(key_id) {
+                Ok(ecdsa_key_id) => ecdsa_key_id,
+                Err(error) => {
+                    return Err(InvariantCheckError {
+                        msg: format!(
+                            "Registry key_id {} could not be converted to an ECDSA signature key id: {:?}",
+                            key_id,
+                            error,
+                        ),
+                        source: None,
+                    });
+                }
+            };
+
             ecdsa_signing_subnet_list
                 .subnets
                 .iter()
@@ -228,8 +239,8 @@ fn check_ecdsa_signing_subnet_lists(
                             source: None,
                         })?
                         .key_ids
-                        .contains(key_id)
-                        .then(|| ())
+                        .contains(&(&ecdsa_key_id).into())
+                        .then_some(())
                         .ok_or(InvariantCheckError {
                             msg: format!(
                                 "The subnet {} does not have the key with {} in its ecdsa configurations",
@@ -241,58 +252,105 @@ fn check_ecdsa_signing_subnet_lists(
         })
 }
 
+fn check_no_orphaned_node_crypto_records(
+    snapshot: &RegistrySnapshot,
+) -> Result<(), InvariantCheckError> {
+    // Collect unique node_ids from crypto and tls records
+    let mut nodes_with_records: HashSet<NodeId> = HashSet::new();
+    for key in snapshot.keys() {
+        let key_string = String::from_utf8(key.clone()).unwrap();
+        if let Some((node_id, _)) = maybe_parse_crypto_node_key(&key_string) {
+            nodes_with_records.insert(node_id);
+        } else if let Some(node_id) = maybe_parse_crypto_tls_cert_key(&key_string) {
+            nodes_with_records.insert(node_id);
+        }
+    }
+
+    // Filter to only node_ids that do not have a node_record in the registry
+    let nodes_with_orphaned_records = nodes_with_records
+        .into_iter()
+        .filter(|node_id| {
+            snapshot
+                .get(make_node_record_key(*node_id).as_bytes())
+                .is_none()
+        })
+        .collect::<Vec<_>>();
+
+    // There should be no crypto or tls records without a node_record
+    if !nodes_with_orphaned_records.is_empty() {
+        return Err(InvariantCheckError {
+            msg: format!(
+                "There are {} or {} entries without a corresponding {} entry: {:?}",
+                CRYPTO_RECORD_KEY_PREFIX,
+                CRYPTO_TLS_CERT_KEY_PREFIX,
+                NODE_RECORD_KEY_PREFIX,
+                nodes_with_orphaned_records
+            ),
+            source: None,
+        });
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ic_crypto::utils::get_node_keys_or_generate_if_missing;
+    use ic_config::crypto::CryptoConfig;
+    use ic_crypto_node_key_generation::get_node_keys_or_generate_if_missing;
     use ic_nns_common::registry::encode_or_panic;
     use ic_protobuf::registry::crypto::v1::AlgorithmId as AlgorithmIdProto;
     use ic_protobuf::registry::node::v1::NodeRecord;
     use ic_registry_keys::{make_crypto_node_key, make_crypto_tls_cert_key, make_node_record_key};
-    use ic_test_utilities::crypto::temp_dir::temp_dir;
+    use ic_types::crypto::CurrentNodePublicKeys;
 
     fn insert_node_crypto_keys(
         node_id: &NodeId,
-        npks: &NodePublicKeys,
+        node_pks: &CurrentNodePublicKeys,
         snapshot: &mut RegistrySnapshot,
     ) {
-        if npks.node_signing_pk.is_some() {
+        if node_pks.node_signing_public_key.is_some() {
             snapshot.insert(
                 make_crypto_node_key(node_id.to_owned(), KeyPurpose::NodeSigning).into_bytes(),
-                encode_or_panic::<PublicKey>(&npks.node_signing_pk.clone().unwrap()),
+                encode_or_panic::<PublicKey>(&node_pks.node_signing_public_key.clone().unwrap()),
             );
         };
-        if npks.committee_signing_pk.is_some() {
+        if node_pks.committee_signing_public_key.is_some() {
             snapshot.insert(
                 make_crypto_node_key(node_id.to_owned(), KeyPurpose::CommitteeSigning).into_bytes(),
-                encode_or_panic::<PublicKey>(&npks.committee_signing_pk.clone().unwrap()),
+                encode_or_panic::<PublicKey>(
+                    &node_pks.committee_signing_public_key.clone().unwrap(),
+                ),
             );
         };
-        if npks.dkg_dealing_encryption_pk.is_some() {
+        if node_pks.dkg_dealing_encryption_public_key.is_some() {
             snapshot.insert(
                 make_crypto_node_key(node_id.to_owned(), KeyPurpose::DkgDealingEncryption)
                     .into_bytes(),
-                encode_or_panic::<PublicKey>(&npks.dkg_dealing_encryption_pk.clone().unwrap()),
+                encode_or_panic::<PublicKey>(
+                    &node_pks.dkg_dealing_encryption_public_key.clone().unwrap(),
+                ),
             );
         };
-        if npks.idkg_dealing_encryption_pk.is_some() {
+        if node_pks.idkg_dealing_encryption_public_key.is_some() {
             snapshot.insert(
                 make_crypto_node_key(node_id.to_owned(), KeyPurpose::IDkgMEGaEncryption)
                     .into_bytes(),
-                encode_or_panic::<PublicKey>(&npks.idkg_dealing_encryption_pk.clone().unwrap()),
+                encode_or_panic::<PublicKey>(
+                    &node_pks.idkg_dealing_encryption_public_key.clone().unwrap(),
+                ),
             );
         };
-        if npks.tls_certificate.is_some() {
+        if node_pks.tls_certificate.is_some() {
             snapshot.insert(
                 make_crypto_tls_cert_key(node_id.to_owned()).into_bytes(),
-                encode_or_panic::<X509PublicKeyCert>(&npks.tls_certificate.clone().unwrap()),
+                encode_or_panic::<X509PublicKeyCert>(&node_pks.tls_certificate.clone().unwrap()),
             );
         };
     }
 
-    fn valid_node_keys_and_node_id() -> (NodePublicKeys, NodeId) {
-        let temp_dir = temp_dir();
-        get_node_keys_or_generate_if_missing(temp_dir.path())
+    fn valid_node_keys_and_node_id() -> (CurrentNodePublicKeys, NodeId) {
+        let (config, _temp_dir) = CryptoConfig::new_in_temp_dir();
+        get_node_keys_or_generate_if_missing(&config, None)
     }
 
     fn insert_dummy_node(node_id: &NodeId, snapshot: &mut RegistrySnapshot) {
@@ -307,15 +365,15 @@ mod tests {
     #[test]
     fn node_crypto_keys_invariants_valid_snapshot() {
         // Crypto keys for the test.
-        let (npks_1, node_id_1) = valid_node_keys_and_node_id();
-        let (npks_2, node_id_2) = valid_node_keys_and_node_id();
+        let (node_pks_1, node_id_1) = valid_node_keys_and_node_id();
+        let (node_pks_2, node_id_2) = valid_node_keys_and_node_id();
 
         // Generate and check a valid snapshot.
         let mut snapshot = RegistrySnapshot::new();
         insert_dummy_node(&node_id_1, &mut snapshot);
         insert_dummy_node(&node_id_2, &mut snapshot);
-        insert_node_crypto_keys(&node_id_1, &npks_1, &mut snapshot);
-        insert_node_crypto_keys(&node_id_2, &npks_2, &mut snapshot);
+        insert_node_crypto_keys(&node_id_1, &node_pks_1, &mut snapshot);
+        insert_node_crypto_keys(&node_id_2, &node_pks_2, &mut snapshot);
         assert!(check_node_crypto_keys_invariants(&snapshot).is_ok());
     }
 
@@ -324,24 +382,20 @@ mod tests {
     #[test]
     fn node_crypto_keys_invariants_missing_committee_key() {
         // Crypto keys for the test.
-        let (npks_1, node_id_1) = valid_node_keys_and_node_id();
-        let (npks_2, node_id_2) = valid_node_keys_and_node_id();
+        let (node_pks_1, node_id_1) = valid_node_keys_and_node_id();
+        let (node_pks_2, node_id_2) = valid_node_keys_and_node_id();
 
         // Generate and check a valid snapshot.
         let mut snapshot = RegistrySnapshot::new();
         insert_dummy_node(&node_id_1, &mut snapshot);
         insert_dummy_node(&node_id_2, &mut snapshot);
-        insert_node_crypto_keys(&node_id_1, &npks_1, &mut snapshot);
+        insert_node_crypto_keys(&node_id_1, &node_pks_1, &mut snapshot);
 
-        let incomplete_npks = NodePublicKeys {
-            version: npks_2.version,
-            node_signing_pk: npks_2.node_signing_pk,
-            committee_signing_pk: None,
-            dkg_dealing_encryption_pk: npks_2.dkg_dealing_encryption_pk,
-            idkg_dealing_encryption_pk: npks_2.idkg_dealing_encryption_pk,
-            tls_certificate: npks_2.tls_certificate,
+        let incomplete_node_public_keys = CurrentNodePublicKeys {
+            committee_signing_public_key: None,
+            ..node_pks_2
         };
-        insert_node_crypto_keys(&node_id_2, &incomplete_npks, &mut snapshot);
+        insert_node_crypto_keys(&node_id_2, &incomplete_node_public_keys, &mut snapshot);
         let result = check_node_crypto_keys_invariants(&snapshot);
         assert!(result.is_err());
         let err = result.unwrap_err();
@@ -355,24 +409,20 @@ mod tests {
     #[test]
     fn node_crypto_keys_invariants_missing_node_signing_key() {
         // Crypto keys for the test.
-        let (npks_1, node_id_1) = valid_node_keys_and_node_id();
-        let (npks_2, node_id_2) = valid_node_keys_and_node_id();
+        let (node_pks_1, node_id_1) = valid_node_keys_and_node_id();
+        let (node_pks_2, node_id_2) = valid_node_keys_and_node_id();
 
         // Generate and check a valid snapshot.
         let mut snapshot = RegistrySnapshot::new();
         insert_dummy_node(&node_id_1, &mut snapshot);
         insert_dummy_node(&node_id_2, &mut snapshot);
-        insert_node_crypto_keys(&node_id_1, &npks_1, &mut snapshot);
+        insert_node_crypto_keys(&node_id_1, &node_pks_1, &mut snapshot);
 
-        let incomplete_npks = NodePublicKeys {
-            version: npks_2.version,
-            node_signing_pk: None,
-            committee_signing_pk: npks_2.committee_signing_pk,
-            dkg_dealing_encryption_pk: npks_2.dkg_dealing_encryption_pk,
-            idkg_dealing_encryption_pk: npks_2.idkg_dealing_encryption_pk,
-            tls_certificate: npks_2.tls_certificate,
+        let incomplete_node_public_keys = CurrentNodePublicKeys {
+            node_signing_public_key: None,
+            ..node_pks_2
         };
-        insert_node_crypto_keys(&node_id_2, &incomplete_npks, &mut snapshot);
+        insert_node_crypto_keys(&node_id_2, &incomplete_node_public_keys, &mut snapshot);
         let result = check_node_crypto_keys_invariants(&snapshot);
         assert!(result.is_err());
         let err = result.unwrap_err();
@@ -386,24 +436,20 @@ mod tests {
     #[test]
     fn node_crypto_keys_invariants_missing_idkg_dealing_encryption_key() {
         // Crypto keys for the test.
-        let (npks_1, node_id_1) = valid_node_keys_and_node_id();
-        let (npks_2, node_id_2) = valid_node_keys_and_node_id();
+        let (node_pks_1, node_id_1) = valid_node_keys_and_node_id();
+        let (node_pks_2, node_id_2) = valid_node_keys_and_node_id();
 
         // Generate and check a valid snapshot.
         let mut snapshot = RegistrySnapshot::new();
         insert_dummy_node(&node_id_1, &mut snapshot);
         insert_dummy_node(&node_id_2, &mut snapshot);
-        insert_node_crypto_keys(&node_id_1, &npks_1, &mut snapshot);
+        insert_node_crypto_keys(&node_id_1, &node_pks_1, &mut snapshot);
 
-        let incomplete_npks = NodePublicKeys {
-            version: npks_2.version,
-            node_signing_pk: npks_2.node_signing_pk,
-            committee_signing_pk: npks_2.committee_signing_pk,
-            dkg_dealing_encryption_pk: npks_2.dkg_dealing_encryption_pk,
-            idkg_dealing_encryption_pk: None,
-            tls_certificate: npks_2.tls_certificate,
+        let incomplete_node_public_keys = CurrentNodePublicKeys {
+            idkg_dealing_encryption_public_key: None,
+            ..node_pks_2
         };
-        insert_node_crypto_keys(&node_id_2, &incomplete_npks, &mut snapshot);
+        insert_node_crypto_keys(&node_id_2, &incomplete_node_public_keys, &mut snapshot);
         let result = check_node_crypto_keys_invariants(&snapshot);
 
         // Currently a missing I-DKG dealing encryption key shall not lead to a
@@ -418,24 +464,20 @@ mod tests {
     #[test]
     fn node_crypto_keys_invariants_missing_tls_cert() {
         // Crypto keys for the test.
-        let (npks_1, node_id_1) = valid_node_keys_and_node_id();
-        let (npks_2, node_id_2) = valid_node_keys_and_node_id();
+        let (node_pks_1, node_id_1) = valid_node_keys_and_node_id();
+        let (node_pks_2, node_id_2) = valid_node_keys_and_node_id();
 
         // Generate and check a valid snapshot.
         let mut snapshot = RegistrySnapshot::new();
         insert_dummy_node(&node_id_1, &mut snapshot);
         insert_dummy_node(&node_id_2, &mut snapshot);
-        insert_node_crypto_keys(&node_id_1, &npks_1, &mut snapshot);
+        insert_node_crypto_keys(&node_id_1, &node_pks_1, &mut snapshot);
 
-        let incomplete_npks = NodePublicKeys {
-            version: npks_2.version,
-            node_signing_pk: npks_2.node_signing_pk,
-            committee_signing_pk: npks_2.committee_signing_pk,
-            dkg_dealing_encryption_pk: npks_2.dkg_dealing_encryption_pk,
-            idkg_dealing_encryption_pk: npks_2.idkg_dealing_encryption_pk,
+        let incomplete_node_public_keys = CurrentNodePublicKeys {
             tls_certificate: None,
+            ..node_pks_2
         };
-        insert_node_crypto_keys(&node_id_2, &incomplete_npks, &mut snapshot);
+        insert_node_crypto_keys(&node_id_2, &incomplete_node_public_keys, &mut snapshot);
         let result = check_node_crypto_keys_invariants(&snapshot);
         assert!(result.is_err());
         let err = result.unwrap_err();
@@ -449,29 +491,26 @@ mod tests {
     #[test]
     fn node_crypto_keys_invariants_invalid_dkg_encryption_key() {
         // Crypto keys for the test.
-        let (npks_1, node_id_1) = valid_node_keys_and_node_id();
-        let (npks_2, node_id_2) = valid_node_keys_and_node_id();
+        let (node_pks_1, node_id_1) = valid_node_keys_and_node_id();
+        let (node_pks_2, node_id_2) = valid_node_keys_and_node_id();
 
         // Generate and check a valid snapshot.
         let mut snapshot = RegistrySnapshot::new();
         insert_dummy_node(&node_id_1, &mut snapshot);
         insert_dummy_node(&node_id_2, &mut snapshot);
-        insert_node_crypto_keys(&node_id_1, &npks_1, &mut snapshot);
+        insert_node_crypto_keys(&node_id_1, &node_pks_1, &mut snapshot);
 
-        let invalid_npks = NodePublicKeys {
-            version: npks_2.version,
-            node_signing_pk: npks_2.node_signing_pk,
-            committee_signing_pk: npks_2.committee_signing_pk,
-            dkg_dealing_encryption_pk: Some(PublicKey {
+        let invalid_node_pks = CurrentNodePublicKeys {
+            dkg_dealing_encryption_public_key: Some(PublicKey {
                 version: 0,
                 algorithm: 0,
                 key_value: vec![],
                 proof_data: None,
+                timestamp: None,
             }),
-            idkg_dealing_encryption_pk: npks_2.idkg_dealing_encryption_pk,
-            tls_certificate: npks_2.tls_certificate,
+            ..node_pks_2
         };
-        insert_node_crypto_keys(&node_id_2, &invalid_npks, &mut snapshot);
+        insert_node_crypto_keys(&node_id_2, &invalid_node_pks, &mut snapshot);
         let result = check_node_crypto_keys_invariants(&snapshot);
         assert!(result.is_err());
         let err = result.unwrap_err();
@@ -486,29 +525,26 @@ mod tests {
     #[test]
     fn node_crypto_keys_invariants_invalid_idkg_encryption_key() {
         // Crypto keys for the test.
-        let (npks_1, node_id_1) = valid_node_keys_and_node_id();
-        let (npks_2, node_id_2) = valid_node_keys_and_node_id();
+        let (node_pks_1, node_id_1) = valid_node_keys_and_node_id();
+        let (node_pks_2, node_id_2) = valid_node_keys_and_node_id();
 
         // Generate and check a valid snapshot.
         let mut snapshot = RegistrySnapshot::new();
         insert_dummy_node(&node_id_1, &mut snapshot);
         insert_dummy_node(&node_id_2, &mut snapshot);
-        insert_node_crypto_keys(&node_id_1, &npks_1, &mut snapshot);
+        insert_node_crypto_keys(&node_id_1, &node_pks_1, &mut snapshot);
 
-        let invalid_npks = NodePublicKeys {
-            version: npks_2.version,
-            node_signing_pk: npks_2.node_signing_pk,
-            committee_signing_pk: npks_2.committee_signing_pk,
-            dkg_dealing_encryption_pk: npks_2.dkg_dealing_encryption_pk,
-            idkg_dealing_encryption_pk: Some(PublicKey {
+        let invalid_node_pks = CurrentNodePublicKeys {
+            idkg_dealing_encryption_public_key: Some(PublicKey {
                 version: 0,
                 algorithm: AlgorithmIdProto::MegaSecp256k1 as i32,
                 key_value: vec![],
                 proof_data: None,
+                timestamp: None,
             }),
-            tls_certificate: npks_2.tls_certificate,
+            ..node_pks_2
         };
-        insert_node_crypto_keys(&node_id_2, &invalid_npks, &mut snapshot);
+        insert_node_crypto_keys(&node_id_2, &invalid_node_pks, &mut snapshot);
         let result = check_node_crypto_keys_invariants(&snapshot);
         assert!(result.is_err());
         let err = result.unwrap_err();
@@ -523,24 +559,20 @@ mod tests {
     #[test]
     fn node_crypto_keys_invariants_duplicated_committee_key() {
         // Crypto keys for the test.
-        let (npks_1, node_id_1) = valid_node_keys_and_node_id();
-        let (npks_2, node_id_2) = valid_node_keys_and_node_id();
+        let (node_pks_1, node_id_1) = valid_node_keys_and_node_id();
+        let (node_pks_2, node_id_2) = valid_node_keys_and_node_id();
 
         // Generate and check a valid snapshot.
         let mut snapshot = RegistrySnapshot::new();
         insert_dummy_node(&node_id_1, &mut snapshot);
         insert_dummy_node(&node_id_2, &mut snapshot);
-        insert_node_crypto_keys(&node_id_1, &npks_1, &mut snapshot);
+        insert_node_crypto_keys(&node_id_1, &node_pks_1, &mut snapshot);
 
-        let duplicated_key_npks = NodePublicKeys {
-            version: npks_2.version,
-            node_signing_pk: npks_2.node_signing_pk,
-            committee_signing_pk: npks_1.committee_signing_pk,
-            dkg_dealing_encryption_pk: npks_2.dkg_dealing_encryption_pk,
-            idkg_dealing_encryption_pk: npks_2.idkg_dealing_encryption_pk,
-            tls_certificate: npks_2.tls_certificate,
+        let duplicated_key_node_pks = CurrentNodePublicKeys {
+            committee_signing_public_key: node_pks_1.committee_signing_public_key,
+            ..node_pks_2
         };
-        insert_node_crypto_keys(&node_id_2, &duplicated_key_npks, &mut snapshot);
+        insert_node_crypto_keys(&node_id_2, &duplicated_key_node_pks, &mut snapshot);
         let result = check_node_crypto_keys_invariants(&snapshot);
         assert!(result.is_err());
         let err = result.unwrap_err();
@@ -554,24 +586,20 @@ mod tests {
     #[test]
     fn node_crypto_keys_invariants_duplicated_idkg_encryption_key() {
         // Crypto keys for the test.
-        let (npks_1, node_id_1) = valid_node_keys_and_node_id();
-        let (npks_2, node_id_2) = valid_node_keys_and_node_id();
+        let (node_pks_1, node_id_1) = valid_node_keys_and_node_id();
+        let (node_pks_2, node_id_2) = valid_node_keys_and_node_id();
 
         // Generate and check a valid snapshot.
         let mut snapshot = RegistrySnapshot::new();
         insert_dummy_node(&node_id_1, &mut snapshot);
         insert_dummy_node(&node_id_2, &mut snapshot);
-        insert_node_crypto_keys(&node_id_1, &npks_1, &mut snapshot);
+        insert_node_crypto_keys(&node_id_1, &node_pks_1, &mut snapshot);
 
-        let duplicated_key_npks = NodePublicKeys {
-            version: npks_2.version,
-            node_signing_pk: npks_2.node_signing_pk,
-            committee_signing_pk: npks_2.committee_signing_pk,
-            dkg_dealing_encryption_pk: npks_2.dkg_dealing_encryption_pk,
-            idkg_dealing_encryption_pk: npks_1.idkg_dealing_encryption_pk,
-            tls_certificate: npks_2.tls_certificate,
+        let duplicated_key_node_pks = CurrentNodePublicKeys {
+            idkg_dealing_encryption_public_key: node_pks_1.idkg_dealing_encryption_public_key,
+            ..node_pks_2
         };
-        insert_node_crypto_keys(&node_id_2, &duplicated_key_npks, &mut snapshot);
+        insert_node_crypto_keys(&node_id_2, &duplicated_key_node_pks, &mut snapshot);
         let result = check_node_crypto_keys_invariants(&snapshot);
         assert!(result.is_err());
         let err = result.unwrap_err();
@@ -585,24 +613,20 @@ mod tests {
     #[test]
     fn node_crypto_keys_invariants_duplicated_tls_cert() {
         // Crypto keys for the test.
-        let (npks_1, node_id_1) = valid_node_keys_and_node_id();
-        let (npks_2, node_id_2) = valid_node_keys_and_node_id();
+        let (node_pks_1, node_id_1) = valid_node_keys_and_node_id();
+        let (node_pks_2, node_id_2) = valid_node_keys_and_node_id();
 
         // Generate and check a valid snapshot.
         let mut snapshot = RegistrySnapshot::new();
         insert_dummy_node(&node_id_1, &mut snapshot);
         insert_dummy_node(&node_id_2, &mut snapshot);
-        insert_node_crypto_keys(&node_id_1, &npks_1, &mut snapshot);
+        insert_node_crypto_keys(&node_id_1, &node_pks_1, &mut snapshot);
 
-        let duplicated_cert_npks = NodePublicKeys {
-            version: npks_2.version,
-            node_signing_pk: npks_2.node_signing_pk,
-            committee_signing_pk: npks_2.committee_signing_pk,
-            dkg_dealing_encryption_pk: npks_2.dkg_dealing_encryption_pk,
-            idkg_dealing_encryption_pk: npks_2.idkg_dealing_encryption_pk,
-            tls_certificate: npks_1.tls_certificate,
+        let duplicated_cert_node_pks = CurrentNodePublicKeys {
+            tls_certificate: node_pks_1.tls_certificate,
+            ..node_pks_2
         };
-        insert_node_crypto_keys(&node_id_2, &duplicated_cert_npks, &mut snapshot);
+        insert_node_crypto_keys(&node_id_2, &duplicated_cert_node_pks, &mut snapshot);
         let result = check_node_crypto_keys_invariants(&snapshot);
         assert!(result.is_err());
         let err = result.unwrap_err();
@@ -615,29 +639,119 @@ mod tests {
     #[test]
     fn node_crypto_keys_invariants_inconsistent_node_id() {
         // Crypto keys for the test.
-        let (npks_1, node_id_1) = valid_node_keys_and_node_id();
-        let (npks_2, node_id_2) = valid_node_keys_and_node_id();
+        let (node_pks_1, node_id_1) = valid_node_keys_and_node_id();
+        let (node_pks_2, node_id_2) = valid_node_keys_and_node_id();
 
         // Generate and check a valid snapshot.
         let mut snapshot = RegistrySnapshot::new();
         insert_dummy_node(&node_id_1, &mut snapshot);
         insert_dummy_node(&node_id_2, &mut snapshot);
-        insert_node_crypto_keys(&node_id_1, &npks_1, &mut snapshot);
+        insert_node_crypto_keys(&node_id_1, &node_pks_1, &mut snapshot);
 
-        let (npks_3, _node_id_3) = valid_node_keys_and_node_id();
-        let inconsistent_signing_key_npks = NodePublicKeys {
-            version: npks_2.version,
-            node_signing_pk: npks_3.node_signing_pk,
-            committee_signing_pk: npks_2.committee_signing_pk,
-            dkg_dealing_encryption_pk: npks_2.dkg_dealing_encryption_pk,
-            idkg_dealing_encryption_pk: npks_2.idkg_dealing_encryption_pk,
-            tls_certificate: npks_2.tls_certificate,
+        let (node_pks_3, _node_id_3) = valid_node_keys_and_node_id();
+        let inconsistent_signing_key_node_pks = CurrentNodePublicKeys {
+            node_signing_public_key: node_pks_3.node_signing_public_key,
+            ..node_pks_2
         };
-        insert_node_crypto_keys(&node_id_2, &inconsistent_signing_key_npks, &mut snapshot);
+        insert_node_crypto_keys(
+            &node_id_2,
+            &inconsistent_signing_key_node_pks,
+            &mut snapshot,
+        );
         let result = check_node_crypto_keys_invariants(&snapshot);
         assert!(result.is_err());
         let err = result.unwrap_err();
         assert!(err.to_string().contains(&node_id_2.to_string()));
         assert!(err.to_string().contains("invalid node signing key"));
+    }
+
+    #[test]
+    fn orphaned_crypto_node_signing_pk() {
+        let (mut orphaned_keys, missing_node) = valid_node_keys_and_node_id();
+        // This leaves only node_signing_pk as orphan.
+        orphaned_keys.committee_signing_public_key = None;
+        orphaned_keys.tls_certificate = None;
+        orphaned_keys.dkg_dealing_encryption_public_key = None;
+        orphaned_keys.idkg_dealing_encryption_public_key = None;
+        run_test_orphaned_crypto_keys(missing_node, orphaned_keys);
+    }
+
+    #[test]
+    fn orphaned_crypto_committee_signing_pk() {
+        let (mut orphaned_keys, missing_node) = valid_node_keys_and_node_id();
+        orphaned_keys.node_signing_public_key = None;
+        // This leaves only committee_signing_pk as orphan.
+        orphaned_keys.tls_certificate = None;
+        orphaned_keys.dkg_dealing_encryption_public_key = None;
+        orphaned_keys.idkg_dealing_encryption_public_key = None;
+        run_test_orphaned_crypto_keys(missing_node, orphaned_keys);
+    }
+
+    #[test]
+    fn orphaned_crypto_tls_certificate() {
+        let (mut orphaned_keys, missing_node) = valid_node_keys_and_node_id();
+        orphaned_keys.node_signing_public_key = None;
+        orphaned_keys.committee_signing_public_key = None;
+        // This leaves only tls_certificate as orphan.
+        orphaned_keys.dkg_dealing_encryption_public_key = None;
+        orphaned_keys.idkg_dealing_encryption_public_key = None;
+        run_test_orphaned_crypto_keys(missing_node, orphaned_keys);
+    }
+
+    #[test]
+    fn orphaned_crypto_dkg_dealing_encryption_pk() {
+        let (mut orphaned_keys, missing_node) = valid_node_keys_and_node_id();
+        orphaned_keys.node_signing_public_key = None;
+        orphaned_keys.committee_signing_public_key = None;
+        orphaned_keys.tls_certificate = None;
+        // This leaves only dkg_dealing_encryption_pk as orphan.
+        orphaned_keys.idkg_dealing_encryption_public_key = None;
+        run_test_orphaned_crypto_keys(missing_node, orphaned_keys);
+    }
+
+    #[test]
+    fn orphaned_crypto_idkg_dealing_encryption_pk() {
+        let (mut orphaned_keys, missing_node) = valid_node_keys_and_node_id();
+        orphaned_keys.node_signing_public_key = None;
+        orphaned_keys.committee_signing_public_key = None;
+        orphaned_keys.tls_certificate = None;
+        orphaned_keys.dkg_dealing_encryption_public_key = None;
+        // This leaves only idkg_dealing_encryption_pk as orphan.
+        run_test_orphaned_crypto_keys(missing_node, orphaned_keys);
+    }
+
+    /// Ensures that if there are any missing keys, the InvariantCheck is triggered for the 'missing_node_id', which
+    /// is not given an entry in the nodes table but will have the public_key records created for it
+    /// This is useful so that we can run the same test on each individual missing key
+    fn run_test_orphaned_crypto_keys(
+        missing_node_id: NodeId,
+        node_pks_with_missing_entries: CurrentNodePublicKeys,
+    ) {
+        // Crypto keys for the test.
+        let (node_pks_1, node_id_1) = valid_node_keys_and_node_id();
+
+        // Generate and check a valid snapshot.
+        let mut snapshot = RegistrySnapshot::new();
+        insert_dummy_node(&node_id_1, &mut snapshot);
+        insert_node_crypto_keys(&node_id_1, &node_pks_1, &mut snapshot);
+        insert_node_crypto_keys(
+            &missing_node_id,
+            &node_pks_with_missing_entries,
+            &mut snapshot,
+        );
+
+        // TODO make this test more robust (all the cases 1 at a time)
+
+        let result = check_node_crypto_keys_invariants(&snapshot);
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(err.to_string().contains(&missing_node_id.to_string()));
+        assert_eq!(
+            err.to_string(),
+            format!(
+                "InvariantCheckError: There are {} or {} entries without a corresponding {} entry: [{}]",
+                CRYPTO_RECORD_KEY_PREFIX, CRYPTO_TLS_CERT_KEY_PREFIX, NODE_RECORD_KEY_PREFIX, missing_node_id
+            )
+        );
     }
 }

@@ -4,36 +4,34 @@ use super::{
 };
 use crate::{
     bitcoin_state::{BitcoinState, BitcoinStateError},
-    canister_state::{
-        system_state::{push_input, CanisterOutputQueuesIterator},
-        ENFORCE_MESSAGE_MEMORY_USAGE,
-    },
+    canister_state::queues::CanisterQueuesLoopDetector,
+    canister_state::system_state::{push_input, CanisterOutputQueuesIterator},
     metadata_state::StreamMap,
     CanisterQueues,
 };
 use ic_base_types::PrincipalId;
 use ic_btc_types_internal::{BitcoinAdapterRequestWrapper, BitcoinAdapterResponse};
 use ic_error_types::{ErrorCode, UserError};
-use ic_interfaces::{
-    execution_environment::CanisterOutOfCyclesError, messages::CanisterInputMessage,
-};
+use ic_interfaces::{execution_environment::CanisterOutOfCyclesError, messages::CanisterMessage};
 use ic_registry_routing_table::RoutingTable;
-use ic_registry_subnet_features::BitcoinFeature;
+use ic_registry_subnet_features::BitcoinFeatureStatus;
 use ic_registry_subnet_type::SubnetType;
+use ic_types::messages::Ingress;
 use ic_types::{
     ingress::IngressStatus,
-    messages::{
-        is_subnet_message, CallbackId, MessageId, RequestOrResponse, Response, SignedIngressContent,
-    },
+    messages::{CallbackId, MessageId, RequestOrResponse, Response},
     xnet::QueueId,
-    CanisterId, MemoryAllocation, NumBytes, QueueIndex, SubnetId, Time,
+    CanisterId, MemoryAllocation, NumBytes, SubnetId, Time,
 };
 use rand::{Rng, SeedableRng};
 use rand_chacha::ChaChaRng;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, VecDeque};
-use std::path::{Path, PathBuf};
 use std::sync::Arc;
+
+/// Maximum message length of a synthetic reject response produced by message
+/// routing.
+pub const MR_SYNTHETIC_REJECT_MESSAGE_MAX_LEN: usize = 255;
 
 /// Input queue type: local or remote subnet.
 #[derive(Clone, Copy, Eq, Debug, PartialEq)]
@@ -143,8 +141,8 @@ impl<'a> OutputIterator<'a> {
             .collect();
 
         let mut rng = ChaChaRng::seed_from_u64(seed);
-        let rotation = rng.gen_range(0, canister_iterators.len().max(1));
-        canister_iterators.rotate_left(rotation as usize);
+        let rotation = rng.gen_range(0..canister_iterators.len().max(1));
+        canister_iterators.rotate_left(rotation);
 
         // Push the subnet queues in front in order to make sure that at least one
         // system message is always routed as long as there is space for it.
@@ -169,21 +167,21 @@ impl<'a> OutputIterator<'a> {
 }
 
 impl std::iter::Iterator for OutputIterator<'_> {
-    type Item = (QueueId, QueueIndex, RequestOrResponse);
+    type Item = (QueueId, RequestOrResponse);
 
     /// Pops a message from the next canister. If this was not the last message
     /// for that canister, the canister iterator is moved to the back of the
     /// iteration order.
     fn next(&mut self) -> Option<Self::Item> {
         if let Some(mut canister_iterator) = self.canister_iterators.pop_front() {
-            if let Some((queue_id, queue_index, msg)) = canister_iterator.next() {
+            if let Some((queue_id, msg)) = canister_iterator.next() {
                 self.size -= 1;
                 if !canister_iterator.is_empty() {
                     self.canister_iterators.push_back(canister_iterator);
                 }
                 debug_assert_eq!(Self::compute_size(&self.canister_iterators), self.size);
 
-                return Some((queue_id, queue_index, msg));
+                return Some((queue_id, msg));
             }
         }
         None
@@ -195,21 +193,19 @@ impl std::iter::Iterator for OutputIterator<'_> {
     }
 }
 
-pub trait PeekableOutputIterator:
-    std::iter::Iterator<Item = (QueueId, QueueIndex, RequestOrResponse)>
-{
+pub trait PeekableOutputIterator: std::iter::Iterator<Item = (QueueId, RequestOrResponse)> {
     /// Peeks into the iterator and returns a reference to the item `next`
     /// would return.
-    fn peek(&self) -> Option<(QueueId, QueueIndex, Arc<RequestOrResponse>)>;
+    fn peek(&self) -> Option<(QueueId, &RequestOrResponse)>;
 
     /// Permanently filters out from iteration the next queue (i.e. all messages
-    /// with the same sender and receiver as the next). The mesages are retained
+    /// with the same sender and receiver as the next). The messages are retained
     /// in the output queue.
     fn exclude_queue(&mut self);
 }
 
 impl PeekableOutputIterator for OutputIterator<'_> {
-    fn peek(&self) -> Option<(QueueId, QueueIndex, Arc<RequestOrResponse>)> {
+    fn peek(&self) -> Option<(QueueId, &RequestOrResponse)> {
         self.canister_iterators.front().and_then(|it| it.peek())
     }
 
@@ -313,7 +309,7 @@ impl std::fmt::Display for StateError {
 // our OP layer.
 // * We don't derive `Hash` because `ingress_history` is a Hashmap that doesn't
 // derive `Hash`.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct ReplicatedState {
     /// States of all canisters, indexed by canister ids.
     pub canister_states: BTreeMap<CanisterId, CanisterState>,
@@ -332,67 +328,37 @@ pub struct ReplicatedState {
     // TODO(EXE-109): Move this queue into `subnet_queues`
     pub consensus_queue: Vec<Response>,
 
-    pub root: PathBuf,
-
-    bitcoin_testnet: BitcoinState,
-}
-
-// We use custom impl of PartialEq because state root is not part of identity.
-impl PartialEq for ReplicatedState {
-    fn eq(&self, rhs: &Self) -> bool {
-        (
-            &self.canister_states,
-            &self.metadata,
-            &self.subnet_queues,
-            &self.consensus_queue,
-        ) == (
-            &rhs.canister_states,
-            &rhs.metadata,
-            &rhs.subnet_queues,
-            &rhs.consensus_queue,
-        )
-    }
+    bitcoin: BitcoinState,
 }
 
 impl ReplicatedState {
-    /// Creates a new empty node state.
-    pub fn new_rooted_at(
-        own_subnet_id: SubnetId,
-        own_subnet_type: SubnetType,
-        root: PathBuf,
-    ) -> ReplicatedState {
+    /// Creates a new empty replicated state.
+    pub fn new(own_subnet_id: SubnetId, own_subnet_type: SubnetType) -> ReplicatedState {
         ReplicatedState {
-            root,
             canister_states: BTreeMap::new(),
             metadata: SystemMetadata::new(own_subnet_id, own_subnet_type),
             subnet_queues: CanisterQueues::default(),
             consensus_queue: Vec::new(),
-            bitcoin_testnet: BitcoinState::default(),
+            bitcoin: BitcoinState::default(),
         }
     }
 
+    /// Creates a replicated state from a checkpoint.
     pub fn new_from_checkpoint(
         canister_states: BTreeMap<CanisterId, CanisterState>,
         metadata: SystemMetadata,
         subnet_queues: CanisterQueues,
-        consensus_queue: Vec<Response>,
-        bitcoin_testnet: BitcoinState,
-        root: PathBuf,
+        bitcoin: BitcoinState,
     ) -> Self {
         let mut res = Self {
             canister_states,
             metadata,
             subnet_queues,
-            consensus_queue,
-            root,
-            bitcoin_testnet,
+            consensus_queue: Vec::new(),
+            bitcoin,
         };
         res.update_stream_responses_size_bytes();
         res
-    }
-
-    pub fn path(&self) -> &Path {
-        &self.root
     }
 
     pub fn canister_state(&self, canister_id: &CanisterId) -> Option<&CanisterState> {
@@ -480,10 +446,6 @@ impl ReplicatedState {
         &self.metadata
     }
 
-    pub fn set_system_metadata(&mut self, metadata: SystemMetadata) {
-        self.metadata = metadata;
-    }
-
     pub fn get_ingress_status(&self, message_id: &MessageId) -> IngressStatus {
         self.metadata
             .ingress_history
@@ -496,12 +458,28 @@ impl ReplicatedState {
         self.metadata.ingress_history.clone()
     }
 
-    pub fn set_ingress_status(&mut self, message_id: MessageId, status: IngressStatus) {
-        self.metadata
-            .ingress_history
-            .insert(message_id, status, self.time());
+    /// Sets the `status` for `message_id` in the ingress history. It will
+    /// be ensured that the cumulative payload size of statuses in the
+    /// ingress history will be below or equal to `ingress_memory_capacity`
+    /// by transitioning `Completed` and `Failed` statuses to `Done` from
+    /// oldest to newest in case inserting `status` pushes the memory
+    /// consumption over the bound.
+    pub fn set_ingress_status(
+        &mut self,
+        message_id: MessageId,
+        status: IngressStatus,
+        ingress_memory_capacity: NumBytes,
+    ) {
+        self.metadata.ingress_history.insert(
+            message_id,
+            status,
+            self.time(),
+            ingress_memory_capacity,
+        );
     }
 
+    /// Prunes ingress history statuses with a pruning time older than
+    /// `self.time()`.
     pub fn prune_ingress_history(&mut self) {
         self.metadata.ingress_history.prune(self.time());
     }
@@ -525,53 +503,47 @@ impl ReplicatedState {
             .sum()
     }
 
-    /// Returns the total memory taken by canisters in bytes.
+    /// Returns:
+    ///   * the total memory taken by canisters in bytes
+    ///   * the memory taken by canister messages in bytes
     ///
-    /// This accounts for the canister memory reservation, where specified; and
-    /// the actual canister memory usage, where no explicit memory reservation
-    /// has been made. Canister message memory usage is included for application
-    /// subnets only.
-    pub fn total_memory_taken(&self) -> NumBytes {
-        self.total_memory_taken_impl(self.metadata.own_subnet_type != SubnetType::System)
-    }
-
-    /// Returns the total memory taken by canisters in bytes, always including
-    /// canister messages (regardless of subnet type).
-    ///
-    /// This accounts for the canister memory reservation, where specified; and
-    /// the actual canister memory usage, where no explicit memory reservation
-    /// has been made.
-    pub fn total_memory_taken_with_messages(&self) -> NumBytes {
-        self.total_memory_taken_impl(true)
-    }
-
-    /// Common implementation for `total_memory_taken()` and
-    /// `total_memory_taken_with_messages()`.
-    fn total_memory_taken_impl(&self, with_messages: bool) -> NumBytes {
-        let mut memory_taken = self
-            .canisters_iter()
-            .map(|canister| match canister.memory_allocation() {
-                MemoryAllocation::Reserved(bytes) => bytes,
-                MemoryAllocation::BestEffort => canister.memory_usage_impl(with_messages),
-            })
-            .sum();
-        if ENFORCE_MESSAGE_MEMORY_USAGE && with_messages {
-            memory_taken += (self.subnet_queues.memory_usage() as u64).into();
-        }
-        memory_taken
-    }
-
-    /// Returns the total memory taken by canister messages in bytes.
-    pub fn message_memory_taken(&self) -> NumBytes {
-        if ENFORCE_MESSAGE_MEMORY_USAGE {
-            NumBytes::new(self.subnet_queues.memory_usage() as u64)
-                + self
-                    .canisters_iter()
-                    .map(|canister| canister.system_state.memory_usage())
-                    .sum()
+    /// Total memory taken accounts for the canister memory reservation, where
+    /// specified; and the actual canister memory usage, where no explicit
+    /// memory reservation has been made. Canister message memory usage is
+    /// included for application subnets only.
+    pub fn total_and_message_memory_taken(&self) -> (NumBytes, NumBytes) {
+        let (raw_total_memory_taken, message_memory_taken) =
+            self.raw_total_and_message_memory_taken();
+        let total_memory_taken = if self.metadata.own_subnet_type != SubnetType::System {
+            raw_total_memory_taken + message_memory_taken
         } else {
-            0.into()
-        }
+            raw_total_memory_taken
+        };
+        (total_memory_taken, message_memory_taken)
+    }
+
+    /// Returns:
+    ///   * the raw total memory taken by canisters in bytes, i.e. without
+    ///     including memory taken by canister messages
+    ///   * the memory taken by canister messages in bytes
+    pub fn raw_total_and_message_memory_taken(&self) -> (NumBytes, NumBytes) {
+        let (raw_memory_taken, mut message_memory_taken) = self
+            .canisters_iter()
+            .map(|canister| {
+                (
+                    match canister.memory_allocation() {
+                        MemoryAllocation::Reserved(bytes) => bytes,
+                        MemoryAllocation::BestEffort => canister.raw_memory_usage(),
+                    },
+                    canister.system_state.memory_usage(),
+                )
+            })
+            .reduce(|accum, val| (accum.0 + val.0, accum.1 + val.1))
+            .unwrap_or_default();
+
+        message_memory_taken += (self.subnet_queues.memory_usage() as u64).into();
+
+        (raw_memory_taken, message_memory_taken)
     }
 
     /// Returns the total memory taken by the ingress history in bytes.
@@ -610,7 +582,6 @@ impl ReplicatedState {
     /// Updates `subnet_available_memory` to reflect any change in memory usage.
     pub fn push_input(
         &mut self,
-        index: QueueIndex,
         msg: RequestOrResponse,
         max_canister_memory_size: NumBytes,
         subnet_available_memory: &mut i64,
@@ -625,7 +596,6 @@ impl ReplicatedState {
         };
         match self.canister_state_mut(&msg.receiver()) {
             Some(receiver_canister) => receiver_canister.push_input(
-                index,
                 msg,
                 max_canister_memory_size,
                 subnet_available_memory,
@@ -637,7 +607,6 @@ impl ReplicatedState {
                 if msg.receiver().get_ref() == subnet_id {
                     push_input(
                         &mut self.subnet_queues,
-                        index,
                         msg,
                         // No canister limit, so pass the subnet limit twice.
                         *subnet_available_memory,
@@ -654,24 +623,40 @@ impl ReplicatedState {
 
     /// Pushes an ingress message into the induction pool (canister or subnet
     /// ingress queue).
-    pub fn push_ingress(&mut self, msg: SignedIngressContent) -> Result<(), StateError> {
-        if is_subnet_message(&msg, self.metadata.own_subnet_id) {
-            self.subnet_queues.push_ingress(msg.into());
+    pub fn push_ingress(&mut self, msg: Ingress) -> Result<(), StateError> {
+        if msg.is_addressed_to_subnet(self.metadata.own_subnet_id) {
+            self.subnet_queues.push_ingress(msg);
         } else {
-            let canister_id = msg.canister_id();
+            let canister_id = msg.receiver;
             let canister = match self.canister_states.get_mut(&canister_id) {
                 Some(canister) => canister,
                 None => return Err(StateError::CanisterNotFound(canister_id)),
             };
-            canister.push_ingress(msg.into());
+            canister.push_ingress(msg);
         }
         Ok(())
     }
 
     /// Extracts the next inter-canister or ingress message (round-robin) from
     /// `self.subnet_queues`.
-    pub fn pop_subnet_input(&mut self) -> Option<CanisterInputMessage> {
+    pub fn pop_subnet_input(&mut self) -> Option<CanisterMessage> {
         self.subnet_queues.pop_input()
+    }
+
+    /// Peeks the next inter-canister or ingress message (round-robin) from
+    /// `self.subnet_queues`.
+    pub fn peek_subnet_input(&mut self) -> Option<CanisterMessage> {
+        self.subnet_queues.peek_input()
+    }
+
+    /// Skips the next inter-canister or ingress message from `self.subnet_queues`.
+    pub fn skip_subnet_input(&mut self, loop_detector: &mut CanisterQueuesLoopDetector) {
+        self.subnet_queues.skip_input(loop_detector);
+    }
+
+    /// Creates a new loop detector.
+    pub fn subnet_queues_loop_detector(&self) -> CanisterQueuesLoopDetector {
+        CanisterQueuesLoopDetector::default()
     }
 
     /// Pushes a `Response` type message into the relevant subnet output queue.
@@ -681,7 +666,7 @@ impl ReplicatedState {
     ///
     /// Panics if the queue does not already exist or there is no reserved slot
     /// to push the `Response` into.
-    pub fn push_subnet_output_response(&mut self, msg: Response) {
+    pub fn push_subnet_output_response(&mut self, msg: Arc<Response>) {
         self.subnet_queues.push_output_response(msg)
     }
 
@@ -740,55 +725,95 @@ impl ReplicatedState {
         self.canister_states.len()
     }
 
+    /// Garbage collects empty canister and subnet queues.
+    pub fn garbage_collect_canister_queues(&mut self) {
+        for (_canister_id, canister) in self.canister_states.iter_mut() {
+            canister.system_state.garbage_collect_canister_queues();
+        }
+        self.subnet_queues.garbage_collect();
+    }
+
     /// Returns a reference to the `BitcoinState`.
-    pub fn bitcoin_testnet(&self) -> &BitcoinState {
-        &self.bitcoin_testnet
+    pub fn bitcoin(&self) -> &BitcoinState {
+        &self.bitcoin
+    }
+
+    /// Returns a mutable reference to the `BitcoinState`.
+    pub fn bitcoin_mut(&mut self) -> &mut BitcoinState {
+        &mut self.bitcoin
     }
 
     /// Pushes a request onto the testnet `BitcoinState` iff the bitcoin testnet
     /// feature is enabled and returns a `StateError` otherwise.
     ///
     /// See documentation of `BitcoinState::push_request` for more information.
-    pub fn push_request_bitcoin_testnet(
+    // TODO(EXC-1097): Remove this method as it isn't being used in production.
+    pub fn push_request_bitcoin(
         &mut self,
         request: BitcoinAdapterRequestWrapper,
     ) -> Result<(), StateError> {
-        match self.metadata.own_subnet_features.bitcoin_testnet() {
-            BitcoinFeature::Enabled => self
-                .bitcoin_testnet
+        match self.metadata.own_subnet_features.bitcoin().status {
+            BitcoinFeatureStatus::Enabled | BitcoinFeatureStatus::Syncing => self
+                .bitcoin
+                .adapter_queues
                 .push_request(request)
                 .map_err(StateError::BitcoinStateError),
-            BitcoinFeature::Paused => Err(StateError::BitcoinStateError(
-                BitcoinStateError::TestnetFeatureNotEnabled,
-            )),
-            BitcoinFeature::Disabled => Err(StateError::BitcoinStateError(
-                BitcoinStateError::TestnetFeatureNotEnabled,
-            )),
+            BitcoinFeatureStatus::Paused | BitcoinFeatureStatus::Disabled => Err(
+                StateError::BitcoinStateError(BitcoinStateError::FeatureNotEnabled),
+            ),
         }
     }
 
-    /// Pushes a response from the Bitcoin Adapter to the testnet `BitcoinState`
-    /// iff the bitcoin testnet feature is not disabled and returns a `StateError`
-    /// otherwise.
-    ///
-    /// See documentation of `BitcoinState::push_response` for more information.
-    pub fn push_response_bitcoin_testnet(
+    /// Pushes a response from the Bitcoin Adapter into the state.
+    pub fn push_response_bitcoin(
         &mut self,
         response: BitcoinAdapterResponse,
     ) -> Result<(), StateError> {
-        match self.metadata.own_subnet_features.bitcoin_testnet() {
-            BitcoinFeature::Enabled => self
-                .bitcoin_testnet
-                .push_response(response)
-                .map_err(StateError::BitcoinStateError),
-            BitcoinFeature::Paused => self
-                .bitcoin_testnet
-                .push_response(response)
-                .map_err(StateError::BitcoinStateError),
-            BitcoinFeature::Disabled => Err(StateError::BitcoinStateError(
-                BitcoinStateError::TestnetFeatureNotEnabled,
-            )),
+        crate::bitcoin::push_response(self, response)
+    }
+
+    pub fn take_bitcoin_state(&mut self) -> BitcoinState {
+        std::mem::take(&mut self.bitcoin)
+    }
+
+    pub fn put_bitcoin_state(&mut self, bitcoin: BitcoinState) {
+        self.bitcoin = bitcoin;
+    }
+
+    /// Times out requests in all `OutputQueues` found in the replicated state (except the subnet
+    /// queues). Returns the number of requests that were timed out.
+    ///
+    /// See `CanisterQueues::time_out_requests` for further details.
+    #[allow(clippy::needless_collect)]
+    pub fn time_out_requests(&mut self, current_time: Time) -> u64 {
+        // Because the borrow checker requires us to remove each canister before
+        // calling `time_out_requests()` on it and replace it afterwards; and removing
+        // and replacing every canister on a large subnet is very costly; we first
+        // filter for the (usually much fewer) canisters with timed requests and only
+        // apply the costly remove-call-replace to those.
+        let canister_ids_with_expired_deadlines = self
+            .canister_states
+            .iter()
+            .filter(|(_, canister_state)| {
+                canister_state
+                    .system_state
+                    .has_expired_deadlines(current_time)
+            })
+            .map(|(canister_id, _)| *canister_id)
+            .collect::<Vec<_>>();
+
+        let mut timed_out_requests_count = 0;
+        for canister_id in canister_ids_with_expired_deadlines {
+            let mut canister = self.canister_states.remove(&canister_id).unwrap();
+            timed_out_requests_count += canister.system_state.time_out_requests(
+                current_time,
+                &canister_id,
+                &self.canister_states,
+            );
+            self.canister_states.insert(canister_id, canister);
         }
+
+        timed_out_requests_count
     }
 }
 

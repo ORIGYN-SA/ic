@@ -23,7 +23,7 @@ struct FieldElementConfig {
 impl FieldElementConfig {
     fn new(ident: syn::Ident, modulus: BigUint, mut params: BTreeMap<String, BigUint>) -> Self {
         let limb_size = 64; // bits of u64
-        let limbs = ((modulus.bits() + limb_size - 1) / limb_size) as usize;
+        let limbs = (modulus.bits() + limb_size - 1) / limb_size;
 
         let m64 = BigUint::one() << limb_size;
 
@@ -190,7 +190,7 @@ fn define_fe_struct(config: &FieldElementConfig) -> proc_macro2::TokenStream {
     let p_dash = config.p_dash;
 
     quote! {
-        #[derive(Copy, Clone, Zeroize)]
+        #[derive(Clone, Zeroize, ZeroizeOnDrop)]
         pub struct #ident {
             limbs: [u64; #limbs]
         }

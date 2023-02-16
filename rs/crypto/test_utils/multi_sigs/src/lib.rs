@@ -1,6 +1,7 @@
 //! Utilities for testing multisignature operations.
 
-use ic_crypto::utils::{NodeKeysToGenerate, TempCryptoComponent};
+use ic_crypto_temp_crypto::{NodeKeysToGenerate, TempCryptoComponent};
+use ic_interfaces::crypto::KeyManager;
 use ic_registry_client_fake::FakeRegistryClient;
 use ic_registry_keys::make_crypto_node_key;
 use ic_registry_proto_data_provider::ProtoRegistryDataProvider;
@@ -23,7 +24,7 @@ impl MultiSigTestEnvironment {
         let registry_data = Arc::new(ProtoRegistryDataProvider::new());
         let registry = Arc::new(FakeRegistryClient::new(Arc::clone(&registry_data) as Arc<_>));
 
-        let registry_version = { RegistryVersion::new(thread_rng().gen_range(1, u32::MAX) as u64) };
+        let registry_version = { RegistryVersion::new(thread_rng().gen_range(1..u32::MAX) as u64) };
 
         let mut env = Self {
             crypto_components: BTreeMap::new(),
@@ -86,16 +87,18 @@ impl MultiSigTestEnvironment {
     }
 
     fn create_crypto_component_with_key_in_registry(&mut self, node_id: NodeId) {
-        let registry = Arc::clone(&self.registry) as Arc<_>;
-        let (temp_crypto, node_keys) = {
-            let keys_to_gen = NodeKeysToGenerate::only_committee_signing_key();
-
-            TempCryptoComponent::new_with_node_keys_generation(registry, node_id, keys_to_gen)
-        };
+        let temp_crypto = TempCryptoComponent::builder()
+            .with_registry(Arc::clone(&self.registry) as Arc<_>)
+            .with_node_id(node_id)
+            .with_keys(NodeKeysToGenerate::only_committee_signing_key())
+            .build();
+        let node_keys = temp_crypto
+            .current_node_public_keys()
+            .expect("Failed to retrieve node public keys");
         self.crypto_components.insert(node_id, temp_crypto);
 
         let committee_pubkey = node_keys
-            .committee_signing_pk
+            .committee_signing_public_key
             .expect("failed to generate committee key");
         self.registry_data
             .add(

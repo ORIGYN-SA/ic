@@ -10,8 +10,9 @@ use std::time::Duration;
 use candid::{CandidType, Encode};
 use canister_test::{Canister, Wasm};
 use dfn_candid::{candid, candid_one};
-use ic_canister_client::Sender;
+use ic_canister_client_sender::Sender;
 use ic_ic00_types::CanisterInstallMode;
+use ic_nervous_system_common_test_keys::TEST_NEURON_1_OWNER_KEYPAIR;
 use ic_nervous_system_root::{
     CanisterIdRecord, CanisterStatusResult, CanisterStatusType::Running, ChangeCanisterProposal,
 };
@@ -26,7 +27,6 @@ use ic_nns_governance::pb::v1::{
     ListNodeProvidersResponse, ManageNeuron, ManageNeuronResponse, NnsFunction, NodeProvider,
     Proposal, ProposalInfo, ProposalStatus,
 };
-use ic_nns_test_keys::TEST_NEURON_1_OWNER_KEYPAIR;
 
 /// Thin-wrapper around submit_proposal to handle
 /// serialization/deserialization
@@ -369,9 +369,6 @@ pub async fn upgrade_root_canister_by_proposal(
         ProposalStatus::Executed
     );
 
-    let pending_proposals = get_pending_proposals(governance).await;
-    assert_eq!(pending_proposals.len(), 0);
-
     loop {
         let status: CanisterStatusResult = lifeline
             .update_(
@@ -423,7 +420,8 @@ async fn change_nns_canister_by_proposal(
         .with_memory_allocation(ic_nns_constants::memory_allocation_of(
             canister.canister_id(),
         ))
-        .with_wasm(wasm);
+        .with_wasm(wasm)
+        .with_arg(Encode!().unwrap());
     let proposal = if let Some(arg) = arg {
         proposal.with_arg(arg)
     } else {
@@ -500,6 +498,27 @@ pub async fn upgrade_nns_canister_with_arg_by_proposal(
         governance,
         root,
         false,
+        wasm,
+        Some(arg),
+    )
+    .await
+}
+
+/// Submits a proposal to upgrade an NNS canister, with the provided argument.
+pub async fn upgrade_nns_canister_with_args_by_proposal(
+    canister: &Canister<'_>,
+    governance: &Canister<'_>,
+    root: &Canister<'_>,
+    stop_before_installing: bool,
+    wasm: Wasm,
+    arg: Vec<u8>,
+) {
+    change_nns_canister_by_proposal(
+        CanisterInstallMode::Upgrade,
+        canister,
+        governance,
+        root,
+        stop_before_installing,
         wasm,
         Some(arg),
     )

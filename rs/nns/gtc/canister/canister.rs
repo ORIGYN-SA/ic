@@ -17,10 +17,6 @@ use ic_nns_gtc_accounts::FORWARD_WHITELIST;
 #[cfg(target_arch = "wasm32")]
 use dfn_core::println;
 
-// Makes expose_build_metadata! available.
-#[macro_use]
-extern crate ic_nervous_system_common;
-
 static mut GTC: Option<Gtc> = None;
 
 fn gtc() -> &'static Gtc {
@@ -78,13 +74,12 @@ fn canister_post_upgrade() {
 
     let serialized = stable::get();
     let gtc = gtc_mut();
-    match gtc.merge(&serialized[..]) {
-        Err(err) => panic!(
+    if let Err(err) = gtc.merge(&serialized[..]) {
+        panic!(
             "Error deserializing canister state post-upgrade. \
              CANISTER MIGHT HAVE BROKEN STATE!!!!. Error: {:?}",
             err
-        ),
-        Ok(()) => (),
+        )
     }
 
     // If the set of whitelisted accounts is empty (like it would
@@ -98,7 +93,7 @@ fn canister_post_upgrade() {
     }
 }
 
-expose_build_metadata! {}
+ic_nervous_system_common_build_metadata::define_get_build_metadata_candid_method! {}
 
 /// Returns the sum of all token balances in the internal ledger
 #[export_name = "canister_query total"]
@@ -210,16 +205,21 @@ fn main() {}
 
 #[test]
 fn check_gtc_candid_file() {
-    let gtc_did = String::from_utf8(std::fs::read("canister/gtc.did").unwrap()).unwrap();
+    let did_path = std::path::PathBuf::from(
+        std::env::var_os("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR env var undefined"),
+    )
+    .join("canister/gtc.did");
+    let did_contents = String::from_utf8(std::fs::read(did_path).unwrap()).unwrap();
 
     // See comments in main above
     candid::export_service!();
     let expected = __export_service();
 
-    if gtc_did != expected {
+    if did_contents != expected {
         panic!(
             "Generated candid definition does not match canister/gtc.did. \
-            Run `cargo run --bin genesis-token-canister > canister/gtc.did` in \
+            Run `bazel run :generate_did > canister/gtc.did` (no nix and/or direnv) or \
+            `cargo run --bin genesis-token-canister > canister/gtc.did` in \
             rs/nns/gtc to update canister/gtc.did."
         )
     }

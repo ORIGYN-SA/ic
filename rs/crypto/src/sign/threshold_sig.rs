@@ -45,22 +45,22 @@ fn pub_coeffs_from_store(
     dkg_id: DkgId,
     lockable_threshold_sig_data_store: &LockableThresholdSigDataStore,
 ) -> Result<CspPublicCoefficients, ThresholdSigDataNotFoundError> {
-    lockable_threshold_sig_data_store
+    let maybe_coeffs = lockable_threshold_sig_data_store
         .read()
         .transcript_data(dkg_id)
-        .map(|data| data.public_coefficients().clone())
-        .ok_or(ThresholdSigDataNotFoundError::ThresholdSigDataNotFound { dkg_id })
+        .map(|data| data.public_coefficients().clone());
+    maybe_coeffs.ok_or(ThresholdSigDataNotFoundError::ThresholdSigDataNotFound { dkg_id })
 }
 
 fn transcript_data_from_store(
     dkg_id: DkgId,
     lockable_threshold_sig_data_store: &LockableThresholdSigDataStore,
 ) -> Result<TranscriptData, ThresholdSigDataNotFoundError> {
-    lockable_threshold_sig_data_store
+    let maybe_transcript_data = lockable_threshold_sig_data_store
         .read()
         .transcript_data(dkg_id)
-        .cloned()
-        .ok_or_else(|| sig_data_not_found_error(dkg_id))
+        .cloned();
+    maybe_transcript_data.ok_or_else(|| sig_data_not_found_error(dkg_id))
 }
 
 fn sig_data_not_found_error(dkg_id: DkgId) -> ThresholdSigDataNotFoundError {
@@ -93,7 +93,7 @@ fn map_threshold_sign_error_or_panic(
             ThresholdSignError::SecretKeyNotFound {
                 dkg_id,
                 algorithm,
-                key_id,
+                key_id: key_id.to_string(),
             }
         }
         // Panic, since these would be implementation errors:
@@ -276,7 +276,7 @@ impl ThresholdSigVerifierInternal {
                 &shares_to_vector(&transcript_data, shares, dkg_id)?,
                 public_coefficients,
             )
-            .map_err(map_csp_combine_sigs_error_or_panic)?;
+            .map_err(map_csp_combine_sigs_error)?;
         combined_threshold_sig_or_panic(csp_signature)
     }
 }
@@ -293,7 +293,9 @@ fn shares_to_vector<H: Signable>(
         let index = index_for_node_id(transcript_data, node_id, dkg_id)?;
         let usize_index = <usize>::try_from(index).expect("usize overflow");
         let csp_sig = CspSignature::try_from(&share)?;
-        *signatures.get_mut(usize_index).unwrap() = Some(csp_sig);
+        *signatures
+            .get_mut(usize_index)
+            .expect("Index unexpectedly out of range") = Some(csp_sig);
     }
     Ok(signatures)
 }
@@ -339,16 +341,12 @@ fn combined_threshold_sig_or_panic<H: Signable>(
     ))
 }
 
-// TODO (DFN-1505): improve the error handling by introducing more specific
-// errors on CSP level.
-fn map_csp_combine_sigs_error_or_panic(error: CryptoError) -> CryptoError {
+fn map_csp_combine_sigs_error(error: CryptoError) -> CryptoError {
     match error {
-        // TODO (DFN-1505): InvalidArgument is returned in these cases:
-        // - threshold too high -> Error must be forwarded to the caller (as is the case now)
-        // - error reading coeffs / unknown algorithm -> should lead to a panic (illegal state).
-        //   This is not the case now!
         CryptoError::MalformedSignature { .. } | CryptoError::InvalidArgument { .. } => error,
-        _ => panic!("Illegal state: unexpected error from the CSP: {}", error),
+        _ => CryptoError::InternalError {
+            internal_error: format!("Unexpected error from the CSP: {}", error),
+        },
     }
 }
 
@@ -378,31 +376,28 @@ impl ThresholdSigVerifierInternal {
                 csp_signature,
                 pub_coeffs,
             )
-            .map_err(map_verify_combined_error_or_panic)
+            .map_err(map_verify_combined_error)
     }
 }
 
 // TODO (DFN-1186): improve the error handling by introducing more specific
 // errors on CSP level.
-fn map_verify_combined_error_or_panic(error: CryptoError) -> CryptoError {
+fn map_verify_combined_error(error: CryptoError) -> CryptoError {
     match error {
-        CryptoError::SignatureVerification { .. } | CryptoError::MalformedSignature { .. } => error,
-        CryptoError::InvalidArgument { .. } => {
-            panic!("Illegal state: unsupported algorithm: {}", error)
-        }
-        CryptoError::MalformedPublicKey { .. } => panic!(
-            "Illegal state: the public key computed from the public coefficients \
-                is malformed: {}",
-            error
-        ),
-        _ => panic!("Illegal state: unexpected error from the CSP: {}", error),
+        CryptoError::SignatureVerification { .. }
+        | CryptoError::MalformedSignature { .. }
+        | CryptoError::InvalidArgument { .. }
+        | CryptoError::MalformedPublicKey { .. } => error,
+        _ => CryptoError::InternalError {
+            internal_error: format!("Unexpected error from the CSP: {}", error),
+        },
     }
 }
 
 impl ThresholdSigVerifierInternal {
     pub fn verify_combined_threshold_sig_by_public_key<C, H>(
         threshold_sig_csp_client: &C,
-        registry: Arc<dyn RegistryClient>,
+        registry: &dyn RegistryClient,
         signature: &CombinedThresholdSigOf<H>,
         message: &H,
         subnet_id: SubnetId,
@@ -427,12 +422,12 @@ impl ThresholdSigVerifierInternal {
                 csp_signature,
                 csp_pub_coeffs,
             )
-            .map_err(map_verify_combined_error_or_panic)
+            .map_err(map_verify_combined_error)
     }
 }
 
 fn initial_ni_dkg_transcript_from_registry(
-    registry: Arc<dyn RegistryClient>,
+    registry: &dyn RegistryClient,
     subnet_id: SubnetId,
     registry_version: RegistryVersion,
     dkg_tag: NiDkgTag,

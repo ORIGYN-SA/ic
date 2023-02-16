@@ -1,4 +1,5 @@
 #![allow(clippy::unwrap_used)]
+
 // SECP256K1_PK_1_DER_HEX was generated via the following commands:
 //   openssl ecparam -name secp256k1 -genkey -noout -out private.ec.key
 //   openssl ec -in private.ec.key -pubout -outform DER -out ecpubkey.der
@@ -12,9 +13,11 @@ const ED25519_PK_DER_BASE64: &str = "MCowBQYDK2VwAyEAGb9ECWmEzf6FQbrBZ9w7lshQhqo
 mod keygen {
     use super::*;
     use crate::{new_keypair, public_key_from_der, public_key_to_der};
+    use ic_crypto_test_utils_reproducible_rng::reproducible_rng;
+
     #[test]
     fn should_correctly_generate_secp256k1_keys() {
-        let (_sk, _pk) = new_keypair().unwrap();
+        let (_sk, _pk) = new_keypair(&mut reproducible_rng()).unwrap();
     }
 
     #[test]
@@ -65,10 +68,11 @@ mod keygen {
 
 mod sign {
     use crate::{new_keypair, sign, types, verify};
+    use ic_crypto_test_utils_reproducible_rng::reproducible_rng;
 
     #[test]
     fn should_correctly_sign_and_verify() {
-        let (sk, pk) = new_keypair().unwrap();
+        let (sk, pk) = new_keypair(&mut reproducible_rng()).unwrap();
 
         let msg = b"some message to sign";
         let signature = sign(msg, &sk).unwrap();
@@ -89,7 +93,7 @@ mod sign {
     // (the number of signatures = 300 has been picked empirically)
     #[test]
     fn should_correctly_generate_and_verify_shorter_signatures() {
-        let (sk, pk) = new_keypair().unwrap();
+        let (sk, pk) = new_keypair(&mut reproducible_rng()).unwrap();
 
         let msg = b"some message to sign";
         for _i in 1..300 {
@@ -103,7 +107,9 @@ mod sign {
 mod verify {
     use crate::types::{PublicKeyBytes, SignatureBytes};
     use crate::{new_keypair, sign, verify};
+    use assert_matches::assert_matches;
     use ic_crypto_internal_test_vectors::ecdsa_secp256k1;
+    use ic_crypto_test_utils_reproducible_rng::reproducible_rng;
     use ic_types::crypto::{AlgorithmId, CryptoError};
     use openssl::bn::{BigNum, BigNumContext};
     use openssl::ec::{EcGroup, EcKey};
@@ -156,7 +162,7 @@ mod verify {
 
     #[test]
     fn should_reject_truncated_ecdsa_pubkey() {
-        let (sk, pk) = new_keypair().unwrap();
+        let (sk, pk) = new_keypair(&mut reproducible_rng()).unwrap();
 
         let msg = b"abc";
         let signature = sign(msg, &sk).unwrap();
@@ -165,20 +171,25 @@ mod verify {
         let invalid_pk = PublicKeyBytes(pk.0[0..pk.0.len() - 1].to_vec());
         let result = verify(&signature, msg, &invalid_pk);
 
-        assert!(
-            matches!(result, Err(CryptoError::MalformedPublicKey{algorithm, key_bytes, internal_error})
-                     if algorithm == AlgorithmId::EcdsaSecp256k1
-                     && key_bytes == Some(invalid_pk.0)
-                     && internal_error.contains(
-                         ":elliptic curve routines:ec_GFp_simple_oct2point:invalid encoding:"
-                     )
-            )
+        // since OpenSSL 3.0.5, ec_GFp_simple_oct2point function is prefixed with ossl_,
+        // so let either version pass the test
+        //
+        // ? in regex stands for 0 or 1 occurrence
+        let re = regex::Regex::new(
+            r":elliptic curve routines:(ossl_)?ec_GFp_simple_oct2point:invalid encoding:",
+        )
+        .unwrap();
+
+        assert_matches!(result, Err(CryptoError::MalformedPublicKey{algorithm, key_bytes, internal_error})
+             if algorithm == AlgorithmId::EcdsaSecp256k1
+             && key_bytes == Some(invalid_pk.0)
+             && re.is_match(&internal_error[..])
         );
     }
 
     #[test]
     fn should_reject_modified_ecdsa_pubkey() {
-        let (sk, pk) = new_keypair().unwrap();
+        let (sk, pk) = new_keypair(&mut reproducible_rng()).unwrap();
 
         let msg = b"abc";
         let signature = sign(msg, &sk).unwrap();
@@ -195,20 +206,18 @@ mod verify {
         let invalid_pk = PublicKeyBytes(modified_key);
 
         let result = verify(&signature, msg, &invalid_pk);
-        assert!(
-            matches!(result, Err(CryptoError::MalformedPublicKey{algorithm, key_bytes, internal_error})
-                     if algorithm == AlgorithmId::EcdsaSecp256k1
-                     && key_bytes == Some(invalid_pk.0)
-                     && internal_error.contains(
-                         ":elliptic curve routines:EC_POINT_set_affine_coordinates:point is not on curve:"
-                     )
-            )
+        assert_matches!(result, Err(CryptoError::MalformedPublicKey{algorithm, key_bytes, internal_error})
+             if algorithm == AlgorithmId::EcdsaSecp256k1
+             && key_bytes == Some(invalid_pk.0)
+             && internal_error.contains(
+                 ":elliptic curve routines:EC_POINT_set_affine_coordinates:point is not on curve:"
+             )
         );
     }
 
     #[test]
     fn should_fail_to_verify_wrong_signature() {
-        let (sk, pk) = new_keypair().unwrap();
+        let (sk, pk) = new_keypair(&mut reproducible_rng()).unwrap();
         let msg = b"some message to sign";
         let mut signature = sign(msg, &sk).unwrap();
         // Modify the last byte of the signature.
@@ -221,7 +230,7 @@ mod verify {
 
     #[test]
     fn should_fail_to_verify_wrong_message() {
-        let (sk, pk) = new_keypair().unwrap();
+        let (sk, pk) = new_keypair(&mut reproducible_rng()).unwrap();
         let msg = b"some message to sign";
         let wrong_msg = b"a different message";
         let signature = sign(msg, &sk).unwrap();
@@ -232,8 +241,9 @@ mod verify {
 
     #[test]
     fn should_fail_to_verify_wrong_key() {
-        let (sk, _) = new_keypair().unwrap();
-        let (_, another_pk) = new_keypair().unwrap();
+        let mut rng = reproducible_rng();
+        let (sk, _) = new_keypair(&mut rng).unwrap();
+        let (_, another_pk) = new_keypair(&mut rng).unwrap();
         let msg = b"some message to sign";
         let signature = sign(msg, &sk).unwrap();
         let result = verify(&signature, msg, &another_pk);

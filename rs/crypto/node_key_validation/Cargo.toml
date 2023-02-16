@@ -1,7 +1,7 @@
 [package]
 name = "ic-crypto-node-key-validation"
 version = "0.8.0"
-edition = "2018"
+edition = "2021"
 
 [dependencies]
 ########################################################
@@ -13,15 +13,17 @@ ic-base-types = { path = "../../types/base_types" }
 ic-crypto-internal-basic-sig-ed25519 = { path = "../internal/crypto_lib/basic_sig/ed25519" }
 ic-crypto-internal-threshold-sig-bls12381 = { path = "../internal/crypto_lib/threshold_sig/bls12_381" }
 ic-crypto-internal-threshold-sig-ecdsa = { path = "../internal/crypto_lib/threshold_sig/tecdsa" }
-ic-crypto-internal-fs-ni-dkg = { path = "../internal/crypto_lib/fs_ni_dkg" }
 ic-crypto-internal-multi-sig-bls12381 = { path = "../internal/crypto_lib/multi_sig/bls12_381" }
 ic-crypto-internal-types = { path = "../internal/crypto_lib/types" }
 ic-crypto-tls-cert-validation = { path = "tls_cert_validation" }
 ic-protobuf = { path = "../../protobuf" }
 ic-types = { path = "../../types/types" }
+serde = { version = "1.0.99", features = [ "derive" ] }
 x509-parser = { version = "0.12.0" }
 
 [dev-dependencies]
+assert_matches = "1.5.0"
 curve25519-dalek = "3.0.2"
-ic-crypto = { path = "../../crypto" }
+ic-config = { path = "../../config" }
+ic-crypto-node-key-generation = { path = "../node_key_generation" }
 ic-test-utilities = { path = "../../test_utilities" }

@@ -1,6 +1,9 @@
 use dfn_candid::{candid, candid_one};
 
-use ic_canister_client::Sender;
+use ic_canister_client_sender::Sender;
+use ic_nervous_system_common_test_keys::{
+    TEST_NEURON_1_OWNER_KEYPAIR, TEST_NEURON_2_OWNER_KEYPAIR,
+};
 use ic_nervous_system_root::{CanisterIdRecord, CanisterStatusResult};
 use ic_nns_common::pb::v1::NeuronId;
 use ic_nns_common::types::ProposalId;
@@ -11,11 +14,11 @@ use ic_nns_governance::pb::v1::{
     NnsFunction, ProposalStatus, Vote,
 };
 use ic_nns_governance::proposal_submission::create_external_update_proposal_candid;
-use ic_nns_test_keys::{TEST_NEURON_1_OWNER_KEYPAIR, TEST_NEURON_2_OWNER_KEYPAIR};
-use ic_nns_test_utils::ids::{TEST_NEURON_1_ID, TEST_NEURON_2_ID};
 use ic_nns_test_utils::{
+    common::NnsInitPayloadsBuilder,
     governance::{get_pending_proposals, wait_for_final_state, UpgradeRootProposal},
-    itest_helpers::{local_test_on_nns_subnet, NnsCanisters, NnsInitPayloadsBuilder},
+    ids::{TEST_NEURON_1_ID, TEST_NEURON_2_ID},
+    itest_helpers::{local_test_on_nns_subnet, NnsCanisters},
 };
 
 #[test]
@@ -48,7 +51,7 @@ fn test_submit_and_accept_root_canister_upgrade_proposal() {
           (export "canister_post_upgrade" (func $remember))
           (export "canister_query read_back" (func $read_back)))"#;
 
-        let wasm_module = wabt::wat2wasm(wat).expect("couldn't convert wat -> wasm");
+        let wasm_module = wat::parse_str(wat).expect("couldn't convert wat -> wasm");
 
         // check root status with focus on the checksum
         let root_status: CanisterStatusResult = nns_canisters

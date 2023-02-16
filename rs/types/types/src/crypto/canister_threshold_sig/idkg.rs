@@ -1,16 +1,18 @@
 //! Defines interactive distributed key generation (IDkg) types.
-use crate::consensus::ecdsa::EcdsaDealing;
 use crate::consensus::get_faults_tolerated;
+use crate::crypto::canister_threshold_sig::error::impl_display_using_debug;
 use crate::crypto::canister_threshold_sig::error::{
-    IDkgParamsValidationError, InitialIDkgDealingsValidationError,
+    IDkgParamsValidationError, IDkgTranscriptIdError, InitialIDkgDealingsValidationError,
 };
-use crate::crypto::{AlgorithmId, CombinedMultiSigOf};
-use crate::{NodeId, NumberOfNodes, RegistryVersion};
+use crate::crypto::{AlgorithmId, CryptoHashOf, Signed, SignedBytesWithoutDomainSeparator};
+use crate::signature::{BasicSignature, BasicSignatureBatch};
+use crate::{Height, NodeId, NumberOfNodes, RegistryVersion};
 use ic_base_types::SubnetId;
 use ic_crypto_internal_types::NodeIndex;
-use serde::{Deserialize, Serialize};
+use serde::{de::Error, Deserialize, Deserializer, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::convert::TryFrom;
+use std::fmt::{self, Debug, Display, Formatter};
 use std::hash::{Hash, Hasher};
 
 pub mod conversions;
@@ -20,34 +22,68 @@ pub use conversions::*;
 #[cfg(test)]
 mod tests;
 
-/// Unique identifier for an IDkg transcript.
+/// Globally unique identifier of an IDKG transcript.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, Hash)]
 pub struct IDkgTranscriptId {
-    id: usize,
-    subnet: SubnetId,
+    /// Identifier incremented by consensus.
+    id: u64,
+    /// Specifies which subnet generates the dealings for this instance of the IDKG protocol.
+    source_subnet: SubnetId,
+    /// Finalized block height in the `source_subnet` which specifies
+    /// the beginning of this instance of the IDKG protocol.
+    source_height: Height,
 }
 
 impl IDkgTranscriptId {
-    pub fn new(subnet: SubnetId, id: usize) -> Self {
-        Self { id, subnet }
+    pub fn new(subnet: SubnetId, id: u64, height: Height) -> Self {
+        Self {
+            id,
+            source_subnet: subnet,
+            source_height: height,
+        }
     }
 
-    pub fn id(&self) -> usize {
+    pub fn id(&self) -> u64 {
         self.id
     }
 
-    pub fn subnet(&self) -> &SubnetId {
-        &self.subnet
+    pub fn source_subnet(&self) -> &SubnetId {
+        &self.source_subnet
     }
 
-    /// Return the next value of this id.
+    pub fn source_height(&self) -> Height {
+        self.source_height
+    }
+
+    /// Returns the next Transcript ID.
     pub fn increment(self) -> Self {
         Self {
             id: self.id + 1,
-            subnet: self.subnet,
+            source_subnet: self.source_subnet,
+            source_height: self.source_height,
         }
     }
+
+    /// Updates the `height` of the Transcript ID.
+    ///
+    /// # Errors:
+    /// * If the `height` is smaller than `self.source_height` the error `DecreasedBlockHeight` is returned.
+    pub(crate) fn update_height(self, height: Height) -> Result<Self, IDkgTranscriptIdError> {
+        if height < self.source_height {
+            return Err(IDkgTranscriptIdError::DecreasedBlockHeight {
+                existing_height: self.source_height,
+                updated_height: height,
+            });
+        }
+        Ok(Self {
+            id: self.id,
+            source_subnet: self.source_subnet,
+            source_height: height,
+        })
+    }
 }
+
+impl_display_using_debug!(IDkgTranscriptId);
 
 /// A set of receivers for IDkg.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -248,14 +284,18 @@ impl IDkgDealers {
     }
 }
 
-/// Parameters used in the creation of IDkg dealings and transcripts.
+/// Parameters used throughout the IDKG protocol.
+/// Note that the same parameters *must* be used throughout an execution of the IDKG protocol.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, Hash)]
 pub struct IDkgTranscriptParams {
     transcript_id: IDkgTranscriptId,
     dealers: IDkgDealers,
     receivers: IDkgReceivers,
     registry_version: RegistryVersion,
+    /// Identifies the cryptographic signature scheme used in the protocol.
+    /// Currently only [`AlgorithmId::ThresholdEcdsaSecp256k1`] is supported.
     algorithm_id: AlgorithmId,
+    /// Mode of operation for this current execution of the protocol.
     operation_type: IDkgTranscriptOperation,
 }
 
@@ -492,58 +532,101 @@ impl IDkgTranscriptParams {
     }
 }
 
+impl_display_using_debug!(IDkgTranscriptParams);
+
 /// Initial params and dealings for a set of receivers assigned to a different subnet.
-/// Only dealings indended for resharing an unmasked transcript can be included in InitialIDkgDealings.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+/// Only dealings intended for resharing an unmasked transcript can be included in InitialIDkgDealings.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Hash)]
 pub struct InitialIDkgDealings {
     params: IDkgTranscriptParams,
-    dealings: BTreeMap<NodeId, IDkgDealing>,
+    dealings: Vec<SignedIDkgDealing>,
 }
 
 impl InitialIDkgDealings {
-    /// Creates an initial set of dealings for receivers on a different subnet.
+    /// Creates an initial set of dealings for receivers on a different subnet with exactly
+    /// `params.unverified_dealings_collection_threshold()` dealings, which is the minimum number
+    /// required by the receiving subnet to complete the IDKG protocol successfully.
+    /// The initial dealings contain at most one dealing from every dealer.
     ///
     /// A `InitialIDkgDealings` can only be created if the following invariants hold:
-    /// * The `params.operation_type` is `IDkgTranscriptOperation::ReshareOfUnmasked`, otherwise the error `InitialIDkgDealingsValidationError::InvalidTranscriptOperation` is returned.
-    /// * The dealings are from nodes in `params.dealers`, otherwise the error `InitialIDkgDealingsValidationError::DealerNotAllowed` is returned.
-    /// * The dealings are for the transcript `params.transcript_id`, otherwise the error `InitialIDkgDealingsValidationError::MismatchingDealing` is returned.
-    /// * The number of dealings is greater than `params.unverified_dealings_collection_threshold`, otherwise the error `InitialIDkgDealingsValidationError::UnsatisfiedCollectionThreshold` is returned.
+    /// * The `params.operation_type` is `IDkgTranscriptOperation::ReshareOfUnmasked`, otherwise
+    ///   the error variant `InvalidTranscriptOperation` is returned.
+    /// * The dealings are from nodes in `params.dealers`, otherwise the error variant
+    ///  `DealerNotAllowed` is returned.
+    /// * The dealings are for the transcript `params.transcript_id`, otherwise the error variant
+    ///   `MismatchingDealing` is returned.
+    /// * Only one dealing is provided from each dealer, otherwise the error variant
+    ///   `MultipleDealingsFromSameDealer` is returned.
+    /// * There are at least `params.unverified_dealings_collection_threshold()` dealings from
+    ///   distinct dealers, otherwise the error variant `UnsatisfiedCollectionThreshold` is returned.
     pub fn new(
         params: IDkgTranscriptParams,
-        dealings: BTreeMap<NodeId, IDkgDealing>,
+        dealings: Vec<SignedIDkgDealing>,
     ) -> Result<Self, InitialIDkgDealingsValidationError> {
         match params.unverified_dealings_collection_threshold() {
             Some(threshold) => {
-                if dealings.len() < threshold.get() as usize {
+                let mut dealings_map = BTreeMap::new();
+                for dealing in &dealings {
+                    if params.dealer_index(dealing.dealer_id()).is_none() {
+                        return Err(InitialIDkgDealingsValidationError::DealerNotAllowed {
+                            node_id: dealing.dealer_id(),
+                        });
+                    }
+                    if dealing.idkg_dealing().transcript_id != params.transcript_id {
+                        return Err(InitialIDkgDealingsValidationError::MismatchingDealing);
+                    }
+                    if dealings_map.insert(dealing.dealer_id(), dealing).is_some() {
+                        return Err(
+                            InitialIDkgDealingsValidationError::MultipleDealingsFromSameDealer {
+                                node_id: dealing.dealer_id(),
+                            },
+                        );
+                    }
+                }
+                let min_dealings: Vec<SignedIDkgDealing> = dealings_map
+                    .into_values()
+                    .take(threshold.get() as usize)
+                    .cloned()
+                    .collect();
+
+                if min_dealings.len() < threshold.get() as usize {
                     return Err(
                         InitialIDkgDealingsValidationError::UnsatisfiedCollectionThreshold {
                             threshold: threshold.get(),
-                            dealings_count: dealings.len() as u32,
+                            dealings_count: min_dealings.len() as u32,
                         },
                     );
                 }
-                for (&dealer, dealing) in &dealings {
-                    if params.dealer_index(dealer).is_none() {
-                        return Err(InitialIDkgDealingsValidationError::DealerNotAllowed {
-                            node_id: dealer,
-                        });
-                    }
-                    if dealing.transcript_id != params.transcript_id {
-                        return Err(InitialIDkgDealingsValidationError::MismatchingDealing);
-                    }
-                }
 
-                Ok(Self { params, dealings })
+                Ok(Self {
+                    params,
+                    dealings: min_dealings,
+                })
             }
             None => Err(InitialIDkgDealingsValidationError::InvalidTranscriptOperation),
         }
     }
 
-    pub fn params(&self) -> IDkgTranscriptParams {
-        self.params.clone()
+    pub fn params(&self) -> &IDkgTranscriptParams {
+        &self.params
     }
-    pub fn dealings(&self) -> BTreeMap<NodeId, IDkgDealing> {
-        self.dealings.clone()
+    pub fn dealings(&self) -> &Vec<SignedIDkgDealing> {
+        &self.dealings
+    }
+}
+
+impl<'de> Deserialize<'de> for InitialIDkgDealings {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        struct InitialIDkgDealingsUnchecked {
+            params: IDkgTranscriptParams,
+            dealings: Vec<SignedIDkgDealing>,
+        }
+        let unchecked = InitialIDkgDealingsUnchecked::deserialize(deserializer)?;
+
+        InitialIDkgDealings::new(unchecked.params, unchecked.dealings).map_err(|validation_error| {
+            D::Error::custom(format!("invariants violated: {validation_error}"))
+        })
     }
 }
 
@@ -570,32 +653,98 @@ pub enum IDkgUnmaskedTranscriptOrigin {
 /// Type and origin of an IDkg transcript.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, Hash)]
 pub enum IDkgTranscriptType {
+    /// Masked transcripts contain dealings based on Pedersen verifiable secret sharing which
+    /// perfectly hides the value shared in the dealing. This means that the commitment to the
+    /// coefficients of the polynomial looks like the sequence `g^(a_0)h^(r_0), g^(a_1)h^(r_1), ...
+    /// g^(a_n)h^(r_n)`, where the `r_i` are random elements and `g` and `h` are two diffenrent
+    /// group's generators.
     Masked(IDkgMaskedTranscriptOrigin),
+
+    /// Unmasked transcripts contain dealings based on Feldmann verifiable secret sharing which
+    /// leak `g^(a_0)` (`a_0` being the shared value) and are therefore not hiding. The commitment to
+    /// the coefficients of the polynomial looks like the sequence `g^(a_0),g^(a_1),...,g^(a_n)`,
+    /// where the `a_i` correspond to the polynomial's coefficients and `g` to a group's generator.
     Unmasked(IDkgUnmaskedTranscriptOrigin),
 }
 
-/// Collection of verified IDkg dealings, together with metadata.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, Hash)]
+/// An IDKG transcript contains a collection of verified IDKG dealings together with some metadata.
+///
+/// Depending on the type of commitment to the polynomial used for the IDKG dealings, the
+/// transcript is considered:
+/// * [`Masked`][`IDkgTranscriptType::Masked`] if the commitment perfectly hides the shared value.
+/// * [`Unmasked`][`IDkgTranscriptType::Unmasked`] if the commitment is not perfectly hiding and
+/// may reveal some informaiton about the shared value.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize, Hash)]
 pub struct IDkgTranscript {
     pub transcript_id: IDkgTranscriptId,
     pub receivers: IDkgReceivers,
     pub registry_version: RegistryVersion,
-    pub verified_dealings: BTreeMap<NodeIndex, IDkgMultiSignedDealing>,
+    pub verified_dealings: BTreeMap<NodeIndex, BatchSignedIDkgDealing>,
     pub transcript_type: IDkgTranscriptType,
     pub algorithm_id: AlgorithmId,
+    #[serde(with = "serde_bytes")]
     pub internal_transcript_raw: Vec<u8>,
 }
 
-/// Identifier for the way an IDkg transcript is created.
+/// Identifier for the way an IDKG transcript is created.
 ///
 /// If earlier transcripts are used in the creation, these are included here.
 #[allow(clippy::large_enum_variant)]
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, Hash)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize, Hash)]
 pub enum IDkgTranscriptOperation {
+    /// Generates a new public/private key pair shared among the replicas.
+    ///
+    /// The resulting transcript is `masked` and so the public key is also not revealed to the
+    /// parties.
     Random,
+
+    /// Starts from a `masked` transcript and returns an `unmasked` transcript.
+    ///
+    /// Useful to reveal `g^a_0` (where `a_0` is the shared secret and g is a group's generator) to
+    /// all parties.
     ReshareOfMasked(IDkgTranscript),
+
+    /// Starts from an `unmasked` transcript and returns an `unmasked` transcript.
+    ///
+    /// Useful to reshare the public key if there was for example a change in the subnet's
+    /// topology.
     ReshareOfUnmasked(IDkgTranscript),
+
+    /// Starts from a pair of transcripts (the first being `unmasked` while the second is `masked`)
+    /// to produce a `masked` transcript.
+    ///
+    /// Useful to compute the product transcripts in
+    /// [`PreSignatureQuadruple`][`crate::crypto::canister_threshold_sig::PreSignatureQuadruple`]:
+    /// * Given a unmasked transcript for sharing a random value `kappa` and a masked transcript
+    /// for sharing a random value `lambda`, compute the masked transcript for sharing the value
+    /// `kappa * lambda`.
+    /// * Given a unmasked transcript for sharing a random value `alpha` and a masked transcript
+    /// for sharing the aforementioned random value `lambda`, compute the masked transcript for
+    /// sharing the value `alpha * lambda`.
     UnmaskedTimesMasked(IDkgTranscript, IDkgTranscript),
+}
+
+impl Debug for IDkgTranscriptOperation {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Random => write!(f, "IDkgTranscriptOperation::Random"),
+            Self::ReshareOfMasked(transcript) => write!(
+                f,
+                "IDkgTranscriptOperation::ReshareOfMasked({:?})",
+                transcript.transcript_id
+            ),
+            Self::ReshareOfUnmasked(transcript) => write!(
+                f,
+                "IDkgTranscriptOperation::ReshareOfUnmasked({:?})",
+                transcript.transcript_id
+            ),
+            Self::UnmaskedTimesMasked(unmasked_transcript, masked_transcript) => write!(
+                f,
+                "UnmaskedTimesMasked::ReshareOfMasked({}, {:?})",
+                unmasked_transcript.transcript_id, masked_transcript.transcript_id
+            ),
+        }
+    }
 }
 
 impl IDkgTranscript {
@@ -627,16 +776,14 @@ impl IDkgTranscript {
     pub fn dealer_id_for_index(&self, index: NodeIndex) -> Option<NodeId> {
         self.verified_dealings
             .get(&index)
-            .map(|signed_dealing| signed_dealing.dealing.idkg_dealing.dealer_id)
+            .map(|verified_dealing| verified_dealing.dealer_id())
     }
 
     /// Returns the index of the dealer with the given ID, or `None` if there is no such index.
     pub fn index_for_dealer_id(&self, dealer_id: NodeId) -> Option<NodeIndex> {
         self.verified_dealings
             .iter()
-            .find(|(_index, signed_dealing)| {
-                signed_dealing.dealing.idkg_dealing.dealer_id == dealer_id
-            })
+            .find(|(_index, verified_dealing)| verified_dealing.dealer_id() == dealer_id)
             .map(|(index, _signed_dealing)| *index)
     }
 
@@ -646,7 +793,6 @@ impl IDkgTranscript {
     /// transcript and the `params`:
     /// * the transcript IDs match
     /// * the receivers match
-    /// * the dealers match
     /// * the registry versions match
     /// * the algorithm IDs match
     /// * the transcript's type matches the transcript type derived from
@@ -676,10 +822,6 @@ impl IDkgTranscript {
                 params.receivers(),
             ));
         }
-        //////////////////////////////////////////////////////////////
-        // TODO (CRP-1382): Check equality of dealers in params and transcript
-        // once the transcript has a dealers field. Also add a respective test.
-        //////////////////////////////////////////////////////////////
         if self.registry_version != params.registry_version() {
             return Err(format!(
                 "mismatching registry versions in transcript ({:?}) and params ({:?})",
@@ -723,7 +865,7 @@ impl IDkgTranscript {
         let dealer_index_to_dealer_id: BTreeMap<NodeIndex, NodeId> = self
             .verified_dealings
             .iter()
-            .map(|(dealer_index, dealing)| (*dealer_index, dealing.dealing.idkg_dealing.dealer_id))
+            .map(|(dealer_index, verified_dealing)| (*dealer_index, verified_dealing.dealer_id()))
             .collect();
         for (dealer_index, dealer_id) in dealer_index_to_dealer_id {
             let dealer_index_in_params = params.dealer_index(dealer_id).ok_or_else(|| {
@@ -740,8 +882,8 @@ impl IDkgTranscript {
             }
         }
         for (dealer_index, signed_dealing) in &self.verified_dealings {
-            let ineligible_signers: BTreeSet<NodeId> = signed_dealing
-                .signers
+            let signers: BTreeSet<NodeId> = signed_dealing.signers();
+            let ineligible_signers: BTreeSet<NodeId> = signers
                 .difference(params.receivers.get())
                 .copied()
                 .collect();
@@ -761,36 +903,185 @@ impl IDkgTranscript {
     }
 }
 
+impl Debug for IDkgTranscript {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        write!(f, "IDkgTranscript {{ ")?;
+        write!(f, "transcript_id: {:?}", self.transcript_id)?;
+        write!(f, ", receivers: {:?}", self.receivers)?;
+        write!(f, ", registry_version: {:?}", self.registry_version)?;
+        write!(
+            f,
+            ", verified_dealings: {:?}",
+            self.verified_dealings.keys()
+        )?;
+        write!(f, ", transcript_type: {:?}", self.transcript_type)?;
+        write!(f, ", algorithm_id: {:?}", self.algorithm_id)?;
+        write!(
+            f,
+            ", internal_transcript_raw: 0x{}",
+            hex::encode(&self.internal_transcript_raw)
+        )?;
+        write!(f, " }}")?;
+        Ok(())
+    }
+}
+
+impl_display_using_debug!(IDkgTranscript);
+
 /// Dealing of an IDkg sharing.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, Hash)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize, Hash)]
 pub struct IDkgDealing {
     pub transcript_id: IDkgTranscriptId,
-    pub dealer_id: NodeId,
+    #[serde(with = "serde_bytes")]
     pub internal_dealing_raw: Vec<u8>,
 }
 
-/// Dealing of an IDkg sharing, along with a combined multisignature.
+impl Debug for IDkgDealing {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        write!(f, "IDkgDealing {{ transcript_id: {}", self.transcript_id)?;
+        write!(
+            f,
+            ", internal_dealing_raw: 0x{}",
+            hex::encode(&self.internal_dealing_raw)
+        )?;
+        write!(f, " }}")?;
+        Ok(())
+    }
+}
+
+impl Display for IDkgDealing {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        write!(f, "Dealing[transcript_id = {:?}]", self.transcript_id,)
+    }
+}
+
+impl SignedBytesWithoutDomainSeparator for IDkgDealing {
+    fn as_signed_bytes_without_domain_separator(&self) -> Vec<u8> {
+        serde_cbor::to_vec(&self).unwrap()
+    }
+}
+
+/// The signed dealing sent by dealers
+///
+/// The iDKG protocol requires `IDkgDealing` to be signed with non-malleable
+/// signatures, that is, the signature-part in the `Signed` struct must use
+/// a type produced by a non-malleable signature scheme. For `BasicSignature`
+/// this is the case, because it is produced by `BasicSigner`, which
+/// guarantees non-malleability.
+pub type SignedIDkgDealing = Signed<IDkgDealing, BasicSignature<IDkgDealing>>;
+
+impl SignedIDkgDealing {
+    pub fn idkg_dealing(&self) -> &IDkgDealing {
+        &self.content
+    }
+
+    pub fn dealer_id(&self) -> NodeId {
+        self.signature.signer
+    }
+}
+
+impl Display for SignedIDkgDealing {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "{}, dealer_id = {:?}",
+            self.content, self.signature.signer,
+        )
+    }
+}
+
+impl SignedBytesWithoutDomainSeparator for SignedIDkgDealing {
+    fn as_signed_bytes_without_domain_separator(&self) -> Vec<u8> {
+        serde_cbor::to_vec(&self).unwrap()
+    }
+}
+
+/// The individual signature share in support of a dealing
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, Hash)]
-pub struct IDkgMultiSignedDealing {
-    pub signature: CombinedMultiSigOf<EcdsaDealing>,
-    pub signers: BTreeSet<NodeId>,
-    pub dealing: EcdsaDealing,
+pub struct IDkgDealingSupport {
+    pub transcript_id: IDkgTranscriptId,
+    pub dealer_id: NodeId,
+    pub dealing_hash: CryptoHashOf<SignedIDkgDealing>,
+    pub sig_share: BasicSignature<SignedIDkgDealing>,
+}
+
+impl Display for IDkgDealingSupport {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "transcript_id = {:?}, dealer_id = {:?}, signer_id = {:?}, dealing_hash = {:?}",
+            self.transcript_id, self.dealer_id, self.sig_share.signer, self.dealing_hash
+        )
+    }
+}
+
+/// IDKG Dealing signed from the dealer, along with a batch of basic signatures in support from the receivers.
+pub type BatchSignedIDkgDealing = Signed<SignedIDkgDealing, BasicSignatureBatch<SignedIDkgDealing>>;
+
+impl BatchSignedIDkgDealing {
+    pub fn idkg_dealing(&self) -> &IDkgDealing {
+        &self.content.content
+    }
+
+    pub fn dealer_id(&self) -> NodeId {
+        self.content.signature.signer
+    }
+
+    pub fn signed_idkg_dealing(&self) -> &SignedIDkgDealing {
+        &self.content
+    }
+
+    pub fn signers(&self) -> BTreeSet<NodeId> {
+        self.signature.signatures_map.keys().copied().collect()
+    }
+
+    pub fn signers_count(&self) -> usize {
+        self.signature.signatures_map.len()
+    }
 }
 
 /// Complaint against an individual IDkg dealing in a transcript.
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, Hash)]
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, Hash)]
 pub struct IDkgComplaint {
     pub transcript_id: IDkgTranscriptId,
     pub dealer_id: NodeId,
+    #[serde(with = "serde_bytes")]
     pub internal_complaint_raw: Vec<u8>,
 }
 
+impl_display_using_debug!(IDkgComplaint);
+
+impl Debug for IDkgComplaint {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        write!(f, "IDkgComplaint {{ transcript_id: {}", self.transcript_id)?;
+        write!(f, ", dealer_id: {}", self.dealer_id)?;
+        // Not including internal_complaint_raw in the output, since it may potentially leak some
+        // information that we do not want included in logs that may stay around for a long time.
+        write!(f, "}}")?;
+        Ok(())
+    }
+}
+
 /// Opening created in response to an IDkgComplaint.
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, Hash)]
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, Hash)]
 pub struct IDkgOpening {
     pub transcript_id: IDkgTranscriptId,
     pub dealer_id: NodeId,
+    #[serde(with = "serde_bytes")]
     pub internal_opening_raw: Vec<u8>,
+}
+
+impl_display_using_debug!(IDkgOpening);
+
+impl Debug for IDkgOpening {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        write!(f, "IDkgOpening {{ transcript_id: {}", self.transcript_id)?;
+        write!(f, ", dealer_id: {}", self.dealer_id)?;
+        // Not including internal_opening_raw in the output, since it may potentially leak some
+        // information that we do not want included in logs that may stay around for a long time.
+        write!(f, "}}")?;
+        Ok(())
+    }
 }
 
 fn number_of_nodes_from_usize(number: usize) -> Result<NumberOfNodes, ()> {
@@ -800,23 +1091,30 @@ fn number_of_nodes_from_usize(number: usize) -> Result<NumberOfNodes, ()> {
 
 /// Contextual data needed for the creation of a dealing.
 ///
-/// Returns a byte vector consisting of:
+/// Returns a byte vector consisting of the concatenation of the following:
+/// The transcript ID, serialized as the concatenation of the following byte vectors:
 /// - IDkgTranscriptId::SubnetId, as a byte-string (prefixed with its
 ///   64-bit-big-endian-integer length)
 /// - IDkgTranscriptId::id, as a big-endian 64-bit integer
-/// - RegistryVersion, as a big-endian 64-bit integer
-/// - AlgorithmId, as an 8-bit integer value
+/// - IDkgTranscriptId::source_subnet, as a big-endian 64-bit integer
+/// The registry version, as a big-endian 64-bit integer
+/// The Algorithm ID, as an 8-bit integer value
 fn context_data(
     transcript_id: &IDkgTranscriptId,
     registry_version: RegistryVersion,
     algorithm_id: AlgorithmId,
 ) -> Vec<u8> {
-    let mut ret = Vec::with_capacity(8 + transcript_id.subnet().get().as_slice().len() + 8 + 8 + 1);
+    let mut ret = Vec::with_capacity(
+        8 + transcript_id.source_subnet().get().as_slice().len() + 8 + 8 + 8 + 1,
+    );
 
-    ret.extend_from_slice(&(transcript_id.subnet().get().as_slice().len() as u64).to_be_bytes());
-    ret.extend_from_slice(transcript_id.subnet().get().as_slice());
-    ret.extend_from_slice(&(transcript_id.id() as u64).to_be_bytes());
-    ret.extend_from_slice(&(registry_version.get() as u64).to_be_bytes());
+    ret.extend_from_slice(
+        &(transcript_id.source_subnet().get().as_slice().len() as u64).to_be_bytes(),
+    );
+    ret.extend_from_slice(transcript_id.source_subnet().get().as_slice());
+    ret.extend_from_slice(&transcript_id.id().to_be_bytes());
+    ret.extend_from_slice(&(transcript_id.source_height().get()).to_be_bytes());
+    ret.extend_from_slice(&registry_version.get().to_be_bytes());
     ret.push(algorithm_id as u8);
 
     ret

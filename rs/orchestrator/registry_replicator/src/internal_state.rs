@@ -1,5 +1,5 @@
-use ic_interfaces::registry::{RegistryClient, ZERO_REGISTRY_VERSION};
-use ic_logger::{warn, ReplicaLogger};
+use ic_interfaces_registry::{RegistryClient, ZERO_REGISTRY_VERSION};
+use ic_logger::{info, warn, ReplicaLogger};
 use ic_protobuf::{
     registry::{
         node::v1::ConnectionEndpoint,
@@ -13,14 +13,14 @@ use ic_registry_client_helpers::{
     routing_table::RoutingTableRegistry,
     subnet::{SubnetRegistry, SubnetTransportRegistry},
 };
-use ic_registry_common::local_store::{Changelog, ChangelogEntry, KeyMutation, LocalStore};
-use ic_registry_common::registry::RegistryCanister;
 use ic_registry_keys::{
     make_routing_table_record_key, make_subnet_list_record_key, make_subnet_record_key,
     ROOT_SUBNET_ID_KEY,
 };
+use ic_registry_local_store::{Changelog, ChangelogEntry, KeyMutation, LocalStore};
+use ic_registry_nns_data_provider::registry::RegistryCanister;
 use ic_registry_routing_table::{CanisterIdRange, RoutingTable};
-use ic_types::crypto::threshold_sig::ThresholdSigPublicKey;
+use ic_types::{crypto::threshold_sig::ThresholdSigPublicKey, Time};
 use ic_types::{NodeId, RegistryVersion, SubnetId};
 use std::collections::BTreeMap;
 use std::convert::TryFrom;
@@ -30,6 +30,8 @@ use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
 use url::Url;
+
+const MAX_CONSECUTIVE_FAILURES: i64 = 3;
 
 /// The `InternalState` encompasses a locally persisted registry changelog which
 /// is kept up to date by repeated calls to [`Self::poll()`]. If this node is
@@ -49,10 +51,13 @@ pub(crate) struct InternalState {
     registry_client: Arc<dyn RegistryClient>,
     local_store: Arc<dyn LocalStore>,
     latest_version: RegistryVersion,
+    last_certified_time: Time,
     nns_pub_key: Option<ThresholdSigPublicKey>,
     nns_urls: Vec<Url>,
     registry_canister: Option<Arc<RegistryCanister>>,
+    registry_canister_fallback: Option<Arc<RegistryCanister>>,
     poll_delay: Duration,
+    failed_poll_count: i64,
 }
 
 impl InternalState {
@@ -61,18 +66,31 @@ impl InternalState {
         node_id: Option<NodeId>,
         registry_client: Arc<dyn RegistryClient>,
         local_store: Arc<dyn LocalStore>,
+        config_urls: Vec<Url>,
         poll_delay: Duration,
     ) -> Self {
+        let last_certified_time = local_store.read_certified_time();
+        let registry_canister_fallback = if !config_urls.is_empty() {
+            Some(Arc::new(RegistryCanister::new_with_query_timeout(
+                config_urls,
+                poll_delay,
+            )))
+        } else {
+            None
+        };
         Self {
             logger,
             node_id,
             registry_client,
             local_store,
             latest_version: ZERO_REGISTRY_VERSION,
+            last_certified_time,
             nns_pub_key: None,
             nns_urls: vec![],
             registry_canister: None,
+            registry_canister_fallback,
             poll_delay,
+            failed_poll_count: 0,
         }
     }
 
@@ -80,7 +98,7 @@ impl InternalState {
     /// [`RegistryCanister`], applies changes to [`LocalStore`] accordingly.
     /// Exits the process if this node appears on a subnet that is started as
     /// the new NNS after a version update.
-    pub(crate) fn poll(&mut self) -> Result<(), String> {
+    pub(crate) async fn poll(&mut self) -> Result<(), String> {
         // Note, this may not actually be the latest version, rather it is the latest
         // version that is locally available
         let latest_version = self.registry_client.get_latest_version();
@@ -99,22 +117,37 @@ impl InternalState {
             }
         }
 
+        let registry_canister = if self.failed_poll_count >= MAX_CONSECUTIVE_FAILURES
+            && self.registry_canister_fallback.is_some()
+        {
+            info!(
+                self.logger,
+                "Polling NNS failed {} times consecutively, trying config urls once...",
+                self.failed_poll_count
+            );
+            self.failed_poll_count = -1;
+            self.registry_canister_fallback.as_ref()
+        } else {
+            self.registry_canister.as_ref()
+        };
+
         // Poll registry canister and apply changes to local changelog
-        if let Some(registry_canister_ref) = self.registry_canister.as_ref() {
+        if let Some(registry_canister_ref) = registry_canister {
             let registry_canister = Arc::clone(registry_canister_ref);
             let nns_pub_key = self
                 .nns_pub_key
                 .expect("registry canister is set => pub key is set");
             // Note, code duplicate in registry_replicator.rs initialize_local_store()
-            let (mut resp, t) = match tokio::task::block_in_place(|| {
-                tokio::runtime::Handle::current().block_on(
-                    // get certified changes since the latest version we have locally
-                    registry_canister
-                        .get_certified_changes_since(latest_version.get(), &nns_pub_key),
-                )
-            }) {
-                Ok((records, _, t)) => (records, t),
+            let (mut resp, t) = match registry_canister
+                .get_certified_changes_since(latest_version.get(), &nns_pub_key)
+                .await
+            {
+                Ok((records, _, t)) => {
+                    self.failed_poll_count = 0;
+                    (records, t)
+                }
                 Err(e) => {
+                    self.failed_poll_count += 1;
                     return Err(format!(
                         "Error when trying to fetch updates from NNS: {:?}",
                         e
@@ -135,6 +168,8 @@ impl InternalState {
                 cl
             });
 
+            let entries = changelog.len();
+
             changelog
                 .into_iter()
                 .enumerate()
@@ -144,9 +179,20 @@ impl InternalState {
                 })
                 .expect("Writing to the FS failed: Stop.");
 
-            self.local_store
-                .update_certified_time(t.as_nanos_since_unix_epoch())
-                .expect("Could not store certified time");
+            if t > self.last_certified_time {
+                self.local_store
+                    .update_certified_time(t.as_nanos_since_unix_epoch())
+                    .expect("Could not store certified time");
+                self.last_certified_time = t;
+            }
+
+            if entries > 0 {
+                info!(
+                    self.logger,
+                    "Stored registry versions up to: {}",
+                    latest_version + RegistryVersion::from(entries as u64)
+                );
+            }
         }
 
         Ok(())

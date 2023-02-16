@@ -1,9 +1,0 @@
-[package]
-name = "ic-consensus-message"
-version = "0.8.0"
-edition = "2018"
-
-[dependencies]
-ic-crypto-hash = { path = "../../crypto/hash" }
-ic-interfaces = { path = "../../interfaces" }
-ic-types = { path = "../../types/types" }

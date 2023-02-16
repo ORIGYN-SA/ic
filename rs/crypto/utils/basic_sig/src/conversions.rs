@@ -144,11 +144,12 @@ impl Ed25519SecretKeyConversions for internal_types::SecretKey {
         let key_data = der_utils::oid_and_key_pair_bytes_from_der(sk_der)
             .map_err(|e| Ed25519DerParseError::OidExtractionError(e.internal_error))?;
         if ed25519_oid() != key_data.oid {
-            return Err(Ed25519DerParseError::OidValueError(key_data.oid));
+            return Err(Ed25519DerParseError::OidValueError(key_data.oid.clone()));
         }
 
         let pk_bytes = key_data
             .pk_bytes
+            .clone()
             .ok_or_else(Ed25519DerParseError::MissingPublicKey)?;
 
         let sk = internal_types::SecretKey::try_from(&*key_data.sk_bytes)
@@ -194,24 +195,25 @@ pub enum InvalidDalekKey {
 ///
 /// # Returns
 /// * The key in PKCS8 v2 format, using binary DER encoding
-pub fn pkcs8_of_dalek_keypair(
-    key_pair: &ed25519_dalek::Keypair,
+pub fn pkcs8_of_ed25519_consensus_key(
+    signing_key: &ed25519_consensus::SigningKey,
 ) -> Result<Vec<u8>, InvalidDalekKey> {
-    let private_key = internal_types::SecretKey::try_from(key_pair.secret.as_bytes().as_ref())
+    let private_key = internal_types::SecretKey::try_from(signing_key.as_bytes().as_ref())
         .map_err(|_| InvalidDalekKey::InvalidSecretKey)?;
-    let public_key = internal_types::PublicKey::try_from(key_pair.public.as_bytes().as_ref())
-        .map_err(|_| InvalidDalekKey::InvalidPublicKey)?;
+    let public_key =
+        internal_types::PublicKey::try_from(signing_key.verification_key().as_bytes().as_ref())
+            .map_err(|_| InvalidDalekKey::InvalidPublicKey)?;
     Ok(private_key.to_der(&public_key))
 }
 
 #[test]
-fn should_be_able_to_generate_pkcs8_of_ed25519_keypair() {
-    let bytes = vec![0x23; 64];
-    let keypair = ed25519_dalek::Keypair::from_bytes(&bytes).expect("Decoding Ed25519 key failed");
-    let pkcs8 = pkcs8_of_dalek_keypair(&keypair).expect("PKCS8 encoding failed");
+fn should_be_able_to_generate_pkcs8_of_ed25519_consensus_key() {
+    let bytes = [0x23; 32];
+    let signing_key = ed25519_consensus::SigningKey::from(bytes);
+    let pkcs8 = pkcs8_of_ed25519_consensus_key(&signing_key).expect("PKCS8 encoding failed");
 
     assert_eq!(hex::encode(pkcs8),
-               "3053020101300506032b6570042204202323232323232323232323232323232323232323232323232323232323232323a1230321002323232323232323232323232323232323232323232323232323232323232323");
+               "3053020101300506032b6570042204202323232323232323232323232323232323232323232323232323232323232323a12303210074f85cda34d1c27c4621484731e91579c3d9c6cfc0d94b281aa11e9162058aa9");
 }
 
 #[derive(Debug, Clone)]

@@ -10,9 +10,7 @@ mod tests;
 use crate::api::{
     CspCreateMEGaKeyError, CspIDkgProtocol, CspThresholdEcdsaSigVerifier, CspThresholdEcdsaSigner,
 };
-use crate::keygen::mega_key_id;
-use crate::secret_key_store::SecretKeyStore;
-use crate::Csp;
+use crate::{Csp, KeyId};
 use ic_crypto_internal_threshold_sig_ecdsa::{
     combine_sig_shares as tecdsa_combine_sig_shares, create_transcript as tecdsa_create_transcript,
     publicly_verify_dealing as tecdsa_verify_dealing_public,
@@ -30,25 +28,24 @@ use ic_crypto_internal_types::scope::{ConstScope, Scope};
 use ic_logger::debug;
 use ic_types::crypto::canister_threshold_sig::error::{
     IDkgCreateDealingError, IDkgCreateTranscriptError, IDkgLoadTranscriptError,
-    IDkgOpenTranscriptError, IDkgVerifyComplaintError, IDkgVerifyDealingPrivateError,
-    IDkgVerifyDealingPublicError, IDkgVerifyOpeningError, IDkgVerifyTranscriptError,
-    ThresholdEcdsaCombineSigSharesError, ThresholdEcdsaSignShareError,
+    IDkgOpenTranscriptError, IDkgRetainKeysError, IDkgVerifyComplaintError,
+    IDkgVerifyDealingPrivateError, IDkgVerifyDealingPublicError, IDkgVerifyOpeningError,
+    IDkgVerifyTranscriptError, ThresholdEcdsaCombineSigSharesError, ThresholdEcdsaSignShareError,
     ThresholdEcdsaVerifyCombinedSignatureError, ThresholdEcdsaVerifySigShareError,
 };
 use ic_types::crypto::canister_threshold_sig::ExtendedDerivationPath;
 use ic_types::crypto::AlgorithmId;
-use ic_types::{NodeIndex, NumberOfNodes, Randomness};
-use rand::{CryptoRng, Rng};
-use std::collections::BTreeMap;
+use ic_types::{NodeIndex, NumberOfNodes, Randomness, RegistryVersion};
+
+use std::collections::{BTreeMap, BTreeSet};
 
 pub const IDKG_MEGA_SCOPE: Scope = Scope::Const(ConstScope::IDkgMEGaEncryptionKeys);
+pub const IDKG_THRESHOLD_KEYS_SCOPE: Scope = Scope::Const(ConstScope::IDkgThresholdKeys);
 
 /// Interactive distributed key generation client
 ///
 /// Please see the trait definition for full documentation.
-impl<R: Rng + CryptoRng + Send + Sync, S: SecretKeyStore, C: SecretKeyStore> CspIDkgProtocol
-    for Csp<R, S, C>
-{
+impl CspIDkgProtocol for Csp {
     fn idkg_create_dealing(
         &self,
         algorithm_id: AlgorithmId,
@@ -81,7 +78,7 @@ impl<R: Rng + CryptoRng + Send + Sync, S: SecretKeyStore, C: SecretKeyStore> Csp
     ) -> Result<(), IDkgVerifyDealingPrivateError> {
         debug!(self.logger; crypto.method_name => "idkg_verify_dealing_private");
 
-        let receiver_key_id = mega_key_id(receiver_public_key);
+        let receiver_key_id = key_id_from_mega_public_key_or_panic(receiver_public_key);
 
         self.csp_vault.idkg_verify_dealing_private(
             algorithm_id,
@@ -168,7 +165,7 @@ impl<R: Rng + CryptoRng + Send + Sync, S: SecretKeyStore, C: SecretKeyStore> Csp
     ) -> Result<BTreeMap<NodeIndex, IDkgComplaintInternal>, IDkgLoadTranscriptError> {
         debug!(self.logger; crypto.method_name => "idkg_load_transcript");
 
-        let key_id = mega_key_id(public_key);
+        let key_id = key_id_from_mega_public_key_or_panic(public_key);
 
         self.csp_vault.idkg_load_transcript(
             dealings,
@@ -190,7 +187,7 @@ impl<R: Rng + CryptoRng + Send + Sync, S: SecretKeyStore, C: SecretKeyStore> Csp
     ) -> Result<(), IDkgLoadTranscriptError> {
         debug!(self.logger; crypto.method_name => "idkg_load_transcript_with_openings");
 
-        let key_id = mega_key_id(public_key);
+        let key_id = key_id_from_mega_public_key_or_panic(public_key);
 
         self.csp_vault.idkg_load_transcript_with_openings(
             dealings,
@@ -202,13 +199,10 @@ impl<R: Rng + CryptoRng + Send + Sync, S: SecretKeyStore, C: SecretKeyStore> Csp
         )
     }
 
-    fn idkg_create_mega_key_pair(
-        &mut self,
-        algorithm_id: AlgorithmId,
-    ) -> Result<MEGaPublicKey, CspCreateMEGaKeyError> {
-        debug!(self.logger; crypto.method_name => "idkg_create_mega_key_pair");
+    fn idkg_gen_dealing_encryption_key_pair(&self) -> Result<MEGaPublicKey, CspCreateMEGaKeyError> {
+        debug!(self.logger; crypto.method_name => "idkg_gen_dealing_encryption_key_pair");
 
-        self.csp_vault.idkg_gen_mega_key_pair(algorithm_id)
+        self.csp_vault.idkg_gen_dealing_encryption_key_pair()
     }
 
     fn idkg_verify_complaint(
@@ -242,7 +236,8 @@ impl<R: Rng + CryptoRng + Send + Sync, S: SecretKeyStore, C: SecretKeyStore> Csp
     ) -> Result<CommitmentOpening, IDkgOpenTranscriptError> {
         debug!(self.logger; crypto.method_name => "idkg_open_dealing");
 
-        let opener_key_id = mega_key_id(opener_public_key);
+        let opener_key_id = key_id_from_mega_public_key_or_panic(opener_public_key);
+
         self.csp_vault.idkg_open_dealing(
             dealing,
             dealer_index,
@@ -266,14 +261,38 @@ impl<R: Rng + CryptoRng + Send + Sync, S: SecretKeyStore, C: SecretKeyStore> Csp
             }
         })
     }
+
+    fn idkg_retain_active_keys(
+        &self,
+        active_transcripts: &BTreeSet<IDkgTranscriptInternal>,
+        oldest_public_key: MEGaPublicKey,
+    ) -> Result<(), IDkgRetainKeysError> {
+        debug!(self.logger; crypto.method_name => "idkg_retain_active_keys");
+
+        let active_key_ids = active_transcripts
+            .iter()
+            .map(|active_transcript| {
+                KeyId::from(active_transcript.combined_commitment.commitment())
+            })
+            .collect();
+
+        self.csp_vault
+            .idkg_retain_active_keys(active_key_ids, oldest_public_key)
+    }
+
+    fn idkg_observe_minimum_registry_version_in_active_idkg_transcripts(
+        &self,
+        registry_version: RegistryVersion,
+    ) {
+        self.metrics
+            .observe_minimum_registry_version_in_active_idkg_transcripts(registry_version.get());
+    }
 }
 
 /// Threshold-ECDSA signature share generation client.
 ///
 /// Please see the trait definition for full documentation.
-impl<R: Rng + CryptoRng + Send + Sync, S: SecretKeyStore, C: SecretKeyStore> CspThresholdEcdsaSigner
-    for Csp<R, S, C>
-{
+impl CspThresholdEcdsaSigner for Csp {
     fn ecdsa_sign_share(
         &self,
         derivation_path: &ExtendedDerivationPath,
@@ -305,9 +324,7 @@ impl<R: Rng + CryptoRng + Send + Sync, S: SecretKeyStore, C: SecretKeyStore> Csp
 /// Threshold-ECDSA signature verification client.
 ///
 /// Please see the trait definition for full documentation.
-impl<R: Rng + CryptoRng + Send + Sync, S: SecretKeyStore, C: SecretKeyStore>
-    CspThresholdEcdsaSigVerifier for Csp<R, S, C>
-{
+impl CspThresholdEcdsaSigVerifier for Csp {
     fn ecdsa_combine_sig_shares(
         &self,
         derivation_path: &ExtendedDerivationPath,
@@ -423,4 +440,8 @@ impl<R: Rng + CryptoRng + Send + Sync, S: SecretKeyStore, C: SecretKeyStore>
             }
         })
     }
+}
+
+fn key_id_from_mega_public_key_or_panic(public_key: &MEGaPublicKey) -> KeyId {
+    KeyId::try_from(public_key).unwrap_or_else(|err| panic!("{}", err))
 }

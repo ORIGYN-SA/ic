@@ -149,11 +149,11 @@ impl UtilityCommand {
                 // Once we finish migration to the Ubuntu-based IC-OS and the Vsock-based HSM
                 // sharing, we'll want to know whether and why the command failed.
                 if StdCommand::new(VSOCK_AGENT_PATH)
-                    .arg("--attach-hsm".to_string())
+                    .arg("--attach-hsm")
                     .status()
                     .is_ok()
                 {
-                    std::thread::sleep(std::time::Duration::from_millis(300));
+                    std::thread::sleep(std::time::Duration::from_secs(5));
                 }
             }
         }
@@ -169,7 +169,26 @@ impl UtilityCommand {
                 // Once we finish migration to the Ubuntu-based IC-OS and the Vsock-based HSM
                 // sharing, we'll want to know if this command failed.
                 let _ = StdCommand::new(VSOCK_AGENT_PATH)
-                    .arg("--detach-hsm".to_string())
+                    .arg("--detach-hsm")
+                    .status();
+            }
+        }
+    }
+
+    /// Ask the host to notify to the console, if the VSOCK_AGENT_PATH binary
+    /// exists. Ignore any errors in the execution.
+    pub fn notify_host(message: &str, count: u8) {
+        if let Ok(metadata) = std::fs::metadata(VSOCK_AGENT_PATH) {
+            let permissions = metadata.permissions();
+            if permissions.mode() & 0o111 != 0 {
+                // Executable exists. We will run it, without checking the result.
+                // Once we finish migration to the Ubuntu-based IC-OS and the Vsock-based HSM
+                // sharing, we'll want to know if this command failed.
+                let _ = StdCommand::new(VSOCK_AGENT_PATH)
+                    .arg("--notify")
+                    .arg(message)
+                    .arg("--count")
+                    .arg(&count.to_string())
                     .status();
             }
         }

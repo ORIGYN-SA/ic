@@ -1,7 +1,10 @@
 use ic_base_types::NumSeconds;
 use ic_config::subnet_config::SubnetConfigs;
-use ic_cycles_account_manager::{IngressInductionCost, IngressInductionCostError};
+use ic_constants::SMALL_APP_SUBNET_MAX_SIZE;
+use ic_cycles_account_manager::IngressInductionCost;
+use ic_ic00_types::{CanisterIdRecord, Payload, IC_00};
 use ic_interfaces::execution_environment::CanisterOutOfCyclesError;
+use ic_logger::replica_logger::no_op_logger;
 use ic_registry_subnet_type::SubnetType;
 use ic_replicated_state::SystemState;
 use ic_test_utilities::{
@@ -11,14 +14,14 @@ use ic_test_utilities::{
         ids::{canister_test_id, subnet_test_id, user_test_id},
         messages::SignedIngressBuilder,
     },
-    with_test_replica_logger,
 };
+use ic_test_utilities_logger::with_test_replica_logger;
 use ic_types::{
-    ic00::{CanisterIdRecord, Payload, IC_00},
-    messages::SignedIngressContent,
+    messages::{extract_effective_canister_id, SignedIngressContent},
     nominal_cycles::NominalCycles,
     CanisterId, ComputeAllocation, Cycles, MemoryAllocation, NumBytes, NumInstructions,
 };
+use prometheus::IntCounter;
 use std::{convert::TryFrom, time::Duration};
 
 const INITIAL_CYCLES: Cycles = Cycles::new(5_000_000_000_000);
@@ -36,6 +39,7 @@ fn test_can_charge_application_subnets() {
                 MemoryAllocation::try_from(NumBytes::from(1 << 20)).unwrap(),
             ] {
                 for freeze_threshold in &[NumSeconds::from(1000), NumSeconds::from(0)] {
+                    let subnet_size = SMALL_APP_SUBNET_MAX_SIZE;
                     let cycles_account_manager = CyclesAccountManagerBuilder::new()
                         .with_subnet_type(*subnet_type)
                         .build();
@@ -43,7 +47,7 @@ fn test_can_charge_application_subnets() {
                     let mut canister = new_canister_state(
                         canister_test_id(1),
                         canister_test_id(2).get(),
-                        Cycles::from(0),
+                        Cycles::zero(),
                         *freeze_threshold,
                     );
                     canister.system_state.memory_allocation = *memory_allocation;
@@ -54,16 +58,20 @@ fn test_can_charge_application_subnets() {
                         MemoryAllocation::BestEffort => canister.memory_usage(*subnet_type),
                         MemoryAllocation::Reserved(bytes) => *bytes,
                     };
-                    let expected_fee = cycles_account_manager
-                        .compute_allocation_cost(compute_allocation, duration)
-                        + cycles_account_manager.memory_cost(memory, duration);
-                    let initial_cycles = expected_fee + Cycles::from(100);
+                    let expected_fee =
+                        cycles_account_manager.compute_allocation_cost(
+                            compute_allocation,
+                            duration,
+                            subnet_size,
+                        ) + cycles_account_manager.memory_cost(memory, duration, subnet_size);
+                    let initial_cycles = expected_fee + Cycles::new(100);
                     *canister.system_state.balance_mut() += initial_cycles;
                     cycles_account_manager
                         .charge_canister_for_resource_allocation_and_usage(
                             &log,
                             &mut canister,
                             duration,
+                            subnet_size,
                         )
                         .unwrap();
                 }
@@ -74,9 +82,9 @@ fn test_can_charge_application_subnets() {
 
 #[test]
 fn withdraw_cycles_with_not_enough_balance_returns_error() {
-    let initial_cycles = Cycles::from(100_000);
+    let initial_cycles = Cycles::new(100_000);
     let memory_usage = NumBytes::from(4 << 30);
-    let amount = Cycles::from(200);
+    let amount = Cycles::new(200);
     {
         let cycles_account_manager = CyclesAccountManagerBuilder::new().build();
         let mut system_state = SystemState::new_running(
@@ -94,6 +102,7 @@ fn withdraw_cycles_with_not_enough_balance_returns_error() {
                 ComputeAllocation::default(),
                 system_state.balance_mut(),
                 amount,
+                SMALL_APP_SUBNET_MAX_SIZE
             ),
             Ok(())
         );
@@ -102,6 +111,7 @@ fn withdraw_cycles_with_not_enough_balance_returns_error() {
             system_state.memory_allocation,
             NumBytes::from(0),
             ComputeAllocation::default(),
+            SMALL_APP_SUBNET_MAX_SIZE,
         );
         assert_eq!(system_state.balance(), initial_cycles - threshold - amount);
     }
@@ -123,6 +133,7 @@ fn withdraw_cycles_with_not_enough_balance_returns_error() {
                 ComputeAllocation::default(),
                 system_state.balance_mut(),
                 amount,
+                SMALL_APP_SUBNET_MAX_SIZE
             ),
             Ok(())
         );
@@ -132,6 +143,7 @@ fn withdraw_cycles_with_not_enough_balance_returns_error() {
             system_state.memory_allocation,
             NumBytes::from(0),
             ComputeAllocation::default(),
+            SMALL_APP_SUBNET_MAX_SIZE,
         );
         assert_eq!(system_state.balance(), initial_cycles - threshold - amount);
     }
@@ -155,6 +167,7 @@ fn withdraw_cycles_with_not_enough_balance_returns_error() {
                     ComputeAllocation::default(),
                     system_state.balance_mut(),
                     amount,
+                    SMALL_APP_SUBNET_MAX_SIZE
                 ),
             Ok(())
         );
@@ -163,6 +176,7 @@ fn withdraw_cycles_with_not_enough_balance_returns_error() {
             system_state.memory_allocation,
             memory_usage,
             ComputeAllocation::default(),
+            SMALL_APP_SUBNET_MAX_SIZE,
         );
         assert_eq!(system_state.balance(), initial_cycles - threshold - amount);
     }
@@ -184,6 +198,7 @@ fn withdraw_cycles_with_not_enough_balance_returns_error() {
                 ComputeAllocation::default(),
                 system_state.balance_mut(),
                 amount,
+                SMALL_APP_SUBNET_MAX_SIZE
             ),
             Err(CanisterOutOfCyclesError {
                 canister_id: canister_test_id(1),
@@ -194,6 +209,7 @@ fn withdraw_cycles_with_not_enough_balance_returns_error() {
                     system_state.memory_allocation,
                     memory_usage,
                     ComputeAllocation::default(),
+                    SMALL_APP_SUBNET_MAX_SIZE
                 )
             })
         );
@@ -201,57 +217,40 @@ fn withdraw_cycles_with_not_enough_balance_returns_error() {
 }
 
 #[test]
-fn add_cycles_does_not_overflow_when_no_balance_limit() {
-    // When there is not `max_cycles_per_canister`,
-    // Cycles is capped by u128::MAX
-    let cycles_balance_expected = Cycles::from(0);
-    let mut system_state = SystemStateBuilder::new()
-        .initial_cycles(cycles_balance_expected)
-        .build();
-    let cycles_account_manager = CyclesAccountManagerBuilder::new().build();
-    assert_eq!(system_state.balance(), cycles_balance_expected);
-
-    let amount = Cycles::from(u128::MAX / 2);
-    cycles_account_manager.add_cycles(system_state.balance_mut(), amount);
-    assert_eq!(system_state.balance(), amount);
-
-    cycles_account_manager.add_cycles(system_state.balance_mut(), amount);
-    assert_eq!(system_state.balance(), Cycles::from(u128::MAX - 1));
-
-    cycles_account_manager.add_cycles(system_state.balance_mut(), Cycles::from(1));
-    assert_eq!(system_state.balance(), Cycles::from(u128::MAX));
-
-    cycles_account_manager.add_cycles(system_state.balance_mut(), Cycles::from(100));
-    assert_eq!(system_state.balance(), Cycles::from(u128::MAX));
-}
-
-#[test]
 fn verify_no_cycles_charged_for_message_execution_on_system_subnets() {
+    let subnet_size = SMALL_APP_SUBNET_MAX_SIZE;
     let mut system_state = SystemStateBuilder::new().build();
     let cycles_account_manager = CyclesAccountManagerBuilder::new()
         .with_subnet_type(SubnetType::System)
         .build();
 
-    cycles_account_manager
-        .withdraw_execution_cycles(
+    let cycles = cycles_account_manager
+        .prepay_execution_cycles(
             &mut system_state,
             NumBytes::from(0),
             ComputeAllocation::default(),
             NumInstructions::from(1_000_000),
+            subnet_size,
         )
         .unwrap();
     assert_eq!(system_state.balance(), INITIAL_CYCLES);
 
-    cycles_account_manager.refund_execution_cycles(
+    let no_op_counter: IntCounter = IntCounter::new("no_op", "no_op").unwrap();
+    cycles_account_manager.refund_unused_execution_cycles(
         &mut system_state,
         NumInstructions::from(5_000_000),
         NumInstructions::from(1_000_000),
+        cycles,
+        &no_op_counter,
+        subnet_size,
+        &no_op_logger(),
     );
     assert_eq!(system_state.balance(), INITIAL_CYCLES);
 }
 
 #[test]
 fn larger_instructions_left_value_doesnt_mint_cycles() {
+    let subnet_size = SMALL_APP_SUBNET_MAX_SIZE;
     let mut system_state = SystemStateBuilder::new().build();
     let cycles_account_manager = CyclesAccountManagerBuilder::new()
         .with_subnet_type(SubnetType::Application)
@@ -259,25 +258,32 @@ fn larger_instructions_left_value_doesnt_mint_cycles() {
 
     let initial_instructions_charged_for = NumInstructions::from(1_000_000);
 
-    cycles_account_manager
-        .withdraw_execution_cycles(
+    let cycles = cycles_account_manager
+        .prepay_execution_cycles(
             &mut system_state,
             NumBytes::from(0),
             ComputeAllocation::default(),
             initial_instructions_charged_for,
+            subnet_size,
         )
         .unwrap();
 
-    cycles_account_manager.refund_execution_cycles(
+    let no_op_counter: IntCounter = IntCounter::new("no_op", "no_op").unwrap();
+    cycles_account_manager.refund_unused_execution_cycles(
         &mut system_state,
         initial_instructions_charged_for * 2,
         initial_instructions_charged_for,
+        cycles,
+        &no_op_counter,
+        subnet_size,
+        &no_op_logger(),
     );
     assert!(system_state.balance() <= INITIAL_CYCLES);
 }
 
 #[test]
 fn canister_charge_for_memory_until_zero_works() {
+    let subnet_size = SMALL_APP_SUBNET_MAX_SIZE;
     let mut system_state = SystemStateBuilder::new().build();
     let subnet_type = SubnetType::Application;
     let config = SubnetConfigs::default()
@@ -301,65 +307,22 @@ fn canister_charge_for_memory_until_zero_works() {
 
     for _ in 0..iterations {
         assert!(cycles_account_manager
-            .charge_for_memory(&mut system_state, gibs, Duration::from_secs(1))
+            .charge_for_memory(&mut system_state, gibs, Duration::from_secs(1), subnet_size)
             .is_ok());
     }
 
     // The fee that will be charged in each iteration
-    let fee = cycles_account_manager.memory_cost(gibs, Duration::from_secs(1));
+    let fee = cycles_account_manager.memory_cost(gibs, Duration::from_secs(1), subnet_size);
     assert!(system_state.balance() < fee);
     assert!(cycles_account_manager
-        .charge_for_memory(&mut system_state, gibs, Duration::from_secs(1))
+        .charge_for_memory(&mut system_state, gibs, Duration::from_secs(1), subnet_size)
         .is_err());
 }
 
 #[test]
-fn ingress_induction_cost_subnet_message_with_invalid_payload() {
-    let cycles_account_manager = CyclesAccountManagerBuilder::new().build();
-
-    for receiver in [IC_00, CanisterId::from(subnet_test_id(0))].iter() {
-        let result = cycles_account_manager.ingress_induction_cost(
-            SignedIngressBuilder::new()
-                .sender(user_test_id(0))
-                .canister_id(*receiver)
-                .method_name("start_canister")
-                .method_payload(vec![]) // an invalid payload
-                .build()
-                .content(),
-        );
-        assert!(
-            matches!(
-                result,
-                Err(IngressInductionCostError::InvalidSubnetPayload(_))
-            ),
-            "Expected InvalidSubnetPayload error, got: {:?}",
-            result
-        );
-    }
-}
-
-#[test]
-fn ingress_induction_cost_subnet_message_with_unknown_method() {
-    for receiver in [IC_00, CanisterId::from(subnet_test_id(0))].iter() {
-        assert_eq!(
-            CyclesAccountManagerBuilder::new()
-                .build()
-                .ingress_induction_cost(
-                    SignedIngressBuilder::new()
-                        .sender(user_test_id(0))
-                        .canister_id(*receiver)
-                        .method_name("unknown_method")
-                        .build()
-                        .content(),
-                ),
-            Err(IngressInductionCostError::UnknownSubnetMethod)
-        );
-    }
-}
-
-#[test]
 fn ingress_induction_cost_valid_subnet_message() {
-    for receiver in [IC_00, CanisterId::from(subnet_test_id(0))].iter() {
+    let subnet_id = subnet_test_id(0);
+    for receiver in [IC_00, CanisterId::from(subnet_id)].iter() {
         let msg: SignedIngressContent = SignedIngressBuilder::new()
             .sender(user_test_id(0))
             .canister_id(*receiver)
@@ -367,17 +330,23 @@ fn ingress_induction_cost_valid_subnet_message() {
             .method_payload(CanisterIdRecord::from(canister_test_id(0)).encode())
             .build()
             .into();
-
+        let effective_canister_id = extract_effective_canister_id(&msg, subnet_id).unwrap();
         let cycles_account_manager = CyclesAccountManagerBuilder::new().build();
         let num_bytes = msg.arg().len() + msg.method_name().len();
 
         assert_eq!(
-            cycles_account_manager.ingress_induction_cost(&msg,),
-            Ok(IngressInductionCost::Fee {
+            cycles_account_manager.ingress_induction_cost(
+                &msg,
+                effective_canister_id,
+                SMALL_APP_SUBNET_MAX_SIZE
+            ),
+            IngressInductionCost::Fee {
                 payer: canister_test_id(0),
-                cost: cycles_account_manager.ingress_message_received_fee()
-                    + cycles_account_manager.ingress_byte_received_fee() * num_bytes
-            })
+                cost: cycles_account_manager
+                    .ingress_message_received_fee(SMALL_APP_SUBNET_MAX_SIZE)
+                    + cycles_account_manager.ingress_byte_received_fee(SMALL_APP_SUBNET_MAX_SIZE)
+                        * num_bytes
+            }
         );
     }
 }
@@ -385,6 +354,7 @@ fn ingress_induction_cost_valid_subnet_message() {
 #[test]
 fn charging_removes_canisters_with_insufficient_balance() {
     with_test_replica_logger(|log| {
+        let subnet_size = SMALL_APP_SUBNET_MAX_SIZE;
         let cycles_account_manager = CyclesAccountManagerBuilder::new().build();
 
         let mut canister = new_canister_state(
@@ -401,13 +371,14 @@ fn charging_removes_canisters_with_insufficient_balance() {
                 &log,
                 &mut canister,
                 Duration::from_secs(1),
+                subnet_size,
             )
             .unwrap();
 
         let mut canister = new_canister_state(
             canister_test_id(1),
             canister_test_id(11).get(),
-            Cycles::from(0),
+            Cycles::zero(),
             NumSeconds::from(0),
         );
         canister.scheduler_state.compute_allocation = ComputeAllocation::try_from(50).unwrap();
@@ -418,13 +389,14 @@ fn charging_removes_canisters_with_insufficient_balance() {
                 &log,
                 &mut canister,
                 Duration::from_secs(1),
+                subnet_size,
             )
             .unwrap_err();
 
         let mut canister = new_canister_state(
             canister_test_id(1),
             canister_test_id(11).get(),
-            Cycles::from(100),
+            Cycles::new(100),
             NumSeconds::from(0),
         );
         canister.scheduler_state.compute_allocation = ComputeAllocation::try_from(50).unwrap();
@@ -435,6 +407,7 @@ fn charging_removes_canisters_with_insufficient_balance() {
                 &log,
                 &mut canister,
                 Duration::from_secs(1),
+                subnet_size,
             )
             .unwrap_err();
     })
@@ -451,12 +424,12 @@ fn cycles_withdraw_no_threshold() {
         .build();
     assert_eq!(system_state.balance(), cycles_balance_expected);
 
-    let threshold = Cycles::from(0);
+    let threshold = Cycles::zero();
     assert!(cycles_account_manager
         .withdraw_with_threshold(
             system_state.canister_id,
             system_state.balance_mut(),
-            Cycles::from(0),
+            Cycles::zero(),
             threshold
         )
         .is_ok());
@@ -477,7 +450,7 @@ fn cycles_withdraw_no_threshold() {
     cycles_balance_expected -= amount;
     assert_eq!(
         system_state.balance(),
-        Cycles::from(i128::MAX as u128) + Cycles::from(1)
+        Cycles::from(i128::MAX as u128) + Cycles::new(1)
     );
 
     assert!(cycles_account_manager
@@ -489,9 +462,9 @@ fn cycles_withdraw_no_threshold() {
         )
         .is_ok());
     cycles_balance_expected -= amount;
-    assert_eq!(system_state.balance(), Cycles::from(1));
+    assert_eq!(system_state.balance(), Cycles::new(1));
 
-    let amount = Cycles::from(1);
+    let amount = Cycles::new(1);
     assert!(cycles_account_manager
         .withdraw_with_threshold(
             system_state.canister_id,
@@ -501,7 +474,7 @@ fn cycles_withdraw_no_threshold() {
         )
         .is_ok());
     cycles_balance_expected -= amount;
-    assert_eq!(system_state.balance(), Cycles::from(0));
+    assert_eq!(system_state.balance(), Cycles::zero());
 
     assert!(cycles_account_manager
         .withdraw_with_threshold(
@@ -512,7 +485,7 @@ fn cycles_withdraw_no_threshold() {
         )
         .is_err());
     cycles_balance_expected -= amount;
-    assert_eq!(system_state.balance(), Cycles::from(0));
+    assert_eq!(system_state.balance(), Cycles::zero());
 }
 
 #[test]
@@ -537,15 +510,28 @@ fn cycles_withdraw_for_execution() {
         system_state.memory_allocation,
         memory_usage,
         compute_allocation,
+        SMALL_APP_SUBNET_MAX_SIZE,
     );
 
     let amount = Cycles::from(initial_amount / 2);
     assert!(cycles_account_manager
-        .consume_cycles(&mut system_state, memory_usage, compute_allocation, amount)
+        .consume_cycles(
+            &mut system_state,
+            memory_usage,
+            compute_allocation,
+            amount,
+            SMALL_APP_SUBNET_MAX_SIZE
+        )
         .is_ok());
     assert_eq!(system_state.balance(), initial_cycles - amount);
     assert!(cycles_account_manager
-        .consume_cycles(&mut system_state, memory_usage, compute_allocation, amount)
+        .consume_cycles(
+            &mut system_state,
+            memory_usage,
+            compute_allocation,
+            amount,
+            SMALL_APP_SUBNET_MAX_SIZE
+        )
         .is_err());
 
     let exec_cycles_max = system_state.balance() - freeze_threshold_cycles;
@@ -556,6 +542,7 @@ fn cycles_withdraw_for_execution() {
             exec_cycles_max,
             memory_usage,
             compute_allocation,
+            SMALL_APP_SUBNET_MAX_SIZE
         )
         .is_ok());
     assert!(cycles_account_manager
@@ -563,21 +550,23 @@ fn cycles_withdraw_for_execution() {
             &mut system_state,
             memory_usage,
             compute_allocation,
-            exec_cycles_max
+            exec_cycles_max,
+            SMALL_APP_SUBNET_MAX_SIZE
         )
         .is_ok());
     assert_eq!(system_state.balance(), freeze_threshold_cycles);
     assert_eq!(
         cycles_account_manager.can_withdraw_cycles(
             &system_state,
-            Cycles::from(10),
+            Cycles::new(10),
             memory_usage,
-            compute_allocation
+            compute_allocation,
+            SMALL_APP_SUBNET_MAX_SIZE
         ),
         Err(CanisterOutOfCyclesError {
             canister_id,
             available: freeze_threshold_cycles,
-            requested: Cycles::from(10),
+            requested: Cycles::new(10),
             threshold: freeze_threshold_cycles,
         })
     );
@@ -588,7 +577,8 @@ fn cycles_withdraw_for_execution() {
             &mut system_state,
             memory_usage,
             compute_allocation,
-            exec_cycles_max
+            exec_cycles_max,
+            SMALL_APP_SUBNET_MAX_SIZE
         )
         .is_err());
     assert!(cycles_account_manager
@@ -596,7 +586,8 @@ fn cycles_withdraw_for_execution() {
             &mut system_state,
             memory_usage,
             compute_allocation,
-            Cycles::from(10u64)
+            Cycles::new(10),
+            SMALL_APP_SUBNET_MAX_SIZE
         )
         .is_err());
     assert!(cycles_account_manager
@@ -604,7 +595,8 @@ fn cycles_withdraw_for_execution() {
             &mut system_state,
             memory_usage,
             compute_allocation,
-            Cycles::from(1u64)
+            Cycles::new(1),
+            SMALL_APP_SUBNET_MAX_SIZE
         )
         .is_err());
     assert!(cycles_account_manager
@@ -612,7 +604,8 @@ fn cycles_withdraw_for_execution() {
             &mut system_state,
             memory_usage,
             compute_allocation,
-            Cycles::from(0u64)
+            Cycles::zero(),
+            SMALL_APP_SUBNET_MAX_SIZE
         )
         .is_ok());
     assert_eq!(system_state.balance(), freeze_threshold_cycles);
@@ -629,11 +622,12 @@ fn withdraw_execution_cycles_consumes_cycles() {
         .canister_metrics
         .consumed_cycles_since_replica_started;
     cycles_account_manager
-        .withdraw_execution_cycles(
+        .prepay_execution_cycles(
             &mut system_state,
             NumBytes::from(0),
             ComputeAllocation::default(),
             NumInstructions::from(1_000_000),
+            SMALL_APP_SUBNET_MAX_SIZE,
         )
         .unwrap();
     let consumed_cycles_after = system_state
@@ -660,7 +654,8 @@ fn withdraw_for_transfer_does_not_consume_cycles() {
             NumBytes::from(0),
             ComputeAllocation::default(),
             system_state.balance_mut(),
-            Cycles::from(1_000_000),
+            Cycles::new(1_000_000),
+            SMALL_APP_SUBNET_MAX_SIZE,
         )
         .unwrap();
     let consumed_cycles_after = system_state
@@ -686,7 +681,8 @@ fn consume_cycles_updates_consumed_cycles() {
             &mut system_state,
             NumBytes::from(0),
             ComputeAllocation::default(),
-            Cycles::from(1_000_000),
+            Cycles::new(1_000_000),
+            SMALL_APP_SUBNET_MAX_SIZE,
         )
         .unwrap();
     let consumed_cycles_after = system_state
@@ -696,25 +692,5 @@ fn consume_cycles_updates_consumed_cycles() {
     assert_eq!(
         consumed_cycles_after - consumed_cycles_before,
         NominalCycles::from(1_000_000)
-    );
-}
-
-#[test]
-fn verify_refund() {
-    let mut system_state = SystemStateBuilder::new().build();
-    let cycles_account_manager = CyclesAccountManagerBuilder::new().build();
-    let initial_consumed_cycles = NominalCycles::from(1000);
-    system_state
-        .canister_metrics
-        .consumed_cycles_since_replica_started = initial_consumed_cycles;
-
-    let cycles = Cycles::from(100);
-    cycles_account_manager.refund_cycles(&mut system_state, cycles);
-    assert_eq!(system_state.balance(), INITIAL_CYCLES + cycles);
-    assert_eq!(
-        system_state
-            .canister_metrics
-            .consumed_cycles_since_replica_started,
-        initial_consumed_cycles - NominalCycles::from(cycles)
     );
 }

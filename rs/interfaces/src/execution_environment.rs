@@ -1,9 +1,10 @@
 //! The execution environment public interface.
 mod errors;
 
-pub use errors::{CanisterHeartbeatError, CanisterOutOfCyclesError, HypervisorError, TrapCode};
+pub use errors::{CanisterOutOfCyclesError, HypervisorError, TrapCode};
 use ic_base_types::NumBytes;
 use ic_error_types::UserError;
+use ic_ic00_types::EcdsaKeyId;
 use ic_registry_provisional_whitelist::ProvisionalWhitelist;
 use ic_registry_subnet_type::SubnetType;
 use ic_sys::{PageBytes, PageIndex};
@@ -11,21 +12,22 @@ use ic_types::{
     crypto::canister_threshold_sig::MasterEcdsaPublicKey,
     ingress::{IngressStatus, WasmResult},
     messages::{
-        CertificateDelegation, HttpQueryResponse, InternalQuery, InternalQueryResponse, MessageId,
-        SignedIngressContent, UserQuery,
+        AnonymousQuery, AnonymousQueryResponse, CertificateDelegation, HttpQueryResponse,
+        MessageId, SignedIngressContent, UserQuery,
     },
-    ComputeAllocation, Cycles, ExecutionRound, Height, NumInstructions, Randomness, Time,
+    CpuComplexity, Cycles, ExecutionRound, Height, NumInstructions, NumPages, Randomness, Time,
 };
 use serde::{Deserialize, Serialize};
-use std::ops::Div;
-use std::sync::{Arc, RwLock};
+use std::convert::TryFrom;
+use std::sync::Arc;
+use std::{collections::BTreeMap, ops};
 use std::{convert::Infallible, fmt};
-use tower::{buffer::Buffer, util::BoxService};
+use tower::{limit::ConcurrencyLimit, util::BoxCloneService};
 
 /// Instance execution statistics. The stats are cumulative and
 /// contain measurements from the point in time when the instance was
 /// created up until the moment they are requested.
-#[derive(Serialize, Deserialize, Clone)]
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
 pub struct InstanceStats {
     /// Total number of (host) pages accessed (read or written) by the instance
     /// and loaded into the linear memory.
@@ -35,9 +37,18 @@ pub struct InstanceStats {
     /// By definition a page that has been dirtied has also been accessed,
     /// hence this dirtied_pages <= accessed_pages
     pub dirty_pages: usize,
+
+    /// Number of times a write access is handled when the page has already been
+    /// read.
+    pub read_before_write_count: usize,
+
+    /// Number of times a write access is handled when the page has not yet been
+    /// read.
+    pub direct_write_count: usize,
 }
 
 /// Errors that can be returned when fetching the available memory on a subnet.
+#[derive(Debug)]
 pub enum SubnetAvailableMemoryError {
     InsufficientMemory {
         requested_total: NumBytes,
@@ -45,6 +56,100 @@ pub enum SubnetAvailableMemoryError {
         available_total: i64,
         available_messages: i64,
     },
+}
+
+/// Performance counter type.
+#[derive(Debug)]
+pub enum PerformanceCounterType {
+    // The number of WebAssembly instructions the canister has executed based on
+    // the given `i64` instruction counter.
+    Instructions(i64),
+}
+
+/// Tracks the execution complexity.
+///
+/// Each execution has an associated complexity, i.e. how much CPU, memory,
+/// disk or network bandwidth it takes.
+///
+/// For now, the complexity counters do not translate into Cycles, but they are rather
+/// used to prevent too complex messages to slow down the whole subnet.
+///
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
+pub struct ExecutionComplexity {
+    /// Accumulated CPU complexity, in instructions.
+    pub cpu: CpuComplexity,
+    /// The number of dirty pages in stable memory.
+    pub stable_dirty_pages: NumPages,
+}
+
+impl ExecutionComplexity {
+    /// Execution complexity with maximum values.
+    pub const MAX: Self = Self {
+        cpu: CpuComplexity::new(i64::MAX),
+        stable_dirty_pages: NumPages::new(u64::MAX),
+    };
+
+    /// Creates execution complexity with a specified CPU complexity.
+    pub fn with_cpu(cpu: NumInstructions) -> Self {
+        Self {
+            cpu: (cpu.get() as i64).into(),
+            ..Default::default()
+        }
+    }
+
+    /// Returns true if the CPU complexity reached the specified
+    /// instructions limit.
+    pub fn cpu_reached(&self, limit: NumInstructions) -> bool {
+        self.cpu.get() >= limit.get() as i64
+    }
+
+    /// Returns the maximum of each complexity.
+    pub fn max(&self, rhs: Self) -> Self {
+        Self {
+            cpu: self.cpu.max(rhs.cpu),
+            stable_dirty_pages: self.stable_dirty_pages.max(rhs.stable_dirty_pages),
+        }
+    }
+}
+
+impl ops::Add for &ExecutionComplexity {
+    type Output = ExecutionComplexity;
+
+    fn add(self, rhs: &ExecutionComplexity) -> ExecutionComplexity {
+        ExecutionComplexity {
+            cpu: self.cpu + rhs.cpu,
+            stable_dirty_pages: self
+                .stable_dirty_pages
+                .get()
+                .saturating_add(rhs.stable_dirty_pages.get())
+                .into(),
+        }
+    }
+}
+
+impl ops::Sub for &ExecutionComplexity {
+    type Output = ExecutionComplexity;
+
+    fn sub(self, rhs: &ExecutionComplexity) -> ExecutionComplexity {
+        ExecutionComplexity {
+            cpu: self.cpu - rhs.cpu,
+            stable_dirty_pages: self
+                .stable_dirty_pages
+                .get()
+                .saturating_sub(rhs.stable_dirty_pages.get())
+                .into(),
+        }
+    }
+}
+
+impl fmt::Display for ExecutionComplexity {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "{{ cpu = {} stable_dirty_pages = {} }}",
+            self.cpu, self.stable_dirty_pages,
+        )
+    }
 }
 
 /// Tracks the available memory on a subnet. The main idea is to separately track
@@ -56,22 +161,17 @@ pub enum SubnetAvailableMemoryError {
 /// Note that there are situations where total available memory is smaller than
 /// the available message memory, i.e., when the memory is consumed by something
 /// other than messages.
-///
-/// This struct is designed that it can eventually replace `SubnetAvailableMemory`,
-/// which currently wraps `AvailableMemory` in an `Arc<RwLock>`. Based on how it is
-/// currently used this wrapping is not strictly necessary and one could alternatively
-/// pass a mutable reference to `AvailableMemory` in the respective places.
-#[derive(Serialize, Deserialize, Clone, Copy, Debug)]
-pub struct AvailableMemory {
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, Default)]
+pub struct SubnetAvailableMemory {
     /// The total memory available on the subnet
     total_memory: i64,
     /// The memory available for messages
     message_memory: i64,
 }
 
-impl AvailableMemory {
+impl SubnetAvailableMemory {
     pub fn new(total_memory: i64, message_memory: i64) -> Self {
-        AvailableMemory {
+        SubnetAvailableMemory {
             total_memory,
             message_memory,
         }
@@ -95,9 +195,47 @@ impl AvailableMemory {
     pub fn max_available_message_memory(&self) -> i64 {
         self.total_memory.min(self.message_memory)
     }
+
+    /// Try to use some memory capacity and fail if not enough is available
+    pub fn try_decrement(
+        &mut self,
+        requested: NumBytes,
+        message_requested: NumBytes,
+    ) -> Result<(), SubnetAvailableMemoryError> {
+        debug_assert!(requested >= message_requested);
+
+        let total_is_available = match i64::try_from(requested.get()) {
+            Ok(x) => x <= self.total_memory || x == 0,
+            Err(_) => false,
+        };
+        let message_is_available = match i64::try_from(message_requested.get()) {
+            Ok(x) => x <= self.message_memory || x == 0,
+            Err(_) => false,
+        };
+
+        if total_is_available && message_is_available {
+            self.total_memory -= requested.get() as i64;
+            self.message_memory -= message_requested.get() as i64;
+            Ok(())
+        } else {
+            Err(SubnetAvailableMemoryError::InsufficientMemory {
+                requested_total: requested,
+                message_requested,
+                available_total: self.total_memory,
+                available_messages: self.message_memory,
+            })
+        }
+    }
+
+    pub fn increment(&mut self, total_amount: NumBytes, message_amount: NumBytes) {
+        debug_assert!(total_amount >= message_amount);
+
+        self.total_memory += total_amount.get() as i64;
+        self.message_memory += message_amount.get() as i64;
+    }
 }
 
-impl Div<i64> for AvailableMemory {
+impl ops::Div<i64> for SubnetAvailableMemory {
     type Output = Self;
 
     fn div(self, rhs: i64) -> Self::Output {
@@ -108,119 +246,10 @@ impl Div<i64> for AvailableMemory {
     }
 }
 
-/// This struct is used to manage the current amount of memory available on the
-/// subnet.
-#[derive(Serialize, Deserialize, Clone, Debug)]
-pub struct SubnetAvailableMemory {
-    /// TODO(EXC-677): Make this just a `AvailableMemory`.
-    #[serde(serialize_with = "ic_utils::serde_arc::serialize_arc")]
-    #[serde(deserialize_with = "ic_utils::serde_arc::deserialize_arc")]
-    available_memory: Arc<RwLock<AvailableMemory>>,
-}
-
-impl From<AvailableMemory> for SubnetAvailableMemory {
-    fn from(available: AvailableMemory) -> Self {
-        SubnetAvailableMemory {
-            available_memory: Arc::new(RwLock::new(available)),
-        }
-    }
-}
-
-impl SubnetAvailableMemory {
-    /// Try to use some memory capacity and fail if not enough is available
-    pub fn try_decrement(
-        &self,
-        requested: NumBytes,
-        message_requested: NumBytes,
-    ) -> Result<(), SubnetAvailableMemoryError> {
-        debug_assert!(requested >= message_requested);
-        let mut available = self.available_memory.write().unwrap();
-
-        let total_is_available =
-            requested.get() as i64 <= available.total_memory || requested.get() == 0;
-        let message_is_available = message_requested.get() as i64 <= available.message_memory
-            || message_requested.get() == 0;
-
-        if total_is_available && message_is_available {
-            (*available).total_memory -= requested.get() as i64;
-            (*available).message_memory -= message_requested.get() as i64;
-            Ok(())
-        } else {
-            Err(SubnetAvailableMemoryError::InsufficientMemory {
-                requested_total: requested,
-                message_requested,
-                available_total: available.total_memory,
-                available_messages: available.message_memory,
-            })
-        }
-    }
-
-    pub fn increment(&self, total_amount: NumBytes, message_amount: NumBytes) {
-        debug_assert!(total_amount >= message_amount);
-
-        let mut available = self.available_memory.write().unwrap();
-        available.total_memory += total_amount.get() as i64;
-        available.message_memory += message_amount.get() as i64;
-    }
-
-    pub fn get_total_memory(&self) -> i64 {
-        self.available_memory.read().unwrap().total_memory
-    }
-
-    pub fn get_message_memory(&self) -> i64 {
-        self.available_memory.read().unwrap().message_memory
-    }
-
-    pub fn get(&self) -> AvailableMemory {
-        *self.available_memory.read().unwrap()
-    }
-
-    pub fn set(&self, available: AvailableMemory) {
-        *self.available_memory.write().unwrap() = available;
-    }
-}
-
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub enum ExecutionMode {
     Replicated,
     NonReplicated,
-}
-
-// Canister and subnet configuration parameters required for execution.
-#[derive(Clone, Debug, Deserialize, Serialize)]
-pub struct ExecutionParameters {
-    /// The total instruction limit of message execution. With deterministic
-    /// time slicing this limit may exceed the per-round instruction limit.
-    /// The message fails with an out-of-instructions error if it executes
-    /// more instructions than this limit.
-    pub total_instruction_limit: NumInstructions,
-
-    /// Without deterministic time slicing, this limit must be equal to
-    /// `total_instruction_limit`. With deterministic time slicing this
-    /// limit specifies the number of instructions to execute before
-    /// pausing the execution.
-    pub slice_instruction_limit: NumInstructions,
-
-    pub canister_memory_limit: NumBytes,
-    pub subnet_available_memory: SubnetAvailableMemory,
-    pub compute_allocation: ComputeAllocation,
-    pub subnet_type: SubnetType,
-    pub execution_mode: ExecutionMode,
-}
-
-/// The data structure returned by
-/// `ExecutionEnvironment.execute_canister_message()`.
-pub struct ExecuteMessageResult<CanisterState> {
-    /// The `CanisterState` after message execution
-    pub canister: CanisterState,
-    /// The amount of instructions left after message execution. This must be <=
-    /// to the instructions_limit that `execute_canister_message()` was called
-    /// with.
-    pub num_instructions_left: NumInstructions,
-    /// Optional status for an Ingress message if available.
-    pub ingress_status: Option<(MessageId, IngressStatus)>,
-    /// The size of the heap delta the canister produced
-    pub heap_delta: NumBytes,
 }
 
 pub type HypervisorResult<T> = Result<T, HypervisorError>;
@@ -232,7 +261,7 @@ pub type HypervisorResult<T> = Result<T, HypervisorError>;
 // The buffer also dampens usage by reducing the risk of
 // spiky traffic when users retry in case failed requests.
 pub type AnonymousQueryService =
-    Buffer<BoxService<InternalQuery, InternalQueryResponse, Infallible>, InternalQuery>;
+    ConcurrencyLimit<BoxCloneService<AnonymousQuery, AnonymousQueryResponse, Infallible>>;
 
 /// Interface for the component to filter out ingress messages that
 /// the canister is not willing to accept.
@@ -241,9 +270,12 @@ pub type AnonymousQueryService =
 // https://docs.rs/tower/0.4.10/tower/buffer/index.html
 // The buffer also dampens usage by reducing the risk of
 // spiky traffic when users retry in case failed requests.
-pub type IngressFilterService = Buffer<
-    BoxService<(ProvisionalWhitelist, SignedIngressContent), Result<(), UserError>, Infallible>,
-    (ProvisionalWhitelist, SignedIngressContent),
+pub type IngressFilterService = ConcurrencyLimit<
+    BoxCloneService<
+        (ProvisionalWhitelist, SignedIngressContent),
+        Result<(), UserError>,
+        Infallible,
+    >,
 >;
 
 // Since this service will be shared across many connections we must
@@ -251,9 +283,8 @@ pub type IngressFilterService = Buffer<
 // https://docs.rs/tower/0.4.10/tower/buffer/index.html
 // The buffer also dampens usage by reducing the risk of
 // spiky traffic when users retry in case failed requests.
-pub type QueryExecutionService = Buffer<
-    BoxService<(UserQuery, Option<CertificateDelegation>), HttpQueryResponse, Infallible>,
-    (UserQuery, Option<CertificateDelegation>),
+pub type QueryExecutionService = ConcurrencyLimit<
+    BoxCloneService<(UserQuery, Option<CertificateDelegation>), HttpQueryResponse, Infallible>,
 >;
 
 /// Interface for the component to execute queries on canisters.  It can be used
@@ -282,6 +313,7 @@ pub enum IngressHistoryError {
 }
 
 /// Interface for reading the history of ingress messages.
+#[allow(clippy::type_complexity)]
 pub trait IngressHistoryReader: Send + Sync {
     /// Returns a function that can be used to query the status for a given
     /// `message_id` using the latest execution state.
@@ -316,16 +348,59 @@ pub trait IngressHistoryWriter: Send + Sync {
 
 /// A trait for handling `out_of_instructions()` calls from the Wasm module.
 pub trait OutOfInstructionsHandler {
-    /// Returns a new instruction limit if the execution should continue.
-    /// Otherwise, returns an error to trap the execution.
+    // This function is invoked if the Wasm instruction counter is negative.
+    //
+    // If it is impossible to recover from the out-of-instructions error then
+    // the function returns `Err(HypervisorError::InstructionLimitExceeded)`.
+    // Otherwise, the function returns a new positive instruction counter.
     fn out_of_instructions(
         &self,
-        num_instructions_left: NumInstructions,
-    ) -> HypervisorResult<NumInstructions>;
+        instruction_counter: i64,
+        execution_complexity: ExecutionComplexity,
+    ) -> HypervisorResult<i64>;
+}
+
+/// Indicates the type of stable memory API being used.
+pub enum StableMemoryApi {
+    Stable64 = 0,
+    Stable32 = 1,
+}
+
+impl TryFrom<i32> for StableMemoryApi {
+    type Error = ();
+
+    fn try_from(value: i32) -> Result<Self, Self::Error> {
+        match value {
+            0 => Ok(Self::Stable64),
+            1 => Ok(Self::Stable32),
+            _ => Err(()),
+        }
+    }
+}
+
+#[test]
+fn stable_memory_api_round_trip() {
+    for i in 0..10 {
+        if let Ok(api) = StableMemoryApi::try_from(i) {
+            assert_eq!(i, api as i32)
+        }
+    }
+}
+
+/// Indicates whether an attempt to grow stable memory succeeded or failed.
+pub enum StableGrowOutcome {
+    Success,
+    Failure,
 }
 
 /// A trait for providing all necessary imports to a Wasm module.
 pub trait SystemApi {
+    /// Stores the complexity accumulated during the message execution.
+    fn set_execution_complexity(&mut self, complexity: ExecutionComplexity);
+
+    /// Returns the accumulated execution complexity.
+    fn execution_complexity(&self) -> &ExecutionComplexity;
+
     /// Stores the execution error, so that the user can evaluate it later.
     fn set_execution_error(&mut self, error: HypervisorError);
 
@@ -344,8 +419,20 @@ pub trait SystemApi {
     /// Returns the subnet type the replica runs on.
     fn subnet_type(&self) -> SubnetType;
 
+    /// Returns the message instruction limit, which is the total instruction
+    /// limit for all slices combined.
+    fn message_instruction_limit(&self) -> NumInstructions;
+
+    /// Returns the number of instructions executed in the current message,
+    /// which is the sum of instructions executed in all slices including the
+    /// current one.
+    fn message_instructions_executed(&self, instruction_counter: i64) -> NumInstructions;
+
     /// Returns the instruction limit for the current execution slice.
     fn slice_instruction_limit(&self) -> NumInstructions;
+
+    /// Returns the number of instructions executed in the current slice.
+    fn slice_instructions_executed(&self, instruction_counter: i64) -> NumInstructions;
 
     /// Copies `size` bytes starting from `offset` inside the opaque caller blob
     /// and copies them to heap[dst..dst+size]. The caller is the canister
@@ -471,24 +558,6 @@ pub trait SystemApi {
     /// Traps, with a possibly helpful message
     fn ic0_trap(&self, src: u32, size: u32, heap: &[u8]) -> HypervisorResult<()>;
 
-    /// Creates a pending inter-canister message that will be scheduled if the
-    /// current message execution completes successfully.
-    #[allow(clippy::too_many_arguments)]
-    fn ic0_call_simple(
-        &mut self,
-        callee_src: u32,
-        callee_size: u32,
-        method_name_src: u32,
-        method_name_len: u32,
-        reply_fun: u32,
-        reply_env: u32,
-        reject_fun: u32,
-        reject_env: u32,
-        data_src: u32,
-        data_len: u32,
-        heap: &[u8],
-    ) -> HypervisorResult<i32>;
-
     /// Begins assembling a call to the canister specified by
     /// callee_src/callee_size at method name_src/name_size. Two mandatory
     /// callbacks are recorded which will be invoked on success and error
@@ -587,6 +656,7 @@ pub trait SystemApi {
     ///
     /// This system call traps if src+size exceeds the size of the WebAssembly
     /// memory or offset+size exceeds the size of the stable memory.
+    /// Returns the number of **new** dirty pages created by the write.
     fn ic0_stable_write(
         &mut self,
         offset: u32,
@@ -630,6 +700,7 @@ pub trait SystemApi {
     /// memory or offset+size exceeds the size of the stable memory.
     ///
     /// It supports bigger stable memory sizes indexed by 64 bit pointers.
+    /// Returns the number of **new** dirty pages created by the write.
     fn ic0_stable64_write(
         &mut self,
         offset: u64,
@@ -638,28 +709,71 @@ pub trait SystemApi {
         heap: &[u8],
     ) -> HypervisorResult<()>;
 
+    /// Determines the number of dirty pages that a stable write would create
+    /// and the cost for those dirty pages (without actually doing the write).
+    fn dirty_pages_from_stable_write(
+        &self,
+        offset: u64,
+        size: u64,
+    ) -> HypervisorResult<(NumPages, NumInstructions)>;
+
+    /// The canister can query the IC for the current time.
     fn ic0_time(&self) -> HypervisorResult<Time>;
 
-    /// This system call is not part of the public spec and used by the
-    /// hypervisor, when execution runs out of instructions.
+    /// The canister can set a global one-off timer at the specific time.
+    fn ic0_global_timer_set(&mut self, time: Time) -> HypervisorResult<Time>;
+
+    /// The canister can query the IC for its version.
+    fn ic0_canister_version(&self) -> HypervisorResult<u64>;
+
+    /// The canister can query the "performance counter", which is
+    /// a deterministic monotonically increasing integer approximating
+    /// the amount of work the canister has done since the beginning of
+    /// the current execution.
     ///
-    /// Returns a new instruction limit if the execution should continue.
-    /// Otherwise, returns an error to trap the execution.
-    fn out_of_instructions(
+    /// The argument type decides which performance counter to return:
+    ///     0 : instruction counter. The number of WebAssembly
+    ///         instructions the system has determined that the canister
+    ///         has executed.
+    ///
+    /// Note: as the instruction counters are not available on the SystemApi level,
+    /// the `ic0_performance_counter_helper()` in `wasmtime_embedder` module does
+    /// most of the work. Yet the function is still implemented here for the consistency.
+    fn ic0_performance_counter(
         &self,
-        num_instructions_left: NumInstructions,
-    ) -> HypervisorResult<NumInstructions>;
+        performance_counter_type: PerformanceCounterType,
+    ) -> HypervisorResult<u64>;
+
+    /// This system call is not part of the public spec and it is invoked when
+    /// Wasm execution has run out of instructions.
+    ///
+    /// If it is impossible to recover from the out-of-instructions error then
+    /// the functions return `Err(HypervisorError::InstructionLimitExceeded)`.
+    /// Otherwise, the function return a new non-negative instruction counter.
+    fn out_of_instructions(&mut self, instruction_counter: i64) -> HypervisorResult<i64>;
 
     /// This system call is not part of the public spec. It's called after a
     /// native `memory.grow` has been called to check whether there's enough
     /// available memory left.
     fn update_available_memory(
         &mut self,
-        native_memory_grow_res: i32,
-        additional_pages: u32,
-    ) -> HypervisorResult<i32>;
+        native_memory_grow_res: i64,
+        additional_pages: u64,
+    ) -> HypervisorResult<()>;
 
-    /// (deprecated) Please use `ic0_canister_cycles_balance128` instead.
+    /// Attempts to allocate memory before calling stable grow. Will also check
+    /// that the current size if valid for the stable memory API being used.
+    fn try_grow_stable_memory(
+        &mut self,
+        current_size: u64,
+        additional_pages: u64,
+        stable_memory_api: StableMemoryApi,
+    ) -> HypervisorResult<StableGrowOutcome>;
+
+    /// Return memory from a previous call to `update_available_memory`.
+    fn deallocate_pages(&mut self, additional_pages: u64);
+
+    /// (deprecated) Please use `ic0_canister_cycle_balance128` instead.
     /// This API supports only 64-bit values.
     ///
     /// Returns the current balance in cycles.
@@ -673,7 +787,7 @@ pub trait SystemApi {
     /// The amount of cycles is represented by a 128-bit value
     /// and is copied in the canister memory starting
     /// starting at the location `dst`.
-    fn ic0_canister_cycles_balance128(&self, dst: u32, heap: &mut [u8]) -> HypervisorResult<()>;
+    fn ic0_canister_cycle_balance128(&self, dst: u32, heap: &mut [u8]) -> HypervisorResult<()>;
 
     /// (deprecated) Please use `ic0_msg_cycles_available128` instead.
     /// This API supports only 64-bit values.
@@ -798,6 +912,23 @@ pub trait SystemApi {
     fn ic0_mint_cycles(&mut self, amount: u64) -> HypervisorResult<u64>;
 }
 
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+
+/// Indicate whether a checkpoint will be taken after the current round or not.
+pub enum ExecutionRoundType {
+    CheckpointRound,
+    OrdinaryRound,
+}
+
+/// Configuration of execution that comes from the registry.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RegistryExecutionSettings {
+    pub max_number_of_canisters: u64,
+    pub provisional_whitelist: ProvisionalWhitelist,
+    pub max_ecdsa_queue_size: u32,
+    pub subnet_size: usize,
+}
+
 pub trait Scheduler: Send {
     /// Type modelling the replicated state.
     ///
@@ -841,21 +972,24 @@ pub trait Scheduler: Send {
     ///   many instructions is left which is used to update the limit for the
     ///   next `pulse` and if the above constraint is satisfied, we can start
     ///   the `pulse`. And so on.
+    #[allow(clippy::too_many_arguments)]
     fn execute_round(
         &self,
         state: Self::State,
         randomness: Randomness,
-        ecdsa_subnet_public_key: Option<MasterEcdsaPublicKey>,
+        ecdsa_subnet_public_keys: BTreeMap<EcdsaKeyId, MasterEcdsaPublicKey>,
         current_round: ExecutionRound,
-        provisional_whitelist: ProvisionalWhitelist,
-        max_number_of_canisters: u64,
+        current_round_type: ExecutionRoundType,
+        registry_settings: &RegistryExecutionSettings,
     ) -> Self::State;
 }
 
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize, Debug)]
 pub struct WasmExecutionOutput {
     pub wasm_result: Result<Option<WasmResult>, HypervisorError>,
     pub num_instructions_left: NumInstructions,
+    pub allocated_bytes: NumBytes,
+    pub allocated_message_bytes: NumBytes,
     pub instance_stats: InstanceStats,
 }
 
@@ -868,11 +1002,11 @@ impl fmt::Display for WasmExecutionOutput {
             },
             Err(err) => format!("{}", err),
         };
-        write!(f, "wasm_result => [{}], instructions left => {}, instace_stats => [ accessed pages => {}, dirty pages => {}]",
+        write!(f, "wasm_result => [{}], instructions left => {}, instance_stats => [ accessed pages => {}, dirty pages => {}]",
                wasm_result_str,
                self.num_instructions_left,
                self.instance_stats.accessed_pages,
-               self.instance_stats.dirty_pages
+               self.instance_stats.dirty_pages,
         )
     }
 }
@@ -883,7 +1017,7 @@ mod tests {
 
     #[test]
     fn test_available_memory() {
-        let available = AvailableMemory::new(20, 10);
+        let available = SubnetAvailableMemory::new(20, 10);
         assert_eq!(available.get_total_memory(), 20);
         assert_eq!(available.get_message_memory(), 10);
         assert_eq!(available.max_available_message_memory(), 10);
@@ -896,7 +1030,8 @@ mod tests {
 
     #[test]
     fn test_subnet_available_memory() {
-        let available: SubnetAvailableMemory = AvailableMemory::new(1 << 30, (1 << 30) - 5).into();
+        let mut available: SubnetAvailableMemory =
+            SubnetAvailableMemory::new(1 << 30, (1 << 30) - 5);
         assert!(available
             .try_decrement(NumBytes::from(10), NumBytes::from(5))
             .is_ok());
@@ -913,7 +1048,7 @@ mod tests {
             .try_decrement(NumBytes::from(1), NumBytes::from(0))
             .is_err());
 
-        let available: SubnetAvailableMemory = AvailableMemory::new(1 << 30, -1).into();
+        let mut available: SubnetAvailableMemory = SubnetAvailableMemory::new(1 << 30, -1);
         assert!(available
             .try_decrement(NumBytes::from(1), NumBytes::from(1))
             .is_err());
@@ -927,10 +1062,26 @@ mod tests {
             .try_decrement(NumBytes::from(1), NumBytes::from(0))
             .is_err());
 
-        let available: SubnetAvailableMemory = AvailableMemory::new(42, 43).into();
+        assert!(available
+            .try_decrement(NumBytes::from(u64::MAX), NumBytes::from(0))
+            .is_err());
+        assert!(available
+            .try_decrement(NumBytes::from(u64::MAX), NumBytes::from(u64::MAX))
+            .is_err());
+        assert!(available
+            .try_decrement(NumBytes::from(i64::MAX as u64 + 1), NumBytes::from(0))
+            .is_err());
+        assert!(available
+            .try_decrement(
+                NumBytes::from(i64::MAX as u64 + 1),
+                NumBytes::from(i64::MAX as u64 + 1)
+            )
+            .is_err());
+
+        let mut available: SubnetAvailableMemory = SubnetAvailableMemory::new(42, 43);
         assert_eq!(available.get_total_memory(), 42);
         assert_eq!(available.get_message_memory(), 43);
-        available.set(AvailableMemory::new(44, 45));
+        available = SubnetAvailableMemory::new(44, 45);
         assert_eq!(available.get_total_memory(), 44);
         assert_eq!(available.get_message_memory(), 45);
         available.increment(NumBytes::from(1), NumBytes::from(0));

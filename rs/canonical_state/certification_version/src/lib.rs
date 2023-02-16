@@ -1,6 +1,6 @@
-use strum_macros::EnumIter;
+use strum_macros::{EnumCount, EnumIter};
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, EnumIter)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, EnumCount, EnumIter)]
 pub enum CertificationVersion {
     /// Initial version.
     V0 = 0,
@@ -18,11 +18,17 @@ pub enum CertificationVersion {
     /// Encoding of canister metadata custom sections.
     V6 = 6,
     /// Support for decoding of `StreamHeader::reject_signals`.
+    /// Support for `done` ingress history status.
     V7 = 7,
     /// Encoding of `StreamHeader::reject_signals`.
+    /// Producing `done` ingress history statuses.
     V8 = 8,
     /// Producing non-empty `StreamHeader::reject_signals`.
     V9 = 9,
+    /// Dropped `SystemMetadata::id_counter`.
+    V10 = 10,
+    /// Producing `error_code` field in `request_status` subtree.
+    V11 = 11,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -55,24 +61,13 @@ impl std::convert::TryFrom<u32> for CertificationVersion {
 
 /// The Canonical State certification version that should be used for newly
 /// computed states.
-pub const CURRENT_CERTIFICATION_VERSION: CertificationVersion = CertificationVersion::V7;
+pub const CURRENT_CERTIFICATION_VERSION: CertificationVersion = CertificationVersion::V10;
 
-/// Maximum supported certification version. Always at least
-/// `CURRENT_CERTIFICATION_VERSION + 1`, since any given canonical state change
-/// is either:
-///
-///  * not yet implemented (true for all future canonical state changes), in
-///    which case the canonical encoding of `CURRENT_CERTIFICATION_VERSION + 1`
-///    must be identical to that of `CURRENT_CERTIFICATION_VERSION` (with the
-///    difference consisting exactly in the fact that that replica is able to
-///    produce the `CURRENT_CERTIFICATION_VERSION + 2` canonical encoding); or
-///
-///  * supported but not enabled, meaning that the canonical encoding for
-///    `CURRENT_CERTIFICATION_VERSION + 1` is explicitly supported.
+/// Maximum supported certification version.
 ///
 /// The replica will panic if requested to certify using a version higher than
 /// this.
-pub const MAX_SUPPORTED_CERTIFICATION_VERSION: CertificationVersion = CertificationVersion::V8;
+pub const MAX_SUPPORTED_CERTIFICATION_VERSION: CertificationVersion = CertificationVersion::V11;
 
 /// Returns a list of all certification versions up to [MAX_SUPPORTED_CERTIFICATION_VERSION].
 pub fn all_supported_versions() -> impl std::iter::Iterator<Item = CertificationVersion> {

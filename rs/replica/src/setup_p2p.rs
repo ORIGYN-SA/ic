@@ -1,34 +1,39 @@
-use crate::setup_bitcoin_client::setup_bitcoin_client;
+use ic_btc_adapter_client::{setup_bitcoin_adapter_clients, BitcoinAdapterClients};
 use ic_btc_consensus::BitcoinPayloadBuilder;
 use ic_config::{artifact_pool::ArtifactPoolConfig, subnet_config::SubnetConfig, Config};
 use ic_consensus::certification::VerifierImpl;
 use ic_crypto::CryptoComponent;
 use ic_cycles_account_manager::CyclesAccountManager;
 use ic_execution_environment::ExecutionServices;
-use ic_interfaces::execution_environment::AnonymousQueryService;
 use ic_interfaces::{
-    certified_stream_store::CertifiedStreamStore,
     consensus_pool::ConsensusPoolCache,
-    execution_environment::{IngressFilterService, QueryExecutionService, QueryHandler},
-    registry::{LocalStoreCertifiedTimeReader, RegistryClient},
+    execution_environment::{
+        AnonymousQueryService, IngressFilterService, QueryExecutionService, QueryHandler,
+    },
 };
+use ic_interfaces_certified_stream_store::CertifiedStreamStore;
 use ic_interfaces_p2p::IngressIngestionService;
+use ic_interfaces_registry::{LocalStoreCertifiedTimeReader, RegistryClient};
 use ic_logger::{info, ReplicaLogger};
-use ic_messaging::{MessageRoutingImpl, XNetEndpoint, XNetEndpointConfig, XNetPayloadBuilderImpl};
+use ic_messaging::MessageRoutingImpl;
 use ic_p2p::P2PThreadJoiner;
 use ic_registry_subnet_type::SubnetType;
 use ic_replica_setup_ic_network::{
     create_networking_stack, init_artifact_pools, P2PStateSyncClient,
 };
 use ic_replicated_state::ReplicatedState;
-use ic_state_manager::StateManagerImpl;
+use ic_state_manager::{state_sync::StateSync, StateManagerImpl};
 use ic_types::{consensus::catchup::CUPWithOriginalProtobuf, NodeId, SubnetId};
+use ic_xnet_endpoint::{XNetEndpoint, XNetEndpointConfig};
+use ic_xnet_payload_builder::XNetPayloadBuilderImpl;
+
 use std::sync::Arc;
 
 #[allow(clippy::too_many_arguments, clippy::type_complexity)]
 pub fn construct_ic_stack(
     replica_logger: ReplicaLogger,
     rt_handle: tokio::runtime::Handle,
+    rt_handle_xnet: tokio::runtime::Handle,
     config: Config,
     subnet_config: SubnetConfig,
     node_id: NodeId,
@@ -66,8 +71,8 @@ pub fn construct_ic_stack(
         };
         match catch_up_package {
             // The orchestrator has persisted a CUP for the replica.
-            Some(cup_from_nm) => {
-                let signed = !cup_from_nm
+            Some(cup_from_orc) => {
+                let signed = !cup_from_orc
                     .cup
                     .signature
                     .signature
@@ -80,35 +85,18 @@ pub fn construct_ic_stack(
                     info!(
                         &replica_logger,
                         "Using the signed CUP with height {}",
-                        cup_from_nm.cup.height()
+                        cup_from_orc.cup.height()
                     );
-                    cup_from_nm
                 } else {
                     // The CUP persisted by the orchestrator is unsigned and hence it was created
-                    // from the registry CUP contents. In this case, we re-create this CUP to avoid
-                    // incompatibility issues, because on other replicas of the same subnet the node
-                    // manager version may differ, so the CUP contents might differ as well.
-                    let registry_cup = make_registry_cup();
-                    // However in a special case of the NNS subnet recovery, we still have to use
-                    // a newer unsigned CUP. The incompatibility issue is not a problem in this
-                    // case, because this CUP will not be created by the orchestrator.
-                    if registry_cup.cup.height() < cup_from_nm.cup.height() {
-                        info!(
-                            &replica_logger,
-                            "Using the newer CUP with height {} passed from the orchestrator",
-                            cup_from_nm.cup.height()
-                        );
-                        cup_from_nm
-                    } else {
-                        info!(
-                            &replica_logger,
-                            "Using the CUP with height {} generated from the registry (CUP height from the orchestrator is {})",
-                            registry_cup.cup.height(),
-                            cup_from_nm.cup.height()
-                        );
-                        registry_cup
-                    }
+                    // from the registry CUP contents.
+                    info!(
+                        &replica_logger,
+                        "Using the unsigned CUP with height {} passed from the orchestrator",
+                        cup_from_orc.cup.height()
+                    );
                 }
+                cup_from_orc
             }
             // No CUP was persisted by the orchestrator, which is usually the case for fresh nodes.
             None => {
@@ -138,6 +126,7 @@ pub fn construct_ic_stack(
         subnet_config.cycles_account_manager_config,
     ));
     let verifier = VerifierImpl::new(crypto.clone());
+
     let state_manager = Arc::new(StateManagerImpl::new(
         Arc::new(verifier),
         subnet_id,
@@ -148,6 +137,8 @@ pub fn construct_ic_stack(
         Some(artifact_pools.consensus_pool_cache.starting_height()),
         config.malicious_behaviour.malicious_flags.clone(),
     ));
+    // Get the file descriptor factory object and pass it down the line to the hypervisor
+    let fd_factory = state_manager.get_fd_factory();
     let execution_services = ExecutionServices::setup_execution(
         replica_logger.clone(),
         &metrics_registry,
@@ -157,6 +148,7 @@ pub fn construct_ic_stack(
         config.hypervisor.clone(),
         Arc::clone(&cycles_account_manager),
         Arc::clone(&state_manager) as Arc<_>,
+        Arc::clone(&fd_factory),
     );
 
     let certified_stream_store: Arc<dyn CertifiedStreamStore> =
@@ -186,6 +178,7 @@ pub fn construct_ic_stack(
             &metrics_registry,
             replica_logger.clone(),
             Arc::clone(&registry) as Arc<_>,
+            config.malicious_behaviour.malicious_flags.clone(),
         )
     };
     let message_router = Arc::new(message_router);
@@ -194,7 +187,7 @@ pub fn construct_ic_stack(
         XNetEndpointConfig::from(Arc::clone(&registry) as Arc<_>, node_id, &replica_logger);
 
     let xnet_endpoint = XNetEndpoint::new(
-        rt_handle.clone(),
+        rt_handle_xnet,
         Arc::clone(&certified_stream_store),
         Arc::clone(&crypto) as Arc<_>,
         Arc::clone(&registry),
@@ -217,24 +210,36 @@ pub fn construct_ic_stack(
     );
     let xnet_payload_builder = Arc::new(xnet_payload_builder);
 
-    let btc_testnet_client = setup_bitcoin_client(
+    let BitcoinAdapterClients {
+        btc_testnet_client,
+        btc_mainnet_client,
+    } = setup_bitcoin_adapter_clients(
         replica_logger.clone(),
+        &metrics_registry,
         rt_handle.clone(),
-        config.adapters_config.bitcoin_testnet_uds_path,
-    );
-    let btc_mainnet_client = setup_bitcoin_client(
-        replica_logger.clone(),
-        rt_handle.clone(),
-        config.adapters_config.bitcoin_mainnet_uds_path,
+        config.adapters_config.clone(),
     );
     let self_validating_payload_builder = BitcoinPayloadBuilder::new(
         state_manager.clone(),
         &metrics_registry,
         btc_mainnet_client,
         btc_testnet_client,
+        subnet_id,
+        Arc::clone(&registry),
         replica_logger.clone(),
     );
     let self_validating_payload_builder = Arc::new(self_validating_payload_builder);
+
+    let canister_http_adapter_client = ic_https_outcalls_adapter_client::setup_canister_http_client(
+        rt_handle.clone(),
+        &metrics_registry,
+        config.adapters_config,
+        execution_services.anonymous_query_handler.clone(),
+        replica_logger.clone(),
+        subnet_type,
+    );
+
+    let state_sync = StateSync::new(state_manager.clone(), replica_logger.clone());
 
     let (ingress_ingestion_service, p2p_runner) = create_networking_stack(
         metrics_registry,
@@ -248,7 +253,8 @@ pub fn construct_ic_stack(
         None,
         Arc::clone(&crypto) as Arc<_>,
         Arc::clone(&state_manager) as Arc<_>,
-        P2PStateSyncClient::Client(Arc::clone(&state_manager) as Arc<_>),
+        Arc::clone(&state_manager) as Arc<_>,
+        P2PStateSyncClient::Client(state_sync),
         xnet_payload_builder as Arc<_>,
         self_validating_payload_builder as Arc<_>,
         message_router as Arc<_>,
@@ -262,6 +268,7 @@ pub fn construct_ic_stack(
         &artifact_pools,
         cycles_account_manager,
         local_store_time_reader,
+        canister_http_adapter_client,
         config.nns_registry_replicator.poll_delay_duration_ms,
     );
     Ok((

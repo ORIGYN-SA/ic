@@ -1,8 +1,7 @@
 //! States capturing the stages of the non-interactive DKG protocol.
 
-use crate::keygen::forward_secure_key_id;
+use crate::key_id::KeyId;
 use crate::threshold::ni_dkg::static_api as ni_dkg_static_api;
-use crate::types::conversions::key_id_from_csp_pub_coeffs;
 use crate::types::CspPublicCoefficients;
 use crate::vault::api::CspVault;
 use ic_crypto_internal_threshold_sig_bls12381::api::ni_dkg_errors;
@@ -15,7 +14,7 @@ use ic_types::crypto::threshold_sig::ni_dkg::config::dealers::NiDkgDealers;
 use ic_types::crypto::threshold_sig::ni_dkg::config::receivers::NiDkgReceivers;
 use ic_types::crypto::threshold_sig::ni_dkg::config::NiDkgThreshold;
 use ic_types::crypto::threshold_sig::ni_dkg::{NiDkgId, NiDkgTag, NiDkgTargetSubnet};
-use ic_types::crypto::{AlgorithmId, KeyId};
+use ic_types::crypto::AlgorithmId;
 use ic_types::{Height, NodeId, NodeIndex, NumberOfNodes, SubnetId};
 use ic_types_test_utils::ids::{node_test_id, subnet_test_id};
 use rand::seq::IteratorRandom;
@@ -60,11 +59,17 @@ pub struct MockNode {
     pub csp_vault: Arc<dyn CspVault>,
 }
 impl MockNode {
-    pub fn random(rng: &mut ChaCha20Rng, csp_vault_factory: fn() -> Arc<dyn CspVault>) -> Self {
+    pub fn random(
+        rng: &mut ChaCha20Rng,
+        csp_vault_factory: impl Fn() -> Arc<dyn CspVault>,
+    ) -> Self {
         let node_id = node_test_id(rng.gen::<u64>());
         Self::from_node_id(node_id, csp_vault_factory)
     }
-    pub fn from_node_id(node_id: NodeId, csp_vault_factory: fn() -> Arc<dyn CspVault>) -> Self {
+    pub fn from_node_id(
+        node_id: NodeId,
+        csp_vault_factory: impl Fn() -> Arc<dyn CspVault>,
+    ) -> Self {
         let csp_vault = csp_vault_factory();
         Self {
             node_id,
@@ -75,7 +80,7 @@ impl MockNode {
     /// Deal, resharing or not.
     #[allow(clippy::too_many_arguments)]
     pub fn create_dealing(
-        &mut self,
+        &self,
         algorithm_id: AlgorithmId,
         dealer_index: NodeIndex,
         threshold: NumberOfNodes,
@@ -83,10 +88,7 @@ impl MockNode {
         receiver_keys: BTreeMap<NodeIndex, CspFsEncryptionPublicKey>,
         resharing_public_coefficients: Option<CspPublicCoefficients>,
     ) -> Result<CspNiDkgDealing, ni_dkg_errors::CspDkgCreateReshareDealingError> {
-        let maybe_reshared_secret_id =
-            resharing_public_coefficients.map(|resharing_public_coefficients| {
-                key_id_from_csp_pub_coeffs(&resharing_public_coefficients)
-            });
+        let maybe_reshared_secret_id = resharing_public_coefficients.as_ref().map(KeyId::from);
         self.csp_vault
             .create_dealing(
                 algorithm_id,
@@ -115,10 +117,10 @@ impl MockNetwork {
     pub fn random(
         rng: &mut ChaCha20Rng,
         size: usize,
-        csp_vault_factory: fn() -> Arc<dyn CspVault>,
+        csp_vault_factory: impl Fn() -> Arc<dyn CspVault>,
     ) -> Self {
         let mut nodes_by_node_id: BTreeMap<NodeId, MockNode> = (0..size)
-            .map(|_| MockNode::random(rng, csp_vault_factory))
+            .map(|_| MockNode::random(rng, &csp_vault_factory))
             .map(|node| (node.node_id, node))
             .collect();
 
@@ -129,7 +131,7 @@ impl MockNetwork {
                 let (id, (pubkey, _pop)) = (
                     *node_id,
                     node.csp_vault
-                        .gen_forward_secure_key_pair(*node_id, AlgorithmId::NiDkg_Groth20_Bls12_381)
+                        .gen_dealing_encryption_key_pair(*node_id)
                         .unwrap_or_else(|_| {
                             panic!(
                                 "Failed to create forward secure encryption key for NodeId {}",
@@ -137,7 +139,7 @@ impl MockNetwork {
                             )
                         }),
                 );
-                node.fs_key_id = forward_secure_key_id(&pubkey);
+                node.fs_key_id = KeyId::from(&pubkey);
                 (id, pubkey)
             })
             .collect();
@@ -163,6 +165,7 @@ pub struct MockDkgConfig {
     pub receivers: NiDkgReceivers,
     pub receiver_keys: BTreeMap<NodeIndex, CspFsEncryptionPublicKey>,
     pub threshold: NiDkgThreshold,
+    pub non_resharing_collection_threshold: NumberOfNodes,
     pub epoch: Epoch,
     // If the transcript of the previous DKG phase is present, resharing DKG is performed.
     pub resharing_transcript: Option<CspNiDkgTranscript>,
@@ -202,7 +205,7 @@ impl MockDkgConfig {
             } else {
                 all_node_ids
                     .iter()
-                    .take(rng.gen_range(min_dealers, num_nodes + 1))
+                    .take(rng.gen_range(min_dealers..=num_nodes))
                     .cloned()
                     .collect()
             },
@@ -210,7 +213,7 @@ impl MockDkgConfig {
         .expect("Could not create NiDkgDealers struct for test");
         let num_dealers = dealers.get().len();
 
-        let num_receivers = rng.gen_range(min_receivers, num_nodes + 1);
+        let num_receivers = rng.gen_range(min_receivers..=num_nodes);
         let receivers =
             NiDkgReceivers::new(all_node_ids.iter().take(num_receivers).cloned().collect())
                 .expect("Could not create NiDkgReceivers struct for test");
@@ -218,10 +221,10 @@ impl MockDkgConfig {
         // Config values
         let algorithm_id = AlgorithmId::NiDkg_Groth20_Bls12_381;
         let dkg_id = random_ni_dkg_id(rng);
-        let max_corrupt_dealers = rng.gen_range(0, num_dealers); // Need at least one honest dealer.
-        let threshold = rng.gen_range(min_threshold, num_receivers + 1); // threshold <= num_receivers
+        let max_corrupt_dealers = rng.gen_range(0..num_dealers); // Need at least one honest dealer.
+        let threshold = rng.gen_range(min_threshold..=num_receivers); // threshold <= num_receivers
         let max_corrupt_receivers =
-            rng.gen_range(0, std::cmp::min(num_receivers + 1 - threshold, threshold)); // (max_corrupt_receivers <= num_receivers - threshold) &&
+            rng.gen_range(0..std::cmp::min(num_receivers + 1 - threshold, threshold)); // (max_corrupt_receivers <= num_receivers - threshold) &&
                                                                                        // (max_corrupt_receivers < threshold)
         let epoch = Epoch::from(rng.gen::<u32>());
 
@@ -241,6 +244,9 @@ impl MockDkgConfig {
             receiver_keys,
             threshold: NiDkgThreshold::new(NumberOfNodes::from(threshold as NodeIndex))
                 .expect("Invalid threshold"),
+            non_resharing_collection_threshold: NumberOfNodes::from(
+                max_corrupt_dealers as NodeIndex + 1,
+            ),
             epoch,
             resharing_transcript,
         }
@@ -388,6 +394,7 @@ impl StateWithTranscript {
         threshold: NumberOfNodes,
         number_of_receivers: NumberOfNodes,
         csp_dealings: BTreeMap<NodeIndex, CspNiDkgDealing>,
+        non_resharing_collection_threshold: NumberOfNodes,
         resharing_public_coefficients: Option<CspPublicCoefficients>,
     ) -> Result<CspNiDkgTranscript, ni_dkg_errors::CspDkgCreateReshareTranscriptError> {
         if let Some(resharing_public_coefficients) = resharing_public_coefficients {
@@ -404,6 +411,7 @@ impl StateWithTranscript {
                 threshold,
                 number_of_receivers,
                 csp_dealings,
+                non_resharing_collection_threshold,
             )
             .map_err(ni_dkg_errors::CspDkgCreateReshareTranscriptError::from)
         }
@@ -421,6 +429,7 @@ impl StateWithTranscript {
             config.threshold.get(),
             config.receivers.count(),
             verified_dealings,
+            config.non_resharing_collection_threshold,
             config
                 .resharing_transcript
                 .as_ref()
@@ -436,12 +445,12 @@ impl StateWithTranscript {
 
     /// Receivers decrypt their threshold secret key using their forward secure
     /// secret key.
-    pub fn load_keys(&mut self) {
-        let network = &mut self.network;
+    pub fn load_keys(&self) {
+        let network = &self.network;
         for (node_index, node_id) in self.config.receivers.iter() {
             let node = network
                 .nodes_by_node_id
-                .get_mut(&node_id)
+                .get(&node_id)
                 .expect("Config refers to a NodeId not in the network");
             node.csp_vault
                 .load_threshold_signing_key(

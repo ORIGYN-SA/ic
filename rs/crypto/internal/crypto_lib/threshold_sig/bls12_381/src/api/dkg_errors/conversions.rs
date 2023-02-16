@@ -1,6 +1,7 @@
 //! Convert DKG error types to and from other error types.
-use super::*;
-use ic_types::crypto::threshold_sig::ni_dkg::errors::create_transcript_error::DkgCreateTranscriptError;
+use ic_types::crypto::threshold_sig::ni_dkg::errors::{
+    create_transcript_error::DkgCreateTranscriptError, MalformedFsEncryptionPublicKeyError,
+};
 
 use crate::api::ni_dkg_errors::{
     CspDkgCreateReshareTranscriptError, CspDkgCreateTranscriptError, CspDkgLoadPrivateKeyError,
@@ -12,17 +13,6 @@ impl From<CspDkgCreateTranscriptError> for DkgCreateTranscriptError {
     fn from(error: CspDkgCreateTranscriptError) -> Self {
         // The errors are handled identically to the resharing variant:
         DkgCreateTranscriptError::from(CspDkgCreateReshareTranscriptError::from(error))
-    }
-}
-
-impl From<DkgCreateEphemeralError> for CryptoError {
-    // Placeholder implementation
-    fn from(create_ephemeral_error: DkgCreateEphemeralError) -> CryptoError {
-        match create_ephemeral_error {
-            DkgCreateEphemeralError::MalformedSecretKeyError(error) => {
-                panic!("Internal error from CSP: {:?}", error)
-            }
-        }
     }
 }
 
@@ -68,61 +58,21 @@ impl From<CspDkgLoadPrivateKeyError> for DkgLoadTranscriptError {
                     panic_prefix, ciphertext_epoch, secret_key_epoch
                 );
             }
-            CspDkgLoadPrivateKeyError::InternalError(e) => {
-                DkgLoadTranscriptError::InternalError(ic_types::crypto::error::InternalError {
-                    internal_error: e.internal_error,
-                })
+            CspDkgLoadPrivateKeyError::TransientInternalError(e) => {
+                DkgLoadTranscriptError::TransientInternalError(
+                    ic_types::crypto::error::InternalError {
+                        internal_error: e.internal_error,
+                    },
+                )
             }
-        }
-    }
-}
-
-impl From<DkgCreateDealingError> for CryptoError {
-    fn from(create_dealing_error: DkgCreateDealingError) -> Self {
-        match create_dealing_error {
-            DkgCreateDealingError::MalformedPublicKeyError(error) => CryptoError::InvalidArgument {
-                message: format!("CSP error: {:?}", error),
-            },
-            DkgCreateDealingError::KeyNotFoundError(error) => CryptoError::InvalidArgument {
-                message: format!("CSP error: {:?}", error),
-            },
-            DkgCreateDealingError::MalformedSecretKeyError(error) => {
-                panic!("Internal error from CSP: {:?}", error)
+            CspDkgLoadPrivateKeyError::MalformedPublicKeyError(error) => {
+                // Forward to the caller because the argument is malformed.
+                DkgLoadTranscriptError::MalformedFsEncryptionPublicKey(
+                    MalformedFsEncryptionPublicKeyError {
+                        internal_error: error.to_string(),
+                    },
+                )
             }
-            DkgCreateDealingError::UnsupportedThresholdParameters(error) => {
-                CryptoError::InvalidArgument {
-                    message: format!("CSP error: {:?}", error),
-                }
-            }
-            DkgCreateDealingError::SizeError(error) => CryptoError::InvalidArgument {
-                message: format!("CSP error: {:?}", error),
-            },
-        }
-    }
-}
-
-impl From<DkgCreateReshareDealingError> for CryptoError {
-    fn from(create_reshare_dealing_error: DkgCreateReshareDealingError) -> Self {
-        match create_reshare_dealing_error {
-            DkgCreateReshareDealingError::MalformedPublicKeyError(error) => {
-                CryptoError::InvalidArgument {
-                    message: format!("CSP error: {:?}", error),
-                }
-            }
-            DkgCreateReshareDealingError::KeyNotFoundError(error) => CryptoError::InvalidArgument {
-                message: format!("CSP error: {:?}", error),
-            },
-            DkgCreateReshareDealingError::MalformedSecretKeyError(error) => {
-                panic!("Internal error from CSP: {:?}", error)
-            }
-            DkgCreateReshareDealingError::UnsupportedThresholdParameters(error) => {
-                CryptoError::InvalidArgument {
-                    message: format!("CSP error: {:?}", error),
-                }
-            }
-            DkgCreateReshareDealingError::SizeError(error) => CryptoError::InvalidArgument {
-                message: format!("CSP error: {:?}", error),
-            },
         }
     }
 }

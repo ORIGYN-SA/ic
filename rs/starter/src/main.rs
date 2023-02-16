@@ -20,64 +20,71 @@
 //!   - serves metrics at localhost:18080 instead of dumping them at stdout
 
 use anyhow::Result;
+use clap::Parser;
 use ic_config::{
+    adapters::AdaptersConfig,
     artifact_pool::ArtifactPoolTomlConfig,
     consensus::ConsensusConfig,
     crypto::CryptoConfig,
     execution_environment::Config as HypervisorConfig,
     flag_status::FlagStatus,
-    http_handler,
-    http_handler::PortConfig,
+    http_handler::Config as HttpHandlerConfig,
     logger::Config as LoggerConfig,
     metrics::{Config as MetricsConfig, Exporter},
     registry_client::{Config as RegistryClientConfig, DataProviderConfig},
     state_manager::Config as StateManagerConfig,
-    transport::{TransportConfig, TransportFlowConfig},
+    transport::TransportConfig,
     ConfigOptional as ReplicaConfig,
 };
-use ic_logger::LoggerImpl;
+use ic_ic00_types::EcdsaKeyId;
+use ic_logger::{info, new_replica_logger_from_config};
 use ic_prep_lib::{
     internet_computer::{IcConfig, TopologyConfig},
     node::{NodeConfiguration, NodeIndex},
     subnet_configuration::SubnetConfig,
 };
-use ic_protobuf::registry::subnet::v1::SubnetFeatures;
+use ic_protobuf::{
+    bitcoin::v1::Network as BitcoinNetwork,
+    registry::subnet::v1::{
+        BitcoinFeatureInfo, BitcoinFeatureStatus, EcdsaConfig, SevFeatureStatus, SubnetFeatures,
+    },
+};
 use ic_registry_provisional_whitelist::ProvisionalWhitelist;
 use ic_registry_subnet_type::SubnetType;
 use ic_types::{registry::connection_endpoint::ConnectionEndpoint, Height};
 use serde::{Deserialize, Serialize};
-use slog::info;
 use std::{
     collections::BTreeMap,
     net::SocketAddr,
     net::{IpAddr, Ipv4Addr, SocketAddrV4},
     time::Duration,
 };
-use std::{io, os::unix::process::CommandExt, path::PathBuf, process::Command};
-use structopt::StructOpt;
+use std::{io, os::unix::process::CommandExt, path::PathBuf, process::Command, str::FromStr};
 use tempfile::TempDir;
 
 const NODE_INDEX: NodeIndex = 100;
 const SUBNET_ID: u64 = 0;
 
 fn main() -> Result<()> {
-    let logger = LoggerImpl::new(&LoggerConfig::default(), "starter_slog".to_string());
-    let log = logger.root.new(slog::o!("Application" => "starter"));
+    let config = CliArgs::parse().validate()?;
+    let logger_config = LoggerConfig {
+        level: config.log_level,
+        ..LoggerConfig::default()
+    };
+    let (log, _async_log_guard) = new_replica_logger_from_config(&logger_config);
 
-    let config = CliArgs::from_args().validate()?;
     info!(log, "ic-starter. Configuration: {:?}", config);
     let config_path = config.state_dir.join("ic.json5");
-    if config_path.as_path().exists() {
-        info!(log, "Use existing replica configuration {:?}", config_path);
-    } else {
-        info!(log, "Initialize replica configuration {:?}", config_path);
 
-        let replica_config = config.build_replica_config();
+    info!(log, "Initialize replica configuration {:?}", config_path);
 
-        // assemble config
-        let config_json = serde_json::to_string(&replica_config).unwrap();
-        std::fs::write(config_path.clone(), config_json.into_bytes()).unwrap();
+    let replica_config = config.build_replica_config();
 
+    // assemble config
+    let config_json = serde_json::to_string(&replica_config).unwrap();
+    std::fs::write(config_path.clone(), config_json.into_bytes()).unwrap();
+
+    if !config.registry_local_store_path.exists() {
         // assemble registry.json
         // At the moment, this always regenerates the node key.
         // TODO: Only regenerate if necessary, depends on CRP-359
@@ -92,14 +99,19 @@ fn main() -> Result<()> {
                 p2p_addr: "org.internetcomputer.p2p1://0.0.0.0:0"
                     .parse()
                     .expect("can't fail"),
-                p2p_num_flows: 1,
-                p2p_start_flow_tag: 0,
                 prometheus_metrics: vec![],
                 node_operator_principal_id: None,
-                no_idkg_key: false,
                 secret_key_store: None,
             },
         );
+
+        let ecdsa_config = config.ecdsa_keyid.clone().map(|key_id| EcdsaConfig {
+            quadruples_to_create_in_advance: 1,
+            key_ids: vec![(&key_id).into()],
+            max_queue_size: 64,
+            signature_request_timeout_ns: None,
+            idkg_key_rotation_period_ms: None,
+        });
 
         let mut topology_config = TopologyConfig::default();
         topology_config.insert_subnet(
@@ -121,6 +133,7 @@ fn main() -> Result<()> {
                 None,
                 None,
                 Some(config.subnet_features),
+                ecdsa_config,
                 None,
                 vec![],
                 vec![],
@@ -131,7 +144,7 @@ fn main() -> Result<()> {
         // step for a specific deployment case in ic-prep: when we want to deploy
         // nodes without assigning them to subnets
 
-        let ic_config = IcConfig::new(
+        let mut ic_config = IcConfig::new(
             /* target_dir= */ config.state_dir.as_path(),
             topology_config,
             /* replica_version_id= */ None,
@@ -143,7 +156,11 @@ fn main() -> Result<()> {
             None,
             None,
             /* ssh_readonly_access_to_unassigned_nodes */ vec![],
+            /* guest_launch_measurement_sha256_hex */ None,
         );
+
+        ic_config.set_use_specified_ids_allocation_range(config.use_specified_ids_allocation_range);
+
         ic_config.initialize()?;
     }
 
@@ -173,15 +190,15 @@ fn main() -> Result<()> {
         .arg("--replica-version")
         .arg(config.replica_version)
         .arg("--config-file")
-        .args(&[config_path.to_str().unwrap()]);
+        .args([config_path.to_str().unwrap()]);
     info!(log, "Executing {:?}", cmd);
     cmd.exec();
 
     Ok(())
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize, StructOpt)]
-#[structopt(name = "ic-starter", about = "Starter.")]
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize, Parser)]
+#[clap(name = "ic-starter", about = "Starter.", version)]
 struct CliArgs {
     /// Path the to replica binary.
     ///
@@ -189,17 +206,17 @@ struct CliArgs {
     /// expected that a config will be found for '--bin replica'. In other
     /// words, it is expected that the starter is invoked from the rs/
     /// directory.
-    #[structopt(long = "replica-path", parse(from_os_str))]
+    #[clap(long = "replica-path", parse(from_os_str))]
     replica_path: Option<PathBuf>,
 
     /// Version of the replica binary.
-    #[structopt(long = "replica-version", default_value = "0.8.0")]
+    #[clap(long = "replica-version", default_value = "0.8.0")]
     replica_version: String,
 
     /// Path to the cargo binary. Not optional because there is a default value.
     ///
     /// Unused if --replica-path is present
-    #[structopt(long = "cargo", default_value = "cargo")]
+    #[clap(long = "cargo", default_value = "cargo")]
     cargo_bin: String,
 
     /// Options to pass to cargo, such as "--release". Not optional because
@@ -209,13 +226,13 @@ struct CliArgs {
     /// instance: cargo run ic-starter -- '--cargo-opts=--release --quiet'
     ///
     /// Unused if --replica-path is present
-    #[structopt(long = "cargo-opts", default_value = "")]
+    #[clap(long = "cargo-opts", default_value = "")]
     cargo_opts: String,
 
     /// Path to the directory containing all state for this replica. (default: a
     /// temp directory that will be deleted immediately when the replica
     /// stops).
-    #[structopt(long = "state-dir", parse(from_os_str))]
+    #[clap(long = "state-dir", parse(from_os_str))]
     state_dir: Option<PathBuf>,
 
     /// The http port of the public API.
@@ -224,14 +241,14 @@ struct CliArgs {
     /// used.
     ///
     /// This argument is incompatible with --http-port-file.
-    #[structopt(long = "http-port")]
+    #[clap(long = "http-port")]
     http_port: Option<u16>,
 
     /// The http listening address of the public API.
     ///
     /// If not specified, and if --http-port-file is empty, then 127.0.0.1:8080
     /// will be used.
-    #[structopt(long = "http-listen-addr")]
+    #[clap(long = "http-listen-addr")]
     http_listen_addr: Option<SocketAddr>,
 
     /// The file where the chosen port of the public api will be written to.
@@ -239,64 +256,98 @@ struct CliArgs {
     /// at start time.
     ///
     /// This argument is incompatible with --http-port.
-    #[structopt(long = "http-port-file", parse(from_os_str))]
+    #[clap(long = "http-port-file", parse(from_os_str))]
     http_port_file: Option<PathBuf>,
 
     /// Arg to control whitelist for creating funds which is either set to "*"
     /// or "".
-    #[structopt(short = "-c", long = "create-funds-whitelist")]
+    #[clap(short = 'c', long = "create-funds-whitelist")]
     provisional_whitelist: Option<String>,
 
-    /// Run replica with the provided log level. Default is Warning
-    #[structopt(long = "log-level",
+    /// Run replica and ic-starter with the provided log level. Default is Warning
+    #[clap(long = "log-level",
                 possible_values = &["critical", "error", "warning", "info", "debug", "trace"],
-                case_insensitive = true)]
+                ignore_case = true)]
     log_level: Option<String>,
 
+    /// Debug overrides to show debug logs for certain components.
+    #[clap(long = "debug-overrides", multiple_values(true))]
+    debug_overrides: Vec<String>,
+
     /// Metrics port. Default is None, i.e. periodically dump metrics on stdout.
-    #[structopt(long = "metrics-port")]
+    #[clap(long = "metrics-port")]
     metrics_port: Option<u16>,
 
     /// Metrics address. Use this in preference to metrics-port
-    #[structopt(long = "metrics-addr")]
+    #[clap(long = "metrics-addr")]
     metrics_addr: Option<SocketAddr>,
 
     /// Unit delay for blockmaker (in milliseconds).
     /// If running integration tests locally (e.g. ic-ref-test),
     /// setting this to 100ms results in faster execution (and higher
     /// CPU consumption).
-    #[structopt(long = "unit-delay-millis")]
+    #[clap(long = "unit-delay-millis")]
     unit_delay_millis: Option<u64>,
 
     /// Initial delay for notary (in milliseconds).
     /// If running integration tests locally (e.g. ic-ref-test),
     /// setting this to 100ms results in faster execution (and higher
     /// CPU consumption).
-    #[structopt(long = "initial-notary-delay-millis")]
+    #[clap(long = "initial-notary-delay-millis")]
     initial_notary_delay_millis: Option<u64>,
 
     /// DKG interval length (in number of blocks).
-    #[structopt(long = "dkg-interval-length")]
+    #[clap(long = "dkg-interval-length")]
     dkg_interval_length: Option<u64>,
 
     /// Whether or not to detect and warn of starvations in consensus.
-    #[structopt(long = "detect-consensus-starvation")]
+    #[clap(long = "detect-consensus-starvation")]
     detect_consensus_starvation: Option<bool>,
 
     /// The backend DB used by Consensus, can be rocksdb or lmdb.
-    #[structopt(long = "consensus-pool-backend",
+    #[clap(long = "consensus-pool-backend",
                 possible_values = &["lmdb", "rocksdb"])]
     consensus_pool_backend: Option<String>,
 
     /// Subnet features
-    #[structopt(long = "subnet-features",
-                possible_values = &["ecdsa_signatures", "canister_sandboxing", "http_requests", "bitcoin_testnet_feature"])]
+    #[clap(long = "subnet-features",
+        possible_values = &[
+            "canister_sandboxing",
+            "http_requests",
+            "bitcoin_testnet",
+            "bitcoin_testnet_syncing",
+            "bitcoin_testnet_paused",
+            "bitcoin_mainnet",
+            "bitcoin_mainnet_syncing",
+            "bitcoin_mainnet_paused",
+            "bitcoin_regtest",
+            "bitcoin_regtest_syncing",
+            "bitcoin_regtest_paused",
+        ],
+        multiple_values(true))]
     subnet_features: Vec<String>,
 
+    /// Enable ecdsa signature by assigning the given key id a freshly generated key.
+    #[clap(long = "ecdsa-keyid")]
+    ecdsa_keyid: Option<String>,
+
     /// Subnet type
-    #[structopt(long = "subnet-type",
+    #[clap(long = "subnet-type",
                 possible_values = &["application", "verified_application", "system"])]
     subnet_type: Option<String>,
+
+    /// Unix Domain Socket for Bitcoin testnet
+    #[clap(long = "bitcoin-testnet-uds-path")]
+    bitcoin_testnet_uds_path: Option<PathBuf>,
+
+    /// Unix Domain Socket for canister http adapter
+    #[clap(long = "canister-http-uds-path")]
+    canister_http_uds_path: Option<PathBuf>,
+
+    /// Whether or not to assign canister ID allocation range for specified IDs to subnet.
+    /// Used only for local replicas.
+    #[clap(long = "use-specified-ids-allocation-range")]
+    use_specified_ids_allocation_range: bool,
 }
 
 impl CliArgs {
@@ -461,10 +512,23 @@ impl CliArgs {
             }
         };
 
+        let ecdsa_keyid = self
+            .ecdsa_keyid
+            .as_ref()
+            .map(|s| EcdsaKeyId::from_str(s))
+            .transpose()
+            .map_err(|err| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("Invalid ecdsa_keyid: {}", err),
+                )
+            })?;
+
         Ok(ValidatedConfig {
             replica_path,
             replica_version,
             log_level,
+            debug_overrides: self.debug_overrides.clone(),
             cargo_bin,
             cargo_opts,
             state_dir,
@@ -483,25 +547,111 @@ impl CliArgs {
             detect_consensus_starvation: self.detect_consensus_starvation,
             consensus_pool_backend: self.consensus_pool_backend,
             subnet_features: to_subnet_features(&self.subnet_features),
+            ecdsa_keyid,
             subnet_type,
+            bitcoin_testnet_uds_path: self.bitcoin_testnet_uds_path,
+            https_outcalls_uds_path: self.canister_http_uds_path,
+            use_specified_ids_allocation_range: self.use_specified_ids_allocation_range,
         })
     }
 }
 
 fn to_subnet_features(features: &[String]) -> SubnetFeatures {
-    let ecdsa_signatures = features.iter().any(|s| s.as_str() == "ecdsa_signatures");
     let canister_sandboxing = features.iter().any(|s| s.as_str() == "canister_sandboxing");
     let http_requests = features.iter().any(|s| s.as_str() == "http_requests");
-    let bitcoin_testnet_feature = features
+    let bitcoin = if features.iter().any(|s| s.as_str() == "bitcoin_testnet") {
+        Some(BitcoinFeatureInfo {
+            network: BitcoinNetwork::Testnet.into(),
+            status: BitcoinFeatureStatus::Enabled.into(),
+        })
+    } else if features
         .iter()
-        .find(|s| s.as_str() == "bitcoin_testnet_feature")
-        .map(|_| 2); // BitcoinFeature::Enabled
+        .any(|s| s.as_str() == "bitcoin_testnet_paused")
+    {
+        Some(BitcoinFeatureInfo {
+            network: BitcoinNetwork::Testnet.into(),
+            status: BitcoinFeatureStatus::Paused.into(),
+        })
+    } else if features
+        .iter()
+        .any(|s| s.as_str() == "bitcoin_testnet_syncing")
+    {
+        Some(BitcoinFeatureInfo {
+            network: BitcoinNetwork::Testnet.into(),
+            status: BitcoinFeatureStatus::Syncing.into(),
+        })
+    } else if features.iter().any(|s| s.as_str() == "bitcoin_mainnet") {
+        Some(BitcoinFeatureInfo {
+            network: BitcoinNetwork::Mainnet.into(),
+            status: BitcoinFeatureStatus::Enabled.into(),
+        })
+    } else if features
+        .iter()
+        .any(|s| s.as_str() == "bitcoin_mainnet_paused")
+    {
+        Some(BitcoinFeatureInfo {
+            network: BitcoinNetwork::Mainnet.into(),
+            status: BitcoinFeatureStatus::Paused.into(),
+        })
+    } else if features
+        .iter()
+        .any(|s| s.as_str() == "bitcoin_mainnet_syncing")
+    {
+        Some(BitcoinFeatureInfo {
+            network: BitcoinNetwork::Mainnet.into(),
+            status: BitcoinFeatureStatus::Syncing.into(),
+        })
+    } else if features.iter().any(|s| s.as_str() == "bitcoin_regtest") {
+        Some(BitcoinFeatureInfo {
+            network: BitcoinNetwork::Regtest.into(),
+            status: BitcoinFeatureStatus::Enabled.into(),
+        })
+    } else if features
+        .iter()
+        .any(|s| s.as_str() == "bitcoin_regtest_syncing")
+    {
+        Some(BitcoinFeatureInfo {
+            network: BitcoinNetwork::Regtest.into(),
+            status: BitcoinFeatureStatus::Syncing.into(),
+        })
+    } else if features
+        .iter()
+        .any(|s| s.as_str() == "bitcoin_regtest_paused")
+    {
+        Some(BitcoinFeatureInfo {
+            network: BitcoinNetwork::Regtest.into(),
+            status: BitcoinFeatureStatus::Paused.into(),
+        })
+    } else {
+        None
+    };
 
+    let sev_status = if features
+        .iter()
+        .any(|s| s.as_str() == "sev_insecure_enabled")
+    {
+        Some(SevFeatureStatus::InsecureEnabled.into())
+    } else if features
+        .iter()
+        .any(|s| s.as_str() == "sev_insecure_integrity_enabled")
+    {
+        Some(SevFeatureStatus::InsecureIntegrityEnabled.into())
+    } else if features
+        .iter()
+        .any(|s| s.as_str() == "sev_secure_no_upgrade_enabled")
+    {
+        Some(SevFeatureStatus::SecureNoUpgradeEnabled.into())
+    } else if features.iter().any(|s| s.as_str() == "sev_secure_enabled") {
+        Some(SevFeatureStatus::SecureEnabled.into())
+    } else {
+        None
+    };
     SubnetFeatures {
-        ecdsa_signatures,
         canister_sandboxing,
         http_requests,
-        bitcoin_testnet_feature,
+        bitcoin_testnet_feature: None,
+        bitcoin,
+        sev_status,
     }
 }
 
@@ -510,6 +660,7 @@ struct ValidatedConfig {
     replica_path: Option<PathBuf>,
     replica_version: String,
     log_level: slog::Level,
+    debug_overrides: Vec<String>,
     cargo_bin: String,
     cargo_opts: String,
     state_dir: PathBuf,
@@ -527,7 +678,11 @@ struct ValidatedConfig {
     detect_consensus_starvation: Option<bool>,
     consensus_pool_backend: Option<String>,
     subnet_features: SubnetFeatures,
+    ecdsa_keyid: Option<EcdsaKeyId>,
     subnet_type: SubnetType,
+    bitcoin_testnet_uds_path: Option<PathBuf>,
+    https_outcalls_uds_path: Option<PathBuf>,
+    use_specified_ids_allocation_range: bool,
 
     // Not intended to ever be read: role is to keep the temp dir from being deleted.
     _state_dir_holder: Option<TempDir>,
@@ -536,16 +691,14 @@ struct ValidatedConfig {
 impl ValidatedConfig {
     fn build_replica_config(self: &ValidatedConfig) -> ReplicaConfig {
         let state_manager = Some(StateManagerConfig::new(self.state_manager_root.clone()));
-        let http_handler = Some(http_handler::ExternalConfig {
-            listen_addr: Some(self.http_listen_addr),
-            port: self
-                .http_port_file
-                .as_ref()
-                .map(|http_port_file| PortConfig::WritePortTo(http_port_file.clone())),
+        let http_handler = Some(HttpHandlerConfig {
+            listen_addr: self.http_listen_addr,
+            port_file_path: self.http_port_file.clone(),
             ..Default::default()
         });
         let metrics = self.metrics_addr.map(|metrics_addr| MetricsConfig {
             exporter: Exporter::Http(metrics_addr),
+            ..Default::default()
         });
 
         let mut artifact_pool_cfg =
@@ -563,17 +716,16 @@ impl ValidatedConfig {
         let logger_config = LoggerConfig {
             node_id: NODE_INDEX,
             level: self.log_level,
+            debug_overrides: self.debug_overrides.clone(),
             ..LoggerConfig::default()
         };
         let logger = Some(logger_config);
 
         let transport = Some(TransportConfig {
             node_ip: "0.0.0.0".to_string(),
-            p2p_flows: vec![TransportFlowConfig {
-                flow_tag: 1234,
-                server_port: 0,
-                queue_size: 1024,
-            }],
+            listening_port: 0,
+            send_queue_size: 1024,
+            ..Default::default()
         });
 
         let hypervisor_config = HypervisorConfig {
@@ -585,12 +737,19 @@ impl ValidatedConfig {
             rate_limiting_of_debug_prints: FlagStatus::Disabled,
             rate_limiting_of_heap_delta: FlagStatus::Disabled,
             rate_limiting_of_instructions: FlagStatus::Disabled,
+            composite_queries: FlagStatus::Enabled,
             ..HypervisorConfig::default()
         };
 
         let hypervisor = Some(hypervisor_config);
 
         let consensus = self.detect_consensus_starvation.map(ConsensusConfig::new);
+
+        let adapters_config = Some(AdaptersConfig {
+            bitcoin_testnet_uds_path: self.bitcoin_testnet_uds_path.clone(),
+            https_outcalls_uds_path: self.https_outcalls_uds_path.clone(),
+            ..AdaptersConfig::default()
+        });
 
         ReplicaConfig {
             registry_client,
@@ -603,6 +762,7 @@ impl ValidatedConfig {
             consensus,
             crypto,
             logger,
+            adapters_config,
             ..ReplicaConfig::default()
         }
     }

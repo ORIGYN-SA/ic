@@ -7,6 +7,8 @@ use ic_crypto_internal_basic_sig_ed25519::types::SignatureBytes as BasicSigEd255
 use ic_protobuf::registry::crypto::v1::X509PublicKeyCert;
 use ic_types::crypto::CryptoResult;
 use ic_types::NodeId;
+use serde::Deserialize;
+use serde::Serialize;
 use std::convert::TryFrom;
 use x509_parser::certificate::X509Certificate;
 use x509_parser::time::ASN1Time;
@@ -15,7 +17,10 @@ use x509_parser::x509::{X509Name, X509Version};
 #[cfg(test)]
 mod tests;
 
-/// Validates a node's TLS certificate.
+/// Validated node's TLS certificate.
+///
+/// The [`certificate`] contained is guaranteed to be immutable and a valid TLS certificate.
+/// Use `try_from((X509PublicKeyCert, NodeId))` to create an instance from an unvalidated certificate and node ID.
 ///
 /// Validation of a *node's TLS certificate* includes verifying that
 /// * the certificate is well-formed, i.e., formatted in X.509 version 3 and
@@ -39,25 +44,37 @@ mod tests;
 ///   that is, the certificate is correctly self-signed
 ///
 /// [RFC 5280 (section 4.1.2.5)]: https://tools.ietf.org/html/rfc5280#section-4.1.2.5
-pub fn validate_tls_certificate(
-    tls_certificate: &X509PublicKeyCert,
-    node_id: NodeId,
-) -> Result<(), TlsCertValidationError> {
-    let x509_cert = parse_x509_v3_certificate(&tls_certificate.certificate_der)?;
-    let subject_cn = single_subject_cn_as_str(&x509_cert)?;
-    ensure_subject_cn_equals_node_id(subject_cn, node_id)?;
-    ensure_single_issuer_cn_equals_subject_cn(&x509_cert, subject_cn)?;
-    ensure_not_ca(&x509_cert)?;
-    ensure_notbefore_date_is_latest_in_two_minutes_from_now(&x509_cert)?;
-    ensure_notafter_date_equals_99991231235959z(&x509_cert)?;
-    ensure_signature_algorithm_is_ed25519(&x509_cert)?;
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ValidTlsCertificate {
+    certificate: X509PublicKeyCert,
+}
 
-    let public_key = ed25519_pubkey_from_x509_cert(&x509_cert)?;
-    verify_ed25519_public_key(&public_key)?;
-    verify_ed25519_signature(&x509_cert, &public_key).map_err(|e| {
-        invalid_tls_certificate_error(format!("signature verification failed: {}", e))
-    })?;
-    Ok(())
+impl ValidTlsCertificate {
+    pub fn get(&self) -> &X509PublicKeyCert {
+        &self.certificate
+    }
+}
+
+impl TryFrom<(X509PublicKeyCert, NodeId)> for ValidTlsCertificate {
+    type Error = TlsCertValidationError;
+
+    fn try_from((certificate, node_id): (X509PublicKeyCert, NodeId)) -> Result<Self, Self::Error> {
+        let x509_cert = parse_x509_v3_certificate(&certificate.certificate_der)?;
+        let subject_cn = single_subject_cn_as_str(&x509_cert)?;
+        ensure_subject_cn_equals_node_id(subject_cn, node_id)?;
+        ensure_single_issuer_cn_equals_subject_cn(&x509_cert, subject_cn)?;
+        ensure_not_ca(&x509_cert)?;
+        ensure_notbefore_date_is_latest_in_two_minutes_from_now(&x509_cert)?;
+        ensure_notafter_date_equals_99991231235959z(&x509_cert)?;
+        ensure_signature_algorithm_is_ed25519(&x509_cert)?;
+
+        let public_key = ed25519_pubkey_from_x509_cert(&x509_cert)?;
+        verify_ed25519_public_key(&public_key)?;
+        verify_ed25519_signature(&x509_cert, &public_key).map_err(|e| {
+            invalid_tls_certificate_error(format!("signature verification failed: {}", e))
+        })?;
+        Ok(Self { certificate })
+    }
 }
 
 fn single_subject_cn_as_str<'a>(
@@ -76,7 +93,7 @@ fn parse_x509_v3_certificate(
     if !remainder.is_empty() {
         return Err(invalid_tls_certificate_error(format!(
             "DER not fully consumed when parsing. Remainder: 0x{}",
-            hex::encode(&remainder)
+            hex::encode(remainder)
         )));
     }
     if x509_cert.version() != X509Version::V3 {
@@ -177,7 +194,7 @@ fn single_cn_as_str<'a>(name: &'a X509Name<'_>) -> Result<&'a str, String> {
         .ok_or("missing common name (CN)")?
         .as_str()
         .map_err(|e| format!("common name (CN) not a string: {:?}", e))?;
-    if cn_iter.next() != None {
+    if cn_iter.next().is_some() {
         return Err("found second common name (CN) entry, but expected a single one".to_string());
     }
     Ok(first_cn_str)

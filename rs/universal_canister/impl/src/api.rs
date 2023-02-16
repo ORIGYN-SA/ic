@@ -5,6 +5,7 @@ extern crate wee_alloc;
 #[global_allocator]
 static ALLOC: wee_alloc::WeeAlloc<'_> = wee_alloc::WeeAlloc::INIT;
 
+#[allow(clippy::unused_unit)]
 mod ic0 {
     #[link(wasm_import_module = "ic0")]
     extern "C" {
@@ -21,6 +22,8 @@ mod ic0 {
         pub fn msg_reject_code() -> u32;
         pub fn msg_reject_msg_copy(dst: u32, offset: u32, size: u32) -> ();
         pub fn msg_reject_msg_size() -> u32;
+        pub fn msg_method_name_copy(dst: u32, offset: u32, size: u32) -> ();
+        pub fn msg_method_name_size() -> u32;
         pub fn msg_reply() -> ();
         pub fn msg_reply_data_append(offset: u32, size: u32) -> ();
         pub fn msg_cycles_available() -> u64;
@@ -61,6 +64,9 @@ mod ic0 {
         pub fn data_certificate_copy(dst: u32, offset: u32, size: u32) -> ();
 
         pub fn time() -> u64;
+        pub fn performance_counter(counter_type: u32) -> u64;
+        pub fn global_timer_set(timestamp: u64) -> u64;
+        pub fn canister_version() -> u64;
     }
 }
 
@@ -81,21 +87,25 @@ pub fn call_new(
     reject_env: u32,
 ) {
     unsafe {
+        #[allow(clippy::fn_to_numeric_cast_with_truncation)]
         ic0::call_new(
             callee.as_ptr() as u32,
             callee.len() as u32,
             method.as_ptr() as u32,
             method.len() as u32,
             reply_fun as u32,
-            reply_env as u32,
+            reply_env,
             reject_fun as u32,
-            reject_env as u32,
+            reject_env,
         )
     }
 }
 
 pub fn call_on_cleanup(fun: fn(u32) -> (), env: u32) {
-    unsafe { ic0::call_on_cleanup(fun as u32, env as u32) }
+    #[allow(clippy::fn_to_numeric_cast_with_truncation)]
+    unsafe {
+        ic0::call_on_cleanup(fun as u32, env)
+    }
 }
 
 pub fn call_data_append(payload: &[u8]) {
@@ -120,24 +130,44 @@ pub fn call_perform() -> u32 {
     unsafe { ic0::call_perform() }
 }
 
+/// Returns the size of the argument data in bytes.
+pub fn msg_arg_data_size() -> u32 {
+    unsafe { ic0::msg_arg_data_size() }
+}
+
+/// Returns a buffer of the given size that is filled with the argument data
+/// bytes starting from the given offset.
+pub fn msg_arg_data_copy(offset: u32, size: u32) -> Vec<u8> {
+    let mut bytes = vec![0; size as usize];
+    unsafe {
+        ic0::msg_arg_data_copy(bytes.as_mut_ptr() as u32, offset, size);
+    }
+    bytes
+}
+
 /// Returns the argument extracted from the message payload.
 pub fn arg_data() -> Vec<u8> {
-    let len: u32 = unsafe { ic0::msg_arg_data_size() };
-    let mut bytes = vec![0; len as usize];
+    msg_arg_data_copy(0, msg_arg_data_size())
+}
+
+/// Returns the size of the caller in bytes.
+pub fn msg_caller_size() -> u32 {
+    unsafe { ic0::msg_caller_size() }
+}
+
+/// Returns a buffer of the given size that is filled with the caller bytes
+/// starting from the given offset.
+pub fn msg_caller_copy(offset: u32, size: u32) -> Vec<u8> {
+    let mut bytes = vec![0; size as usize];
     unsafe {
-        ic0::msg_arg_data_copy(bytes.as_mut_ptr() as u32, 0, len);
+        ic0::msg_caller_copy(bytes.as_mut_ptr() as u32, offset, size);
     }
     bytes
 }
 
 /// Returns the caller of the current call.
 pub fn caller() -> Vec<u8> {
-    let len: u32 = unsafe { ic0::msg_caller_size() };
-    let mut bytes = vec![0; len as usize];
-    unsafe {
-        ic0::msg_caller_copy(bytes.as_mut_ptr() as u32, 0, len);
-    }
-    bytes
+    msg_caller_copy(0, msg_caller_size())
 }
 
 /// Returns the canister id as a blob.
@@ -154,14 +184,24 @@ pub fn status() -> u32 {
     unsafe { ic0::canister_status() }
 }
 
-/// Returns the rejection message.
-pub fn reject_message() -> Vec<u8> {
-    let len: u32 = unsafe { ic0::msg_reject_msg_size() };
-    let mut bytes = vec![0; len as usize];
+/// Returns the size of the reject message in bytes.
+pub fn msg_reject_msg_size() -> u32 {
+    unsafe { ic0::msg_reject_msg_size() }
+}
+
+/// Returns a buffer of the given size that is filled with the reject message
+/// bytes starting from the given offset.
+pub fn msg_reject_msg_copy(offset: u32, size: u32) -> Vec<u8> {
+    let mut bytes = vec![0; size as usize];
     unsafe {
-        ic0::msg_reject_msg_copy(bytes.as_mut_ptr() as u32, 0, len);
+        ic0::msg_reject_msg_copy(bytes.as_mut_ptr() as u32, offset, size);
     }
     bytes
+}
+
+/// Returns the rejection message.
+pub fn reject_message() -> Vec<u8> {
+    msg_reject_msg_copy(0, msg_reject_msg_size())
 }
 
 pub fn reply_data_append(payload: &[u8]) {
@@ -292,6 +332,27 @@ pub fn data_certificate() -> Vec<u8> {
 
 pub fn time() -> u64 {
     unsafe { ic0::time() }
+}
+
+pub fn performance_counter(counter_type: u32) -> u64 {
+    unsafe { ic0::performance_counter(counter_type) }
+}
+
+pub fn method_name() -> Vec<u8> {
+    let len: u32 = unsafe { ic0::msg_method_name_size() };
+    let mut bytes = vec![0; len as usize];
+    unsafe {
+        ic0::msg_method_name_copy(bytes.as_mut_ptr() as u32, 0, len);
+    }
+    bytes
+}
+
+pub fn global_timer_set(timestamp: u64) -> u64 {
+    unsafe { ic0::global_timer_set(timestamp) }
+}
+
+pub fn canister_version() -> u64 {
+    unsafe { ic0::canister_version() }
 }
 
 /// Prints the given message.

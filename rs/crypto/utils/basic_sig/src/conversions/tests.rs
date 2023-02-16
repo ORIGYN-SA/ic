@@ -1,5 +1,6 @@
 use super::test_data;
 use super::*;
+use assert_matches::assert_matches;
 
 #[test]
 fn der_pk_decoding_should_match_test_data() {
@@ -135,14 +136,15 @@ fn should_fail_convert_pubkey_nodeid_bad_bytes() {
         algorithm: 0,
         key_value: bad_bytes,
         proof_data: None,
+        timestamp: None,
     };
 
     let result = derive_node_id(&bad_proto_key);
 
-    assert!(matches!(
-        result.unwrap_err(),
+    assert_matches!(
+        result.expect_err("Unexpected success."),
         InvalidNodePublicKey::MalformedRawBytes { internal_error: _ }
-    ));
+    );
 }
 
 #[test]
@@ -154,6 +156,7 @@ fn should_convert_pubkey_nodeid_known_result() {
         algorithm: 0,
         key_value: vec![1; 32], // length is all that matters
         proof_data: None,
+        timestamp: None,
     };
 
     let result = derive_node_id(&proto_key);

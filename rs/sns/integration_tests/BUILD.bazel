@@ -1,0 +1,205 @@
+load("@rules_rust//rust:defs.bzl", "rust_library")
+load("//bazel:canisters.bzl", "rust_canister")
+load("//bazel:defs.bzl", "rust_test_suite_with_extra_srcs")
+
+package(default_visibility = ["//visibility:public"])
+
+DEPENDENCIES = [
+    "//rs/crypto/sha",
+    "//rs/nervous_system/common",
+    "//rs/nervous_system/common/test_keys",
+    "//rs/nns/constants",
+    "//rs/rosetta-api/icrc1",
+    "//rs/rosetta-api/icrc1/ledger",
+    "//rs/rosetta-api/icp_ledger/ledger",
+    "//rs/rosetta-api/ledger_core",
+    "//rs/rosetta-api/ledger_canister_core",
+    "//rs/rust_canisters/dfn_candid",
+    "//rs/rust_canisters/dfn_core",
+    "//rs/rust_canisters/dfn_json",
+    "//rs/rust_canisters/dfn_protobuf",
+    "//rs/rust_canisters/canister_test",
+    "//rs/state_machine_tests",
+    "//rs/sns/cli",
+    "//rs/sns/governance",
+    "//rs/sns/root",
+    "//rs/sns/init",
+    "//rs/sns/test_utils",
+    "//rs/test_utilities/load_wasm",
+    "//rs/types/base_types",
+    "//rs/types/ic00_types",
+    "//rs/types/types",
+    "//rs/universal_canister/lib",
+    "@crate_index//:byteorder",
+    "@crate_index//:candid",
+    "@crate_index//:hex",
+    "@crate_index//:maplit",
+    "@crate_index//:pretty-bytes",
+    "@crate_index//:proptest",
+    "@crate_index//:prost",
+    "@crate_index//:rand_0_8_4",
+    "@crate_index//:serde",
+    "@crate_index//:serde_yaml",
+]
+
+MACRO_DEPENDENCIES = [
+    "@crate_index//:async-trait",
+]
+
+DEV_DEPENDENCIES = [
+    "//rs/canister_client/sender",
+    "//rs/crypto",
+    "//rs/nervous_system/root",
+    "//rs/nns/common",
+    "//rs/nns/governance",
+    "//rs/nns/sns-wasm",
+    "//rs/nns/test_utils",
+    "//rs/rosetta-api/icp_ledger",
+    "//rs/rust_canisters/on_wire",
+    "//rs/sns/swap",
+    "@crate_index//:assert_matches",
+    "@crate_index//:itertools",
+    "@crate_index//:lazy_static",
+    "@crate_index//:num-traits",
+    "@crate_index//:pretty_assertions",
+    "@crate_index//:rust_decimal",
+    "@crate_index//:tokio",
+    "@crate_index//:wat",
+]
+
+MACRO_DEV_DEPENDENCIES = [
+    "@crate_index//:rust_decimal_macros",
+]
+
+ALIASES = {}
+
+rust_library(
+    name = "lib",
+    srcs = glob(
+        ["src/**"],
+    ),
+    aliases = ALIASES,
+    crate_name = "ic_sns_integration_tests",
+    proc_macro_deps = MACRO_DEPENDENCIES,
+    version = "0.8.0",
+    deps = DEPENDENCIES,
+)
+
+rust_canister(
+    name = "sns-test-dapp-canister",
+    srcs = ["test_canisters/test_dapp_canister.rs"],
+    service_file = ":test_canisters/empty.did",
+    deps = [
+        "//rs/rust_canisters/dfn_candid",
+        "//rs/rust_canisters/dfn_core",
+    ],
+)
+
+rust_canister(
+    name = "sns-governance-mem-test-canister",
+    srcs = ["test_canisters/sns_governance_mem_test_canister.rs"],
+    service_file = ":test_canisters/empty.did",
+    deps = [
+        "//rs/nervous_system/common",
+        "//rs/rosetta-api/icrc1",
+        "//rs/rust_canisters/dfn_core",
+        "//rs/sns/governance",
+        "//rs/types/base_types",
+        "@crate_index//:pretty-bytes",
+        "@crate_index//:prost",
+        "@crate_index//:rand_0_8_4",
+    ],
+)
+
+DATA_DEPS = [
+    ":sns-governance-mem-test-canister",
+    ":sns-test-dapp-canister",
+    "//rs/canister_sandbox",
+    "//rs/canister_sandbox/sandbox_launcher",
+    "//rs/nervous_system/common/test_canister",
+    "//rs/nns/cmc:cycles-minting-canister",
+    "//rs/nns/governance:governance-canister-test",
+    "//rs/nns/gtc:genesis-token-canister",
+    "//rs/nns/handlers/root:root-canister",
+    "//rs/nns/sns-wasm:sns-wasm-canister",
+    "//rs/registry/canister:registry-canister",
+    "//rs/rosetta-api/icp_ledger/ledger:ledger-canister-wasm-notify-method",
+    "//rs/rosetta-api/icp_ledger/ledger:ledger-canister-wasm",
+    "//rs/rosetta-api/icrc1/archive:archive_canister",
+    "//rs/rosetta-api/icrc1/index:index_canister",
+    "//rs/rosetta-api/icrc1/ledger:ledger_canister",
+    "//rs/sns/governance:sns-governance-canister-test",
+    "//rs/sns/root:sns-root-canister",
+    "//rs/sns/swap:sns-swap-canister",
+]
+
+ENV = {
+    "CARGO_MANIFEST_DIR": "rs/sns/integration_tests",
+    "CYCLES_MINTING_CANISTER_WASM_PATH": "$(rootpath //rs/nns/cmc:cycles-minting-canister)",
+    "GENESIS_TOKEN_CANISTER_WASM_PATH": "$(rootpath //rs/nns/gtc:genesis-token-canister)",
+    "GOVERNANCE_CANISTER_TEST_WASM_PATH": "$(rootpath //rs/nns/governance:governance-canister-test)",
+    "IC_ICRC1_ARCHIVE_WASM_PATH": "$(rootpath //rs/rosetta-api/icrc1/archive:archive_canister)",
+    "IC_ICRC1_INDEX_WASM_PATH": "$(rootpath //rs/rosetta-api/icrc1/index:index_canister)",
+    "IC_ICRC1_LEDGER_WASM_PATH": "$(rootpath //rs/rosetta-api/icrc1/ledger:ledger_canister)",
+    "LEDGER_CANISTER_WASM_PATH": "$(rootpath //rs/rosetta-api/icp_ledger/ledger:ledger-canister-wasm)",
+    "IC_NERVOUS_SYSTEM_COMMON_TEST_CANISTER_WASM_PATH": "$(rootpath //rs/nervous_system/common/test_canister:test_canister)",
+    "LAUNCHER_BINARY": "$(rootpath //rs/canister_sandbox/sandbox_launcher)",
+    "LEDGER_CANISTER_NOTIFY_METHOD_WASM_PATH": "$(rootpath //rs/rosetta-api/icp_ledger/ledger:ledger-canister-wasm-notify-method)",
+    "REGISTRY_CANISTER_WASM_PATH": "$(rootpath //rs/registry/canister:registry-canister)",
+    "ROOT_CANISTER_WASM_PATH": "$(rootpath //rs/nns/handlers/root:root-canister)",
+    "SANDBOX_BINARY": "$(rootpath //rs/canister_sandbox)",
+    "SNS_GOVERNANCE_CANISTER_WASM_PATH": "$(rootpath //rs/sns/governance:sns-governance-canister-test)",
+    "SNS_GOVERNANCE_MEM_TEST_CANISTER_WASM_PATH": "$(rootpath //rs/sns/integration_tests:sns-governance-mem-test-canister)",
+    "SNS_ROOT_CANISTER_WASM_PATH": "$(rootpath //rs/sns/root:sns-root-canister)",
+    "SNS_SWAP_CANISTER_WASM_PATH": "$(rootpath //rs/sns/swap:sns-swap-canister)",
+    "SNS_TEST_DAPP_CANISTER_WASM_PATH": "$(rootpath //rs/sns/integration_tests:sns-test-dapp-canister)",
+    "SNS_WASM_CANISTER_WASM_PATH": "$(rootpath //rs/nns/sns-wasm:sns-wasm-canister)",
+}
+
+rust_test_suite_with_extra_srcs(
+    name = "integration_test",
+    size = "large",
+    srcs = glob(
+        ["src/*.rs"],
+        exclude = [
+            "src/lib.rs",
+        ],
+    ),
+    aliases = ALIASES,
+    args = [
+        "--test-threads",
+        "7",
+    ],
+    crate_features = ["test"],
+    data = DATA_DEPS,
+    env = ENV,
+    extra_srcs = [],
+    proc_macro_deps = MACRO_DEPENDENCIES + MACRO_DEV_DEPENDENCIES,
+    tags = ["cpu:8"],
+    deps = DEPENDENCIES + DEV_DEPENDENCIES + [
+        "//rs/sns/governance:governance_test_feature",
+        "//rs/sns/governance:build_script",
+    ],
+)
+
+rust_test_suite_with_extra_srcs(
+    name = "long_bench",
+    size = "enormous",
+    srcs = ["src/swap.rs"],
+    aliases = ALIASES,
+    args = ["swap_load_test"],
+    crate_features = [
+        "test",
+        "long_bench",
+    ],
+    data = DATA_DEPS,
+    env = ENV,
+    extra_srcs = ["src/lib.rs"],
+    proc_macro_deps = MACRO_DEPENDENCIES + MACRO_DEV_DEPENDENCIES,
+    tags = ["manual"],
+    deps = DEPENDENCIES + DEV_DEPENDENCIES + [
+        "//rs/sns/governance:governance_test_feature",
+        "//rs/sns/governance:build_script",
+        "@crate_index//:chrono",
+    ],
+)

@@ -1,12 +1,13 @@
 [package]
 name = "ic-registry-client-helpers"
 version = "0.8.0"
-edition = "2018"
+edition = "2021"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-ic-interfaces = { path = "../../interfaces" }
+ic-ic00-types = { path = "../../types/ic00_types" }
+ic-interfaces-registry = { path = "../../interfaces/registry" }
 ic-protobuf = { path = "../../protobuf" }
 ic-registry-common-proto = { path = "../proto" }
 ic-registry-keys = { path = "../keys" }

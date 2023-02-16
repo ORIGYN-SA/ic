@@ -3,19 +3,23 @@ use crate::{
     types::{
         arbitrary,
         ids::{canister_test_id, message_test_id, subnet_test_id, user_test_id},
-        messages::SignedIngressBuilder,
+        messages::{RequestBuilder, SignedIngressBuilder},
     },
 };
 use ic_base_types::NumSeconds;
 use ic_btc_types_internal::BitcoinAdapterRequestWrapper;
+use ic_ic00_types::CanisterStatusType;
 use ic_registry_routing_table::{CanisterIdRange, RoutingTable};
 use ic_registry_subnet_features::SubnetFeatures;
 use ic_registry_subnet_type::SubnetType;
 use ic_replicated_state::{
+    bitcoin_state::BitcoinState,
     canister_state::{
         execution_state::{CustomSection, CustomSectionType, WasmBinary, WasmMetadata},
         testing::new_canister_queues_for_test,
-        QUEUE_INDEX_NONE,
+    },
+    metadata_state::subnet_call_context_manager::{
+        BitcoinGetSuccessorsContext, BitcoinSendTransactionInternalContext,
     },
     metadata_state::Stream,
     page_map::PageMap,
@@ -25,17 +29,20 @@ use ic_replicated_state::{
 };
 use ic_types::messages::CallbackId;
 use ic_types::methods::{Callback, WasmClosure};
+use ic_types::time::UNIX_EPOCH;
 use ic_types::{
     messages::{Ingress, Request, RequestOrResponse},
-    xnet::{QueueId, StreamHeader, StreamIndex, StreamIndexedQueue},
-    CanisterId, CanisterStatusType, ComputeAllocation, Cycles, ExecutionRound, MemoryAllocation,
-    NumBytes, PrincipalId, QueueIndex, SubnetId, Time,
+    xnet::{StreamHeader, StreamIndex, StreamIndexedQueue},
+    CanisterId, ComputeAllocation, Cycles, ExecutionRound, MemoryAllocation, NumBytes, PrincipalId,
+    SubnetId, Time,
 };
 use ic_wasm_types::CanisterModule;
 use proptest::prelude::*;
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::convert::TryFrom;
-use std::sync::Arc;
+use std::{
+    collections::{BTreeMap, BTreeSet, VecDeque},
+    sync::Arc,
+};
 
 const WASM_PAGE_SIZE_BYTES: usize = 65536;
 const DEFAULT_FREEZE_THRESHOLD: NumSeconds = NumSeconds::new(1 << 30);
@@ -46,8 +53,8 @@ pub struct ReplicatedStateBuilder {
     subnet_type: SubnetType,
     subnet_id: SubnetId,
     batch_time: Time,
-    time_of_last_allocation_charge: Time,
     subnet_features: SubnetFeatures,
+    bitcoin_state: BitcoinState,
     bitcoin_adapter_requests: Vec<BitcoinAdapterRequestWrapper>,
 }
 
@@ -76,11 +83,6 @@ impl ReplicatedStateBuilder {
         self
     }
 
-    pub fn with_time_of_last_allocation(mut self, time: Time) -> Self {
-        self.time_of_last_allocation_charge = time;
-        self
-    }
-
     pub fn with_subnet_features(mut self, subnet_features: SubnetFeatures) -> Self {
         self.subnet_features = subnet_features;
         self
@@ -94,9 +96,13 @@ impl ReplicatedStateBuilder {
         self
     }
 
+    pub fn with_bitcoin_state(mut self, state: BitcoinState) -> Self {
+        self.bitcoin_state = state;
+        self
+    }
+
     pub fn build(self) -> ReplicatedState {
-        let mut state =
-            ReplicatedState::new_rooted_at(self.subnet_id, self.subnet_type, "Initial".into());
+        let mut state = ReplicatedState::new(self.subnet_id, self.subnet_type);
 
         for canister in self.canisters {
             state.put_canister_state(canister);
@@ -114,11 +120,36 @@ impl ReplicatedStateBuilder {
         state.metadata.network_topology.routing_table = Arc::new(routing_table);
 
         state.metadata.batch_time = self.batch_time;
-        state.metadata.time_of_last_allocation_charge = self.time_of_last_allocation_charge;
         state.metadata.own_subnet_features = self.subnet_features;
+        state.put_bitcoin_state(self.bitcoin_state);
 
         for request in self.bitcoin_adapter_requests.into_iter() {
-            state.push_request_bitcoin_testnet(request).unwrap();
+            match request {
+                BitcoinAdapterRequestWrapper::GetSuccessorsRequest(_)
+                | BitcoinAdapterRequestWrapper::SendTransactionRequest(_) => unreachable!(),
+                BitcoinAdapterRequestWrapper::CanisterGetSuccessorsRequest(payload) => {
+                    state
+                        .metadata
+                        .subnet_call_context_manager
+                        .push_bitcoin_get_successors_request(BitcoinGetSuccessorsContext {
+                            request: RequestBuilder::default().build(),
+                            payload,
+                            time: mock_time(),
+                        });
+                }
+                BitcoinAdapterRequestWrapper::CanisterSendTransactionRequest(payload) => {
+                    state
+                        .metadata
+                        .subnet_call_context_manager
+                        .push_bitcoin_send_transaction_internal_request(
+                            BitcoinSendTransactionInternalContext {
+                                request: RequestBuilder::default().build(),
+                                payload,
+                                time: mock_time(),
+                            },
+                        );
+                }
+            }
         }
 
         state
@@ -132,8 +163,8 @@ impl Default for ReplicatedStateBuilder {
             subnet_type: SubnetType::Application,
             subnet_id: subnet_test_id(1),
             batch_time: mock_time(),
-            time_of_last_allocation_charge: mock_time(),
             subnet_features: SubnetFeatures::default(),
+            bitcoin_state: BitcoinState::default(),
             bitcoin_adapter_requests: Vec::new(),
         }
     }
@@ -152,6 +183,7 @@ pub struct CanisterStateBuilder {
     freeze_threshold: NumSeconds,
     call_contexts: Vec<CallContext>,
     inputs: Vec<RequestOrResponse>,
+    time_of_last_allocation_charge: Time,
 }
 
 impl CanisterStateBuilder {
@@ -221,7 +253,12 @@ impl CanisterStateBuilder {
     }
 
     pub fn with_canister_request(mut self, request: Request) -> Self {
-        self.inputs.push(RequestOrResponse::Request(request));
+        self.inputs.push(request.into());
+        self
+    }
+
+    pub fn with_time_of_last_allocation_charge(mut self, time: Time) -> Self {
+        self.time_of_last_allocation_charge = time;
         self
     }
 
@@ -280,17 +317,17 @@ impl CanisterStateBuilder {
         for input in self.inputs {
             system_state
                 .queues_mut()
-                .push_input(QUEUE_INDEX_NONE, input, InputQueueType::RemoteSubnet)
+                .push_input(input, InputQueueType::RemoteSubnet)
                 .unwrap();
         }
 
         let stable_memory = if let Some(data) = self.stable_memory {
             Memory::new(
                 PageMap::from(&data[..]),
-                NumWasmPages::new((data.len() / WASM_PAGE_SIZE_BYTES) as usize + 1),
+                NumWasmPages::new((data.len() / WASM_PAGE_SIZE_BYTES) + 1),
             )
         } else {
-            Memory::default()
+            Memory::new_for_testing()
         };
 
         let execution_state = match self.wasm {
@@ -308,6 +345,7 @@ impl CanisterStateBuilder {
             execution_state,
             scheduler_state: SchedulerState {
                 compute_allocation: self.compute_allocation,
+                time_of_last_allocation_charge: self.time_of_last_allocation_charge,
                 ..SchedulerState::default()
             },
         }
@@ -329,6 +367,7 @@ impl Default for CanisterStateBuilder {
             freeze_threshold: DEFAULT_FREEZE_THRESHOLD,
             call_contexts: Vec::default(),
             inputs: Vec::default(),
+            time_of_last_allocation_charge: UNIX_EPOCH,
         }
     }
 }
@@ -419,7 +458,7 @@ impl CallContextBuilder {
             self.call_origin,
             self.responded,
             false,
-            Cycles::from(0),
+            Cycles::zero(),
             self.time,
         )
     }
@@ -439,17 +478,11 @@ pub fn initial_execution_state() -> ExecutionState {
     let mut metadata: BTreeMap<String, CustomSection> = BTreeMap::new();
     metadata.insert(
         String::from("candid"),
-        CustomSection {
-            visibility: CustomSectionType::Private,
-            content: vec![0, 2],
-        },
+        CustomSection::new(CustomSectionType::Private, vec![0, 2]),
     );
     metadata.insert(
         String::from("dummy"),
-        CustomSection {
-            visibility: CustomSectionType::Public,
-            content: vec![2, 1],
-        },
+        CustomSection::new(CustomSectionType::Public, vec![2, 1]),
     );
     let wasm_metadata = WasmMetadata::new(metadata);
 
@@ -457,8 +490,8 @@ pub fn initial_execution_state() -> ExecutionState {
         canister_root: "NOT_USED".into(),
         session_nonce: None,
         wasm_binary: WasmBinary::new(CanisterModule::new(vec![])),
-        wasm_memory: Memory::default(),
-        stable_memory: Memory::default(),
+        wasm_memory: Memory::new_for_testing(),
+        stable_memory: Memory::new_for_testing(),
         exported_globals: vec![],
         exports: ExportedFunctions::new(BTreeSet::new()),
         metadata: wasm_metadata,
@@ -474,6 +507,7 @@ pub fn canister_from_exec_state(
         system_state: SystemStateBuilder::new()
             .memory_allocation(NumBytes::new(8 * 1024 * 1024 * 1024)) // 8GiB
             .canister_id(canister_id)
+            .initial_cycles(INITIAL_CYCLES)
             .build(),
         execution_state: Some(execution_state),
         scheduler_state: Default::default(),
@@ -594,8 +628,7 @@ pub fn get_initial_state_with_balance(
     initial_cycles: Cycles,
     own_subnet_type: SubnetType,
 ) -> ReplicatedState {
-    let mut state =
-        ReplicatedState::new_rooted_at(subnet_test_id(1), own_subnet_type, "Initial".into());
+    let mut state = ReplicatedState::new(subnet_test_id(1), own_subnet_type);
 
     for canister_id in 0..canister_num {
         let mut canister_state_builder = CanisterStateBuilder::new()
@@ -605,10 +638,13 @@ pub fn get_initial_state_with_balance(
 
         for i in 0..message_num_per_canister {
             canister_state_builder = canister_state_builder.with_ingress(
-                SignedIngressBuilder::new()
-                    .canister_id(canister_test_id(canister_id))
-                    .nonce(i)
-                    .build()
+                (
+                    SignedIngressBuilder::new()
+                        .canister_id(canister_test_id(canister_id))
+                        .nonce(i)
+                        .build(),
+                    None,
+                )
                     .into(),
             );
         }
@@ -672,6 +708,8 @@ pub fn register_callback(
         Some(originator),
         Some(respondent),
         Cycles::zero(),
+        Some(Cycles::new(42)),
+        Some(Cycles::new(84)),
         WasmClosure::new(0, 2),
         WasmClosure::new(0, 2),
         None,
@@ -698,127 +736,46 @@ pub fn insert_dummy_canister(
 }
 
 prop_compose! {
-    /// Creates a `ReplicatedState` with a variable amount of canisters and input messages
-    /// per canister based on a uniform distribution of the input parameters.
-    /// Each canister has a variable `allocation` and
-    /// `last_full_execution_round` and a minimal Wasm module.
-    ///
-    /// Example:
-    ///
-    /// ```no_run
-    /// use ic_test_utilities::state::arb_replicated_state;
-    /// use proptest::prelude::*;
-    ///
-    /// proptest! {
-    ///     #[test]
-    ///     fn dummy_test(state in arb_replicated_state(10, 10, 5)) {
-    ///         println!("{:?}", state);
-    ///     }
-    /// }
-    /// ```
-    pub fn arb_replicated_state(
-        canister_num_max: u64,
-        message_num_per_canister_max: u64,
-        last_round_max: u64,
-    )
-    (
-        canister_states in prop::collection::vec(
-            arb_canister_state(last_round_max), 1..canister_num_max as usize
-        ),
-        message_num_per_canister in 1..message_num_per_canister_max,
-    ) -> ReplicatedState {
-        let mut state = ReplicatedStateBuilder::new().build();
-        for (_, mut canister_state) in canister_states.into_iter().enumerate() {
-            let canister_id = canister_state.canister_id();
-            for i in 0..message_num_per_canister {
-                canister_state.push_ingress(
-                    SignedIngressBuilder::new()
-                        .canister_id(canister_id)
-                        .nonce(i)
-                        .build()
-                        .into()
-                );
-            }
-            state.put_canister_state(canister_state);
+    /// Produces a strategy that generates an arbitrary `signals_end` and between
+    /// `[sig_min_size, sig_max_size]` reject signals .
+    pub fn arb_reject_signals(sig_min_size: usize, sig_max_size: usize)(
+        sig_start in 0..10000u64,
+        sigs in prop::collection::btree_set(arbitrary::stream_index(100 + sig_max_size as u64), sig_min_size..=sig_max_size),
+        sig_end_delta in 0..10u64,
+    ) -> (StreamIndex, VecDeque<StreamIndex>) {
+        let mut reject_signals = VecDeque::with_capacity(sigs.len());
+        let sig_start = sig_start.into();
+        for s in sigs {
+            reject_signals.push_back(s + sig_start);
         }
-        state
+        let sig_end = sig_start + reject_signals.back().unwrap_or(&0.into()).increment() + sig_end_delta.into();
+        (sig_end, reject_signals)
     }
 }
 
 prop_compose! {
-    fn arb_canister_state(
-        last_round_max: u64,
-    )
-    (
-        (allocation, round) in arb_compute_allocation_and_last_round(last_round_max)
-    ) -> CanisterState {
-        let mut execution_state = initial_execution_state();
-        execution_state.wasm_binary = WasmBinary::new(CanisterModule::new(wabt::wat2wasm(r#"(module)"#).unwrap()));
-        let scheduler_state = SchedulerState::default();
-        let system_state = SystemState::new_running(
-            canister_test_id(0),
-            user_test_id(24).get(),
-            INITIAL_CYCLES,
-            DEFAULT_FREEZE_THRESHOLD,
-        );
-        let mut canister_state = CanisterState::new(
-            system_state,
-            Some(execution_state),
-            scheduler_state
-        );
-        canister_state.scheduler_state.compute_allocation = allocation;
-        canister_state.scheduler_state.last_full_execution_round = round;
-        canister_state
-    }
-}
-
-prop_compose! {
-    fn arb_compute_allocation_and_last_round(
-        last_round_max: u64
-    )
-    (
-        a in -100..120,
-        round in 0..last_round_max,
-    ) -> (ComputeAllocation, ExecutionRound) {
-        // Clamp `a` to [0, 100], but with high probability for 0 and somewhat
-        // higher probability for 100.
-        let a = if a < 0 {
-            0
-        } else if a > 100 {
-            100
-        } else {
-            a
-        };
-
-        (
-            ComputeAllocation::try_from(a as u64).unwrap(),
-            ExecutionRound::from(round),
-        )
-    }
-}
-
-prop_compose! {
-    pub fn arb_stream(min_size: usize, max_size: usize)(
+    /// Produces a strategy that generates a stream with between
+    /// `[min_size, max_size]` messages and between `[sig_min_size, sig_max_size]`
+    /// reject signals.
+    pub fn arb_stream(min_size: usize, max_size: usize, sig_min_size: usize, sig_max_size: usize)(
         msg_start in 0..10000u64,
-        sig_end in 0..10000u64,
         reqs in prop::collection::vec(arbitrary::request(), min_size..=max_size),
+        (signals_end, reject_signals) in arb_reject_signals(sig_min_size, sig_max_size),
     ) -> Stream {
         let mut messages = StreamIndexedQueue::with_begin(StreamIndex::from(msg_start));
         for r in reqs {
             messages.push(r.into())
         }
 
-        let signals_end = StreamIndex::from(sig_end);
-
-        Stream::new(messages, signals_end)
+        Stream::with_signals(messages, signals_end, reject_signals)
     }
 }
 
 prop_compose! {
-    /// Generates a strategy consisting of an arbitrary stream and valid slice begin and message
+    /// Produces a strategy consisting of an arbitrary stream and valid slice begin and message
     /// count values for extracting a slice from the stream.
-    pub fn arb_stream_slice(min_size: usize, max_size: usize)(
-        stream in arb_stream(min_size, max_size),
+    pub fn arb_stream_slice(min_size: usize, max_size: usize, sig_min_size: usize, sig_max_size: usize)(
+        stream in arb_stream(min_size, max_size, sig_min_size, sig_max_size),
         from_percent in -20..120i64,
         percent_above_min_size in 0..120i64,
     ) ->  (Stream, StreamIndex, usize) {
@@ -834,43 +791,13 @@ prop_compose! {
 }
 
 prop_compose! {
-    pub fn arb_reject_signals(sig_end: u64, sig_min_size: usize, sig_max_size: usize)(
-        sigs in prop::collection::btree_set(arbitrary::stream_index(sig_end), sig_min_size..=std::cmp::min(sig_end as usize, sig_max_size)),
-    ) -> VecDeque<StreamIndex> {
-        let mut reject_signals = VecDeque::with_capacity(sigs.len());
-        for s in sigs {
-            reject_signals.push_back(s);
-        }
-        reject_signals
-    }
-}
-
-prop_compose! {
-    pub fn arb_stream_with_signals(min_size: usize, max_size: usize, sig_end: u64, sig_min_size: usize, sig_max_size: usize)(
-        msg_start in 0..10000u64,
-        reqs in prop::collection::vec(arbitrary::request(), min_size..=max_size),
-        sigs in arb_reject_signals(sig_end, sig_min_size, sig_max_size),
-    ) -> Stream {
-        let mut messages = StreamIndexedQueue::with_begin(StreamIndex::from(msg_start));
-        for r in reqs {
-            messages.push(r.into())
-        }
-
-        let signals_end = StreamIndex::from(sig_end);
-
-        Stream::with_signals(messages, signals_end, sigs)
-    }
-}
-
-prop_compose! {
-    pub fn arb_stream_header(sig_end: u64, sig_min_size: usize, sig_max_size: usize)(
+    pub fn arb_stream_header(sig_min_size: usize, sig_max_size: usize)(
         msg_start in 0..10000u64,
         msg_len in 0..10000u64,
-        reject_signals in arb_reject_signals(sig_end, sig_min_size, sig_max_size),
+        (signals_end, reject_signals) in arb_reject_signals(sig_min_size, sig_max_size),
     ) -> StreamHeader {
         let begin = StreamIndex::from(msg_start);
         let end = StreamIndex::from(msg_start + msg_len);
-        let signals_end = StreamIndex::from(sig_end);
 
         StreamHeader {
             begin,
@@ -988,7 +915,7 @@ prop_compose! {
 
         replicated_state.metadata.batch_time = Time::from_nanos_since_unix_epoch(time);
         let mut rng = ChaChaRng::seed_from_u64(time);
-        let rotation = rng.gen_range(0, raw_requests.len().max(1));
+        let rotation = rng.gen_range(0..raw_requests.len().max(1));
         raw_requests.rotate_left(rotation);
 
         if let Some(requests) = subnet_queue_requests {
@@ -997,15 +924,4 @@ prop_compose! {
 
         (replicated_state, raw_requests, total_requests)
     }
-}
-
-/// Asserts that the values returned by `next()` match the ones returned by
-/// `peek()` before.
-pub fn assert_next_eq(
-    peek: (QueueId, QueueIndex, Arc<RequestOrResponse>),
-    next: Option<(QueueId, QueueIndex, RequestOrResponse)>,
-) {
-    let next =
-        next.unwrap_or_else(|| panic!("Peek returned a message {:?}, while pop didn't", peek));
-    assert_eq!((peek.0, peek.1, peek.2.as_ref()), (next.0, next.1, &next.2));
 }

@@ -1,37 +1,45 @@
 use criterion::{black_box, BatchSize, BenchmarkId, Criterion};
 use criterion_time::ProcessTime;
+use ic_base_types::NumBytes;
 use ic_canonical_state::{
     hash_tree::{crypto_hash_lazy_tree, hash_lazy_tree},
     lazy_tree::LazyTree,
 };
+use ic_certification_version::CURRENT_CERTIFICATION_VERSION;
 use ic_crypto_tree_hash::{
     flatmap, FlatMap, Label, LabeledTree, MixedHashTree, WitnessGenerator, WitnessGeneratorImpl,
 };
 use ic_registry_subnet_type::SubnetType;
 use ic_replicated_state::{
-    metadata_state::Stream, testing::ReplicatedStateTesting, ReplicatedState,
+    canister_state::execution_state::{CustomSection, CustomSectionType, WasmMetadata},
+    metadata_state::Stream,
+    testing::ReplicatedStateTesting,
+    ReplicatedState,
 };
 use ic_state_manager::{stream_encoding::encode_stream_slice, tree_hash::hash_state};
 use ic_test_utilities::{
     mock_time,
+    state::{get_initial_state, get_running_canister},
     types::{
         ids::{canister_test_id, message_test_id, subnet_test_id, user_test_id},
         messages::{RequestBuilder, ResponseBuilder},
     },
 };
 use ic_types::{
-    messages::{CallbackId, Payload, RequestOrResponse},
+    messages::{CallbackId, Payload},
     xnet::StreamIndex,
     Cycles,
 };
+use maplit::btreemap;
 use std::convert::TryFrom;
 
 fn bench_traversal(c: &mut Criterion<ProcessTime>) {
     const NUM_STREAM_MESSAGES: u64 = 1_000;
+    const NUM_CANISTERS: u64 = 10_000;
     const NUM_STATUSES: u64 = 30_000;
 
     let subnet_type = SubnetType::Application;
-    let mut state = ReplicatedState::new_rooted_at(subnet_test_id(1), subnet_type, "TEST".into());
+    let mut state = ReplicatedState::new(subnet_test_id(1), subnet_type);
 
     state.modify_streams(|streams| {
         for remote_subnet in 2..10 {
@@ -40,26 +48,24 @@ fn bench_traversal(c: &mut Criterion<ProcessTime>) {
             for i in 0..NUM_STREAM_MESSAGES {
                 stream.increment_signals_end();
                 let msg = if i % 2 == 0 {
-                    RequestOrResponse::Request(
-                        RequestBuilder::new()
-                            .receiver(canister_test_id(i))
-                            .sender(canister_test_id(i))
-                            .sender_reply_callback(CallbackId::from(i))
-                            .payment(Cycles::from(10))
-                            .method_name("test".to_string())
-                            .method_payload(vec![1; 100])
-                            .build(),
-                    )
+                    RequestBuilder::new()
+                        .receiver(canister_test_id(i))
+                        .sender(canister_test_id(i))
+                        .sender_reply_callback(CallbackId::from(i))
+                        .payment(Cycles::new(10))
+                        .method_name("test".to_string())
+                        .method_payload(vec![1; 100])
+                        .build()
+                        .into()
                 } else {
-                    RequestOrResponse::Response(
-                        ResponseBuilder::new()
-                            .originator(canister_test_id(i))
-                            .respondent(canister_test_id(i))
-                            .originator_reply_callback(CallbackId::from(i))
-                            .refund(Cycles::from(10))
-                            .response_payload(Payload::Data(vec![2, 100]))
-                            .build(),
-                    )
+                    ResponseBuilder::new()
+                        .originator(canister_test_id(i))
+                        .respondent(canister_test_id(i))
+                        .originator_reply_callback(CallbackId::from(i))
+                        .refund(Cycles::new(10))
+                        .response_payload(Payload::Data(vec![2, 100]))
+                        .build()
+                        .into()
                 };
                 stream.push(msg);
             }
@@ -68,46 +74,58 @@ fn bench_traversal(c: &mut Criterion<ProcessTime>) {
         }
     });
 
+    for i in 0..NUM_CANISTERS {
+        state.canister_states.insert(
+            canister_test_id(i),
+            get_running_canister(canister_test_id(i)),
+        );
+    }
+
     let user_id = user_test_id(1);
     let time = mock_time();
 
     for i in 1..NUM_STATUSES {
         use ic_error_types::{ErrorCode, UserError};
-        use ic_types::ingress::{IngressStatus::*, WasmResult::*};
+        use ic_types::ingress::{IngressState::*, IngressStatus::*, WasmResult::*};
 
         let status = match i % 6 {
-            0 => Received {
+            0 => Known {
                 receiver: canister_test_id(i).get(),
                 user_id,
                 time,
+                state: Received,
             },
-            1 => Completed {
+            1 => Known {
                 receiver: canister_test_id(i).get(),
                 user_id,
-                result: Reply(vec![1; 100]),
                 time,
+                state: Completed(Reply(vec![1; 100])),
             },
-            2 => Completed {
+            2 => Known {
                 receiver: canister_test_id(i).get(),
                 user_id,
-                result: Reject("bad request".to_string()),
                 time,
+                state: Completed(Reject("bad request".to_string())),
             },
-            3 => Failed {
+            3 => Known {
                 receiver: canister_test_id(i).get(),
                 user_id,
-                error: UserError::new(ErrorCode::CanisterNotFound, "canister XXX not found"),
                 time,
+                state: Failed(UserError::new(
+                    ErrorCode::CanisterNotFound,
+                    "canister XXX not found",
+                )),
             },
-            4 => Processing {
+            4 => Known {
                 receiver: canister_test_id(i).get(),
                 user_id,
                 time,
+                state: Processing,
             },
             5 => Unknown,
             _ => unreachable!(),
         };
-        state.set_ingress_status(message_test_id(i), status);
+        state.set_ingress_status(message_test_id(i), status, NumBytes::from(u64::MAX));
     }
 
     assert_eq!(
@@ -205,6 +223,22 @@ fn bench_traversal(c: &mut Criterion<ProcessTime>) {
         b.iter(|| {
             black_box(hash_tree.witness::<MixedHashTree>(&data_tree_100_statuses));
         });
+    });
+
+    let state_100_custom_sections = {
+        let mut state = get_initial_state(/*num_canisters=*/ 100u64, 0);
+        state.metadata.certification_version = CURRENT_CERTIFICATION_VERSION;
+        assert_eq!(state.canister_states.len(), 100);
+        for canister in state.canister_states.values_mut() {
+            canister.execution_state.as_mut().unwrap().metadata = WasmMetadata::new(btreemap! {
+                "large_section".to_string() => CustomSection::new(CustomSectionType::Public, vec![1u8; 1 << 20]),
+            });
+        }
+        state
+    };
+
+    c.bench_function("traverse/hash_custom_sections/100", |b| {
+        b.iter(|| black_box(hash_lazy_tree(&LazyTree::from(&state_100_custom_sections))));
     });
 
     let mut group = c.benchmark_group("drop_tree");

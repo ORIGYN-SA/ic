@@ -1,29 +1,28 @@
 use ic_btc_types_internal::{BitcoinAdapterRequestWrapper, BitcoinAdapterResponseWrapper};
 use std::time::Duration;
+use strum_macros::IntoStaticStr;
 
 /// Describe RPC error -- can be either related to transport (i.e.
-/// failure to transport or parse a message) or to server (i.e. server
-/// responded, but gave us a message indicating an error).
-#[derive(Debug)]
-pub enum RpcError {
+/// failure to transport) or to server (i.e. server responded, but
+/// gave us a message indicating an error).
+#[derive(Debug, IntoStaticStr)]
+pub enum BitcoinAdapterClientError {
     /// Failure at transport.
     ConnectionBroken,
-    /// Failure at server endpoint.
-    ServerError {
-        /// gRPC status code.
-        /// See https://grpc.github.io/grpc/core/md_doc_statuscodes.html for more information.
-        status_code: u16,
-        message: String,
-        source: Box<dyn std::error::Error + Send + Sync + 'static>,
-    },
-    /// Invalid request passed to the client.
-    InvalidRequest(BitcoinAdapterRequestWrapper),
+    /// Bitcoin adapter client is unavailable at the moment and is not able to serve requests.
+    // Likely a transient error. For example still syncing the header chain up to the lastest checkpoint.
+    // You can retry the operation.
+    Unavailable(String),
+    /// Bitcoin adapter request was cancelled by the adapter client. Likely a timeout.
+    Cancelled(String),
+    /// Catch-all for unexpected errors in the bitcoin client. Likely a fatal error.
+    Unknown(String),
 }
 
-pub type RpcResult<T> = Result<T, RpcError>;
+pub type RpcResult<T> = Result<T, BitcoinAdapterClientError>;
 
 pub struct Options {
-    pub timeout: Option<Duration>,
+    pub timeout: Duration,
 }
 
 impl Default for Options {
@@ -31,7 +30,7 @@ impl Default for Options {
         Self {
             // Since we are allowed to block only for few milliseconds the consensus thread,
             // set reasonable defaults.
-            timeout: Some(Duration::from_millis(10)),
+            timeout: Duration::from_millis(10),
         }
     }
 }

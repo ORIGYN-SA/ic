@@ -1,5 +1,6 @@
 use ic_canister_sandbox_common::protocol::id::ExecId;
 use ic_canister_sandbox_common::protocol::structs::SandboxExecOutput;
+use ic_embedders::wasm_executor::SliceExecutionOutput;
 /// Execution state registry for sandbox processes.
 ///
 /// This tracks the "active" executions on a sandbox process and
@@ -24,7 +25,13 @@ use ic_canister_sandbox_common::protocol::structs::SandboxExecOutput;
 use std::collections::HashMap;
 use std::sync::Mutex;
 
-type CompletionFunction = Box<dyn FnOnce(ExecId, SandboxExecOutput) + Sync + Send + 'static>;
+#[allow(clippy::large_enum_variant)]
+pub enum CompletionResult {
+    Paused(SliceExecutionOutput),
+    Finished(SandboxExecOutput),
+}
+
+type CompletionFunction = Box<dyn FnOnce(ExecId, CompletionResult) + Sync + Send + 'static>;
 
 /// Represents an execution in progress on the sandbox process.
 ///
@@ -63,16 +70,24 @@ impl ActiveExecutionStateRegistry {
     /// in, except when there is a possible collision.
     pub fn register_execution<F>(&self, completion: F) -> ExecId
     where
-        F: FnOnce(ExecId, SandboxExecOutput) + Send + Sync + 'static,
+        F: FnOnce(ExecId, CompletionResult) + Send + Sync + 'static,
     {
         let exec_id = ExecId::new();
+        self.register_execution_with_id(exec_id, completion);
+        exec_id
+    }
+
+    /// Registers an execution with the given id.
+    pub fn register_execution_with_id<F>(&self, exec_id: ExecId, completion: F)
+    where
+        F: FnOnce(ExecId, CompletionResult) + Send + Sync + 'static,
+    {
         let completion = Box::new(completion);
         let state = ActiveExecutionState {
             completion: Some(Box::new(completion)),
         };
         let mut mut_states = self.states.lock().unwrap();
         mut_states.insert(exec_id, state);
-        exec_id
     }
 
     /// Removes the given [`ExecId`] and returns its [`CompletionFunction`].

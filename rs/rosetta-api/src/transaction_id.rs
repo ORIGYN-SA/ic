@@ -1,10 +1,12 @@
 use std::{convert::TryFrom, str::FromStr};
 
+use ic_ledger_canister_core::ledger::LedgerTransaction;
+use ic_ledger_core::block::HashOf;
 use ic_types::{
     messages::{HttpCallContent, HttpRequestEnvelope},
     PrincipalId,
 };
-use ledger_canister::{HashOf, SendArgs, Transaction};
+use icp_ledger::{SendArgs, Transaction};
 use serde::{Deserialize, Serialize};
 
 use crate::{convert, errors::ApiError, request_types::RequestType};
@@ -19,7 +21,7 @@ pub const NEURON_MANAGEMENT_PSEUDO_HASH: &str =
 ///
 /// The transaction_identifier uniquely identifies a transaction in a particular
 /// network and block or in the mempool.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "conversion", derive(LabelledGeneric))]
 pub struct TransactionIdentifier {
     /// Any transactions that are attributable only to a block (ex: a block
@@ -56,7 +58,7 @@ impl TransactionIdentifier {
                     "A transaction ID cannot be generated from a constructed transaction without an explicit 'created_at_time'"
             ))?;
 
-                let from = ledger_canister::AccountIdentifier::new(from, from_subaccount);
+                let from = icp_ledger::AccountIdentifier::new(from, from_subaccount);
 
                 let hash = Transaction::new(from, to, amount, fee, memo, created_at_time).hash();
 
@@ -66,11 +68,14 @@ impl TransactionIdentifier {
             | RequestType::StartDissolve { .. }
             | RequestType::StopDissolve { .. }
             | RequestType::SetDissolveTimestamp { .. }
+            | RequestType::ChangeAutoStakeMaturity { .. }
             | RequestType::Disburse { .. }
             | RequestType::AddHotKey { .. }
             | RequestType::RemoveHotKey { .. }
             | RequestType::Spawn { .. }
+            | RequestType::RegisterVote { .. }
             | RequestType::MergeMaturity { .. }
+            | RequestType::StakeMaturity { .. }
             | RequestType::NeuronInfo { .. }
             | RequestType::Follow { .. } => {
                 // Unfortunately, staking operations don't really have a transaction ID

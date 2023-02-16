@@ -5,23 +5,23 @@ use ic_crypto::{
     CryptoComponent, KeyBytesContentType,
 };
 use ic_crypto_internal_test_vectors::test_data;
-use ic_interfaces::crypto::{BasicSigVerifierByPublicKey, SignableMock, DOMAIN_IC_REQUEST};
+use ic_interfaces::crypto::BasicSigVerifierByPublicKey;
 use ic_logger::replica_logger::no_op_logger;
 use ic_registry_client_fake::FakeRegistryClient;
 use ic_registry_proto_data_provider::ProtoRegistryDataProvider;
-use ic_test_utilities::types::ids::node_test_id;
 use ic_types::crypto::{AlgorithmId, BasicSig, BasicSigOf, UserPublicKey};
+use ic_types::crypto::{SignableMock, DOMAIN_IC_REQUEST};
 use ic_types::messages::MessageId;
+use ic_types_test_utils::ids::node_test_id;
 use std::sync::Arc;
 
-use crate::ed25519_utils::ed25519_signature_and_public_key;
+use ic_crypto_test_utils::ed25519_utils::ed25519_signature_and_public_key;
+use ic_interfaces::time_source::SysTimeSource;
 use openssl::ec::{EcGroup, EcKey};
 use openssl::ecdsa::EcdsaSig;
 use openssl::nid::Nid;
 use openssl::pkey::PKey;
 use openssl::sha::sha256;
-
-mod ed25519_utils;
 
 #[test]
 fn should_verify_request_id_ed25519_signature() {
@@ -378,8 +378,10 @@ fn crypto_component(config: &CryptoConfig) -> CryptoComponent {
     let dummy_registry = FakeRegistryClient::new(Arc::new(ProtoRegistryDataProvider::new()));
     CryptoComponent::new_with_fake_node_id(
         config,
+        None,
         Arc::new(dummy_registry),
         node_test_id(42),
         no_op_logger(),
+        Arc::new(SysTimeSource::new()),
     )
 }

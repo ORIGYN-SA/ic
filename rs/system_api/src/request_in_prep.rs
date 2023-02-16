@@ -1,13 +1,10 @@
-use crate::{routing, sandbox_safe_system_state::SandboxSafeSystemState, valid_subslice};
-use ic_ic00_types::IC_00;
+use crate::{sandbox_safe_system_state::SandboxSafeSystemState, valid_subslice};
 use ic_interfaces::execution_environment::{HypervisorError, HypervisorResult};
-use ic_logger::{info, ReplicaLogger};
-use ic_registry_subnet_type::SubnetType;
-use ic_replicated_state::NetworkTopology;
+use ic_logger::ReplicaLogger;
 use ic_types::{
     messages::{CallContextId, Request},
     methods::{Callback, WasmClosure},
-    CanisterId, Cycles, NumBytes, PrincipalId, SubnetId,
+    CanisterId, Cycles, NumBytes, PrincipalId,
 };
 use serde::{Deserialize, Serialize};
 use std::convert::TryFrom;
@@ -94,7 +91,7 @@ impl RequestInPrep {
             on_reply,
             on_reject,
             on_cleanup: None,
-            cycles: Cycles::from(0),
+            cycles: Cycles::zero(),
             method_name,
             method_payload: Vec::new(),
             max_size_remote_subnet,
@@ -144,10 +141,15 @@ impl RequestInPrep {
     }
 }
 
+pub(crate) struct RequestWithPrepayment {
+    pub request: Request,
+    pub prepayment_for_response_execution: Cycles,
+    pub prepayment_for_response_transmission: Cycles,
+}
+
 /// Turns a `RequestInPrep` into a `Request`.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn into_request(
-    network_topology: &NetworkTopology,
     RequestInPrep {
         sender,
         callee,
@@ -161,104 +163,60 @@ pub(crate) fn into_request(
         multiplier_max_size_local_subnet,
     }: RequestInPrep,
     call_context_id: CallContextId,
-    own_subnet_id: SubnetId,
-    own_subnet_type: SubnetType,
     sandbox_safe_system_state: &mut SandboxSafeSystemState,
-    logger: &ReplicaLogger,
-) -> HypervisorResult<Request> {
-    let (destination_canister, destination_subnet) = if callee == IC_00.get() {
-        // This is a request to ic:00. Update `callee` to be the appropriate
-        // subnet.
-        let destination_subnet = routing::resolve_destination(
-            network_topology,
-            method_name.as_str(),
-            method_payload.as_slice(),
-            own_subnet_id,
-        )
-        .unwrap_or({
-            info!(
-                logger,
-                "Under construction request: Couldn't find the right subnet. Send it to the current subnet {},
-            which will handle rejecting the request gracefully: sender id {}, receiver id {}, method_name {}.", own_subnet_id,
-                sender, callee, method_name
-            );
-            own_subnet_id
-        });
-        (
-            CanisterId::new(destination_subnet.get()).unwrap(),
-            destination_subnet,
-        )
-    } else {
-        let destination_canister =
-            CanisterId::new(callee).map_err(HypervisorError::InvalidCanisterId)?;
-        let destination_subnet = network_topology
-            .routing_table
-            .route(destination_canister.get())
-            .unwrap_or(own_subnet_id);
-        (destination_canister, destination_subnet)
-    };
+    _logger: &ReplicaLogger,
+) -> HypervisorResult<RequestWithPrepayment> {
+    let destination_canister =
+        CanisterId::new(callee).map_err(HypervisorError::InvalidCanisterId)?;
 
-    let destination_subnet_type = match network_topology.subnets.get(&destination_subnet) {
-        None => own_subnet_type,
-        Some(subnet_topology) => subnet_topology.subnet_type,
-    };
-
-    // are on, apply the desired constraints.
-    match (own_subnet_type, destination_subnet_type) {
-        (SubnetType::Application, SubnetType::Application)
-        | (SubnetType::VerifiedApplication, SubnetType::VerifiedApplication)
-        | (SubnetType::System, SubnetType::System) => {}
-
-        (SubnetType::Application, SubnetType::System)
-        | (SubnetType::VerifiedApplication, SubnetType::Application)
-        | (SubnetType::VerifiedApplication, SubnetType::System)
-        | (SubnetType::System, SubnetType::Application)
-        | (SubnetType::System, SubnetType::VerifiedApplication) => {}
-
-        (SubnetType::Application, SubnetType::VerifiedApplication) => {
-            if cycles != Cycles::from(0) {
-                return Err(HypervisorError::ContractViolation(
-                    "Canisters on Application subnets cannot send cycles to canisters on VerifiedApplication subnets".to_string(),
-                ));
-            }
-        }
-    }
-
-    let current_size = method_name.len() + method_payload.len();
+    let payload_size = (method_name.len() + method_payload.len()) as u64;
     {
         let max_size_local_subnet = max_size_remote_subnet * multiplier_max_size_local_subnet;
-        if current_size > max_size_local_subnet.get() as usize {
+        if payload_size > max_size_local_subnet.get() {
             return Err(HypervisorError::ContractViolation(format!(
                 "RequestInPrep: size of message {} exceeded the allowed remote-subnet limit {}",
-                current_size, max_size_remote_subnet
+                payload_size, max_size_remote_subnet
             )));
         }
     }
 
-    if destination_subnet != own_subnet_id && current_size > max_size_remote_subnet.get() as usize {
-        return Err(HypervisorError::ContractViolation(format!(
-            "RequestInPrep: size of message {} destined to another subnet cannot exceed {}",
-            current_size, max_size_remote_subnet
-        )));
-    }
+    let prepayment_for_response_execution =
+        sandbox_safe_system_state.prepayment_for_response_execution();
+    let prepayment_for_response_transmission =
+        sandbox_safe_system_state.prepayment_for_response_transmission();
 
     let callback_id = sandbox_safe_system_state.register_callback(Callback::new(
         call_context_id,
         Some(sender),
         Some(destination_canister),
         cycles,
+        Some(prepayment_for_response_execution),
+        Some(prepayment_for_response_transmission),
         on_reply,
         on_reject,
         on_cleanup,
     ))?;
 
-    Ok(Request {
+    let req = Request {
         sender,
         receiver: destination_canister,
         method_name,
         method_payload,
         sender_reply_callback: callback_id,
         payment: cycles,
+    };
+    // We cannot call `Request::payload_size_bytes()` before constructing the
+    // request, so ensure our separate calculation matches the actual size.
+    debug_assert_eq!(
+        req.payload_size_bytes().get(),
+        payload_size,
+        "Inconsistent request payload size calculation"
+    );
+
+    Ok(RequestWithPrepayment {
+        request: req,
+        prepayment_for_response_execution,
+        prepayment_for_response_transmission,
     })
 }
 

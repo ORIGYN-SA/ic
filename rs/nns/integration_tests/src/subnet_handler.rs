@@ -1,29 +1,35 @@
 use dfn_candid::candid;
 
 use ic_base_types::{PrincipalId, SubnetId};
-use ic_canister_client::Sender;
+use ic_canister_client_sender::Sender;
 
+use ic_nervous_system_common_test_keys::{
+    TEST_NEURON_1_OWNER_KEYPAIR, TEST_NEURON_2_OWNER_KEYPAIR,
+};
 use ic_nns_common::{
     registry::encode_or_panic,
     types::{NeuronId, ProposalId},
 };
 use ic_nns_governance::pb::v1::{ManageNeuronResponse, NnsFunction, ProposalStatus, Vote};
-use ic_nns_test_keys::{TEST_NEURON_1_OWNER_KEYPAIR, TEST_NEURON_2_OWNER_KEYPAIR};
-use ic_nns_test_utils::ids::TEST_NEURON_2_ID;
 use ic_nns_test_utils::{
+    common::NnsInitPayloadsBuilder,
     governance::{get_pending_proposals, submit_external_update_proposal, wait_for_final_state},
     ids::TEST_NEURON_1_ID,
-    itest_helpers::{local_test_on_nns_subnet, NnsCanisters, NnsInitPayloadsBuilder},
-    registry::get_value,
+    ids::TEST_NEURON_2_ID,
+    itest_helpers::{local_test_on_nns_subnet, NnsCanisters},
+    registry::get_value_or_panic,
 };
 use ic_protobuf::registry::subnet::v1::SubnetRecord;
 use ic_registry_keys::make_subnet_record_key;
 use ic_registry_subnet_type::SubnetType;
 use ic_registry_transport::{insert, pb::v1::RegistryAtomicMutateRequest};
-use ic_types::p2p::{
-    build_default_gossip_config, ADVERT_BEST_EFFORT_PERCENTAGE, MAX_ARTIFACT_STREAMS_PER_PEER,
-    MAX_CHUNK_SIZE, MAX_CHUNK_WAIT_MS, MAX_DUPLICITY, PFN_EVALUATION_PERIOD_MS,
-    RECEIVE_CHECK_PEER_SET_SIZE, REGISTRY_POLL_PERIOD_MS, RETRANSMISSION_REQUEST_MS,
+use ic_types::{
+    p2p::{
+        build_default_gossip_config, MAX_ARTIFACT_STREAMS_PER_PEER, MAX_CHUNK_SIZE,
+        MAX_CHUNK_WAIT_MS, MAX_DUPLICITY, PFN_EVALUATION_PERIOD_MS, RECEIVE_CHECK_PEER_SET_SIZE,
+        REGISTRY_POLL_PERIOD_MS, RETRANSMISSION_REQUEST_MS,
+    },
+    ReplicaVersion,
 };
 use registry_canister::mutations::do_update_subnet::UpdateSubnetPayload;
 
@@ -46,7 +52,7 @@ fn test_submit_and_accept_update_subnet_proposal() {
                 max_block_payload_size: 4 * 1024 * 1024,
                 unit_delay_millis: 500,
                 initial_notary_delay_millis: 1500,
-                replica_version_id: "version_42".to_string(),
+                replica_version_id: ReplicaVersion::default().into(),
                 dkg_interval_length: 0,
                 dkg_dealings_per_block: 1,
                 gossip_config: Some(build_default_gossip_config()),
@@ -69,7 +75,7 @@ fn test_submit_and_accept_update_subnet_proposal() {
                 .with_test_neurons()
                 .with_initial_mutations(vec![RegistryAtomicMutateRequest {
                     mutations: vec![insert(
-                        key.as_bytes().to_vec(),
+                        key.as_bytes(),
                         encode_or_panic(&initial_subnet_record),
                     )],
                     preconditions: vec![],
@@ -78,7 +84,7 @@ fn test_submit_and_accept_update_subnet_proposal() {
             let nns_canisters = NnsCanisters::set_up(&runtime, nns_init_payload).await;
 
             let subnet_record_after_setup: SubnetRecord =
-                get_value(&nns_canisters.registry, key.as_bytes()).await;
+                get_value_or_panic(&nns_canisters.registry, key.as_bytes()).await;
 
             assert_eq!(subnet_record_after_setup, initial_subnet_record);
 
@@ -99,7 +105,6 @@ fn test_submit_and_accept_update_subnet_proposal() {
                 pfn_evaluation_period_ms: Some(PFN_EVALUATION_PERIOD_MS),
                 registry_poll_period_ms: Some(REGISTRY_POLL_PERIOD_MS),
                 retransmission_request_ms: Some(RETRANSMISSION_REQUEST_MS),
-                advert_best_effort_percentage: Some(ADVERT_BEST_EFFORT_PERCENTAGE),
                 set_gossip_config_to_default: false,
                 start_as_nns: None,
                 subnet_type: None,
@@ -110,6 +115,7 @@ fn test_submit_and_accept_update_subnet_proposal() {
                 features: None,
                 ecdsa_config: None,
                 ecdsa_key_signing_enable: None,
+                ecdsa_key_signing_disable: None,
                 max_number_of_canisters: Some(200),
                 ssh_readonly_access: Some(vec!["pub_key_0".to_string()]),
                 ssh_backup_access: Some(vec!["pub_key_1".to_string()]),
@@ -156,7 +162,7 @@ fn test_submit_and_accept_update_subnet_proposal() {
             assert_eq!(pending_proposals, vec![]);
 
             let subnet_record_after_update: SubnetRecord =
-                get_value(&nns_canisters.registry, key.as_bytes()).await;
+                get_value_or_panic(&nns_canisters.registry, key.as_bytes()).await;
 
             assert_eq!(
                 subnet_record_after_update,
@@ -167,7 +173,7 @@ fn test_submit_and_accept_update_subnet_proposal() {
                     max_block_payload_size: 4 * 1024 * 1024,
                     unit_delay_millis: 500,
                     initial_notary_delay_millis: 1500,
-                    replica_version_id: "version_42".to_string(),
+                    replica_version_id: ReplicaVersion::default().into(),
                     dkg_interval_length: 10,
                     dkg_dealings_per_block: 1,
                     gossip_config: Some(build_default_gossip_config()),

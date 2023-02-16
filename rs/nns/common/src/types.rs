@@ -29,8 +29,18 @@ impl From<CanisterIdProto> for CanisterId {
 }
 
 // A unique Id for a Neuron.
-#[cfg_attr(test, derive(comparable::Comparable))]
-#[derive(CandidType, Clone, Copy, Debug, Serialize, Deserialize, Eq, Hash, PartialEq)]
+#[derive(
+    CandidType,
+    Clone,
+    Copy,
+    Debug,
+    Serialize,
+    Deserialize,
+    Eq,
+    Hash,
+    PartialEq,
+    comparable::Comparable,
+)]
 pub struct NeuronId(pub u64);
 
 impl From<NeuronIdProto> for NeuronId {
@@ -85,7 +95,7 @@ impl Display for ProposalId {
 }
 
 /// The payload of a proposal to update the ICP/XDR conversion rate in the CMC.
-#[derive(CandidType, Default, Deserialize, Clone, Debug, PartialEq, Eq)]
+#[derive(CandidType, Default, Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 pub struct UpdateIcpXdrConversionRatePayload {
     pub data_source: String,
     pub timestamp_seconds: u64,

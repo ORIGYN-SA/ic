@@ -3,7 +3,7 @@
 //! messages of Consensus payloads and to keep track of finalized Ingress
 //! Messages to ensure that no message is added to a block more than once.
 use crate::IngressManager;
-use ic_constants::MAX_INGRESS_TTL;
+use ic_constants::{MAX_INGRESS_TTL, SMALL_APP_SUBNET_MAX_SIZE};
 use ic_cycles_account_manager::IngressInductionCost;
 use ic_interfaces::{
     execution_environment::IngressHistoryReader,
@@ -15,7 +15,7 @@ use ic_interfaces::{
     validation::{ValidationError, ValidationResult},
 };
 use ic_interfaces_state_manager::StateManagerError;
-use ic_logger::{error, warn};
+use ic_logger::warn;
 use ic_registry_client_helpers::subnet::IngressMessageSettings;
 use ic_replicated_state::ReplicatedState;
 use ic_types::{
@@ -23,13 +23,13 @@ use ic_types::{
     batch::{IngressPayload, ValidationContext},
     consensus::Payload,
     ingress::{IngressSets, IngressStatus},
-    messages::{MessageId, SignedIngress},
+    messages::{extract_effective_canister_id, MessageId, SignedIngress},
     CanisterId, CountBytes, Cycles, Height, NumBytes, Time,
 };
 use ic_validator::{validate_request, RequestValidationError};
 use std::{collections::BTreeMap, sync::Arc};
 
-impl<'a> IngressSelector for IngressManager {
+impl IngressSelector for IngressManager {
     fn get_ingress_payload(
         &self,
         past_ingress: &dyn IngressSetQuery,
@@ -54,7 +54,7 @@ impl<'a> IngressSelector for IngressManager {
             }
         };
 
-        let state = match self.state_manager.get_state_at(certified_height) {
+        let state = match self.state_reader.get_state_at(certified_height) {
             Ok(state) => state,
             Err(err) => {
                 warn!(
@@ -81,7 +81,7 @@ impl<'a> IngressSelector for IngressManager {
         let mut cycles_needed: BTreeMap<CanisterId, Cycles> = BTreeMap::new();
         let mut num_messages = 0;
 
-        let messages_in_payload = self.ingress_pool.select_validated(
+        let mut messages_in_payload = self.ingress_pool.select_validated(
             expiry_range,
             Box::new(move |ingress_obj| {
                 let result = self.validate_ingress(
@@ -116,19 +116,34 @@ impl<'a> IngressSelector for IngressManager {
             }),
         );
 
-        let payload = IngressPayload::from(messages_in_payload);
-        debug_assert!(payload.count_bytes() <= byte_limit.get() as usize);
-
-        // A last step is to validate the payload we just created. It will be
-        // an error if this fails, in which case we log the error, and return
-        // an empty payload instead.
-        match self.validate_ingress_payload(&payload, past_ingress, context) {
-            Ok(()) => payload,
-            Err(err) => {
-                error!(self.log, "Created an invalid IngressPayload: {:?}", err);
-                IngressPayload::default()
+        // NOTE: Since the `Vec<SignedIngress>` is deserialized and slightly smaller than the
+        // serialized `IngressPayload`, we need to check the size of the latter.
+        // In the improbable case, that the deserialized form fits the size limit but the
+        // serialized form does not, we need to remove some `SignedIngress` and try again.
+        let payload = loop {
+            let payload = IngressPayload::from(messages_in_payload.clone());
+            let payload_size = payload.count_bytes();
+            if payload_size < byte_limit.get() as usize {
+                break payload;
             }
-        }
+
+            warn!(
+                self.log,
+                "Serialized form of ingress (was {} bytes) did not pass \
+                size restriction ({} bytes), reducing ingress and trying again",
+                payload_size,
+                byte_limit.get()
+            );
+            messages_in_payload.pop();
+            if messages_in_payload.is_empty() {
+                break IngressPayload::default();
+            }
+        };
+
+        let payload_size = payload.count_bytes();
+        debug_assert!(payload_size <= byte_limit.get() as usize);
+
+        payload
     }
 
     fn validate_ingress_payload(
@@ -162,7 +177,7 @@ impl<'a> IngressSelector for IngressManager {
             }
         };
 
-        let state = match self.state_manager.get_state_at(certified_height) {
+        let state = match self.state_reader.get_state_at(certified_height) {
             Ok(state) => state.take(),
             Err(err) => {
                 warn!(
@@ -315,20 +330,33 @@ impl IngressManager {
 
         // Skip the message if there aren't enough cycles to induct the message.
         let msg = signed_ingress.content();
-        match self.cycles_account_manager.ingress_induction_cost(msg) {
-            Ok(IngressInductionCost::Fee {
+        let effective_canister_id =
+            extract_effective_canister_id(msg, self.subnet_id).map_err(|_| {
+                ValidationError::Permanent(IngressPermanentError::InvalidManagementMessage)
+            })?;
+        let subnet_size = state
+            .metadata
+            .network_topology
+            .get_subnet_size(&state.metadata.own_subnet_id)
+            .unwrap_or(SMALL_APP_SUBNET_MAX_SIZE);
+        match self.cycles_account_manager.ingress_induction_cost(
+            msg,
+            effective_canister_id,
+            subnet_size,
+        ) {
+            IngressInductionCost::Fee {
                 payer,
                 cost: ingress_cost,
-            }) => match state.canister_state(&payer) {
+            } => match state.canister_state(&payer) {
                 Some(canister) => {
-                    let cumulative_ingress_cost = cycles_needed
-                        .entry(payer)
-                        .or_insert_with(|| Cycles::from(0));
+                    let cumulative_ingress_cost =
+                        cycles_needed.entry(payer).or_insert_with(Cycles::zero);
                     if let Err(err) = self.cycles_account_manager.can_withdraw_cycles(
                         &canister.system_state,
                         *cumulative_ingress_cost + ingress_cost,
                         canister.memory_usage(state.metadata.own_subnet_type),
                         canister.scheduler_state.compute_allocation,
+                        subnet_size,
                     ) {
                         return Err(ValidationError::Permanent(
                             IngressPermanentError::InsufficientCycles(err),
@@ -342,13 +370,8 @@ impl IngressManager {
                     ));
                 }
             },
-            Ok(IngressInductionCost::Free) => {
+            IngressInductionCost::Free => {
                 // Do nothing.
-            }
-            Err(_) => {
-                return Err(ValidationError::Permanent(
-                    IngressPermanentError::InvalidManagementMessage,
-                ));
             }
         };
 
@@ -465,7 +488,7 @@ mod tests {
     use super::*;
     use crate::tests::{access_ingress_pool, setup, setup_registry, setup_with_params};
     use assert_matches::assert_matches;
-    use ic_crypto::crypto_hash;
+    use ic_ic00_types::{CanisterIdRecord, Payload, IC_00};
     use ic_interfaces::{
         artifact_pool::UnvalidatedArtifact,
         execution_environment::IngressHistoryError,
@@ -484,10 +507,11 @@ mod tests {
         },
         FastForwardTimeSource,
     };
+    use ic_types::crypto::crypto_hash;
     use ic_types::{
         artifact::{IngressMessageAttribute, IngressMessageId},
         batch::IngressPayload,
-        ic00::{CanisterIdRecord, Payload, IC_00},
+        ingress::{IngressState, IngressStatus},
         messages::{MessageId, SignedIngress},
         time::current_time_and_expiry_time,
         Height, RegistryVersion,
@@ -1066,10 +1090,11 @@ mod tests {
         ingress_hist_reader
             .expect_get_status_at_height()
             .returning(|_| {
-                Ok(Box::new(|_| IngressStatus::Received {
+                Ok(Box::new(|_| IngressStatus::Known {
                     receiver: canister_test_id(0).get(),
                     user_id: user_test_id(0),
                     time: mock_time(),
+                    state: IngressState::Received,
                 }))
             });
         setup_with_params(
@@ -1158,10 +1183,11 @@ mod tests {
                 let message_id1_cl = MessageId::from(&message_id1_cl);
                 Ok(Box::new(move |msg_id| {
                     if *msg_id == message_id1_cl {
-                        IngressStatus::Processing {
+                        IngressStatus::Known {
                             receiver: canister_test_id(0).get(),
                             user_id: user_test_id(0),
                             time: mock_time(),
+                            state: IngressState::Processing,
                         }
                     } else {
                         IngressStatus::Unknown
@@ -1355,8 +1381,11 @@ mod tests {
                             // Enough cycles to induct only m1
                             .with_cycles(
                                 cycles_account_manager
-                                    .ingress_induction_cost(m1.content())
-                                    .unwrap()
+                                    .ingress_induction_cost(
+                                        m1.content(),
+                                        None,
+                                        SMALL_APP_SUBNET_MAX_SIZE,
+                                    )
                                     .cost(),
                             )
                             .build(),
@@ -1365,7 +1394,7 @@ mod tests {
                         CanisterStateBuilder::default()
                             .with_canister_id(canister_test_id(1))
                             // No cycles
-                            .with_cycles(0)
+                            .with_cycles(0u128)
                             .build(),
                     )
                     .build(),
@@ -1428,7 +1457,7 @@ mod tests {
                         CanisterStateBuilder::default()
                             .with_canister_id(canister_test_id(0))
                             // Not enough cycles
-                            .with_cycles(0)
+                            .with_cycles(0u128)
                             .build(),
                     )
                     .build(),
@@ -1615,7 +1644,7 @@ mod tests {
                     .with_canister(
                         CanisterStateBuilder::new()
                             .with_canister_id(canister_test_id(2))
-                            .with_cycles(0)
+                            .with_cycles(0u128)
                             .build(),
                     )
                     .build(),
@@ -1726,6 +1755,70 @@ mod tests {
                         ))
                     );
                 }
+            },
+        );
+    }
+
+    #[tokio::test]
+    async fn test_nearly_oversized_ingress() {
+        const MAX_SIZE: usize = 2 * 1024 * 1024;
+        const ALMOST_MAX_SIZE: usize = 2 * 1024 * 1024 - 140;
+
+        let subnet_id = subnet_test_id(0);
+        let registry = setup_registry(subnet_id, MAX_SIZE);
+
+        setup_with_params(
+            None,
+            Some((registry, subnet_id)),
+            None,
+            Some(
+                ReplicatedStateBuilder::new()
+                    .with_subnet_id(subnet_id)
+                    .with_canister(
+                        CanisterStateBuilder::default()
+                            .with_canister_id(canister_test_id(0))
+                            .build(),
+                    )
+                    .build(),
+            ),
+            |ingress_manager, ingress_pool| {
+                let msg = SignedIngressBuilder::new()
+                    .method_payload(vec![0; ALMOST_MAX_SIZE])
+                    .expiry_time(mock_time())
+                    .build();
+
+                let msg_id = IngressMessageId::from(&msg);
+                let msg_attribute = IngressMessageAttribute::new(&msg);
+                let msg_hash = crypto_hash(msg.binary()).get();
+                let _payload = IngressPayload::from(vec![msg.clone()]);
+
+                ingress_pool.write().unwrap().insert(UnvalidatedArtifact {
+                    message: msg,
+                    peer_id: node_test_id(0),
+                    timestamp: mock_time(),
+                });
+                ingress_pool
+                    .write()
+                    .unwrap()
+                    .apply_changeset(vec![ChangeAction::MoveToValidated((
+                        msg_id,
+                        node_test_id(0),
+                        0,
+                        msg_attribute,
+                        msg_hash,
+                    ))]);
+
+                let validation_context = ValidationContext {
+                    registry_version: RegistryVersion::new(1),
+                    certified_height: Height::new(0),
+                    time: mock_time(),
+                };
+
+                let _payload = ingress_manager.get_ingress_payload(
+                    &HashSet::new(),
+                    &validation_context,
+                    NumBytes::new(MAX_SIZE as u64),
+                );
             },
         );
     }

@@ -1,6 +1,13 @@
 use ic_canister_sandbox_common::protocol::sbxsvc;
 use ic_canister_sandbox_common::*;
+use ic_embedders::{
+    wasm_utils::{Segments, WasmImportsDetails},
+    CompilationResult, SerializedModule, SerializedModuleBytes,
+};
+use ic_replicated_state::canister_state::execution_state::WasmMetadata;
+use ic_types::NumInstructions;
 
+use std::collections::BTreeSet;
 use std::os::unix::io::FromRawFd;
 use std::sync::Arc;
 
@@ -18,22 +25,44 @@ impl sandbox_service::SandboxService for DummySandboxService {
         println!("Sandbox: Received 'terminate' request");
         rpc::Call::new_resolved(Ok(sbxsvc::TerminateReply {}))
     }
+
     fn open_wasm(&self, _req: sbxsvc::OpenWasmRequest) -> rpc::Call<sbxsvc::OpenWasmReply> {
         println!("Sandbox: Received 'open_wasm' request");
-        rpc::Call::new_resolved(Ok(sbxsvc::OpenWasmReply(Ok(()))))
+        rpc::Call::new_resolved(Ok(sbxsvc::OpenWasmReply(Ok((
+            CompilationResult::empty_for_testing(),
+            SerializedModule {
+                bytes: Arc::new(SerializedModuleBytes::empty()),
+                exported_functions: BTreeSet::new(),
+                data_segments: Segments::default(),
+                wasm_metadata: WasmMetadata::default(),
+                compilation_cost: NumInstructions::from(0),
+                imports_details: WasmImportsDetails::default(),
+            },
+        )))))
     }
+
+    fn open_wasm_serialized(
+        &self,
+        _req: sbxsvc::OpenWasmSerializedRequest,
+    ) -> rpc::Call<sbxsvc::OpenWasmSerializedReply> {
+        unimplemented!();
+    }
+
     fn close_wasm(&self, _req: sbxsvc::CloseWasmRequest) -> rpc::Call<sbxsvc::CloseWasmReply> {
         unimplemented!();
     }
+
     fn open_memory(&self, _req: sbxsvc::OpenMemoryRequest) -> rpc::Call<sbxsvc::OpenMemoryReply> {
         unimplemented!();
     }
+
     fn close_memory(
         &self,
         _req: sbxsvc::CloseMemoryRequest,
     ) -> rpc::Call<sbxsvc::CloseMemoryReply> {
         unimplemented!();
     }
+
     fn start_execution(
         &self,
         _req: sbxsvc::StartExecutionRequest,
@@ -41,10 +70,31 @@ impl sandbox_service::SandboxService for DummySandboxService {
         unimplemented!();
     }
 
+    fn resume_execution(
+        &self,
+        _req: sbxsvc::ResumeExecutionRequest,
+    ) -> rpc::Call<sbxsvc::ResumeExecutionReply> {
+        unimplemented!()
+    }
+
+    fn abort_execution(
+        &self,
+        _req: sbxsvc::AbortExecutionRequest,
+    ) -> rpc::Call<sbxsvc::AbortExecutionReply> {
+        unimplemented!()
+    }
+
     fn create_execution_state(
         &self,
         _req: sbxsvc::CreateExecutionStateRequest,
     ) -> rpc::Call<sbxsvc::CreateExecutionStateReply> {
+        unimplemented!()
+    }
+
+    fn create_execution_state_serialized(
+        &self,
+        _req: sbxsvc::CreateExecutionStateSerializedRequest,
+    ) -> rpc::Call<sbxsvc::CreateExecutionStateSerializedReply> {
         unimplemented!()
     }
 }

@@ -1,0 +1,149 @@
+load("@rules_rust//rust:defs.bzl", "rust_binary", "rust_library", "rust_test", "rust_test_suite")
+load("//bazel:canisters.bzl", "rust_canister")
+load("//bazel:prost.bzl", "generated_files_check")
+load("@rules_rust//cargo:cargo_build_script.bzl", "cargo_build_script")
+
+package(default_visibility = ["//visibility:public"])
+
+filegroup(
+    name = "protos",
+    srcs = glob(["proto/**"]),
+)
+
+DEPENDENCIES = [
+    "//rs/nervous_system/common",
+    "//rs/nervous_system/root",
+    "//rs/rosetta-api/icrc1",
+    "//rs/rust_canisters/canister_log",
+    "//rs/rust_canisters/dfn_candid",
+    "//rs/rust_canisters/dfn_core",
+    "//rs/rust_canisters/http_types",
+    "//rs/types/base_types",
+    "//rs/types/ic00_types",
+    "//rs/sns/swap",
+    "@crate_index//:build-info",
+    "@crate_index//:candid",
+    "@crate_index//:comparable",
+    "@crate_index//:ic-metrics-encoder",
+    "@crate_index//:lazy_static",
+    "@crate_index//:num-traits",
+    "@crate_index//:prost",
+    "@crate_index//:serde",
+]
+
+MACRO_DEPENDENCIES = [
+    "//rs/nervous_system/common/build_metadata",
+    "@crate_index//:async-trait",
+]
+
+BUILD_DEPENDENCIES = [
+    "@crate_index//:build-info-build",
+]
+
+ALIASES = {}
+
+cargo_build_script(
+    name = "build_script",
+    srcs = ["build.rs"],
+    aliases = ALIASES,
+    data = [],  # build script data (e.g. template files) goes here
+    version = "0.8.0",
+    deps = BUILD_DEPENDENCIES,
+)
+
+rust_library(
+    name = "root",
+    srcs = glob([
+        "src/**",
+        "gen/**",
+    ]),
+    aliases = ALIASES,
+    crate_name = "ic_sns_root",
+    proc_macro_deps = MACRO_DEPENDENCIES,
+    version = "0.8.0",
+    deps = DEPENDENCIES + [":build_script"],
+)
+
+rust_binary(
+    name = "generate_did",
+    srcs = ["canister/canister.rs"],
+    compile_data = ["canister/root.did"],
+    proc_macro_deps = MACRO_DEPENDENCIES,
+    deps = DEPENDENCIES + [
+        ":build_script",
+        ":root",
+    ],
+)
+
+rust_canister(
+    name = "sns-root-canister",
+    srcs = ["canister/canister.rs"],
+    aliases = ALIASES,
+    compile_data = ["canister/root.did"],
+    proc_macro_deps = MACRO_DEPENDENCIES,
+    service_file = ":canister/root.did",
+    deps = DEPENDENCIES + [
+        ":build_script",
+        ":root",
+    ],
+)
+
+generated_files_check(
+    name = "check_generated_files",
+    srcs = ["tests/check_generated_files.rs"],
+    data = glob(["gen/**"]) + [
+        ":protos",
+        "//rs/types/base_types:protos",
+    ],
+    manifest_dir = "rs/sns/root",
+    deps = [
+        "//rs/sns/root/protobuf_generator:lib",
+        "//rs/test_utilities/compare_dirs",
+        "@crate_index//:tempfile",
+    ],
+)
+
+DEV_DEPENDENCIES = [
+    "//rs/sns/root/protobuf_generator:lib",
+    "//rs/test_utilities/compare_dirs",
+    "@crate_index//:tempfile",
+    "@crate_index//:tokio",
+]
+
+MACRO_DEV_DEPENDENCIES = []
+
+rust_test(
+    name = "root_test",
+    aliases = ALIASES,
+    crate = ":root",
+    data = [
+        "//rs/sns/root:proto/ic_sns_root/pb/v1/root.proto",
+        "//rs/types/base_types:proto/ic_base_types/pb/v1/types.proto",
+    ],
+    env = {
+        "CARGO_MANIFEST_DIR": "rs/sns/root/",
+    },
+    proc_macro_deps = MACRO_DEPENDENCIES + MACRO_DEV_DEPENDENCIES,
+    deps = DEPENDENCIES + DEV_DEPENDENCIES + [":build_script"],
+)
+
+rust_test(
+    name = "canister_unit_test",
+    crate = ":_wasm_sns-root-canister",
+    data = ["canister/root.did"],
+    env = {"CARGO_MANIFEST_DIR": "rs/sns/root"},
+)
+
+rust_test_suite(
+    name = "root_integration_tests",
+    srcs = glob(
+        ["tests/**/*.rs"],
+        exclude = ["tests/check_generated_files.rs"],
+    ),
+    aliases = ALIASES,
+    env = {
+        "CARGO_MANIFEST_DIR": "rs/sns/root/",
+    },
+    proc_macro_deps = MACRO_DEPENDENCIES + MACRO_DEV_DEPENDENCIES,
+    deps = [":root"] + DEPENDENCIES + DEV_DEPENDENCIES + [":build_script"],
+)

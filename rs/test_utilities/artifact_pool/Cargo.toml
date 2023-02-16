@@ -1,15 +1,15 @@
 [package]
 name = "ic-test-artifact-pool"
 version = "0.8.0"
-edition = "2018"
+edition = "2021"
 
 [dependencies]
 ic-artifact-pool = { path = "../../artifact_pool" }
 ic-config = { path = "../../config" }
 ic-consensus = { path = "../../consensus" }
-ic-consensus-message = { path = "../../consensus/message" }
 ic-crypto = { path = "../../crypto" }
 ic-interfaces = { path = "../../interfaces" }
+ic-interfaces-registry = { path = "../../interfaces/registry" }
 ic-interfaces-state-manager = { path = "../../interfaces/state_manager" }
 ic-logger = { path = "../../monitoring/logger" }
 ic-metrics = { path = "../../monitoring/metrics" }

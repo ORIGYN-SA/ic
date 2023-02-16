@@ -17,18 +17,19 @@
 //! into a complete finalization, at which point the block and its ancestors
 //! become finalized.
 use crate::consensus::{
-    batch_delivery::deliver_batches, membership::Membership, metrics::FinalizerMetrics,
-    pool_reader::PoolReader, prelude::*,
+    batch_delivery::deliver_batches,
+    membership::Membership,
+    metrics::{BatchStats, BlockStats, FinalizerMetrics},
+    pool_reader::PoolReader,
+    prelude::*,
 };
 use ic_interfaces::{
     ingress_manager::IngressSelector,
     messaging::{MessageRouting, MessageRoutingError},
-    registry::RegistryClient,
 };
-use ic_interfaces_state_manager::StateManager;
+use ic_interfaces_registry::RegistryClient;
 use ic_logger::{debug, trace, ReplicaLogger};
 use ic_metrics::MetricsRegistry;
-use ic_replicated_state::ReplicatedState;
 use ic_types::replica_config::ReplicaConfig;
 use std::cell::RefCell;
 use std::sync::Arc;
@@ -40,7 +41,6 @@ pub struct Finalizer {
     crypto: Arc<dyn ConsensusCrypto>,
     message_routing: Arc<dyn MessageRouting>,
     ingress_selector: Arc<dyn IngressSelector>,
-    state_manager: Arc<dyn StateManager<State = ReplicatedState>>,
     log: ReplicaLogger,
     metrics: FinalizerMetrics,
     prev_finalized_height: RefCell<Height>,
@@ -55,7 +55,6 @@ impl Finalizer {
         crypto: Arc<dyn ConsensusCrypto>,
         message_routing: Arc<dyn MessageRouting>,
         ingress_selector: Arc<dyn IngressSelector>,
-        state_manager: Arc<dyn StateManager<State = ReplicatedState>>,
         log: ReplicaLogger,
         metrics_registry: MetricsRegistry,
     ) -> Self {
@@ -66,7 +65,6 @@ impl Finalizer {
             crypto,
             message_routing,
             ingress_selector,
-            state_manager,
             log,
             metrics: FinalizerMetrics::new(metrics_registry),
             prev_finalized_height: RefCell::new(Height::from(0)),
@@ -94,32 +92,13 @@ impl Finalizer {
         let _ = deliver_batches(
             &*self.message_routing,
             pool,
-            &*self.state_manager,
             &*self.registry_client,
             self.replica_config.subnet_id,
             ReplicaVersion::default(),
             &self.log,
             None,
-            Some(&|result,
-                   batch_height,
-                   ingress_count,
-                   ingress_bytes,
-                   xnet_bytes,
-                   ingress_ids,
-                   block_hash,
-                   block_height,
-                   block_context_certified_height| {
-                self.process_batch_delivery_result(
-                    result,
-                    batch_height,
-                    ingress_count,
-                    ingress_bytes,
-                    xnet_bytes,
-                    ingress_ids,
-                    block_hash,
-                    block_height,
-                    block_context_certified_height,
-                )
+            Some(&|result, block_stats, batch_stats| {
+                self.process_batch_delivery_result(result, block_stats, batch_stats)
             }),
         );
 
@@ -135,38 +114,13 @@ impl Finalizer {
     fn process_batch_delivery_result(
         &self,
         result: &Result<(), MessageRoutingError>,
-        batch_height: u64,
-        ingress_count: usize,
-        ingress_bytes: usize,
-        xnet_bytes: usize,
-        ingress_ids: Vec<ic_types::artifact::IngressMessageId>,
-        block_hash: &str,
-        block_height: u64,
-        block_context_certified_height: u64,
+        block_stats: BlockStats,
+        batch_stats: BatchStats,
     ) {
         match result {
             Ok(()) => {
-                self.metrics
-                    .batches_delivered
-                    .with_label_values(&["success"])
-                    .inc();
-                self.metrics.batch_height.set(batch_height as i64);
-                self.metrics
-                    .ingress_messages_delivered
-                    .observe(ingress_count as f64);
-                self.metrics
-                    .ingress_message_bytes_delivered
-                    .observe(ingress_bytes as f64);
-                self.metrics.xnet_bytes_delivered.observe(xnet_bytes as f64);
-                self.metrics
-                    .finalization_certified_state_difference
-                    .set((block_height - block_context_certified_height) as i64);
-                debug!(
-                    self.log,
-                    "block_delivered";
-                    block.hash => block_hash
-                );
-                for ingress in ingress_ids.iter() {
+                self.metrics.process(&block_stats, &batch_stats);
+                for ingress in batch_stats.ingress_ids.iter() {
                     debug!(
                         self.log,
                         "ingress_message_delivered";
@@ -174,7 +128,7 @@ impl Finalizer {
                     );
                 }
                 self.ingress_selector
-                    .request_purge_finalized_messages(ingress_ids);
+                    .request_purge_finalized_messages(batch_stats.ingress_ids);
             }
             Err(MessageRoutingError::QueueIsFull) => {
                 self.metrics
@@ -243,7 +197,8 @@ impl Finalizer {
         // If notarization shares exists created by this replica at height `h`
         // that sign a block different than `notarized_block`, do not finalize.
         let other_notarizaed_shares_exists = pool.get_notarization_shares(h).any(|x| {
-            x.signature.signer == me && x.content.block != ic_crypto::crypto_hash(&notarized_block)
+            x.signature.signer == me
+                && x.content.block != ic_types::crypto::crypto_hash(&notarized_block)
         });
         if other_notarizaed_shares_exists {
             return None;
@@ -257,7 +212,7 @@ impl Finalizer {
     fn finalize_height(&self, pool: &PoolReader<'_>, height: Height) -> Option<FinalizationShare> {
         let content = FinalizationContent::new(
             height,
-            ic_crypto::crypto_hash(&self.pick_block_to_finality_sign(pool, height)?),
+            ic_types::crypto::crypto_hash(&self.pick_block_to_finality_sign(pool, height)?),
         );
         let signature = self
             .crypto
@@ -332,7 +287,7 @@ impl Finalizer {
         pool: &PoolReader<'_>,
         block: &Block,
     ) -> Option<FinalizationShare> {
-        let content = FinalizationContent::new(block.height, ic_crypto::crypto_hash(block));
+        let content = FinalizationContent::new(block.height, ic_types::crypto::crypto_hash(block));
         let signature = self
             .crypto
             .sign(
@@ -351,7 +306,7 @@ mod tests {
     use super::*;
     use crate::consensus::batch_delivery::generate_responses_to_setup_initial_dkg_calls;
     use crate::consensus::mocks::{dependencies, dependencies_with_subnet_params, Dependencies};
-    use ic_interfaces_state_manager::Labeled;
+    use ic_ic00_types::SetupInitialDKGResponse;
     use ic_logger::replica_logger::no_op_logger;
     use ic_metrics::MetricsRegistry;
     use ic_registry_subnet_type::SubnetType;
@@ -361,7 +316,6 @@ mod tests {
     use ic_test_utilities::{
         ingress_selector::FakeIngressSelector,
         message_routing::FakeMessageRouting,
-        state_manager::{FakeStateManager, MockStateManager},
         types::ids::{node_test_id, subnet_test_id},
     };
     use ic_test_utilities_registry::SubnetRecordBuilder;
@@ -369,11 +323,10 @@ mod tests {
         crypto::threshold_sig::ni_dkg::{
             NiDkgId, NiDkgTag, NiDkgTargetId, NiDkgTargetSubnet, NiDkgTranscript,
         },
-        ic00::SetupInitialDKGResponse,
         messages::{CallbackId, Request},
     };
     use std::collections::BTreeMap;
-    use std::{collections::BTreeSet, path::PathBuf, str::FromStr, sync::Arc};
+    use std::{collections::BTreeSet, str::FromStr, sync::Arc};
 
     /// Given a single block, just finalize it
     #[test]
@@ -396,7 +349,6 @@ mod tests {
 
             let message_routing = Arc::new(message_routing);
             let ingress_selector = Arc::new(FakeIngressSelector::new());
-            let state_manager = Arc::new(FakeStateManager::new());
 
             let finalizer = Finalizer::new(
                 replica_config,
@@ -405,7 +357,6 @@ mod tests {
                 crypto,
                 message_routing.clone(),
                 ingress_selector,
-                state_manager,
                 no_op_logger(),
                 MetricsRegistry::new(),
             );
@@ -496,7 +447,6 @@ mod tests {
                 crypto,
                 message_routing.clone(),
                 ingress_selector,
-                Arc::new(FakeStateManager::new()),
                 no_op_logger(),
                 metrics_registry,
             );
@@ -517,7 +467,7 @@ mod tests {
                 RegistryVersion::from(1)
             );
             assert_eq!(block.context.registry_version, RegistryVersion::from(10));
-            block_proposal.content = HashedBlock::new(ic_crypto::crypto_hash, block.clone());
+            block_proposal.content = HashedBlock::new(ic_types::crypto::crypto_hash, block.clone());
             pool.insert_validated(block_proposal.clone());
             pool.insert_validated(pool.make_next_beacon());
             pool.insert_validated(pool.make_next_tape());
@@ -577,15 +527,8 @@ mod tests {
     }
 
     #[test]
-    fn test_generate_responsens_to_subnet_calls() {
+    fn test_generate_responses_to_subnet_calls() {
         const TARGET_ID: NiDkgTargetId = NiDkgTargetId::new([8; 32]);
-
-        // Create a replicated state
-        let mut replicated_state = ReplicatedState::new_rooted_at(
-            subnet_test_id(0),
-            SubnetType::System,
-            PathBuf::from("/tmp"),
-        );
 
         // Manually create `SystemMetadata` with custom context
         let mut metadata = SystemMetadata::new(subnet_test_id(0), SubnetType::System);
@@ -607,20 +550,11 @@ mod tests {
                 nodes_in_target_subnet: BTreeSet::new(),
                 target_id: TARGET_ID,
                 registry_version: RegistryVersion::from(1),
+                time: metadata.batch_time,
             },
         )]
         .drain(..)
         .collect::<BTreeMap<_, _>>();
-        replicated_state.set_system_metadata(metadata);
-
-        // Build a `MockStateManager`, that returns the state with the custom context
-        let mut state_manager = MockStateManager::new();
-        state_manager
-            .expect_get_state_at()
-            .return_const(Ok(Labeled::new(
-                Height::from(0),
-                Arc::new(replicated_state),
-            )));
 
         // Build some transcipts with matching ids and tags
         let transcripts_for_new_subnets = vec![
@@ -631,6 +565,7 @@ mod tests {
                     dkg_tag: NiDkgTag::LowThreshold,
                     target_subnet: NiDkgTargetSubnet::Remote(TARGET_ID),
                 },
+                CallbackId::from(1),
                 Ok(NiDkgTranscript::dummy_transcript_for_tests()),
             ),
             (
@@ -640,23 +575,16 @@ mod tests {
                     dkg_tag: NiDkgTag::HighThreshold,
                     target_subnet: NiDkgTargetSubnet::Remote(TARGET_ID),
                 },
+                CallbackId::from(1),
                 Ok(NiDkgTranscript::dummy_transcript_for_tests()),
             ),
         ]
         .drain(..)
-        .collect::<BTreeMap<_, _>>();
+        .collect::<Vec<_>>();
 
-        // Run the function
-        use ic_interfaces_state_manager::StateReader;
-        let state = state_manager.get_state_at(Height::from(1)).unwrap();
-        let setup_initial_dkg_contexts = &state
-            .get_ref()
-            .metadata
-            .subnet_call_context_manager
-            .setup_initial_dkg_contexts;
+        // Run the
         let result = generate_responses_to_setup_initial_dkg_calls(
-            setup_initial_dkg_contexts,
-            &transcripts_for_new_subnets,
+            &transcripts_for_new_subnets[..],
             &no_op_logger(),
         );
         assert_eq!(result.len(), 1);

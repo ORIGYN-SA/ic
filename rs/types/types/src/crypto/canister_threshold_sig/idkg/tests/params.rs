@@ -2,12 +2,13 @@ use super::super::*;
 use crate::crypto::AlgorithmId;
 use crate::NodeId;
 use crate::RegistryVersion;
+use assert_matches::assert_matches;
 use maplit::btreeset;
 use std::collections::BTreeSet;
 
 use crate::crypto::canister_threshold_sig::idkg::tests::test_utils::{
     mock_masked_transcript_type, mock_transcript, mock_unmasked_transcript_type,
-    transcript_id_generator,
+    random_transcript_id,
 };
 use ic_crypto_test_utils_canister_threshold_sigs::{node_id, set_of_nodes};
 
@@ -16,7 +17,7 @@ fn should_return_correct_dealer_index_for_random() {
     let dealers = set_of_nodes(&[42, 43, 45]);
 
     let params = IDkgTranscriptParams::new(
-        transcript_id_generator(),
+        random_transcript_id(),
         dealers.clone(),
         dealers,
         RegistryVersion::from(0),
@@ -46,7 +47,7 @@ fn should_return_correct_dealer_index_for_reshare_masked() {
     assert!(dealers.is_subset(previous_transcript.receivers.get()));
 
     let params = IDkgTranscriptParams::new(
-        transcript_id_generator(),
+        random_transcript_id(),
         dealers.clone(),
         dealers,
         RegistryVersion::from(0),
@@ -77,7 +78,7 @@ fn should_return_correct_dealer_index_for_reshare_unmasked() {
     assert!(dealers.is_subset(previous_transcript.receivers.get()));
 
     let params = IDkgTranscriptParams::new(
-        transcript_id_generator(),
+        random_transcript_id(),
         dealers.clone(),
         dealers,
         RegistryVersion::from(0),
@@ -113,7 +114,7 @@ fn should_return_correct_dealer_index_for_unmasked_times_masked() {
     assert!(dealers.is_subset(previous_masked_transcript.receivers.get()));
 
     let params = IDkgTranscriptParams::new(
-        transcript_id_generator(),
+        random_transcript_id(),
         dealers.clone(),
         dealers,
         RegistryVersion::from(0),
@@ -139,7 +140,7 @@ fn should_return_none_initial_dealings_collection_threshold_for_random() {
     let dealers = set_of_nodes(&[1, 2, 3]);
 
     let params = IDkgTranscriptParams::new(
-        transcript_id_generator(),
+        random_transcript_id(),
         dealers.clone(),
         dealers,
         RegistryVersion::from(0),
@@ -158,7 +159,7 @@ fn should_return_none_initial_dealings_collection_threshold_for_masked() {
 
     let masked_transcript = mock_transcript(Some(dealers.clone()), mock_masked_transcript_type());
     let params = IDkgTranscriptParams::new(
-        transcript_id_generator(),
+        random_transcript_id(),
         dealers.clone(),
         dealers,
         RegistryVersion::from(0),
@@ -180,7 +181,7 @@ fn should_return_none_initial_dealings_collection_threshold_for_unmasked_times_m
         mock_transcript(Some(dealers.clone()), mock_unmasked_transcript_type());
 
     let params = IDkgTranscriptParams::new(
-        transcript_id_generator(),
+        random_transcript_id(),
         dealers.clone(),
         dealers,
         RegistryVersion::from(0),
@@ -222,7 +223,7 @@ fn check_unverified_dealings_collection_threshold_for_unmasked(
 
     let transcript = mock_transcript(Some(dealers.clone()), mock_unmasked_transcript_type());
     let params = IDkgTranscriptParams::new(
-        transcript_id_generator(),
+        random_transcript_id(),
         dealers.clone(),
         dealers,
         RegistryVersion::from(0),
@@ -240,7 +241,7 @@ fn check_unverified_dealings_collection_threshold_for_unmasked(
 #[test]
 fn should_return_correct_receiver_index() {
     let params = IDkgTranscriptParams::new(
-        transcript_id_generator(),
+        random_transcript_id(),
         set_of_nodes(&[42, 43, 45]),
         set_of_nodes(&[43, 45, 46]),
         RegistryVersion::from(0),
@@ -266,7 +267,7 @@ fn should_not_create_with_empty_dealers() {
     let empty_dealers = BTreeSet::new();
 
     let result = IDkgTranscriptParams::new(
-        transcript_id_generator(),
+        random_transcript_id(),
         empty_dealers,
         btreeset! {node_id(1)},
         RegistryVersion::from(0),
@@ -274,10 +275,7 @@ fn should_not_create_with_empty_dealers() {
         IDkgTranscriptOperation::Random,
     );
 
-    assert!(matches!(
-        result,
-        Err(IDkgParamsValidationError::DealersEmpty)
-    ));
+    assert_matches!(result, Err(IDkgParamsValidationError::DealersEmpty));
 }
 
 #[test]
@@ -285,7 +283,7 @@ fn should_not_create_with_empty_receivers() {
     let empty_receivers = BTreeSet::new();
 
     let result = IDkgTranscriptParams::new(
-        transcript_id_generator(),
+        random_transcript_id(),
         btreeset! {node_id(1)},
         empty_receivers,
         RegistryVersion::from(0),
@@ -293,10 +291,7 @@ fn should_not_create_with_empty_receivers() {
         IDkgTranscriptOperation::Random,
     );
 
-    assert!(matches!(
-        result,
-        Err(IDkgParamsValidationError::ReceiversEmpty)
-    ));
+    assert_matches!(result, Err(IDkgParamsValidationError::ReceiversEmpty));
 }
 
 #[test]
@@ -379,7 +374,7 @@ fn should_not_create_with_placeholder_algid() {
     nodes.insert(node_id(1));
 
     let result = IDkgTranscriptParams::new(
-        transcript_id_generator(),
+        random_transcript_id(),
         nodes.clone(),
         nodes,
         RegistryVersion::from(0),
@@ -387,12 +382,12 @@ fn should_not_create_with_placeholder_algid() {
         IDkgTranscriptOperation::Random,
     );
 
-    assert!(matches!(
-        result.unwrap_err(),
-        IDkgParamsValidationError::UnsupportedAlgorithmId {
+    assert_matches!(
+        result,
+        Err(IDkgParamsValidationError::UnsupportedAlgorithmId {
             algorithm_id: AlgorithmId::Placeholder
-        }
-    ));
+        })
+    );
 }
 
 #[test]
@@ -400,7 +395,7 @@ fn should_not_create_with_wrong_algid() {
     let nodes = set_of_nodes(&[1]);
 
     let result = IDkgTranscriptParams::new(
-        transcript_id_generator(),
+        random_transcript_id(),
         nodes.clone(),
         nodes,
         RegistryVersion::from(0),
@@ -408,12 +403,12 @@ fn should_not_create_with_wrong_algid() {
         IDkgTranscriptOperation::Random,
     );
 
-    assert!(matches!(
-        result.unwrap_err(),
-        IDkgParamsValidationError::UnsupportedAlgorithmId {
+    assert_matches!(
+        result,
+        Err(IDkgParamsValidationError::UnsupportedAlgorithmId {
             algorithm_id: AlgorithmId::RsaSha256
-        }
-    ));
+        })
+    );
 }
 
 #[test]
@@ -659,7 +654,7 @@ fn check_params_creation(
     };
 
     let result = IDkgTranscriptParams::new(
-        transcript_id_generator(),
+        random_transcript_id(),
         node_set.clone(),
         node_set,
         RegistryVersion::from(0),

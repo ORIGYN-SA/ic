@@ -1,36 +1,44 @@
 use canister_test::{RemoteTestRuntime, Runtime};
-use ic_base_types::PrincipalId;
+use clap::Parser;
+use ic_base_types::{PrincipalId, SubnetId};
 use ic_canister_client::{Agent, Sender};
 use ic_nns_common::pb::v1::NeuronId;
+use ic_nns_constants::REGISTRY_CANISTER_ID;
 use ic_nns_governance::pb::v1::Governance as GovernanceProto;
 use ic_nns_init::make_hsm_sender;
 use ic_nns_init::set_up_env_vars_for_all_canisters;
-use ic_nns_test_utils::itest_helpers::{NnsCanisters, NnsInitPayloads, NnsInitPayloadsBuilder};
+use ic_nns_test_utils::{
+    common::{NnsInitPayloads, NnsInitPayloadsBuilder},
+    itest_helpers::NnsCanisters,
+};
 use prost::Message;
 use std::fs;
 use std::io::Write;
 use std::path::Path;
 use std::path::PathBuf;
-use structopt::StructOpt;
 use url::Url;
 
-#[derive(Debug, StructOpt)]
-#[structopt(name = "ic-nns-init", about = "Install and initialize NNS canisters.")]
+#[derive(Debug, Parser)]
+#[clap(
+    name = "ic-nns-init",
+    about = "Install and initialize NNS canisters.",
+    version
+)]
 struct CliArgs {
-    #[structopt(long)]
+    #[clap(long)]
     url: Option<Url>,
 
     /// Path to a directory containing the .wasm file for each NNS
     /// canister.
     ///
     /// Optional: defaults to the current directory.
-    #[structopt(long, parse(from_os_str))]
+    #[clap(long, parse(from_os_str))]
     wasm_dir: Option<PathBuf>,
 
     /// Path to a .csv file for initialising the `neurons` canister.
     ///
     /// Optional: defaults to creating canisters with test neurons.
-    #[structopt(long, parse(from_os_str))]
+    #[clap(long, parse(from_os_str))]
     initial_neurons: Option<PathBuf>,
 
     /// Path to the file containing the initial registry required for NNS
@@ -41,22 +49,22 @@ struct CliArgs {
     /// ProtoRegistryDataProvider::load_from_file.
     ///
     /// This option is incompatible with --registry-local-store-dir !
-    #[structopt(long)]
+    #[clap(long)]
     initial_registry: Option<PathBuf>,
 
     /// Path to a directory containing one file for each registry version to be
     /// inserted as initial content into the registry.
     ///
     /// This option is incompatible with --initial-registry !
-    #[structopt(long)]
+    #[clap(long)]
     registry_local_store_dir: Option<PathBuf>,
 
     /// Use an HSM to sign calls.
-    #[structopt(long)]
+    #[clap(long)]
     use_hsm: bool,
 
     /// The slot related to the HSM key that shall be used.
-    #[structopt(
+    #[clap(
         long = "slot",
         default_value = "0x0",
         help = "Only required if use-hsm is set. Ignored otherwise."
@@ -64,7 +72,7 @@ struct CliArgs {
     hsm_slot: String,
 
     /// The id of the key on the HSM that shall be used.
-    #[structopt(
+    #[clap(
         long = "key-id",
         default_value = "",
         help = "Only required if use-hsm is set. Ignored otherwise."
@@ -72,7 +80,7 @@ struct CliArgs {
     key_id: String,
 
     /// The PIN used to unlock the HSM.
-    #[structopt(
+    #[clap(
         long = "pin",
         default_value = "",
         help = "Only required if use-hsm is set. Ignored otherwise."
@@ -81,39 +89,43 @@ struct CliArgs {
 
     /// The Governance protobuf file with which to initialize the governance
     /// system.
-    #[structopt(long)]
+    #[clap(long)]
     governance_pb_file: Option<PathBuf>,
 
     /// If `true`, initialize the GTC and Governance canisters with Genesis
     /// neurons.
-    #[structopt(long)]
+    #[clap(long)]
     initialize_with_gtc_neurons: bool,
 
-    /// Create the ledger with existing accounts with 10_000 tokens in on
+    /// Create the ledger with existing accounts with 1_000_000_000 tokens in on
     /// behalf of these principals.
-    #[structopt(long)]
+    #[clap(long, multiple_values(true))]
     initialize_ledger_with_test_accounts_for_principals: Vec<PrincipalId>,
 
-    /// Create the ledger with existing accounts with 10_000 tokens on
+    /// Create the ledger with existing accounts with 1_000_000_000 tokens on
     /// the specified ledger accounts.
-    #[structopt(long)]
+    #[clap(long, multiple_values(true))]
     initialize_ledger_with_test_accounts: Vec<String>,
 
     /// If set, instead of installing the NNS, ic-nns-init will only output
     /// the initial state, candid encoded. This can be used to reset the
     /// state of the NNS canisters to a consistent state.
-    #[structopt(long)]
+    #[clap(long)]
     output_initial_state_candid_only: bool,
 
     /// The number of months over which a GTC Seed Round account will be
     /// released as neurons (one neuron each month).
-    #[structopt(long)]
+    #[clap(long)]
     months_to_release_seed_round_gtc_neurons: Option<u8>,
 
     /// The number of months over which a GTC Early Contributor Tokenholder
     /// (ECT) account will be released as neurons (one neuron each month).
-    #[structopt(long)]
+    #[clap(long)]
     months_to_release_ect_gtc_neurons: Option<u8>,
+
+    /// The subnets to which SNS may be deployed
+    #[clap(long, multiple_values(true))]
+    sns_subnet: Vec<PrincipalId>,
 }
 
 const LOG_PREFIX: &str = "[ic-nns-init] ";
@@ -129,7 +141,7 @@ const GTC_FORWARD_ALL_UNCLAIMED_ACCOUNTS_RECIPIENT_NEURON_ID: NeuronId = NeuronI
 
 #[tokio::main]
 async fn main() {
-    let args = CliArgs::from_iter_safe(std::env::args())
+    let args = CliArgs::try_parse_from(std::env::args())
         .unwrap_or_else(|e| panic!("Illegal arguments: {}", e));
 
     let init_payloads = create_init_payloads(&args);
@@ -184,7 +196,10 @@ async fn main() {
 
         // Don't let the "Test" distract you -- the RemoteTestRuntime is simply a
         // client-side view of a subnet.
-        let runtime = Runtime::Remote(RemoteTestRuntime { agent });
+        let runtime = Runtime::Remote(RemoteTestRuntime {
+            agent,
+            effective_canister_id: REGISTRY_CANISTER_ID.into(),
+        });
         NnsCanisters::set_up(&runtime, init_payloads).await;
         eprintln!(
             "{}All NNS canisters have been set up on the replica with {}",
@@ -232,11 +247,11 @@ fn create_init_payloads(args: &CliArgs) -> NnsInitPayloads {
     let mut test_ledger_accounts = vec![];
 
     for principal in &args.initialize_ledger_with_test_accounts_for_principals {
-        test_ledger_accounts.push(ledger_canister::AccountIdentifier::new(*principal, None));
+        test_ledger_accounts.push(icp_ledger::AccountIdentifier::new(*principal, None));
     }
     for account_hex in &args.initialize_ledger_with_test_accounts {
         test_ledger_accounts.push(
-            ledger_canister::AccountIdentifier::from_hex(account_hex)
+            icp_ledger::AccountIdentifier::from_hex(account_hex)
                 .expect("failed to parse ledger account identifier"),
         );
     }
@@ -244,7 +259,7 @@ fn create_init_payloads(args: &CliArgs) -> NnsInitPayloads {
     for account in test_ledger_accounts.into_iter() {
         init_payloads_builder.ledger.initial_values.insert(
             account,
-            ledger_canister::Tokens::from_tokens(10000).expect("Couldn't create icpts"),
+            icp_ledger::Tokens::from_tokens(1_000_000_000).expect("Couldn't create icpts"),
         );
         eprintln!(
             "{}Initializing with test ledger account: {}",
@@ -270,6 +285,14 @@ fn create_init_payloads(args: &CliArgs) -> NnsInitPayloads {
         .genesis_token
         .forward_whitelisted_unclaimed_accounts_recipient_neuron_id =
         Some(GTC_FORWARD_ALL_UNCLAIMED_ACCOUNTS_RECIPIENT_NEURON_ID);
+
+    init_payloads_builder.sns_wasms.with_sns_subnet_ids(
+        args.sns_subnet
+            .iter()
+            .cloned()
+            .map(SubnetId::from)
+            .collect(),
+    );
 
     println!("{}Initialized governance.", LOG_PREFIX);
 

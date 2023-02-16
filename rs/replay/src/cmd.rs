@@ -1,6 +1,6 @@
-use clap::Clap;
+use clap::Parser;
 use ic_types::{CanisterId, PrincipalId, SubnetId};
-use ledger_canister::AccountIdentifier;
+use icp_ledger::AccountIdentifier;
 use std::path::PathBuf;
 
 pub struct ClapSubnetId(pub SubnetId);
@@ -15,11 +15,11 @@ impl std::str::FromStr for ClapSubnetId {
     }
 }
 
-#[derive(Clap)]
+#[derive(Parser)]
 #[clap(version = "1.0")]
 pub struct ReplayToolArgs {
     /// Path to Replica configuration file.
-    pub config: PathBuf,
+    pub config: Option<PathBuf>,
 
     /// Caller id that is allowed to mutate the registry canister.
     #[clap(long)]
@@ -30,14 +30,18 @@ pub struct ReplayToolArgs {
 
     /// Subnet id of the replica, whose state we use
     #[clap(long)]
-    pub subnet_id: ClapSubnetId,
+    pub subnet_id: Option<ClapSubnetId>,
+
+    /// Data root directory; if not specified, the value from the replica config is used
+    #[clap(long)]
+    pub data_root: Option<PathBuf>,
 
     #[clap(long)]
     /// The replay will stop at this height and make a checkpoint.
     pub replay_until_height: Option<u64>,
 }
 
-#[derive(Clap)]
+#[derive(Clone, Parser)]
 pub enum SubCommand {
     /// Add a new version of the replica binary to the registry.
     AddAndBlessReplicaVersion(AddAndBlessReplicaVersionCmd),
@@ -49,11 +53,16 @@ pub enum SubCommand {
     /// Remove all nodes from the subnet record that this node belongs to.
     /// Note that this does not remove individual node records.
     RemoveSubnetNodes,
-    /// Create a recovery CUP.
-    SetRecoveryCup(SetRecoveryCupCmd),
+    /// Create a recovery CUP and write it to a file.
+    GetRecoveryCup(GetRecoveryCupCmd),
+
+    /// Restore from the backup. Deprecated.
+    RestoreFromBackup(RestoreFromBackupCmd),
 
     /// Restore from the backup.
-    RestoreFromBackup(RestoreFromBackupCmd),
+    /// Same as RestoreFromBackup but uses the registry local store from
+    /// the parameter. The other one will be substituted with this.
+    RestoreFromBackup2(RestoreFromBackup2Cmd),
 
     /// The replay will add a test Neuron to the Governance canister
     /// and the corresponding account in the ledger.
@@ -68,21 +77,26 @@ pub enum SubCommand {
     /// WARNING: This is a test-only sub-command and should only be used in
     /// tests.
     WithTrustedNeuronsFollowingNeuronForTests(WithTrustedNeuronsFollowingNeuronCmd),
+
+    /// Verify the signature of a CUP from a subnet
+    VerifySubnetCUP(VerifySubnetCUPCmd),
 }
 
-#[derive(Clap)]
-pub struct SetRecoveryCupCmd {
+#[derive(Clone, Parser)]
+pub struct GetRecoveryCupCmd {
     /// State hash (in hex).
     pub state_hash: String,
     /// Height of the recovery CUP to create.
     pub height: u64,
+    /// Output file
+    pub output_file: PathBuf,
     /// Registry store URI
     pub registry_store_uri: Option<String>,
     /// Registry store SHA256 hash
     pub registry_store_sha256: Option<String>,
 }
 
-#[derive(Clap)]
+#[derive(Clone, Parser)]
 pub struct AddAndBlessReplicaVersionCmd {
     /// The Replica version ID.
     pub replica_version_id: String,
@@ -94,7 +108,7 @@ pub struct AddAndBlessReplicaVersionCmd {
     pub update_subnet_record: bool,
 }
 
-#[derive(Clap)]
+#[derive(Clone, Parser)]
 pub struct RestoreFromBackupCmd {
     /// Registry local store path
     pub registry_local_store_path: PathBuf,
@@ -106,7 +120,19 @@ pub struct RestoreFromBackupCmd {
     pub start_height: u64,
 }
 
-#[derive(Clap)]
+#[derive(Clone, Parser)]
+pub struct RestoreFromBackup2Cmd {
+    /// Registry local store path
+    pub registry_local_store_path: PathBuf,
+    /// Backup spool path
+    pub backup_spool_path: PathBuf,
+    /// The replica version to be restored
+    pub replica_version: String,
+    /// Height from which the restoration should happen
+    pub start_height: u64,
+}
+
+#[derive(Clone, Parser)]
 pub struct AddRegistryContentCmd {
     /// Path to a directory containing one file for each registry version to be
     /// inserted as initial content into the registry.
@@ -124,7 +150,7 @@ pub struct AddRegistryContentCmd {
     pub allowed_mutation_key_prefixes: String,
 }
 
-#[derive(Clap)]
+#[derive(Clone, Parser)]
 pub struct WithLedgerAccountCmd {
     /// The account identifier that should be created with `e8s_to_mint` ICP.
     pub account_identifier: AccountIdentifier,
@@ -132,16 +158,26 @@ pub struct WithLedgerAccountCmd {
     pub e8s_to_mint: u64,
 }
 
-#[derive(Clap)]
+#[derive(Clone, Parser)]
 pub struct WithTrustedNeuronsFollowingNeuronCmd {
     /// The neuron id of the neuron that the trusted neurons should follow.
     pub neuron_id: u64,
+    /// The controller of the neuron.
+    pub neuron_controller: PrincipalId,
 }
 
-#[derive(Clap)]
+#[derive(Clone, Parser)]
 pub struct WithNeuronCmd {
     /// The controller of the neuron.
     pub neuron_controller: PrincipalId,
     /// How much stake the neuron will have.
     pub neuron_stake_e8s: u64,
+}
+
+#[derive(Clone, Parser, Debug)]
+pub struct VerifySubnetCUPCmd {
+    /// File wih the content of the CUP
+    pub cup_file: PathBuf,
+    /// File wih the content of the public key
+    pub public_key_file: PathBuf,
 }

@@ -1,21 +1,22 @@
-use ic_canister_client::Sender;
+use ic_canister_client_sender::Sender;
+use ic_nervous_system_common_test_keys::{
+    TEST_NEURON_1_OWNER_KEYPAIR, TEST_USER1_PRINCIPAL, TEST_USER2_PRINCIPAL, TEST_USER3_PRINCIPAL,
+    TEST_USER4_PRINCIPAL, TEST_USER5_PRINCIPAL, TEST_USER6_PRINCIPAL, TEST_USER7_PRINCIPAL,
+};
 use ic_nns_common::types::{NeuronId, ProposalId, UpdateIcpXdrConversionRatePayload};
 use ic_nns_governance::pb::v1::{
     manage_neuron::{Command, NeuronIdOrSubaccount},
     manage_neuron_response::Command as CommandResponse,
     proposal::Action,
-    GovernanceError, ManageNeuron, ManageNeuronResponse, NnsFunction, NodeProvider, Proposal,
-    ProposalStatus, RewardNodeProvider, RewardNodeProviders,
+    GovernanceError, ManageNeuron, ManageNeuronResponse, MostRecentMonthlyNodeProviderRewards,
+    NnsFunction, NodeProvider, Proposal, ProposalStatus, RewardNodeProvider, RewardNodeProviders,
 };
-use ic_nns_test_keys::{
-    TEST_NEURON_1_OWNER_KEYPAIR, TEST_USER1_PRINCIPAL, TEST_USER2_PRINCIPAL, TEST_USER3_PRINCIPAL,
-    TEST_USER4_PRINCIPAL, TEST_USER5_PRINCIPAL, TEST_USER6_PRINCIPAL, TEST_USER7_PRINCIPAL,
-};
-use ic_nns_test_utils::governance::{add_node_provider, submit_external_update_proposal};
 use ic_nns_test_utils::{
+    common::NnsInitPayloadsBuilder,
+    governance::{add_node_provider, submit_external_update_proposal},
     governance::{get_pending_proposals, wait_for_final_state},
     ids::TEST_NEURON_1_ID,
-    itest_helpers::{local_test_on_nns_subnet, NnsCanisters, NnsInitPayloadsBuilder},
+    itest_helpers::{local_test_on_nns_subnet, NnsCanisters},
 };
 use ic_protobuf::registry::dc::v1::{AddOrRemoveDataCentersProposalPayload, DataCenterRecord};
 use ic_protobuf::registry::node_rewards::v2::{
@@ -28,9 +29,12 @@ use cycles_minting_canister::IcpXdrConversionRateCertifiedResponse;
 use dfn_candid::candid_one;
 use dfn_protobuf::protobuf;
 use ic_nns_common::pb::v1::NeuronId as ProtoNeuronId;
+use ic_nns_governance::governance::TimeWarp;
 use ic_nns_governance::pb::v1::reward_node_provider::{RewardMode, RewardToAccount};
 use ic_types::PrincipalId;
-use ledger_canister::{AccountBalanceArgs, AccountIdentifier, Tokens, TOKEN_SUBDIVIDABLE_BY};
+use icp_ledger::{
+    tokens_from_proto, AccountBalanceArgs, AccountIdentifier, Tokens, TOKEN_SUBDIVIDABLE_BY,
+};
 use std::collections::BTreeMap;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -63,7 +67,7 @@ fn test_automated_node_provider_remuneration() {
         let expected_node_provider_reward_1 = RewardNodeProvider {
             node_provider: Some(node_provider_1.clone()),
             amount_e8s: expected_rewards_e8s_1,
-            reward_mode: reward_mode_1,
+            reward_mode: reward_mode_1.clone(),
         };
 
         let node_operator_id_2 = *TEST_USER3_PRINCIPAL;
@@ -82,7 +86,7 @@ fn test_automated_node_provider_remuneration() {
         let expected_node_provider_reward_2 = RewardNodeProvider {
             node_provider: Some(node_provider_2.clone()),
             amount_e8s: expected_rewards_e8s_2,
-            reward_mode: reward_mode_2,
+            reward_mode: reward_mode_2.clone(),
         };
 
         let node_operator_id_3 = *TEST_USER5_PRINCIPAL;
@@ -101,15 +105,15 @@ fn test_automated_node_provider_remuneration() {
         let expected_node_provider_reward_3 = RewardNodeProvider {
             node_provider: Some(node_provider_3.clone()),
             amount_e8s: expected_rewards_e8s_3,
-            reward_mode: reward_mode_3,
+            reward_mode: reward_mode_3.clone(),
         };
 
         let node_operator_id_4 = *TEST_USER7_PRINCIPAL;
 
         // Add Node Providers
-        add_node_provider(&nns_canisters, node_provider_1).await;
-        add_node_provider(&nns_canisters, node_provider_2).await;
-        add_node_provider(&nns_canisters, node_provider_3).await;
+        add_node_provider(&nns_canisters, node_provider_1.clone()).await;
+        add_node_provider(&nns_canisters, node_provider_2.clone()).await;
+        add_node_provider(&nns_canisters, node_provider_3.clone()).await;
 
         // Add Node Operator 1
         let rewardable_nodes_1 = btreemap! { "default".to_string() => 10 };
@@ -119,6 +123,7 @@ fn test_automated_node_provider_remuneration() {
             &node_provider_id_1,
             "AN1",
             rewardable_nodes_1,
+            "0:0:0:0:0:0:0:0",
         )
         .await;
 
@@ -133,6 +138,7 @@ fn test_automated_node_provider_remuneration() {
             &node_provider_id_2,
             "BC1",
             rewardable_nodes_2,
+            "0:0:0:0:0:0:0:0",
         )
         .await;
 
@@ -148,6 +154,7 @@ fn test_automated_node_provider_remuneration() {
             &node_provider_id_3,
             "FM1",
             rewardable_nodes_3,
+            "0:0:0:0:0:0:0:0",
         )
         .await;
 
@@ -162,33 +169,12 @@ fn test_automated_node_provider_remuneration() {
             &node_provider_id_1,
             "BC1",
             rewardable_nodes_4,
+            "0:0:0:0:0:0:0:0",
         )
         .await;
 
-        // Add conversion rates to populate the average conversion rate
-        let mut payload = UpdateIcpXdrConversionRatePayload {
-            timestamp_seconds: SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_secs(),
-            xdr_permyriad_per_icp: 10_000,
-            ..Default::default()
-        };
-
-        for _ in 0..30 {
-            set_icp_xdr_conversion_rate(&nns_canisters, payload.clone()).await;
-            payload.timestamp_seconds += 86400;
-            payload.xdr_permyriad_per_icp += 10_000;
-        }
-
-        let average_rate_result: IcpXdrConversionRateCertifiedResponse = nns_canisters
-            .cycles_minting
-            .query_("get_average_icp_xdr_conversion_rate", candid_one, ())
-            .await
-            .expect("Error calling get_average_icp_xdr_conversion_rate");
-
-        let average_xdr_permyriad_per_icp = average_rate_result.data.xdr_permyriad_per_icp;
-        assert_eq!(average_xdr_permyriad_per_icp, 155_000);
+        // Set the average conversion rate
+        set_average_icp_xdr_conversion_rate(&nns_canisters, 155_000).await;
 
         // Call get_monthly_node_provider_rewards assert the value is as expected
         let monthly_node_provider_rewards_result: Result<RewardNodeProviders, GovernanceError> =
@@ -215,6 +201,10 @@ fn test_automated_node_provider_remuneration() {
         assert_account_balance(&nns_canisters, node_provider_2_account, 0).await;
         assert_account_balance(&nns_canisters, node_provider_3_account, 0).await;
 
+        // Assert there is no most recent monthly Node Provider reward
+        let most_recent_rewards = get_most_recent_rewards(&nns_canisters).await;
+        assert!(most_recent_rewards.is_none());
+
         // Submit and execute proposal to pay NPs via Registry-driven rewards
         reward_node_providers_via_registry(&nns_canisters).await;
 
@@ -238,8 +228,224 @@ fn test_automated_node_provider_remuneration() {
         )
         .await;
 
+        // Assert the most recent monthly Node Provider reward was set as expected
+        let mut most_recent_rewards = get_most_recent_rewards(&nns_canisters).await.unwrap();
+        let np_rewards_from_proposal_timestamp = most_recent_rewards.timestamp;
+
+        assert!(most_recent_rewards
+            .rewards
+            .contains(&expected_node_provider_reward_1));
+        assert!(most_recent_rewards
+            .rewards
+            .contains(&expected_node_provider_reward_2));
+        assert!(most_recent_rewards
+            .rewards
+            .contains(&expected_node_provider_reward_3));
+
+        // Assert advancing time less than a month doesn't trigger monthly NP rewards
+        let _: () = nns_canisters
+            .governance
+            .update_("set_time_warp", candid_one, TimeWarp { delta_s: 60 })
+            .await
+            .expect("Error calling set_time_warp");
+
+        let mut rewards_were_triggered = false;
+        for _i in 0..5 {
+            let most_recent_rewards = get_most_recent_rewards(&nns_canisters).await.unwrap();
+            if most_recent_rewards.timestamp != np_rewards_from_proposal_timestamp {
+                rewards_were_triggered = true;
+                break;
+            }
+        }
+
+        assert!(
+            !rewards_were_triggered,
+            "Automated rewards were trigerred even though less than 1 month has passed."
+        );
+
+        // Assert account balances haven't changed
+        assert_account_balance(
+            &nns_canisters,
+            node_provider_1_account,
+            expected_node_provider_reward_1.amount_e8s,
+        )
+        .await;
+
+        assert_account_balance(
+            &nns_canisters,
+            node_provider_2_account,
+            expected_node_provider_reward_2.amount_e8s,
+        )
+        .await;
+
+        assert_account_balance(
+            &nns_canisters,
+            node_provider_3_account,
+            expected_node_provider_reward_3.amount_e8s,
+        )
+        .await;
+
+        // Set a new average conversion rate so that we can assert that the automated monthly
+        // NP rewards paid a different reward than the proposal-based reward.
+        let average_icp_xdr_conversion_rate_for_automated_rewards = 345_000;
+        set_average_icp_xdr_conversion_rate(
+            &nns_canisters,
+            average_icp_xdr_conversion_rate_for_automated_rewards,
+        )
+        .await;
+
+        // Assert that advancing time by a month triggers an automated monthly NP reward event
+        let _: () = nns_canisters
+            .governance
+            .update_("set_time_warp", candid_one, TimeWarp { delta_s: 2629800 })
+            .await
+            .expect("Error calling set_time_warp");
+
+        let mut rewards_were_triggered = false;
+        let mut np_rewards_from_automation_timestamp = most_recent_rewards.timestamp;
+        for _i in 0..10 {
+            most_recent_rewards = get_most_recent_rewards(&nns_canisters).await.unwrap();
+            np_rewards_from_automation_timestamp = most_recent_rewards.timestamp;
+            if np_rewards_from_automation_timestamp == np_rewards_from_proposal_timestamp {
+                continue;
+            }
+            rewards_were_triggered = true;
+        }
+
+        assert!(
+            rewards_were_triggered,
+            "Automated rewards were not trigerred even though more than 1 month has passed."
+        );
+
+        assert_ne!(
+            np_rewards_from_automation_timestamp,
+            np_rewards_from_proposal_timestamp
+        );
+
+        let expected_automated_rewards_e8s_1 = (((10 * 24_000) + (21 * 68_000) + (6 * 11_000))
+            * TOKEN_SUBDIVIDABLE_BY)
+            / average_icp_xdr_conversion_rate_for_automated_rewards;
+
+        let expected_automated_node_provider_reward_1 = RewardNodeProvider {
+            node_provider: Some(node_provider_1),
+            amount_e8s: expected_automated_rewards_e8s_1,
+            reward_mode: reward_mode_1,
+        };
+
+        let expected_automated_rewards_e8s_2 = (((35 * 68_000) + (17 * 11_000))
+            * TOKEN_SUBDIVIDABLE_BY)
+            / average_icp_xdr_conversion_rate_for_automated_rewards;
+
+        let expected_automated_node_provider_reward_2 = RewardNodeProvider {
+            node_provider: Some(node_provider_2),
+            amount_e8s: expected_automated_rewards_e8s_2,
+            reward_mode: reward_mode_2,
+        };
+
+        let expected_automated_rewards_e8s_3 = (((19 * 234_000) + (33 * 907_000) + (4 * 103_000))
+            * TOKEN_SUBDIVIDABLE_BY)
+            / average_icp_xdr_conversion_rate_for_automated_rewards;
+
+        let expected_automated_node_provider_reward_3 = RewardNodeProvider {
+            node_provider: Some(node_provider_3),
+            amount_e8s: expected_automated_rewards_e8s_3,
+            reward_mode: reward_mode_3,
+        };
+
+        assert!(most_recent_rewards
+            .rewards
+            .contains(&expected_automated_node_provider_reward_1));
+
+        assert!(most_recent_rewards
+            .rewards
+            .contains(&expected_automated_node_provider_reward_2));
+
+        assert!(most_recent_rewards
+            .rewards
+            .contains(&expected_automated_node_provider_reward_3));
+
+        // Assert additional rewards have been transfered to the Node Provider accounts
+        assert_account_balance(
+            &nns_canisters,
+            node_provider_1_account,
+            expected_node_provider_reward_1.amount_e8s + expected_automated_rewards_e8s_1,
+        )
+        .await;
+
+        assert_account_balance(
+            &nns_canisters,
+            node_provider_2_account,
+            expected_node_provider_reward_2.amount_e8s + expected_automated_rewards_e8s_2,
+        )
+        .await;
+
+        assert_account_balance(
+            &nns_canisters,
+            node_provider_3_account,
+            expected_node_provider_reward_3.amount_e8s + expected_automated_rewards_e8s_3,
+        )
+        .await;
+
         Ok(())
     });
+}
+
+/// Set the average ICP/XDR conversion rate
+async fn set_average_icp_xdr_conversion_rate(
+    nns_canisters: &NnsCanisters<'_>,
+    average_icp_xdr_conversion_rate: u64,
+) {
+    let latest_conversion_rate_timestamp: u64 = nns_canisters
+        .cycles_minting
+        .query_("get_average_icp_xdr_conversion_rate", candid_one, ())
+        .await
+        .map(|response: IcpXdrConversionRateCertifiedResponse| response.data.timestamp_seconds)
+        .unwrap_or_else(|_| {
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_secs()
+        });
+
+    let mut payload = UpdateIcpXdrConversionRatePayload {
+        timestamp_seconds: latest_conversion_rate_timestamp,
+        xdr_permyriad_per_icp: average_icp_xdr_conversion_rate,
+        ..Default::default()
+    };
+
+    // Add conversion rate proposals for the past 31 days.
+    payload.timestamp_seconds -= 86400 * 31;
+    for _ in 0..31 {
+        payload.timestamp_seconds += 86400;
+        set_icp_xdr_conversion_rate(nns_canisters, payload.clone()).await;
+    }
+
+    let average_rate_result: IcpXdrConversionRateCertifiedResponse = nns_canisters
+        .cycles_minting
+        .query_("get_average_icp_xdr_conversion_rate", candid_one, ())
+        .await
+        .expect("Error calling get_average_icp_xdr_conversion_rate");
+
+    let actual_average_icp_xdr_conversion_rate = average_rate_result.data.xdr_permyriad_per_icp;
+    assert_eq!(
+        actual_average_icp_xdr_conversion_rate,
+        average_icp_xdr_conversion_rate
+    );
+}
+
+/// Return the most recent monthly Node Provider rewards
+async fn get_most_recent_rewards(
+    nns_canisters: &NnsCanisters<'_>,
+) -> Option<MostRecentMonthlyNodeProviderRewards> {
+    nns_canisters
+        .governance
+        .update_(
+            "get_most_recent_monthly_node_provider_rewards",
+            candid_one,
+            (),
+        )
+        .await
+        .expect("Error calling get_most_recent_monthly_node_provider_rewards")
 }
 
 /// Submit and execute a RewardNodeProviders proposal with the `use_registry_derived_rewards`
@@ -301,6 +507,7 @@ async fn assert_account_balance(
             AccountBalanceArgs { account },
         )
         .await
+        .map(tokens_from_proto)
         .unwrap();
     assert_eq!(Tokens::from_e8s(e8s), user_balance);
 }
@@ -428,6 +635,7 @@ async fn add_node_operator(
     np_id: &PrincipalId,
     dc_id: &str,
     rewardable_nodes: BTreeMap<String, u32>,
+    ipv6: &str,
 ) {
     let proposal_payload = AddNodeOperatorPayload {
         node_operator_principal_id: Some(*no_id),
@@ -435,6 +643,7 @@ async fn add_node_operator(
         node_provider_principal_id: Some(*np_id),
         dc_id: dc_id.into(),
         rewardable_nodes,
+        ipv6: Some(ipv6.into()),
     };
 
     let proposal_id: ProposalId = submit_external_update_proposal(

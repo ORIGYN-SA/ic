@@ -2,6 +2,10 @@ syntax = "proto3";
 package state.canister_state_bits.v1;
 import "types/v1/types.proto";
 import "state/queues/v1/queues.proto";
+import "state/ingress/v1/ingress.proto";
+import "state/v1/metadata.proto";
+
+import "google/protobuf/wrappers.proto";
 
 message CallContext {
   message Ingress {
@@ -12,14 +16,15 @@ message CallContext {
     types.v1.CanisterId canister_id = 1;
     uint64 callback_id = 2;
   }
-  message Heartbeat {}
+  // System task is either a Heartbeat or a GlobalTimer.
+  message SystemTask {}
 
   oneof call_origin {
     Ingress ingress = 1;
     CanisterUpdateOrQuery canister_update = 2;
     types.v1.UserId query = 3;
     CanisterUpdateOrQuery canister_query = 4;
-    Heartbeat heartbeat = 7;
+    SystemTask system_task = 7;
   }
   bool responded = 5;
   state.queues.v1.Funds available_funds = 6;
@@ -45,6 +50,8 @@ message Callback {
   state.queues.v1.Cycles cycles_sent = 5;
   types.v1.CanisterId originator = 6;
   types.v1.CanisterId respondent = 7;
+  state.queues.v1.Cycles prepayment_for_response_execution = 8;
+  state.queues.v1.Cycles prepayment_for_response_transmission = 9;
 }
 
 message CallbackEntry {
@@ -60,7 +67,7 @@ message CallContextManager {
 }
 
 message CyclesAccount {
-  // Cycle balance is store as u128::to_bytes_le()
+  // Cycle balance is stored as u128::to_bytes_le()
   bytes cycles_balance = 1;
   reserved 2;
   reserved "max_exec_cycles";
@@ -85,11 +92,13 @@ message WasmMethod {
     SYSTEM_METHOD_CANISTER_INSPECT_MESSAGE = 5;
     SYSTEM_METHOD_CANISTER_HEARTBEAT = 6;
     SYSTEM_METHOD_EMPTY = 7;
+    SYSTEM_METHOD_CANISTER_GLOBAL_TIMER = 8;
   }
   oneof wasm_method {
     string update = 1;
     string query = 2;
     SystemMethod system = 3;
+    string composite_query = 4;
   }
 }
 
@@ -102,6 +111,7 @@ enum CustomSectionType {
 message WasmCustomSection {
     CustomSectionType visibility = 1;
     bytes content = 2;
+    optional bytes hash = 3;
 }
 
 message WasmMetadata {
@@ -114,6 +124,7 @@ message ExecutionStateBits {
   repeated WasmMethod exports = 3;
   uint64 last_executed_round = 4;
   WasmMetadata metadata = 5;
+  optional bytes binary_hash = 6;
 }
 
 message StopCanisterContext {
@@ -143,6 +154,41 @@ message CanisterStatusStopping {
 }
 
 message CanisterStatusStopped {}
+
+message ExecutionTask {
+  enum CanisterTask {
+    CANISTER_TASK_UNSPECIFIED = 0;
+    CANISTER_TASK_HEARTBEAT = 1;
+    CANISTER_TASK_TIMER = 2;
+  }
+
+  message AbortedExecution {
+    oneof input {
+      state.queues.v1.Request request = 1;
+      state.queues.v1.Response response = 2;
+      ingress.v1.Ingress ingress = 3;
+      CanisterTask task = 5;
+    }
+    // The execution cost that has already been charged from the canister.
+    // Retried execution does not have to pay for it again.
+    state.queues.v1.Cycles prepaid_execution_cycles = 4;
+  }
+
+  message AbortedInstallCode {
+    oneof message {
+      state.queues.v1.Request request = 1;
+      ingress.v1.Ingress ingress = 2;
+    }
+    // The execution cost that has already been charged from the canister.
+    // Retried execution does not have to pay for it again.
+    state.queues.v1.Cycles prepaid_execution_cycles = 3;
+  }
+
+  oneof task {
+    AbortedExecution aborted_execution = 1;
+    AbortedInstallCode aborted_install_code = 2;
+  }
+}
 
 message CanisterStateBits {
   reserved 1;
@@ -190,4 +236,15 @@ message CanisterStateBits {
   // The instruction debit for install_code messages of this canister. This is
   // tracked for the purposes of rate limiting the install_code messages.
   uint64 install_code_debit = 29;
+  // Contains tasks that need to be executed before processing any input of the
+  // canister.
+  repeated ExecutionTask task_queue = 30;
+  // Time of last charge for resource allocations.
+  google.protobuf.UInt64Value time_of_last_allocation_charge_nanos = 31;
+  // Postponed charges that are not applied to `cycles_balance` yet.
+  state.queues.v1.Cycles cycles_debit = 32;
+  // Canister global timer, in nanoseconds since Unix epoch.
+  optional uint64 global_timer_nanos = 33;
+  // Canister version.
+  uint64 canister_version = 34;
 }

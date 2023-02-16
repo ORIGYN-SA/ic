@@ -1,11 +1,3 @@
-use ic_registry_transport::{
-    pb::v1::{
-        registry_mutation::Type, RegistryAtomicMutateRequest, RegistryDelta, RegistryMutation,
-        RegistryValue,
-    },
-    Error,
-};
-
 use crate::{
     common::LOG_PREFIX,
     pb::v1::{
@@ -13,6 +5,14 @@ use crate::{
     },
 };
 use ic_certified_map::RbTree;
+use ic_registry_transport::{
+    pb::v1::{
+        registry_mutation::Type, RegistryAtomicMutateRequest, RegistryDelta, RegistryMutation,
+        RegistryValue,
+    },
+    Error,
+};
+use ic_types::messages::MAX_INTER_CANISTER_PAYLOAD_IN_BYTES_U64;
 use prost::Message;
 use std::cmp::max;
 use std::collections::{BTreeMap, VecDeque};
@@ -20,6 +20,13 @@ use std::fmt;
 
 #[cfg(target_arch = "wasm32")]
 use dfn_core::println;
+
+/// The maximum size a registry delta, used to ensure that response payloads
+/// stay under `MAX_INTER_CANISTER_PAYLOAD_IN_BYTES_U64`.
+///
+/// We reserve ⅓ of the response buffer capacity for encoding overhead.
+pub const MAX_REGISTRY_DELTAS_SIZE: usize =
+    2 * MAX_INTER_CANISTER_PAYLOAD_IN_BYTES_U64 as usize / 3;
 
 /// The type for the registry map.
 ///
@@ -153,7 +160,7 @@ impl Registry {
                 *size += value.len() + key.as_ref().len();
                 Some(*size)
             })
-            .take_while(|size| *size < max_bytes)
+            .take_while(|size| *size <= max_bytes)
             .count()
     }
 
@@ -210,9 +217,7 @@ impl Registry {
             mutations,
             preconditions: vec![],
         };
-        let bytes = pb_encode(&req);
-
-        self.changelog.insert(version.into(), bytes);
+        self.changelog_insert(version, &req);
 
         for mutation in req.mutations {
             (*self.store.entry(mutation.key).or_default()).push_back(RegistryValue {
@@ -237,6 +242,13 @@ impl Registry {
         }
         self.increment_version();
         self.apply_mutations_as_version(mutations, self.version);
+    }
+
+    /// This is needed to test certain edge cases where the registry is in an invalid state
+    /// such as when a new invariant is added.
+    #[cfg(test)]
+    pub(crate) fn dangerously_apply_mutations(&mut self, mutations: Vec<RegistryMutation>) {
+        self.apply_mutations(mutations)
     }
 
     /// Verifies the implicit precondition corresponding to the mutation_type
@@ -268,7 +280,7 @@ impl Registry {
             .collect()
     }
 
-    /// Checks that invariants hold after applying mutations
+    /// Checks that invariants would hold after applying mutations, and applies the mutations if they do
     pub fn maybe_apply_mutation_internal(&mut self, mutations: Vec<RegistryMutation>) {
         println!(
             "{}Received a mutate call containing a list of {} mutations",
@@ -276,10 +288,16 @@ impl Registry {
             mutations.len()
         );
 
+        self.verify_mutations_internal(&mutations);
+        self.apply_mutations(mutations);
+    }
+
+    /// Checks that invariants would hold after applying the mutations
+    pub(crate) fn verify_mutations_internal(&self, mutations: &Vec<RegistryMutation>) {
         let errors = self.verify_mutation_type(mutations.as_slice());
         if !errors.is_empty() {
             panic!(
-                "{}Transaction rejected because of the following errors: [{}].",
+                "{}Verification of the mutation type failed with the following errors: [{}].",
                 LOG_PREFIX,
                 errors
                     .iter()
@@ -290,7 +308,6 @@ impl Registry {
         }
 
         self.check_global_state_invariants(mutations.as_slice());
-        self.apply_mutations(mutations);
     }
 
     /// Serializes the registry contents using the specified version of stable
@@ -330,6 +347,23 @@ impl Registry {
 
     pub fn changelog(&self) -> &RbTree<EncodedVersion, Vec<u8>> {
         &self.changelog
+    }
+
+    /// Inserts a changelog entry at the given version, while enforcing the
+    /// [`MAX_REGISTRY_DELTAS_SIZE`] limit.
+    fn changelog_insert(&mut self, version: u64, req: &RegistryAtomicMutateRequest) {
+        let version = EncodedVersion::from(version);
+        let bytes = pb_encode(req);
+
+        let delta_size = version.as_ref().len() + bytes.len();
+        if delta_size > MAX_REGISTRY_DELTAS_SIZE {
+            panic!(
+                "{}Transaction rejected because delta would be too large: {} vs {}.",
+                LOG_PREFIX, delta_size, MAX_REGISTRY_DELTAS_SIZE
+            );
+        }
+
+        self.changelog.insert(version, bytes);
     }
 
     /// Sets the content of the registry from its serialized representation.
@@ -417,18 +451,15 @@ impl Registry {
                 }
                 // We iterated over keys in ascending order, so the mutations
                 // must also be sorted by key, resulting in canonical encoding.
-                self.changelog = mutations_by_version
-                    .into_iter()
-                    .map(|(v, mutations)| {
-                        (
-                            EncodedVersion::from(v),
-                            pb_encode(&RegistryAtomicMutateRequest {
-                                mutations,
-                                preconditions: vec![],
-                            }),
-                        )
-                    })
-                    .collect()
+                for (v, mutations) in mutations_by_version.into_iter() {
+                    self.changelog_insert(
+                        v,
+                        &RegistryAtomicMutateRequest {
+                            mutations,
+                            preconditions: vec![],
+                        },
+                    );
+                }
             }
         }
     }
@@ -444,8 +475,7 @@ fn pb_encode(msg: &impl prost::Message) -> Vec<u8> {
 mod tests {
     use super::*;
     use ic_registry_transport::{delete, insert, update, upsert};
-    use rand::Rng;
-    use rand_core::SeedableRng;
+    use rand::{Rng, SeedableRng};
     use rand_distr::{Alphanumeric, Distribution, Poisson, Uniform};
 
     /// Simulate a round-trip through stable memory, which is an essential part
@@ -658,7 +688,7 @@ mod tests {
         ));
         assert_empty!(apply_mutations_skip_invariant_checks(
             &mut registry,
-            vec![insert(&key, &value2)]
+            vec![insert(&key, value2)]
         ));
 
         serialize_then_deserialize(registry);
@@ -704,9 +734,9 @@ mod tests {
     fn test_count_fitting_deltas() {
         let mut registry = Registry::new();
 
-        let mutation1 = upsert(&[90; 50], &[1; 50]);
-        let mutation2 = upsert(&[90; 100], &[1; 100]);
-        let mutation3 = upsert(&[89; 200], &[1; 200]);
+        let mutation1 = upsert([90; 50], [1; 50]);
+        let mutation2 = upsert([90; 100], [1; 100]);
+        let mutation3 = upsert([89; 200], [1; 200]);
 
         for mutation in [&mutation1, &mutation2, &mutation3] {
             assert_empty!(apply_mutations_skip_invariant_checks(
@@ -729,6 +759,46 @@ mod tests {
 
         assert_eq!(registry.count_fitting_deltas(3, 2000000), 0);
         assert_eq!(registry.count_fitting_deltas(4, 2000000), 0);
+    }
+
+    #[test]
+    fn test_count_fitting_deltas_max_size() {
+        let mut registry = Registry::new();
+        let version = 1;
+        let key = b"key";
+
+        let max_value = vec![0; max_mutation_value_size(version, key)];
+
+        let mutation1 = upsert([90; 50], [1; 50]);
+        let mutation2 = upsert(key, max_value);
+        let mutation3 = upsert([89; 200], [1; 200]);
+
+        for mutation in [&mutation1, &mutation2, &mutation3] {
+            assert_empty!(apply_mutations_skip_invariant_checks(
+                &mut registry,
+                vec![mutation.clone()]
+            ));
+        }
+
+        assert_eq!(registry.count_fitting_deltas(0, 100), 0);
+        assert_eq!(
+            registry.count_fitting_deltas(0, MAX_REGISTRY_DELTAS_SIZE),
+            1
+        );
+
+        assert_eq!(
+            registry.count_fitting_deltas(1, MAX_REGISTRY_DELTAS_SIZE - 1),
+            0
+        );
+        assert_eq!(
+            registry.count_fitting_deltas(1, MAX_REGISTRY_DELTAS_SIZE),
+            1
+        );
+
+        assert_eq!(registry.count_fitting_deltas(2, 300), 0);
+        assert_eq!(registry.count_fitting_deltas(2, 1000), 1);
+
+        assert_eq!(registry.count_fitting_deltas(3, 2000000), 0);
     }
 
     #[test]
@@ -780,7 +850,7 @@ mod tests {
         // After inserting the key, delete should succeed.
         assert_empty!(apply_mutations_skip_invariant_checks(
             &mut registry,
-            vec![insert(&key, &value)]
+            vec![insert(&key, value)]
         ));
         assert_empty!(apply_mutations_skip_invariant_checks(
             &mut registry,
@@ -860,7 +930,7 @@ mod tests {
     struct RandomByteVectorGenerator {
         mean_length: f32,
     }
-    impl rand_distr::Distribution<Vec<u8>> for RandomByteVectorGenerator {
+    impl Distribution<Vec<u8>> for RandomByteVectorGenerator {
         fn sample<R>(&self, rng: &mut R) -> Vec<u8>
         where
             R: Rng + ?Sized,
@@ -899,17 +969,15 @@ mod tests {
 
     #[test]
     fn test_icsup_2589() {
-        use rand_core::RngCore;
-
         let mut rng = rand::rngs::SmallRng::from_entropy();
         let registry = initialize_random_registry(3, 1000, 13.0, 150);
 
         let mut serializable_form = registry.serializable_form_at(ReprVersion::Version1);
         // Remove half of the entries, but retain the first and the last entry.
         let initial_len = registry.changelog().iter().count();
-        serializable_form.changelog.retain(|entry| {
-            entry.version == 1 || rng.next_u32() % 2 == 0 || entry.version == initial_len as u64
-        });
+        serializable_form
+            .changelog
+            .retain(|entry| entry.version == 1 || rng.gen() || entry.version == initial_len as u64);
         let len_after_random_trim = serializable_form.changelog.len();
         assert!(len_after_random_trim < initial_len);
 
@@ -927,6 +995,141 @@ mod tests {
         // The restore should add the missing versions.
         restored.from_serializable_form(restore_from_v1);
         assert_eq!(restored.changelog().iter().count(), initial_len);
+    }
+
+    #[test]
+    fn test_changelog_insert_max_size_delta() {
+        let mut registry = Registry::new();
+        let version = 1;
+        let key = b"key";
+
+        let max_value = vec![0; max_mutation_value_size(version, key)];
+        let mutations = vec![upsert(key, max_value)];
+        let req = RegistryAtomicMutateRequest {
+            mutations,
+            preconditions: vec![],
+        };
+        registry.changelog_insert(version, &req);
+
+        // We should have one changelog entry.
+        assert_eq!(1, registry.changelog().iter().count());
+        assert!(registry
+            .changelog()
+            .get(EncodedVersion::from(version).as_ref())
+            .is_some());
+    }
+
+    #[test]
+    #[should_panic(expected = "[Registry] Transaction rejected because delta would be too large")]
+    fn test_changelog_insert_delta_too_large() {
+        let mut registry = Registry::new();
+        let version = 1;
+        let key = b"key";
+
+        let too_large_value = vec![0; max_mutation_value_size(version, key) + 1];
+        let mutations = vec![upsert(key, too_large_value)];
+        let req = RegistryAtomicMutateRequest {
+            mutations,
+            preconditions: vec![],
+        };
+
+        registry.changelog_insert(1, &req);
+    }
+
+    #[test]
+    fn test_apply_mutations_max_size_delta() {
+        let mut registry = Registry::new();
+        let version = 1;
+        let key = b"key";
+
+        let max_value = vec![0; max_mutation_value_size(version, key)];
+        let mutations = vec![upsert(key, &max_value)];
+        apply_mutations_skip_invariant_checks(&mut registry, mutations);
+
+        assert_eq!(registry.latest_version(), version);
+        assert_eq!(
+            registry.get(key, version),
+            Some(&RegistryValue {
+                value: max_value,
+                version,
+                deletion_marker: false
+            })
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "[Registry] Transaction rejected because delta would be too large")]
+    fn test_apply_mutations_delta_too_large() {
+        let mut registry = Registry::new();
+        let version = 1;
+        let key = b"key";
+
+        let too_large_value = vec![0; max_mutation_value_size(version, key) + 1];
+        let mutations = vec![upsert(key, too_large_value)];
+
+        apply_mutations_skip_invariant_checks(&mut registry, mutations);
+    }
+
+    /// Common implementation for `from_serializable_form()` tests.
+    ///
+    /// In order to avoid panicking, "manually" constructs a registry containing
+    /// a single mutation / mutate request that is zero or more bytes above
+    /// `MAX_REGISTRY_DELTAS_SIZE`. Then serializes it using the given version
+    /// and tests deserialization.
+    fn test_from_serializable_form_impl(bytes_above_max_size: usize, repr_version: ReprVersion) {
+        let mut registry = Registry::new();
+        let version = 1;
+        let key = b"key";
+
+        let value = vec![0; max_mutation_value_size(version, key) + bytes_above_max_size];
+        let mutation = upsert(key, value);
+        let mutations = vec![mutation.clone()];
+        let req = RegistryAtomicMutateRequest {
+            mutations,
+            preconditions: vec![],
+        };
+        // Circumvent `changelog_insert()` to insert potentially oversized mutations.
+        registry
+            .changelog
+            .insert(EncodedVersion::from(version), pb_encode(&req));
+
+        (*registry.store.entry(mutation.key).or_default()).push_back(RegistryValue {
+            version,
+            value: mutation.value,
+            deletion_marker: mutation.mutation_type == Type::Delete as i32,
+        });
+        registry.version = version;
+
+        // Serialize.
+        let stable_repr = registry.serializable_form_at(repr_version);
+
+        // Deserialize.
+        let mut deserialized = Registry::new();
+        deserialized.from_serializable_form(stable_repr);
+
+        assert_eq!(deserialized, registry);
+    }
+
+    #[test]
+    fn test_from_serializable_form_version_unspecified_max_size_delta() {
+        test_from_serializable_form_impl(0, ReprVersion::Unspecified)
+    }
+
+    #[test]
+    fn test_from_serializable_form_version1_max_size_delta() {
+        test_from_serializable_form_impl(0, ReprVersion::Version1)
+    }
+
+    #[test]
+    #[should_panic(expected = "[Registry] Transaction rejected because delta would be too large")]
+    fn test_from_serializable_form_version_unspecified_delta_too_large() {
+        test_from_serializable_form_impl(1, ReprVersion::Unspecified)
+    }
+
+    #[test]
+    #[should_panic(expected = "[Registry] Transaction rejected because delta would be too large")]
+    fn test_from_serializable_form_version1_delta_too_large() {
+        test_from_serializable_form_impl(1, ReprVersion::Version1)
     }
 
     #[allow(unused_must_use)] // Required because insertion errors are ignored.
@@ -963,7 +1166,7 @@ mod tests {
         for k in &keys {
             apply_mutations_skip_invariant_checks(
                 &mut registry,
-                vec![insert(k.as_bytes(), &gen.sample(&mut rng))],
+                vec![insert(k.as_bytes(), gen.sample(&mut rng))],
             );
         }
         // Now let's do some mutations.
@@ -975,7 +1178,7 @@ mod tests {
                 &mut registry,
                 vec![update(
                     &keys[key_index_distr.sample(&mut rng)],
-                    &gen.sample(&mut rng),
+                    gen.sample(&mut rng),
                 )],
             );
         }
@@ -999,12 +1202,42 @@ Average length of the values: {} (desired: {})",
             average(
                 changes
                     .iter()
-                    .map(|delta| delta.values.iter())
-                    .flatten()
+                    .flat_map(|delta| delta.values.iter())
                     .map(|registry_value| registry_value.value.len())
             ),
             mean_value_length
         );
         registry
+    }
+
+    /// Computes the mutation value size (given the version and key) that will
+    /// result in a delta of exactly `MAX_REGISTRY_DELTAS_SIZE` bytes.
+    fn max_mutation_value_size(version: u64, key: &[u8]) -> usize {
+        fn delta_size(version: u64, key: &[u8], value_size: usize) -> usize {
+            let req = RegistryAtomicMutateRequest {
+                mutations: vec![upsert(key, vec![0; value_size])],
+                preconditions: vec![],
+            };
+
+            let version = EncodedVersion::from(version);
+            let bytes = pb_encode(&req);
+
+            version.as_ref().len() + bytes.len()
+        }
+
+        // Start off with an oversized delta.
+        let too_large_delta_size = delta_size(version, key, MAX_REGISTRY_DELTAS_SIZE);
+
+        // Compoute the value size that will give us a delta of exactly
+        // MAX_REGISTRY_DELTAS_SIZE.
+        let max_value_size = 2 * MAX_REGISTRY_DELTAS_SIZE - too_large_delta_size;
+
+        // Ensure we actually get a MAX_REGISTRY_DELTAS_SIZE delta.
+        assert_eq!(
+            MAX_REGISTRY_DELTAS_SIZE,
+            delta_size(version, key, max_value_size)
+        );
+
+        max_value_size
     }
 }

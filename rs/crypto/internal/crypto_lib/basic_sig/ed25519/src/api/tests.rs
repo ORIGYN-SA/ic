@@ -3,8 +3,8 @@ mod keygen {
 
     use crate::{keypair_from_rng, public_key_from_der};
     use ic_crypto_internal_test_vectors::unhex::hex_to_32_bytes;
+    use rand::SeedableRng;
     use rand_chacha::ChaCha20Rng;
-    use rand_core::SeedableRng;
 
     #[test]
     fn should_correctly_generate_ed25519_keys() {
@@ -116,8 +116,8 @@ mod ed25519_cr_yp_to {
             assert_eq!(
                 sm,
                 hex::encode(
-                    s.0.to_vec()
-                        .into_iter()
+                    s.0.iter()
+                        .copied()
                         .chain(m.into_iter())
                         .collect::<Vec<u8>>()
                 ),
@@ -211,11 +211,18 @@ mod wycheproof {
 
 mod verify {
     use crate::types::{PublicKeyBytes, SecretKeyBytes, SignatureBytes};
-    use crate::{public_key_from_der, public_key_to_der, sign, verify};
+    use crate::{
+        keypair_from_rng, public_key_from_der, public_key_to_der, sign, verify,
+        verify_batch_vartime,
+    };
+    use ic_crypto_internal_seed::Seed;
     use ic_crypto_internal_test_vectors::ed25519::Ed25519TestVector::RFC8032_ED25519_1;
     use ic_crypto_internal_test_vectors::ed25519::Ed25519TestVector::RFC8032_ED25519_SHA_ABC;
     use ic_crypto_internal_test_vectors::ed25519::{crypto_lib_testvec, Ed25519TestVector};
     use ic_crypto_secrets_containers::SecretArray;
+    use ic_crypto_test_utils_reproducible_rng::reproducible_rng;
+    use ic_types::crypto::CryptoResult;
+    use rand::RngCore;
     use strum::IntoEnumIterator;
 
     #[test]
@@ -231,6 +238,138 @@ mod verify {
                 test_vec
             );
         }
+    }
+
+    #[test]
+    fn should_correctly_verify_batches_of_signatures_using_different_keys_on_same_message(
+    ) -> CryptoResult<()> {
+        const INPUT_SIZES: [usize; 9] = [1, 2, 3, 4, 5, 10, 30, 50, 100];
+        const NUM_ITERATIONS: usize = 10;
+        let mut rng = reproducible_rng();
+
+        let corrupt_sig = |sig: &SignatureBytes| {
+            let mut sig_copy = sig.to_owned();
+            sig_copy.0[0] ^= 1u8;
+            sig_copy
+        };
+
+        let verify_consistent_error =
+            |key_sig_pairs: &[(&PublicKeyBytes, &SignatureBytes)], msg: &[u8], seed: Seed| {
+                let verification_returned_error = key_sig_pairs
+                    .iter()
+                    .map(|(pk, sig)| verify(sig, msg, pk))
+                    .collect::<Result<Vec<_>, _>>()
+                    .is_err();
+                assert!(verification_returned_error);
+
+                let batch_verification_returned_error =
+                    verify_batch_vartime(key_sig_pairs, msg, seed).is_err();
+                // one-by-one and batch verification should return consistent verification results
+                assert_eq!(
+                    verification_returned_error,
+                    batch_verification_returned_error
+                );
+            };
+
+        for input_size in INPUT_SIZES {
+            for _ in 0..NUM_ITERATIONS {
+                // random message
+                let mut msg = [0u8; 32];
+                rng.fill_bytes(&mut msg[..]);
+
+                // random secret/public key pairs
+                let key_pairs: Vec<_> = (0..input_size)
+                    .map(|_| keypair_from_rng(&mut rng))
+                    .collect();
+
+                // correct signatures of `msg`
+                let sigs: Vec<_> = key_pairs
+                    .iter()
+                    .map(|pair| sign(&msg[..], &pair.0))
+                    .collect::<Result<Vec<_>, _>>()?;
+
+                // pairs of refs of correct keys and sigs
+                let key_sig_pairs: Vec<_> = key_pairs
+                    .iter()
+                    .zip(sigs.iter())
+                    .map(|((_sk, pk), sig)| (pk, sig))
+                    .collect();
+
+                // everything correct, should verify correctly
+                verify_batch_vartime(&key_sig_pairs, &msg, Seed::from_rng(&mut rng))?;
+
+                // corrupt each signature by flipping a bit and check that both batched and non-batched verification return an error
+                {
+                    let corrupt_sigs: Vec<_> = sigs.iter().map(|sig| corrupt_sig(sig)).collect();
+                    let key_corrupt_sig_pairs: Vec<_> = key_pairs
+                        .iter()
+                        .zip(corrupt_sigs.iter())
+                        .map(|((_sk, pk), sig)| (pk, sig))
+                        .collect();
+                    verify_consistent_error(&key_corrupt_sig_pairs, &msg, Seed::from_rng(&mut rng));
+                }
+
+                // corrupt one randomly selected signature by flipping a bit and check that both batched and non-batched verification return an error
+                {
+                    let corrupt_pos = rng.next_u32() as usize % sigs.len();
+                    let mut corrupt_sigs: Vec<_> = sigs.clone();
+                    corrupt_sigs[corrupt_pos] = corrupt_sig(&corrupt_sigs[corrupt_pos]);
+
+                    let key_corrupt_sig_pairs: Vec<_> = key_pairs
+                        .iter()
+                        .zip(corrupt_sigs.iter())
+                        .map(|((_sk, pk), sig)| (pk, sig))
+                        .collect();
+                    verify_consistent_error(&key_corrupt_sig_pairs, &msg, Seed::from_rng(&mut rng));
+                }
+
+                if input_size > 1 {
+                    // positions to swap
+                    let pos_0 = rng.next_u32() as usize % sigs.len();
+                    let pos_1 = loop {
+                        let pos = rng.next_u32() as usize % sigs.len();
+                        if pos != pos_0 {
+                            break pos;
+                        }
+                    };
+
+                    // check that the verification fails for both batched and non-batched verification for swapped public keys
+                    {
+                        let mut corrupt_key_pairs = key_pairs.clone();
+                        corrupt_key_pairs.swap(pos_0, pos_1);
+
+                        let corrupt_key_sig_pairs: Vec<_> = corrupt_key_pairs
+                            .iter()
+                            .zip(sigs.iter())
+                            .map(|((_sk, pk), sig)| (pk, sig))
+                            .collect();
+                        verify_consistent_error(
+                            &corrupt_key_sig_pairs,
+                            &msg,
+                            Seed::from_rng(&mut rng),
+                        );
+                    }
+
+                    // check that the verification fails for both batched and non-batched verification for swapped sigs
+                    {
+                        let mut corrupt_sigs = sigs.clone();
+                        corrupt_sigs.swap(pos_0, pos_1);
+
+                        let key_corrupt_sig_pairs: Vec<_> = key_pairs
+                            .iter()
+                            .zip(corrupt_sigs.iter())
+                            .map(|((_sk, pk), sig)| (pk, sig))
+                            .collect();
+                        verify_consistent_error(
+                            &key_corrupt_sig_pairs,
+                            &msg,
+                            Seed::from_rng(&mut rng),
+                        );
+                    }
+                }
+            }
+        }
+        Ok(())
     }
 
     #[test]
@@ -330,6 +469,7 @@ mod verify_public_key {
     use crate::types::PublicKeyBytes;
     use crate::{keypair_from_rng, verify_public_key};
     use curve25519_dalek::edwards::CompressedEdwardsY;
+    use ic_crypto_test_utils_reproducible_rng::reproducible_rng;
 
     #[test]
     fn should_fail_public_key_verification_if_point_is_not_on_curve() {
@@ -362,7 +502,7 @@ mod verify_public_key {
     #[test]
     fn should_fail_public_key_verification_if_point_has_wrong_order() {
         let point_with_composite_order = {
-            let (_sk_bytes, pk_bytes) = keypair_from_rng(&mut rand::thread_rng());
+            let (_sk_bytes, pk_bytes) = keypair_from_rng(&mut reproducible_rng());
             let point_of_prime_order = CompressedEdwardsY(pk_bytes.0).decompress().unwrap();
             let point_of_order_8 = CompressedEdwardsY([0; 32]).decompress().unwrap();
             let point_of_composite_order = point_of_prime_order + point_of_order_8;
@@ -371,5 +511,36 @@ mod verify_public_key {
         };
         let pubkey_with_composite_order = PublicKeyBytes(point_with_composite_order.compress().0);
         assert!(!verify_public_key(&pubkey_with_composite_order));
+    }
+}
+
+mod non_malleability {
+    use crate::types::{PublicKeyBytes, SignatureBytes};
+    use crate::verify;
+    use assert_matches::assert_matches;
+    use ic_crypto_internal_test_vectors::ed25519::{crypto_lib_testvec, Ed25519TestVector};
+    use ic_types::crypto::CryptoError;
+    use num_bigint::BigUint;
+    use strum::IntoEnumIterator;
+
+    #[test]
+    fn should_fail_to_verify_malleable_signature() {
+        for test_vec in Ed25519TestVector::iter() {
+            let (_sk, pk, msg, mut sig) = crypto_lib_testvec(test_vec);
+
+            // Add curve order (L) to the S-element of the valid signature (R || S)
+            let s = BigUint::from_bytes_le(&sig[32..]); // little-endian according to RFC8032
+            let l = BigUint::from_bytes_le(curve25519_dalek::constants::BASEPOINT_ORDER.as_bytes());
+            sig[32..].copy_from_slice(&(s + l).to_bytes_le());
+
+            let result = verify(&SignatureBytes(sig), &msg, &PublicKeyBytes(pk));
+
+            assert_matches!(
+                result,
+                Err(CryptoError::SignatureVerification { .. }),
+                "Signature for test vector is malleable: {:?}",
+                test_vec
+            );
+        }
     }
 }

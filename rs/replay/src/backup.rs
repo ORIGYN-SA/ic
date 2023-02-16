@@ -1,26 +1,21 @@
 use ic_artifact_pool::consensus_pool::ConsensusPoolImpl;
 use ic_config::artifact_pool::BACKUP_GROUP_SIZE;
-use ic_consensus::consensus::{pool_reader::PoolReader, utils::lookup_replica_version};
-use ic_consensus_message::ConsensusMessageHashable;
+use ic_consensus::consensus::{dkg_key_manager::DkgKeyManager, pool_reader::PoolReader};
+use ic_crypto_for_verification_only::CryptoComponentForVerificationOnly;
 use ic_interfaces::{
-    certification::{Verifier, VerifierError},
+    artifact_pool::UnvalidatedArtifact,
     consensus_pool::{ChangeAction, MutableConsensusPool},
-    crypto::{MultiSigVerifier, ThresholdSigVerifierByPublicKey},
-    registry::RegistryClient,
     time_source::SysTimeSource,
-    validation::ValidationResult,
 };
-use ic_interfaces_state_manager::{StateHashError, StateManager};
-use ic_logger::replica_logger::no_op_logger;
+use ic_interfaces_registry::RegistryClient;
 use ic_protobuf::types::v1 as pb;
 use ic_registry_client_helpers::subnet::SubnetRegistry;
 use ic_types::{
     consensus::{
-        certification::Certification, BlockProposal, CatchUpContentProtobufBytes, CatchUpPackage,
-        Finalization, HasHeight, Notarization, RandomBeacon, RandomTape,
+        BlockProposal, CatchUpPackage, ConsensusMessageHashable, Finalization, Notarization,
+        RandomBeacon, RandomTape,
     },
-    crypto::{CombinedThresholdSig, CombinedThresholdSigOf},
-    Height, RegistryVersion, ReplicaVersion, SubnetId,
+    Height, RegistryVersion, SubnetId,
 };
 use prost::Message;
 use std::{
@@ -31,6 +26,9 @@ use std::{
     path::{Path, PathBuf},
     sync::Arc,
 };
+
+use crate::player::ReplayError;
+use crate::validator::{InvalidArtifact, ReplayValidator};
 
 // A set of backup artifacts corresponding to a single height.
 pub(super) struct HeightArtifacts {
@@ -69,17 +67,17 @@ pub(crate) enum ExitPoint {
     /// We restored all artifacts before a block with the certified height in
     /// the validation context higher than the last state height.
     StateBehind(Height),
+    /// Can't proceed because artifact validation failed after the given height.
+    ValidationIncomplete(Height),
 }
 
 /// Deserialize the CUP at the given height and inserts it into the pool.
 pub(crate) fn insert_cup_at_height(
     pool: &mut dyn MutableConsensusPool,
-    registry: Arc<dyn RegistryClient>,
-    subnet_id: SubnetId,
     backup_dir: &Path,
     height: Height,
 ) {
-    let cup = read_cup_at_height(registry, subnet_id, backup_dir, height);
+    let cup = read_cup_at_height(backup_dir, height);
     pool.apply_changes(
         &SysTimeSource::new(),
         ChangeAction::AddToValidated(cup.into_message()).into(),
@@ -87,41 +85,19 @@ pub(crate) fn insert_cup_at_height(
 }
 
 /// Deserializes the CUP at the given height and returns it.
-pub(crate) fn read_cup_at_height(
-    registry: Arc<dyn RegistryClient>,
-    subnet_id: SubnetId,
-    backup_dir: &Path,
-    height: Height,
-) -> CatchUpPackage {
+pub(crate) fn read_cup_at_height(backup_dir: &Path, height: Height) -> CatchUpPackage {
     let group_key = (height.get() / BACKUP_GROUP_SIZE) * BACKUP_GROUP_SIZE;
-    let buffer = read_file(
-        &backup_dir
-            .join(group_key.to_string())
-            .join(height.to_string())
-            .join("catch_up_package.bin"),
-    );
+    let file = &backup_dir
+        .join(group_key.to_string())
+        .join(height.to_string())
+        .join("catch_up_package.bin");
+    let buffer = read_file(file);
 
     let protobuf = ic_protobuf::types::v1::CatchUpPackage::decode(buffer.as_slice())
         .expect("Protobuf decoding failed");
 
-    let cup = CatchUpPackage::try_from(&protobuf)
-        .unwrap_or_else(|_| panic!("{}", deserialization_error(height)));
-
-    // We cannot verify the genesis CUP with this subnet's public key.
-    if height.get() != 0 {
-        let crypto =
-            ic_crypto::CryptoComponentFatClient::new_for_verification_only(registry.clone());
-        crypto
-            .verify_combined_threshold_sig_by_public_key(
-                &CombinedThresholdSigOf::new(CombinedThresholdSig(protobuf.signature)),
-                &CatchUpContentProtobufBytes(protobuf.content),
-                subnet_id,
-                cup.content.block.get_value().context.registry_version,
-            )
-            .expect("Verification of the signature on the CUP failed");
-    }
-
-    cup
+    CatchUpPackage::try_from(&protobuf)
+        .unwrap_or_else(|err| panic!("{}", deserialization_error(file, err)))
 }
 
 /// Read all files from the backup folder starting from the `start_height` and
@@ -186,16 +162,17 @@ pub(super) fn heights_to_artifacts_metadata(
 /// points which require the execution state to catch up.
 pub(crate) fn deserialize_consensus_artifacts(
     registry_client: Arc<dyn RegistryClient>,
+    crypto: Arc<dyn CryptoComponentForVerificationOnly>,
     pool: &mut ConsensusPoolImpl,
     height_to_batches: &mut BTreeMap<Height, HeightArtifacts>,
     subnet_id: SubnetId,
-    current_replica_version: &ReplicaVersion,
     latest_state_height: Height,
+    validator: &ReplayValidator,
+    dkg_manager: &mut DkgKeyManager,
+    invalid_artifacts: &mut Vec<InvalidArtifact>,
 ) -> ExitPoint {
-    let time_source = SysTimeSource::new();
+    let time_source = validator.get_timesource();
     let mut last_cup_height: Option<Height> = None;
-    let crypto =
-        ic_crypto::CryptoComponentFatClient::new_for_verification_only(registry_client.clone());
 
     loop {
         let height = match height_to_batches.iter().next() {
@@ -230,6 +207,7 @@ pub(crate) fn deserialize_consensus_artifacts(
         let registry_version = pool_reader
             .registry_version(height)
             .expect("Cannot retrieve the registry version from the pool");
+        let last_finalized_height = pool_reader.get_finalized_height();
 
         let mut finalized_block_hash = None;
         // We should never insert more than one finalization, because it breaks a lot of
@@ -237,11 +215,12 @@ pub(crate) fn deserialize_consensus_artifacts(
         if let Some(file_name) = &height_artifacts.finalizations.get(0) {
             // Save the hash of the finalized block proposal.
             finalized_block_hash = file_name.split('_').nth(1);
-            let buffer = read_file(&path.join(file_name));
+            let file = &path.join(file_name);
+            let buffer = read_file(file);
             let finalization = Finalization::try_from(
                 pb::Finalization::decode(buffer.as_slice()).expect("Protobuf decoding failed"),
             )
-            .unwrap_or_else(|_| panic!("{}", deserialization_error(height)));
+            .unwrap_or_else(|err| panic!("{}", deserialization_error(file, err)));
 
             let unique_signers: BTreeSet<_> =
                 finalization.signature.signers.clone().into_iter().collect();
@@ -268,11 +247,12 @@ pub(crate) fn deserialize_consensus_artifacts(
             // Otherwise, insert all.
             .filter(|name| name.contains(finalized_block_hash.unwrap_or("")))
         {
-            let buffer = read_file(&path.join(file_name));
+            let file = &path.join(file_name);
+            let buffer = read_file(file);
             let proposal = BlockProposal::try_from(
                 pb::BlockProposal::decode(buffer.as_slice()).expect("Protobuf decoding failed"),
             )
-            .unwrap_or_else(|_| panic!("{}", deserialization_error(height)));
+            .unwrap_or_else(|err| panic!("{}", deserialization_error(file, err)));
 
             let validation_context = &proposal.content.as_ref().context;
             let certified_height = validation_context.certified_height;
@@ -321,7 +301,7 @@ pub(crate) fn deserialize_consensus_artifacts(
             RandomBeacon::try_from(
                 pb::RandomBeacon::decode(buffer.as_slice()).expect("Protobuf decoding failed"),
             )
-            .unwrap_or_else(|_| panic!("{}", deserialization_error(height)))
+            .unwrap_or_else(|err| panic!("{}", deserialization_error(&rb_path, err)))
             .into_message(),
         );
 
@@ -338,34 +318,63 @@ pub(crate) fn deserialize_consensus_artifacts(
             RandomTape::try_from(
                 pb::RandomTape::decode(buffer.as_slice()).expect("Protobuf decoding failed"),
             )
-            .unwrap_or_else(|_| panic!("{}", deserialization_error(height)))
+            .unwrap_or_else(|err| panic!("{}", deserialization_error(&rt_path, err)))
             .into_message(),
         );
 
         // Insert the notarizations.
         for file_name in &height_artifacts.notarizations {
-            let buffer = read_file(&path.join(file_name));
+            let file = &path.join(file_name);
+            let buffer = read_file(file);
             artifacts.push(
                 Notarization::try_from(
                     pb::Notarization::decode(buffer.as_slice()).expect("Protobuf decoding failed"),
                 )
-                .unwrap_or_else(|_| panic!("{}", deserialization_error(height)))
+                .unwrap_or_else(|err| panic!("{}", deserialization_error(file, err)))
                 .into_message(),
             );
         }
 
-        assert!(
-            artifacts.iter().all(|v| v.check_integrity()),
-            "The integrity of all artifacts is ensured"
-        );
+        artifacts.into_iter().for_each(|message| {
+            pool.insert(UnvalidatedArtifact {
+                message,
+                peer_id: validator.replica_cfg.node_id,
+                timestamp: time_source.get_relative_time(),
+            })
+        });
 
-        pool.apply_changes(
-            &time_source,
-            artifacts
-                .into_iter()
-                .map(ChangeAction::AddToValidated)
-                .collect(),
-        );
+        // If we are adding a new finalization this round, artifacts should be validated
+        // up until the new height, else we stay at the last finalized height
+        let target_height = if finalized_block_hash.is_some() {
+            height
+        } else {
+            last_finalized_height
+        };
+        // call validator, which moves artifacts to validated or removes invalid
+        let (mut invalid, failure_after_height) =
+            match validator.validate(pool, dkg_manager, target_height) {
+                Ok(artifacts) => (artifacts, None),
+                Err(ReplayError::ValidationIncomplete(h, artifacts)) => (artifacts, Some(h)),
+                Err(other) => {
+                    println!("Unexpected failure during validation: {:?}", other);
+                    (Vec::new(), Some(last_finalized_height))
+                }
+            };
+        invalid.iter().for_each(|i| match i.get_file_name() {
+            Some(name) => {
+                assert!(
+                    path.join(&name).exists(),
+                    "Path to invalid artifact doesn't exist."
+                );
+                println!("Invalid artifact detected: {:?}", path.join(name));
+            }
+            None => println!("Failed to get path for invalid artifact: {:?}", i),
+        });
+        invalid_artifacts.append(&mut invalid);
+
+        if let Some(height) = failure_after_height {
+            return ExitPoint::ValidationIncomplete(height);
+        }
 
         // If we just inserted a height_artifacts, which finalizes the last seen CUP
         // height, we need to deliver all batches before we insert the cup.
@@ -375,87 +384,12 @@ pub(crate) fn deserialize_consensus_artifacts(
                     "Found a CUP at height {:?}, finalized at height {:?}",
                     cup_height, height
                 );
-                match lookup_replica_version(
-                    &*registry_client,
-                    subnet_id,
-                    &no_op_logger(),
-                    registry_version,
-                ) {
-                    Some(replica_version) if &replica_version != current_replica_version => {
-                        println!(
-                            "⚠️  Please use the replay tool of version {} to continue backup recovery from height {:?}",
-                            replica_version, cup_height
-                        );
-                    }
-                    _ => {}
-                }
                 return ExitPoint::CUPHeightWasFinalized(cup_height);
             }
         }
     }
 }
 
-/// Checks that the restored catch-up package contains the same state hash as
-/// the one computed by the state manager from the restored artifacts and drops
-/// all states below the last CUP.
-pub(crate) fn assert_consistency_and_clean_up<T>(
-    state_manager: &dyn StateManager<State = T>,
-    pool: &mut ConsensusPoolImpl,
-) {
-    let last_cup = pool.get_cache().catch_up_package();
-    if last_cup.height() == Height::from(0) {
-        return;
-    }
-    let hash = loop {
-        match state_manager.get_state_hash_at(last_cup.height()) {
-            Ok(hash) => break hash,
-            Err(StateHashError::Transient(err)) => {
-                println!(
-                    "REPLAY WARN: no hash for the state at CUP height {:?}: {:?}; waiting...",
-                    last_cup.height(),
-                    err
-                );
-                std::thread::sleep(std::time::Duration::from_secs(3));
-            }
-            Err(StateHashError::Permanent(err)) => {
-                panic!(
-                    "REPLAY ERROR: couldn't fetch the state at CUP height {:?}: {:?}",
-                    last_cup.height(),
-                    err
-                );
-            }
-        }
-    };
-    assert_eq!(
-        hash,
-        last_cup.content.state_hash,
-        "The hash state of the CUP at height {:?} does not correspond to the hash of the computed state",
-        last_cup.height()
-    );
-    let purge_height = last_cup.height();
-    println!("Removing all states below height {:?}", purge_height);
-    state_manager.remove_states_below(purge_height);
-    pool.apply_changes(
-        &SysTimeSource::new(),
-        ChangeAction::PurgeValidatedBelow(purge_height).into(),
-    );
-}
-
-fn deserialization_error(height: Height) -> String {
-    format!("Couldn't deserialize artifacts at height {:?}", height)
-}
-
-// A mock we're using to instantiate the StateManager. Since we're not verifying
-// any certifications during the backup, we can use a mocked verifier.
-pub(crate) struct MockVerifier {}
-
-impl Verifier for MockVerifier {
-    fn validate(
-        &self,
-        _subnet_id: SubnetId,
-        _certification: &Certification,
-        _registry_version: RegistryVersion,
-    ) -> ValidationResult<VerifierError> {
-        Ok(())
-    }
+fn deserialization_error(file: &Path, err: String) -> String {
+    format!("Couldn't deserialize artifact {:?}: {}", file, err)
 }

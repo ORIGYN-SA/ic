@@ -3,14 +3,19 @@ use std::time::Duration;
 
 pub const KILOBYTE: u64 = 1024;
 pub const MEGABYTE: u64 = KILOBYTE * KILOBYTE;
+
+/// Propagate value from `ic_constants`.
 /// The configuration for app subnets is used for new app subnets with at most
-/// 13 nodes. App subnets with more than 13 nodes will be deployed with the NNS
+/// X nodes. App subnets with more nodes will be deployed with the NNS
 /// subnet configs.
-pub const SMALL_APP_SUBNET_MAX_SIZE: usize = 13;
+pub use ic_constants::SMALL_APP_SUBNET_MAX_SIZE;
+
+/// Current NNS subnet size. Used in SLO tests as default.
+pub const NNS_SUBNET_SIZE: usize = 40;
 pub const UNIT_DELAY_APP_SUBNET: Duration = Duration::from_millis(1000);
 pub const UNIT_DELAY_NNS_SUBNET: Duration = Duration::from_millis(3000);
 pub const INITIAL_NOTARY_DELAY_APP_SUBNET: Duration = Duration::from_millis(600);
-pub const INITIAL_NOTARY_DELAY_NNS_SUBNET: Duration = Duration::from_millis(2000);
+pub const INITIAL_NOTARY_DELAY_NNS_SUBNET: Duration = Duration::from_millis(1000);
 pub const INGRESS_BYTES_PER_BLOCK_SOFT_CAP: u64 = 2 * MEGABYTE;
 pub const MAX_INGRESS_MESSAGES_PER_BLOCK: u64 = 1000;
 pub const MAX_BLOCK_PAYLOAD_SIZE: u64 = 4 * MEGABYTE;
@@ -26,7 +31,7 @@ pub const MAX_INGRESS_BYTES_PER_MESSAGE_NNS_SUBNET: u64 = 3 * MEGABYTE + 512 * K
 /// would have after a DKG summary block, making the total length
 /// `DKG_INTERVAL_LENGTH` + 1.
 pub const DKG_INTERVAL_LENGTH_APP_SUBNET: Height = Height::new(499);
-pub const DKG_INTERVAL_LENGTH_NNS_SUBNET: Height = Height::new(99);
+pub const DKG_INTERVAL_LENGTH_NNS_SUBNET: Height = Height::new(199);
 /// The default upper bound for the number of allowed dkg dealings in a
 /// block.
 pub const DKG_DEALINGS_PER_BLOCK: usize = 1;

@@ -1,153 +1,419 @@
 //! A command-line tool to initialize, deploy and interact with a SNS (Service Nervous System)
 
-use candid::{CandidType, Encode, IDLArgs};
-use ic_base_types::{CanisterId, PrincipalId};
-use ic_sns_governance::init::GovernanceCanisterInitPayloadBuilder;
-use ic_sns_governance::pb::v1::{Governance, NeuronPermissionList, NeuronPermissionType};
-use ic_sns_root::pb::v1::SnsRootCanister;
-use ledger_canister::{
-    AccountIdentifier, BinaryAccountBalanceArgs, LedgerCanisterInitPayload, Tokens,
-};
-use maplit::hashset;
-use std::collections::HashMap;
-use std::fs::File;
-use std::path::PathBuf;
-use std::process::{Command, Output};
-use std::str::FromStr;
-use structopt::StructOpt;
+mod deploy;
+mod init_config_file;
+mod unit_helpers;
 
-#[derive(Debug, StructOpt)]
-#[structopt(
+use crate::deploy::{DirectSnsDeployerForTests, SnsWasmSnsDeployer};
+use crate::init_config_file::{
+    InitConfigFileArgs, SnsCliInitConfig, SnsInitialTokenDistributionConfig,
+};
+use anyhow::anyhow;
+use candid::{CandidType, Encode, IDLArgs};
+use clap::Parser;
+use ic_base_types::PrincipalId;
+use ic_crypto_sha::Sha256;
+use ic_nns_constants::SNS_WASM_CANISTER_ID;
+use ic_sns_init::pb::v1::sns_init_payload::InitialTokenDistribution;
+use ic_sns_init::pb::v1::{
+    AirdropDistribution, DeveloperDistribution, FractionalDeveloperVotingPower, NeuronDistribution,
+    SnsInitPayload, SwapDistribution, TreasuryDistribution,
+};
+use ic_sns_wasm::pb::v1::{AddWasmRequest, SnsCanisterType, SnsWasm};
+use icp_ledger::{AccountIdentifier, BinaryAccountBalanceArgs};
+use std::convert::TryFrom;
+use std::fs::File;
+use std::io::{Read, Write};
+use std::path::PathBuf;
+use std::process::{exit, Command, Output};
+use std::str::FromStr;
+use tempfile::NamedTempFile;
+
+#[derive(Debug, Parser)]
+#[clap(
     name = "sns-cli",
-    about = "Initialize, deploy and interact with an SNS."
+    about = "Initialize, deploy and interact with an SNS.",
+    version
 )]
 struct CliArgs {
-    #[structopt(subcommand)]
+    #[clap(subcommand)]
     sub_command: SubCommand,
 }
 
-#[derive(Debug, StructOpt)]
+#[derive(Debug, Parser)]
 enum SubCommand {
-    LocalDeploy(LocalDeployArgs),
+    /// Deploy an sns through the sns-wasms canister.
+    Deploy(DeployArgs),
+    /// Deploy an sns directly to a subnet, skipping the sns-wasms canister.
+    /// For use in tests only.
+    DeploySkippingSnsWasmsForTests(DeployArgs),
+    /// Deploy an sns directly to a subnet, skipping the sns-wasms canister.
+    /// The SNS canisters remain controlled by the developer after deployment.
+    /// For use in tests only.
+    DeployTestflight(DeployTestflightArgs),
+    /// Add a wasms for one of the SNS canisters, skipping the NNS proposal,
+    /// for tests.
+    AddSnsWasmForTests(AddSnsWasmForTestsArgs),
+    /// Display the balance of a given account.
     AccountBalance(AccountBalanceArgs),
+    /// Manage the config file where the initial sns parameters are set.
+    InitConfigFile(InitConfigFileArgs),
 }
 
 /// The arguments used to configure a SNS deployment
-#[derive(Debug, StructOpt)]
-struct LocalDeployArgs {
-    /// The transaction fee that must be paid for ledger transactions (except
-    /// minting and burning governance tokens), denominated in e8s (1 token = 100,000,000 e8s).
+#[derive(Debug, Parser)]
+pub struct DeployArgs {
+    /// Print all error and info messages.
     #[structopt(long)]
-    transaction_fee_e8s: Option<u64>,
+    verbose: bool,
 
-    /// The name of the governance token controlled by this SNS, for example "Bitcoin"
-    #[structopt(long)]
-    pub token_name: String,
+    /// The network to deploy to. This can be "local", "ic", or the URL of an IC network.
+    #[structopt(default_value = "local", long)]
+    network: String,
 
-    /// The symbol of the governance token controlled by this SNS, for example "BTC"
-    #[structopt(long)]
-    pub token_symbol: String,
+    /// The initial config file, this file should have all the necessary parameters to deploy an SNS.
+    /// See command "init-config-file"
+    #[clap(long, parse(from_os_str))]
+    pub init_config_file: PathBuf,
 
-    /// The initial Ledger accounts that the SNS will be initialized with. This is a JSON file
-    /// containing a JSON map from principal ID to the number of e8s to initialize the corresponding
-    /// principal's account with. Note that sub-accounts are not yet supported.
+    /// The canister ID or name (via dfx.json) of SNS-WASMS to use instead of the default
     ///
-    /// For example, this file can contain:
-    /// { "fpyvw-ycywu-lzoho-vmluf-zivfl-534ds-uccto-ovwu6-xxpnj-j2hzq-dqe": 1000000000,
-    ///   "fod6j-klqsi-ljm4t-7v54x-2wd6s-6yduy-spdkk-d2vd4-iet7k-nakfi-qqe": 2000000000 }
-    #[structopt(long, parse(from_os_str))]
-    pub initial_ledger_accounts: Option<PathBuf>,
+    /// This is useful for testing CLI commands against local replicas without fully deployed NNS
+    #[clap(long)]
+    pub override_sns_wasm_canister_id_for_tests: Option<String>,
 
-    /// The number of e8s (10E-8 of a token) that a rejected proposal costs the proposer.
-    #[structopt(long)]
-    pub proposal_reject_cost_e8s: Option<u64>,
-
-    /// The minimum number of e8s (10E-8 of a token) that can be staked in a neuron.
+    /// The canister ID of the wallet to use on this subnet.
     ///
-    /// To ensure that staking and disbursing of the neuron work, the chosen value
-    /// must be larger than the transaction_fee_e8s.
+    /// This is needed in testnet scenarios or if you want to use a different wallet than the one
+    /// currently set for your dfx identity.
+    #[clap(long)]
+    pub wallet_canister_override: Option<PrincipalId>,
+
+    /// The SNS-WASMS canister candid, used to parse canister IDs from the response.
+    ///
+    /// Corresponds to the dfx canister call --candid flag.
+    #[clap(long)]
+    pub candid: Option<String>,
+
+    /// The amount of cycles to initialize each SNS canister with. This can be omitted when
+    /// deploying locally.
     #[structopt(long)]
-    pub neuron_minimum_stake_e8s: Option<u64>,
+    initial_cycles_per_canister: Option<u64>,
+
+    /// Saves the returned canister IDs in the specified json file.
+    ///
+    /// Default: canister_ids.json
+    #[structopt(default_value = "canister_ids.json", long)]
+    save_to: PathBuf,
+
+    /// Saves the SNS canister IDs in the specified json file for sns-quill.
+    ///
+    /// Default: sns_canister_ids.json
+    #[structopt(default_value = "sns_canister_ids.json", long)]
+    sns_canister_ids_save_to: PathBuf,
+
+    /// The fee to provide
+    #[structopt(default_value = "180000000000000", long)]
+    with_cycles: u64,
+
+    /// The directory with SNS canister WASMs.
+    #[structopt(default_value = ".", long)]
+    wasms_dir: PathBuf,
+}
+
+/// The arguments used to configure a SNS testflight deployment
+#[derive(Debug, Parser)]
+pub struct DeployTestflightArgs {
+    /// Print all error and info messages.
+    #[structopt(long)]
+    verbose: bool,
+
+    /// The network to deploy to. This can be "local", "ic", or the URL of an IC network.
+    #[structopt(default_value = "local", long)]
+    network: String,
+
+    /// The initial config file, this file should have all the necessary parameters to deploy an SNS.
+    /// See command "init-config-file"
+    #[clap(long, parse(from_os_str))]
+    pub init_config_file: Option<PathBuf>,
+
+    /// The canister ID of the wallet to use on this subnet.
+    ///
+    /// This is needed in testnet scenarios or if you want to use a different wallet than the one
+    /// currently set for your dfx identity.
+    #[clap(long)]
+    pub wallet_canister_override: Option<PrincipalId>,
+
+    /// The amount of cycles to initialize each SNS canister with. This can be omitted when
+    /// deploying locally.
+    #[structopt(default_value = "500000000000", long)]
+    initial_cycles_per_canister: u64,
+
+    /// Saves the SNS canister IDs in the specified json file for sns-quill.
+    ///
+    /// Default: sns_canister_ids.json
+    #[structopt(default_value = "sns_canister_ids.json", long)]
+    sns_canister_ids_save_to: PathBuf,
+
+    /// The directory with SNS canister WASMs.
+    #[structopt(default_value = ".", long)]
+    wasms_dir: PathBuf,
 }
 
 /// The arguments used to display the account balance of a user
-#[derive(Debug, StructOpt)]
+#[derive(Debug, Parser)]
 struct AccountBalanceArgs {
     /// The principal ID of the account owner to display their main account balance (note that
     /// subaccounts are not yet supported). If not specified, the principal of the current dfx
     /// identity is used.
-    #[structopt(long)]
+    #[clap(long)]
     pub principal_id: Option<String>,
+
+    /// The network to deploy to. This can be "local", "ic", or the URL of an IC network.
+    #[structopt(default_value = "local", long)]
+    network: String,
 }
 
-impl LocalDeployArgs {
-    const MAX_TOKEN_SYMBOL_LENGTH: usize = 10;
-    const MAX_TOKEN_NAME_LENGTH: usize = 255;
+#[derive(Debug, Parser)]
+struct AddSnsWasmForTestsArgs {
+    #[clap(long, parse(from_os_str))]
+    wasm_file: PathBuf,
 
+    canister_type: String,
+
+    /// The canister ID of SNS-WASMS to use instead of the default
+    ///
+    /// This is useful for testing CLI commands against local replicas without fully deployed NNS
+    #[clap(long)]
+    pub override_sns_wasm_canister_id_for_tests: Option<String>,
+
+    #[structopt(default_value = "local", long)]
+    network: String,
+}
+
+impl DeployArgs {
     /// panic! if any args are invalid
     pub fn validate(&self) {
-        if self.token_symbol.len() > Self::MAX_TOKEN_SYMBOL_LENGTH {
-            panic!(
-                "Error: token-symbol must be fewer than {} characters, given character count: {}",
-                Self::MAX_TOKEN_SYMBOL_LENGTH,
-                self.token_symbol.len()
-            );
-        }
-
-        if self.token_name.len() > Self::MAX_TOKEN_NAME_LENGTH {
-            panic!(
-                "Error: token-name must be fewer than {} characters, given character count: {}",
-                Self::MAX_TOKEN_NAME_LENGTH,
-                self.token_name.len()
+        if self.network == "ic" {
+            // TODO(NNS1-1511) For sns-subnet deploys, we have set fee, and will not need this
+            // parameter, but will need to ensure user intends to pay the fee
+            assert!(
+                self.initial_cycles_per_canister.is_some(),
+                "When deploying to the ic network, initial_cycles_per_canister must be set"
             );
         }
     }
 
-    /// Parse the supplied `initial_ledger_accounts` JSON file into a map of account identifiers
-    /// to `Tokens`
-    pub fn get_initial_accounts(&self) -> HashMap<AccountIdentifier, Tokens> {
-        // Read and parse the accounts JSON file.
-        let accounts: HashMap<String, u64> = self
-            .initial_ledger_accounts
-            .clone()
-            .map(|file_name| {
-                let file =
-                    File::open(file_name).expect("Couldn't open initial ledger accounts file");
-                let accounts: HashMap<String, u64> = serde_json::from_reader(file)
-                    .expect("Could not parse the initial ledger accounts file");
-                accounts
-            })
-            .unwrap_or_default();
-
-        // Validate principal IDs and convert from raw (String, u64) pairs
-        // to (AccountIdentifier, Tokens) pairs.
-        accounts
-            .iter()
-            .map(|(principal_str, e8s)| {
-                let principal_id = PrincipalId::from_str(principal_str).unwrap_or_else(|_| {
-                    panic!("Could not parse {} as a principal ID", principal_str)
-                });
-                (principal_id.into(), Tokens::from_e8s(*e8s))
-            })
-            .collect()
+    pub fn generate_sns_init_payload(&self) -> anyhow::Result<SnsInitPayload> {
+        generate_sns_init_payload(&self.init_config_file)
     }
 }
 
-/// The canister IDs of all SNS canisters
-struct SnsCanisterIds {
-    pub governance: PrincipalId,
-    pub ledger: PrincipalId,
-    pub root: PrincipalId,
+pub fn generate_sns_init_payload(init_config_file: &PathBuf) -> anyhow::Result<SnsInitPayload> {
+    let file = File::open(init_config_file).map_err(|err| {
+        anyhow!(
+            "Couldn't open initial parameters file ({:?}): {}",
+            init_config_file,
+            err
+        )
+    })?;
+
+    let sns_cli_init_config: SnsCliInitConfig = serde_yaml::from_reader(file).map_err(|err| {
+        anyhow!(
+            "Couldn't parse the initial parameters file ({:?}): {}",
+            init_config_file,
+            err
+        )
+    })?;
+
+    let sns_init_payload = SnsInitPayload::try_from(sns_cli_init_config).map_err(|err| {
+        anyhow!(
+            "Error encountered when building the SnsInitPayload from the config file: {}",
+            err
+        )
+    })?;
+
+    sns_init_payload
+        .validate()
+        .map_err(|err| anyhow!("Initial parameters file failed validation: {}", err))?;
+
+    Ok(sns_init_payload)
+}
+
+impl DeployTestflightArgs {
+    pub fn generate_sns_init_payload(&self) -> anyhow::Result<SnsInitPayload> {
+        match &self.init_config_file {
+            Some(init_config_file) => generate_sns_init_payload(init_config_file),
+            None => {
+                let developer_identity = get_identity("get-principal", &self.network);
+                let developer_neuron = NeuronDistribution {
+                    controller: Some(developer_identity),
+                    stake_e8s: 1500000000,
+                    memo: 0,
+                    dissolve_delay_seconds: 15780000,
+                    vesting_period_seconds: None,
+                };
+                let developer_dist = DeveloperDistribution {
+                    developer_neurons: vec![developer_neuron],
+                };
+                let treasury_dist = TreasuryDistribution {
+                    total_e8s: 5000000000,
+                };
+                let swap_dist = SwapDistribution {
+                    total_e8s: 6000000000,
+                    initial_swap_amount_e8s: 3000000000,
+                };
+                let airdrop_dist = AirdropDistribution {
+                    airdrop_neurons: vec![],
+                };
+                let dists = FractionalDeveloperVotingPower {
+                    developer_distribution: Some(developer_dist),
+                    treasury_distribution: Some(treasury_dist),
+                    swap_distribution: Some(swap_dist),
+                    airdrop_distribution: Some(airdrop_dist),
+                };
+                let initial_token_distribution = SnsInitialTokenDistributionConfig {
+                    initial_token_distribution: Some(
+                        InitialTokenDistribution::FractionalDeveloperVotingPower(dists),
+                    ),
+                };
+                let mut sns_init_config = SnsCliInitConfig {
+                    initial_token_distribution,
+                    ..Default::default()
+                };
+                sns_init_config.sns_ledger.token_name = Some("MyTestToken".to_string());
+                sns_init_config.sns_ledger.token_symbol = Some("MTT".to_string());
+                sns_init_config
+                    .sns_governance
+                    .fallback_controller_principal_ids = vec![developer_identity.to_string()];
+                sns_init_config.sns_governance.url = Some("https://example.com".to_string());
+                sns_init_config.sns_governance.name = Some("My_Test_Token".to_string());
+                sns_init_config.sns_governance.description =
+                    Some("MyTestTokenDescription".to_string());
+                sns_init_config.try_into()
+            }
+        }
+    }
+}
+
+impl AddSnsWasmForTestsArgs {
+    pub fn get_wasm_file_bytes(&self) -> Vec<u8> {
+        let mut file = File::open(&self.wasm_file).expect("Couldn't open wasm file");
+        let mut buf = Vec::new();
+        file.read_to_end(&mut buf).expect("Couldn't read wasm file");
+        buf
+    }
 }
 
 fn main() {
-    let args = CliArgs::from_iter_safe(std::env::args())
-        .unwrap_or_else(|e| panic!("Illegal arguments: {}", e));
+    let args = match CliArgs::try_parse_from(std::env::args()) {
+        Ok(args) => args,
+        Err(e) => {
+            eprintln!("{}", e);
+            std::process::exit(1);
+        }
+    };
 
     match args.sub_command {
-        SubCommand::LocalDeploy(args) => local_deploy(args),
+        SubCommand::Deploy(args) => deploy(args),
+        SubCommand::DeploySkippingSnsWasmsForTests(args) => {
+            deploy_skipping_sns_wasms_for_tests(args)
+        }
+        SubCommand::DeployTestflight(args) => deploy_testflight(args),
+        SubCommand::AddSnsWasmForTests(args) => add_sns_wasm_for_tests(args),
         SubCommand::AccountBalance(args) => print_account_balance(args),
+        SubCommand::InitConfigFile(args) => init_config_file::exec(args),
     }
+}
+
+/// Deploy via SNS-WASM canister.
+fn deploy(args: DeployArgs) {
+    args.validate();
+    let sns_init_payload = args.generate_sns_init_payload().unwrap_or_else(|err| {
+        eprintln!(
+            "Error encountered when generating the SnsInitPayload: {}",
+            err
+        );
+        exit(1);
+    });
+    SnsWasmSnsDeployer::new(args, sns_init_payload).deploy();
+}
+
+/// Deploy an SNS with the given DeployArgs, skipping sns-wasm.
+fn deploy_skipping_sns_wasms_for_tests(args: DeployArgs) {
+    args.validate();
+    let sns_init_payload = args.generate_sns_init_payload().unwrap_or_else(|err| {
+        eprintln!(
+            "Error encountered when generating the SnsInitPayload: {}",
+            err
+        );
+        exit(1);
+    });
+    DirectSnsDeployerForTests::new(args, sns_init_payload).deploy()
+}
+
+/// Deploy an SNS with the given DeployTestflightArgs, skipping sns-wasm.
+/// The SNS canisters remain controlled by the developer after deployment.
+fn deploy_testflight(args: DeployTestflightArgs) {
+    let sns_init_payload = args.generate_sns_init_payload().unwrap_or_else(|err| {
+        eprintln!(
+            "Error encountered when generating the SnsInitPayload: {}",
+            err
+        );
+        exit(1);
+    });
+    DirectSnsDeployerForTests::new_testflight(args, sns_init_payload).deploy()
+}
+
+fn add_sns_wasm_for_tests(args: AddSnsWasmForTestsArgs) {
+    let sns_wasm_bytes = args.get_wasm_file_bytes();
+    let sns_wasm_hash = {
+        let mut state = Sha256::new();
+        state.write(&sns_wasm_bytes);
+        state.finish()
+    };
+
+    let sns_canister_type = match args.canister_type.as_str() {
+        "archive" => SnsCanisterType::Archive,
+        "root" => SnsCanisterType::Root,
+        "governance" => SnsCanisterType::Governance,
+        "ledger" => SnsCanisterType::Ledger,
+        "swap" => SnsCanisterType::Swap,
+        "index" => SnsCanisterType::Index,
+        _ => panic!("Uknown canister type."),
+    };
+
+    let add_sns_wasm_request = AddWasmRequest {
+        wasm: Some(SnsWasm {
+            wasm: sns_wasm_bytes,
+            canister_type: sns_canister_type as i32,
+        }),
+        hash: sns_wasm_hash.to_vec(),
+    };
+
+    let sns_wasms_canister_id = args
+        .override_sns_wasm_canister_id_for_tests
+        .as_ref()
+        .map(|principal| PrincipalId::from_str(principal).unwrap())
+        .unwrap_or_else(|| SNS_WASM_CANISTER_ID.get());
+
+    let idl = IDLArgs::from_bytes(&Encode!(&add_sns_wasm_request).unwrap()).unwrap();
+    let mut argument_file = NamedTempFile::new().expect("Could not open temp file");
+    argument_file
+        .write_all(format!("{}", idl).as_bytes())
+        .expect("Could not write wasm to temp file");
+    let argument_path = argument_file.path().as_os_str().to_str().unwrap();
+
+    call_dfx(&[
+        "canister",
+        "--network",
+        &args.network,
+        "call",
+        "--argument-file",
+        argument_path,
+        &sns_wasms_canister_id.to_string(),
+        "add_wasm",
+    ]);
 }
 
 /// Print the Ledger account balance of the principal in `AccountBalanceArgs` if given, else
@@ -157,7 +423,7 @@ fn print_account_balance(args: AccountBalanceArgs) {
         PrincipalId::from_str(&principal_str)
             .unwrap_or_else(|_| panic!("Could not parse {} as a PrincipalId", principal_str))
     } else {
-        get_identity("get-principal")
+        get_identity("get-principal", &args.network)
     };
 
     let account: AccountIdentifier = principal_id.into();
@@ -169,6 +435,8 @@ fn print_account_balance(args: AccountBalanceArgs) {
 
     call_dfx(&[
         "canister",
+        "--network",
+        &args.network,
         "call",
         "sns_ledger",
         "account_balance",
@@ -176,91 +444,10 @@ fn print_account_balance(args: AccountBalanceArgs) {
     ]);
 }
 
-/// Deploy SNS canisters to the local network (e.g. a local network brought up using `dfx start`)
-fn local_deploy(args: LocalDeployArgs) {
-    args.validate();
-    create_all_canisters();
-    let sns_canister_ids = get_sns_canister_ids();
-    install_sns_canisters(&sns_canister_ids, &args);
-    set_sns_canister_controllers(&sns_canister_ids);
-    validate_local_deployment();
-    println!("\n***** Successfully deployed! *****");
-}
-
-/// Validate that the local SNS deployment executed successfully
-fn validate_local_deployment() {
-    println!("Validating local deployment...");
-    print_nervous_system_parameters();
-    print_ledger_transfer_fee();
-    print_token_symbol();
-    print_token_name();
-}
-
-/// Call Governance's `get_nervous_system_parameters` method and print the result
-fn print_nervous_system_parameters() {
-    println!("Governance Nervous System Parameters:");
-    call_dfx(&[
-        "canister",
-        "call",
-        "sns_governance",
-        "get_nervous_system_parameters",
-        "(null)",
-    ]);
-}
-
-/// Call the Ledger's `transfer_fee` method and print the result
-fn print_ledger_transfer_fee() {
-    println!("Ledger transfer_fee:");
-    call_dfx(&[
-        "canister",
-        "call",
-        "sns_ledger",
-        "transfer_fee",
-        "(record {})",
-    ]);
-}
-
-/// Call the Ledger's `symbol` method and print the result
-fn print_token_symbol() {
-    println!("Ledger token symbol:");
-    call_dfx(&["canister", "call", "sns_ledger", "symbol", "()"]);
-}
-
-/// Call the Ledger's `name` method and print the result
-fn print_token_name() {
-    println!("Ledger token name:");
-    call_dfx(&["canister", "call", "sns_ledger", "name", "()"]);
-}
-
-/// Set the SNS canister controllers appropriately.
-///
-/// Governance and Ledger must be controlled only by Root, and Root must be controlled
-/// only by Governance.
-fn set_sns_canister_controllers(sns_canister_ids: &SnsCanisterIds) {
-    println!("Setting SNS canister controllers...");
-    let wallet_canister = get_identity("get-wallet");
-    let dfx_identity = get_identity("get-principal");
-
-    // Governance must be controlled by only Root
-    add_controller(sns_canister_ids.root, "sns_governance");
-    remove_controller(wallet_canister, "sns_governance");
-    remove_controller(dfx_identity, "sns_governance");
-
-    // Root must be controlled by only Governance
-    add_controller(sns_canister_ids.governance, "sns_root");
-    remove_controller(wallet_canister, "sns_root");
-    remove_controller(dfx_identity, "sns_root");
-
-    // Ledger must be controlled by only Root
-    add_controller(sns_canister_ids.root, "sns_ledger");
-    remove_controller(wallet_canister, "sns_ledger");
-    remove_controller(dfx_identity, "sns_ledger");
-}
-
 /// Return the `PrincipalId` of the given dfx identity
-fn get_identity(identity: &str) -> PrincipalId {
+pub fn get_identity(identity: &str, network: &str) -> PrincipalId {
     println!("dfx identity {}", identity);
-    let output = call_dfx(&["identity", identity]);
+    let output = call_dfx(&["identity", "--network", network, identity]);
 
     let canister_id = String::from_utf8(output.stdout).unwrap_or_else(|_| {
         panic!(
@@ -277,106 +464,12 @@ fn get_identity(identity: &str) -> PrincipalId {
     })
 }
 
-/// Add `controller` as a new controller of the canister given by `canister_name`
-fn add_controller(controller: PrincipalId, canister_name: &str) {
-    call_dfx(&[
-        "canister",
-        "update-settings",
-        "--add-controller",
-        &controller.to_string(),
-        canister_name,
-    ]);
-}
-
-/// Remove `controller` as a controller of the canister given by `canister_name`
-fn remove_controller(controller: PrincipalId, canister_name: &str) {
-    call_dfx(&[
-        "canister",
-        "update-settings",
-        "--remove-controller",
-        &controller.to_string(),
-        canister_name,
-    ]);
-}
-
-/// Install the SNS canisters
-fn install_sns_canisters(sns_canister_ids: &SnsCanisterIds, args: &LocalDeployArgs) {
-    install_governance(sns_canister_ids, args);
-    install_ledger(sns_canister_ids, args);
-    install_root(sns_canister_ids);
-}
-
-/// Install and initialize Governance
-fn install_governance(sns_canister_ids: &SnsCanisterIds, args: &LocalDeployArgs) {
-    let init_args = hex_encode_candid(governance_init_args(sns_canister_ids, args));
-    install_canister("sns_governance", &init_args);
-}
-
-/// Install and initialize Ledger
-fn install_ledger(sns_canister_ids: &SnsCanisterIds, args: &LocalDeployArgs) {
-    let init_args = hex_encode_candid(ledger_init_args(sns_canister_ids, args));
-    install_canister("sns_ledger", &init_args);
-}
-
-/// Install and initialize Root
-fn install_root(sns_canister_ids: &SnsCanisterIds) {
-    let init_args = hex_encode_candid(root_init_args(sns_canister_ids));
-    install_canister("sns_root", &init_args);
-}
-
-/// Install the given canister
-fn install_canister(sns_canister_name: &str, init_args: &str) {
-    call_dfx(&[
-        "canister",
-        "install",
-        "--argument-type=raw",
-        "--argument",
-        init_args,
-        sns_canister_name,
-    ]);
-}
-
-/// Allocate canister IDs for all SNS canisters
-fn create_all_canisters() {
-    println!("Creating canisters...");
-    call_dfx(&["canister", "create", "--all"]);
-}
-
-/// Return the canister IDs of all SNS canisters
-fn get_sns_canister_ids() -> SnsCanisterIds {
-    SnsCanisterIds {
-        governance: get_canister_id("sns_governance"),
-        ledger: get_canister_id("sns_ledger"),
-        root: get_canister_id("sns_root"),
-    }
-}
-
-/// Return the canister ID of the canister given by `canister_name`
-fn get_canister_id(canister_name: &str) -> PrincipalId {
-    println!("dfx canister id {}", canister_name);
-    let output = call_dfx(&["canister", "id", canister_name]);
-
-    let canister_id = String::from_utf8(output.stdout).unwrap_or_else(|_| {
-        panic!(
-            "Could not parse the output of 'dfx canister id {}' as a string",
-            canister_name
-        )
-    });
-
-    PrincipalId::from_str(canister_id.trim()).unwrap_or_else(|_| {
-        panic!(
-            "Could not parse the output of 'dfx canister id {}' as a PrincipalId",
-            canister_name
-        )
-    })
-}
-
 /// Calls `dfx` with the given args
 fn call_dfx(args: &[&str]) -> Output {
     let output = Command::new("dfx")
         .args(args)
         .output()
-        .unwrap_or_else(|_| panic!("dfx failed when called with args: {:?}", args));
+        .unwrap_or_else(|e| panic!("dfx failed when called with args: {:?}: {}", args, e));
 
     // Some dfx commands output stderr instead of stdout, so we assign it for use in both
     // success and error cases below.
@@ -386,7 +479,7 @@ fn call_dfx(args: &[&str]) -> Output {
         print!("{}", String::from_utf8_lossy(&output.stdout));
         print!("{}", std_err);
     } else {
-        panic!(
+        println!(
             "dfx failed when called with args: {:?}, error: {}",
             args, std_err
         );
@@ -396,60 +489,7 @@ fn call_dfx(args: &[&str]) -> Output {
 }
 
 /// Given a `CandidType`, return the hex encoding of this object.
-fn hex_encode_candid(candid: impl CandidType) -> String {
+pub fn hex_encode_candid(candid: impl CandidType) -> String {
     let bytes = Encode!(&candid).unwrap();
-    hex::encode(&bytes)
-}
-
-/// Constuct the params used to initialize a SNS Governance canister.
-fn governance_init_args(sns_canister_ids: &SnsCanisterIds, args: &LocalDeployArgs) -> Governance {
-    let mut governance = GovernanceCanisterInitPayloadBuilder::new().build();
-    governance.ledger_canister_id = Some(sns_canister_ids.ledger);
-    governance.root_canister_id = Some(sns_canister_ids.root);
-
-    for parameters in governance.parameters.iter_mut() {
-        let all_permissions = NeuronPermissionList {
-            permissions: NeuronPermissionType::all(),
-        };
-        parameters.neuron_claimer_permissions = Some(all_permissions.clone());
-        parameters.neuron_grantable_permissions = Some(all_permissions.clone());
-
-        if let Some(neuron_minimum_stake_e8s) = args.neuron_minimum_stake_e8s {
-            parameters.neuron_minimum_stake_e8s = Some(neuron_minimum_stake_e8s);
-        }
-
-        if let Some(proposal_reject_cost_e8s) = args.proposal_reject_cost_e8s {
-            parameters.reject_cost_e8s = Some(proposal_reject_cost_e8s);
-        }
-    }
-
-    governance
-}
-
-/// Constuct the params used to initialize a SNS Ledger canister.
-fn ledger_init_args(
-    sns_canister_ids: &SnsCanisterIds,
-    args: &LocalDeployArgs,
-) -> LedgerCanisterInitPayload {
-    let mut payload = LedgerCanisterInitPayload::builder()
-        .minting_account(sns_canister_ids.governance.into())
-        .token_symbol_and_name(&args.token_symbol, &args.token_name)
-        .build()
-        .unwrap();
-
-    payload.transfer_fee = args.transaction_fee_e8s.map(Tokens::from_e8s);
-    payload.initial_values = args.get_initial_accounts();
-
-    let governance_canister_id = CanisterId::new(sns_canister_ids.governance).unwrap();
-    let ledger_canister_id = CanisterId::new(sns_canister_ids.ledger).unwrap();
-    payload.send_whitelist = hashset! { governance_canister_id, ledger_canister_id };
-
-    payload
-}
-
-/// Constuct the params used to initialize a SNS Root canister.
-fn root_init_args(sns_canister_ids: &SnsCanisterIds) -> SnsRootCanister {
-    SnsRootCanister {
-        governance_canister_id: Some(sns_canister_ids.governance),
-    }
+    hex::encode(bytes)
 }

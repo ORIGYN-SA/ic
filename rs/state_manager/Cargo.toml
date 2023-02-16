@@ -1,20 +1,20 @@
 [package]
 name = "ic-state-manager"
 version = "0.8.0"
-edition = "2018"
+edition = "2021"
 
 [dependencies]
 bit-vec = "0.6.3"
-crossbeam-channel = "0.5.0"
+crossbeam-channel = "0.5.5"
 hex = "0.4.2"
 ic-base-types = { path = "../types/base_types" }
 ic-canonical-state = { path = "../canonical_state" }
 ic-config = { path = "../config" }
-ic-crypto-hash = { path = "../crypto/hash" }
 ic-crypto-sha = { path = "../crypto/sha" }
 ic-crypto-tree-hash = { path = "../crypto/tree_hash" }
 ic-error-types = { path = "../types/error_types" }
 ic-interfaces = { path = "../interfaces" }
+ic-interfaces-certified-stream-store = { path = "../interfaces/certified_stream_store" }
 ic-interfaces-state-manager = { path = "../interfaces/state_manager" }
 ic-logger = { path = "../monitoring/logger" }
 ic-metrics = { path = "../monitoring/metrics" }
@@ -25,16 +25,19 @@ ic-state-layout = { path = "../state_layout" }
 ic-sys = { path = "../sys" }
 ic-types = { path = "../types/types" }
 ic-utils = { path = "../utils" }
-parking_lot = "0.11.1"
+nix = "0.23.0"
+parking_lot = "0.12.1"
 prometheus = { version = "0.12.0", features = [ "process" ] }
-prost = "0.9.0"
-rand = "0.7.3"
-rand_chacha = "0.2.2"
+prost = "0.11.0"
+rand = "0.8"
+rand_chacha = "0.3"
 scoped_threadpool = "0.1.*"
 serde = { version = "1.0.99", features = [ "derive" ] }
 serde_bytes = "0.11"
-slog = { version = "2.5.2", features = ["nested-values", "max_level_trace", "release_max_level_debug"] }
+slog = { version = "2.5.2", features = ["nested-values", "release_max_level_debug"] }
 tree-deserializer = { path = "../tree_deserializer" }
+uuid = { version = "1.2.1", features = ["v4", "serde"] }
+libc = "0.2.91"
 
 [lib]
 bench = false
@@ -43,17 +46,24 @@ bench = false
 assert_matches = "1.3.0"
 criterion = "0.3"
 criterion-time = { path = "../criterion_time" }
+ic-btc-types = { path = "../bitcoin/types/public" }
+ic-btc-types-internal = { path = "../bitcoin/types/internal" }
+ic-certification-version = { path = "../canonical_state/certification_version" }
+ic-error-types = { path = "../types/error_types" }
+ic-ic00-types = { path = "../types/ic00_types" }
+ic-registry-routing-table = { path = "../registry/routing_table" }
+ic-registry-subnet-features = { path = "../registry/subnet_features" }
 ic-sys = { path = "../sys" }
 ic-test-utilities = { path = "../test_utilities" }
+ic-test-utilities-logger = { path = "../test_utilities/logger" }
+ic-test-utilities-metrics = { path = "../test_utilities/metrics" }
+ic-test-utilities-tmpdir = { path = "../test_utilities/tmpdir" }
 ic-wasm-types = { path = "../types/wasm_types" }
 maplit = "1.0.2"
-proptest = "0.9.4"
-proptest-derive = "0.1.0"
+proptest = "1.0"
+proptest-derive = "0.3.0"
+strum = "0.23.0"
 tempfile = "3.1.0"
-
-[[bench]]
-name = "checkpoint"
-harness = false
 
 [[bench]]
 name = "bench_traversal"

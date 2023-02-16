@@ -1,26 +1,21 @@
-#[path = "./integration_tests/mod.rs"]
-mod integration_tests;
+mod common;
 
 use assert_matches::assert_matches;
 use candid::Encode;
 use canister_test::{Canister, Project, Runtime};
 use ic_crypto_tree_hash::{flatmap, lookup_path, Label, LabeledTree, MixedHashTree};
-use ic_interfaces::registry::RegistryTransportRecord;
+use ic_interfaces_registry::RegistryTransportRecord;
 use ic_nns_common::registry::encode_or_panic;
-
 use ic_nns_constants::GOVERNANCE_CANISTER_ID;
 use ic_nns_test_utils::itest_helpers::{
     forward_call_via_universal_canister, set_up_universal_canister,
 };
-
 use ic_nns_test_utils::{
     itest_helpers::{local_test_on_nns_subnet, maybe_upgrade_to_self, UpgradeTestingScenario},
     registry::invariant_compliant_mutation_as_atomic_req,
 };
 use ic_nns_test_utils_macros::parameterized_upgrades;
-
-use ic_registry_common::certification::decode_hash_tree;
-
+use ic_registry_nns_data_provider::certification::decode_hash_tree;
 use ic_registry_transport::{
     insert,
     pb::v1::{
@@ -51,7 +46,7 @@ async fn try_to_install_registry_canister(
     init_payload: RegistryCanisterInitPayload,
 ) -> Result<Canister<'_>, String> {
     let encoded = Encode!(&init_payload).unwrap();
-    let proj = Project::new(env!("CARGO_MANIFEST_DIR"));
+    let proj = Project::new();
     proj.cargo_bin("registry-canister", &[])
         .install(runtime)
         .bytes(encoded)
@@ -398,7 +393,7 @@ fn test_does_not_return_more_than_1000_certified_deltas() {
 fn test_canister_installation_traps_on_bad_init_payload() {
     local_test_on_nns_subnet(|runtime| async move {
         assert_matches!(
-            Project::new(env!("CARGO_MANIFEST_DIR"))
+            Project::new()
             .cargo_bin("registry-canister", &[])
                 .install(&runtime)
                 .bytes(b"This is not legal candid".to_vec())
@@ -526,7 +521,7 @@ fn test_that_init_traps_if_any_init_mutation_fails() {
             .build();
         assert_matches!(
                 try_to_install_registry_canister(&runtime, init_payload).await,
-                Err(msg) if msg.contains("Transaction rejected"));
+                Err(msg) if msg.contains("Verification of the mutation type failed"));
         Ok(())
     });
 }

@@ -1,5 +1,6 @@
 //! An utility to help inspecting the stable memory of NNS canisters.
 
+use clap::Parser;
 use ic_base_types::CanisterId;
 use ic_nns_constants::{
     CYCLES_MINTING_CANISTER_ID, GENESIS_TOKEN_CANISTER_ID, GOVERNANCE_CANISTER_ID,
@@ -7,7 +8,7 @@ use ic_nns_constants::{
 };
 use ic_nns_governance::pb::v1::{Governance as GovernanceProto, Neuron};
 use ic_nns_gtc::pb::v1::Gtc as GtcProto;
-use ledger_canister::{AccountIdentifier, Subaccount};
+use icp_ledger::{AccountIdentifier, Subaccount};
 use prost::Message;
 use std::convert::TryInto;
 use std::fs::File;
@@ -15,30 +16,30 @@ use std::io::{Read, Write};
 use std::path::Path;
 use std::path::PathBuf;
 use std::string::ToString;
-use structopt::StructOpt;
 
 /// Command line argument to the utility.
-#[derive(Debug, StructOpt)]
-#[structopt(
+#[derive(Debug, Parser)]
+#[clap(
     name = "nns-inspector",
-    about = "Read and decode the NNS's stable memory."
+    about = "Read and decode the NNS's stable memory.",
+    version
 )]
 struct CliArgs {
     /// Path to stable the `canister_states` directory
-    #[structopt(parse(from_os_str))]
+    #[clap(parse(from_os_str))]
     input: PathBuf,
 
-    #[structopt(parse(from_os_str), default_value = ".")]
+    #[clap(parse(from_os_str), default_value = ".")]
     output: PathBuf,
 
     /// The location of the "rs" directory. Used to find .proto files.
-    #[structopt(long, parse(from_os_str), default_value = ".")]
+    #[clap(long, parse(from_os_str), default_value = ".")]
     rs: PathBuf,
 }
 
 /// Main method to run the utility.
 fn main() {
-    let args = CliArgs::from_iter_safe(std::env::args())
+    let args = CliArgs::try_parse_from(std::env::args())
         .unwrap_or_else(|e| panic!("Illegal arguments: {}", e));
 
     assert!(
@@ -145,14 +146,14 @@ fn decode_governance_stable_memory(gov_pb: PathBuf, output: &Path, rs: &Path) {
     let mut cmd_base = std::process::Command::new("protoc");
     let cmd = cmd_base
         // -I: where to find included protos (transitively)
-        .args(&["-I", "nns/governance/proto"])
-        .args(&["-I", "rosetta-api/ledger_canister/proto"])
-        .args(&["-I", "types/base_types/proto"])
-        .args(&["-I", "nns/common/proto"])
+        .args(["-I", "nns/governance/proto"])
+        .args(["-I", "rosetta-api/icp_ledger/proto"])
+        .args(["-I", "types/base_types/proto"])
+        .args(["-I", "nns/common/proto"])
         // Main arg: the main proto file
         .arg("nns/governance/proto/ic_nns_governance/pb/v1/governance.proto")
         // the actual command
-        .args(&["--decode", "ic_nns_governance.pb.v1.Governance"])
+        .args(["--decode", "ic_nns_governance.pb.v1.Governance"])
         .current_dir(rs)
         .stdin(File::open(gov_pb.clone()).unwrap())
         .stdout(File::create(output.join("governance_stable_memory.textproto")).unwrap());
@@ -224,15 +225,15 @@ fn decode_gtc_stable_memory(gtc_pb: PathBuf, output: &Path, rs: &Path) {
     let mut cmd_base = std::process::Command::new("protoc");
     let cmd = cmd_base
         // -I: where to find included protos (transitively)
-        .args(&["-I", "nns/governance/proto"])
-        .args(&["-I", "rosetta-api/ledger_canister/proto"])
-        .args(&["-I", "types/base_types/proto"])
-        .args(&["-I", "nns/common/proto"])
-        .args(&["-I", "nns/gtc/proto"])
+        .args(["-I", "nns/governance/proto"])
+        .args(["-I", "rosetta-api/icp_ledger/proto"])
+        .args(["-I", "types/base_types/proto"])
+        .args(["-I", "nns/common/proto"])
+        .args(["-I", "nns/gtc/proto"])
         // Main arg: the main proto file
         .arg("nns/gtc/proto/ic_nns_gtc/pb/v1/gtc.proto")
         // the actual command
-        .args(&["--decode", "ic_nns_gtc.pb.v1.Gtc"])
+        .args(["--decode", "ic_nns_gtc.pb.v1.Gtc"])
         .current_dir(rs)
         .stdin(File::open(gtc_pb.clone()).unwrap())
         .stdout(File::create(output.join("gtc_stable_memory.textproto")).unwrap());

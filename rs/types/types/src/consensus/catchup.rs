@@ -2,8 +2,8 @@
 
 use crate::{
     consensus::{
-        Block, Committee, HasCommittee, HasHeight, HasVersion, HashedBlock, HashedRandomBeacon,
-        RandomBeacon, ThresholdSignature, ThresholdSignatureShare,
+        Block, Committee, ConsensusMessageHashable, HasCommittee, HasHeight, HasVersion,
+        HashedBlock, HashedRandomBeacon, RandomBeacon, ThresholdSignature, ThresholdSignatureShare,
     },
     crypto::threshold_sig::ni_dkg::NiDkgId,
     crypto::*,
@@ -158,7 +158,7 @@ impl From<&CatchUpPackage> for pb::CatchUpPackage {
 impl TryFrom<&pb::CatchUpPackage> for CatchUpPackage {
     type Error = String;
     fn try_from(cup: &pb::CatchUpPackage) -> Result<CatchUpPackage, String> {
-        Ok(CatchUpPackage {
+        let ret = CatchUpPackage {
             content: CatchUpContent::try_from(
                 pb::CatchUpContent::decode(&cup.content[..])
                     .map_err(|e| format!("CatchUpContent failed to decode {:?}", e))?,
@@ -173,7 +173,12 @@ impl TryFrom<&pb::CatchUpPackage> for CatchUpPackage {
                 )
                 .map_err(|e| format!("Unable to decode CUP signer {:?}", e))?,
             },
-        })
+        };
+        if ret.check_integrity() {
+            Ok(ret)
+        } else {
+            Err("CatchUpPackage validity check failed".to_string())
+        }
     }
 }
 
@@ -249,7 +254,7 @@ pub struct CatchUpContentProtobufBytes(pub Vec<u8>);
 /// A catch up package paired with the original protobuf. Note that the protobuf
 /// contained in this struct is only partially deserialized and has the ORIGINAL
 /// bytes CatchUpContent bytes that were signed in yet to be deserialized form.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, Hash)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct CUPWithOriginalProtobuf {
     /// The CUP as [`CatchUpPackage`](type@CatchUpPackage)
     pub cup: CatchUpPackage,

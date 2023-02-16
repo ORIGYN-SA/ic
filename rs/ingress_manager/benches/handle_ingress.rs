@@ -20,9 +20,11 @@ use ic_constants::MAX_INGRESS_TTL;
 use ic_ingress_manager::IngressManager;
 use ic_interfaces::{
     artifact_pool::UnvalidatedArtifact, ingress_manager::IngressHandler,
-    ingress_pool::MutableIngressPool, registry::RegistryClient, time_source::TimeSource,
+    ingress_pool::MutableIngressPool, time_source::TimeSource,
 };
+use ic_interfaces_registry::RegistryClient;
 use ic_interfaces_state_manager::Labeled;
+use ic_interfaces_state_manager_mocks::MockStateManager;
 use ic_logger::{replica_logger::no_op_logger, ReplicaLogger};
 use ic_metrics::MetricsRegistry;
 use ic_registry_client::client::RegistryClientImpl;
@@ -37,14 +39,13 @@ use ic_test_utilities::{
     history::MockIngressHistory,
     mock_time,
     state::ReplicatedStateBuilder,
-    state_manager::MockStateManager,
     types::ids::{canister_test_id, node_test_id, subnet_test_id, user_test_id},
     types::messages::SignedIngressBuilder,
     FastForwardTimeSource,
 };
 use ic_test_utilities_registry::test_subnet_record;
 use ic_types::{
-    ingress::IngressStatus,
+    ingress::{IngressState, IngressStatus},
     malicious_flags::MaliciousFlags,
     messages::{MessageId, SignedIngress},
     Height, RegistryVersion, SubnetId, Time,
@@ -83,11 +84,13 @@ impl SimulatedIngressHistory {
                     if set.1.contains(ingress_id) {
                         IngressStatus::Unknown
                     } else {
-                        IngressStatus::Completed {
+                        IngressStatus::Known {
                             receiver: canister_test_id(0).get(),
                             user_id: user_test_id(0),
-                            result: ic_types::ingress::WasmResult::Reply(vec![]),
                             time: mock_time(),
+                            state: IngressState::Completed(ic_types::ingress::WasmResult::Reply(
+                                vec![],
+                            )),
                         }
                     }
                 })
@@ -161,13 +164,11 @@ where
         &mut IngressManager,
     ),
 {
-    ic_test_utilities::with_test_replica_logger(|log| {
+    ic_test_utilities_logger::with_test_replica_logger(|log| {
         ic_test_utilities::artifact_pool_config::with_test_pool_config(|pool_config| {
             let time_source = FastForwardTimeSource::new();
             // Set initial time to non-zero
-            time_source
-                .set_time(mock_time() + Duration::from_secs(1))
-                .unwrap();
+            time_source.advance_time(Duration::from_secs(1));
             let (history, ingress_hist_reader) = SimulatedIngressHistory::new(time_source.clone());
             let history = Arc::new(history);
             let history_cl = history.clone();
@@ -185,9 +186,7 @@ where
                         BTreeMap::new(),
                         metadata,
                         CanisterQueues::default(),
-                        Vec::new(),
                         BitcoinState::default(),
-                        std::path::PathBuf::new(),
                     )),
                 )
             });
@@ -204,12 +203,12 @@ where
                 node_test_id(VALIDATOR_NODE_ID),
             ));
             let mut state_manager = MockStateManager::new();
-            state_manager.expect_get_state_at().return_const(Ok(
-                ic_interfaces_state_manager::Labeled::new(
+            state_manager
+                .expect_get_state_at()
+                .return_const(Ok(Labeled::new(
                     Height::new(0),
                     Arc::new(ReplicatedStateBuilder::default().build()),
-                ),
-            ));
+                )));
 
             let metrics_registry = MetricsRegistry::new();
             let ingress_pool = Arc::new(RwLock::new(IngressPoolImpl::new(
@@ -252,9 +251,8 @@ fn prepare(time_source: &dyn TimeSource, duration: Duration, num: usize) -> Vec<
     let mut rng = rand::thread_rng();
     (0..num)
         .map(|i| {
-            let expiry = std::time::Duration::from_millis(
-                rng.gen::<u64>() % ((max_expiry - now).as_millis() as u64),
-            );
+            let expiry =
+                Duration::from_millis(rng.gen::<u64>() % ((max_expiry - now).as_millis() as u64));
             SignedIngressBuilder::new()
                 .method_payload(vec![0; PAYLOAD_SIZE])
                 .nonce(i as u64)
@@ -338,9 +336,7 @@ fn handle_ingress(criterion: &mut Criterion) {
                                 if now >= start + time_span {
                                     break;
                                 }
-                                time_source
-                                    .set_time(now + Duration::from_millis(200))
-                                    .unwrap();
+                                time_source.advance_time(Duration::from_millis(200));
                             }
                             elapsed += bench_start.elapsed();
                         }

@@ -14,11 +14,12 @@
 //! All [`Artifact`] sub-types must also implement [`ChunkableArtifact`] trait
 //! defined in the chunkable module.
 use crate::{
-    canister_http::CanisterHttpResponseShare,
+    canister_http::{CanisterHttpResponseAttribute, CanisterHttpResponseShare},
+    chunkable::{ArtifactChunk, ChunkId, ChunkableArtifact},
     consensus::{certification::CertificationMessageHash, ConsensusMessageHash},
     crypto::{CryptoHash, CryptoHashOf},
     filetree_sync::{FileTreeSyncArtifact, FileTreeSyncId},
-    messages::{MessageId, SignedRequestBytes},
+    messages::MessageId,
     p2p::GossipAdvert,
     CryptoHashOfState, Height, Time,
 };
@@ -26,17 +27,21 @@ use derive_more::{AsMut, AsRef, From, TryInto};
 use ic_protobuf::p2p::v1 as pb;
 use ic_protobuf::proxy::{try_from_option_field, ProxyDecodeError};
 use serde::{Deserialize, Serialize};
-use std::convert::{TryFrom, TryInto};
-use strum_macros::EnumIter;
+use std::{
+    convert::{TryFrom, TryInto},
+    sync::Arc,
+};
+use strum_macros::{EnumIter, IntoStaticStr};
 
 pub use crate::{
     consensus::{
         certification::CertificationMessage,
         dkg::Message as DkgMessage,
-        ecdsa::{EcdsaMessage, EcdsaMessageAttribute, EcdsaMessageHash},
+        ecdsa::{EcdsaArtifactId, EcdsaMessage, EcdsaMessageAttribute},
         ConsensusMessage, ConsensusMessageAttribute,
     },
     messages::SignedIngress,
+    state_sync::FILE_GROUP_CHUNK_ID_OFFSET,
 };
 
 /// The artifact type
@@ -45,10 +50,11 @@ pub use crate::{
 #[allow(clippy::large_enum_variant)]
 pub enum Artifact {
     ConsensusMessage(ConsensusMessage),
-    IngressMessage(SignedRequestBytes),
+    IngressMessage(SignedIngress),
     CertificationMessage(CertificationMessage),
     DkgMessage(DkgMessage),
     EcdsaMessage(EcdsaMessage),
+    CanisterHttpMessage(CanisterHttpResponseShare),
     FileTreeSync(FileTreeSyncArtifact),
     StateSync(StateSyncMessage),
 }
@@ -62,6 +68,7 @@ pub enum ArtifactAttribute {
     DkgMessage(DkgMessageAttribute),
     CertificationMessage(CertificationMessageAttribute),
     EcdsaMessage(EcdsaMessageAttribute),
+    CanisterHttpMessage(CanisterHttpResponseAttribute),
     FileTreeSync(FileTreeSyncAttribute),
     StateSync(StateSyncAttribute),
 }
@@ -83,15 +90,24 @@ pub enum ArtifactId {
 /// Artifact tags is used to select an artifact subtype when we do not have
 /// Artifact/ArtifactId/ArtifactAttribute. For example, when lookup quota
 /// or filters.
-#[derive(EnumIter, TryInto, Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(EnumIter, TryInto, Clone, Copy, Debug, PartialEq, Eq, Hash, IntoStaticStr)]
+#[strum(serialize_all = "snake_case")]
 pub enum ArtifactTag {
+    #[strum(serialize = "canister_http")]
     CanisterHttpArtifact,
+    #[strum(serialize = "certification")]
     CertificationArtifact,
+    #[strum(serialize = "consensus")]
     ConsensusArtifact,
+    #[strum(serialize = "dkg")]
     DkgArtifact,
+    #[strum(serialize = "ecdsa")]
     EcdsaArtifact,
+    #[strum(serialize = "file_tree_sync")]
     FileTreeSyncArtifact,
+    #[strum(serialize = "ingress")]
     IngressArtifact,
+    #[strum(serialize = "state_sync")]
     StateSyncArtifact,
 }
 
@@ -139,6 +155,7 @@ impl From<&Artifact> for ArtifactTag {
             Artifact::CertificationMessage(_) => ArtifactTag::CertificationArtifact,
             Artifact::DkgMessage(_) => ArtifactTag::DkgArtifact,
             Artifact::EcdsaMessage(_) => ArtifactTag::EcdsaArtifact,
+            Artifact::CanisterHttpMessage(_) => ArtifactTag::CanisterHttpArtifact,
             Artifact::FileTreeSync(_) => ArtifactTag::FileTreeSyncArtifact,
             Artifact::StateSync(_) => ArtifactTag::StateSyncArtifact,
         }
@@ -152,7 +169,6 @@ impl From<&Artifact> for ArtifactTag {
 #[derive(AsMut, AsRef, Default, Clone, Debug, Eq, PartialEq, Hash)]
 pub struct ArtifactFilter {
     pub consensus_filter: ConsensusMessageFilter,
-    pub ingress_filter: IngressMessageFilter,
     pub certification_filter: CertificationMessageFilter,
     pub state_sync_filter: StateSyncFilter,
     pub no_filter: (),
@@ -191,13 +207,10 @@ pub type ArtifactPriorityFn =
 /// parameterized by a type variable, which is of `ArtifactKind` trait.
 /// It is mostly a convenience to pass around a collection of types
 /// instead of all of them individually.
-// The Unpin constraint is because the Message type was used to define an actor
-// type, of which 'start_in_arbiter' is called, and actix requires Unpin.
 pub trait ArtifactKind: Sized {
     const TAG: ArtifactTag;
     type Id;
-    type Message: Unpin;
-    type SerializeAs;
+    type Message;
     type Attribute;
     type Filter: Default;
 
@@ -207,11 +220,11 @@ pub trait ArtifactKind: Sized {
     /// Returns the advert send request to be sent to P2P.
     fn message_to_advert_send_request(
         msg: &<Self as ArtifactKind>::Message,
-        advert_class: AdvertClass,
+        dest: ArtifactDestination,
     ) -> AdvertSendRequest<Self> {
         AdvertSendRequest {
             advert: Self::message_to_advert(msg),
-            advert_class,
+            dest,
         }
     }
 
@@ -305,35 +318,18 @@ where
 /// The type of advert gossip for a particular artifact,
 /// as determined by the client
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub enum AdvertClass {
+pub enum ArtifactDestination {
     /// The client considers the artifact to be critical and
     /// requests all peers be notified. This is the default
     /// class of service provided by the networking layer,
     /// if the optimizations are not enabled.
-    Critical,
-
-    /// The client does not need all the peers to be notified
-    /// for the artifact. Instead, it lets the networking
-    /// layer decide the advert distribution volume and recipient
-    /// set, based on performance vs reliability trade offs.
-    /// Please note this is only advisory. Network layer may
-    /// decide to fall back to Critical class, depending on
-    /// its configuration.
-    BestEffort,
-
-    /// The client does not need peers to be notified for this
-    /// artifact type. Please note this is only advisory.
-    /// Network layer may decide to fall back to  Critical class,
-    /// depending on its configuration.
-    None,
+    AllPeersInSubnet,
 }
 
-impl AdvertClass {
+impl ArtifactDestination {
     pub fn as_str(&self) -> &str {
         match self {
-            Self::Critical => "critical",
-            Self::BestEffort => "best_effort",
-            Self::None => "none",
+            Self::AllPeersInSubnet => "all_peers_in_subnet",
         }
     }
 }
@@ -341,7 +337,7 @@ impl AdvertClass {
 /// Wrapper to generate the advert send requests
 pub struct AdvertSendRequest<Artifact: ArtifactKind> {
     pub advert: Advert<Artifact>,
-    pub advert_class: AdvertClass,
+    pub dest: ArtifactDestination,
 }
 
 // -----------------------------------------------------------------------------
@@ -417,16 +413,6 @@ impl IngressMessageAttribute {
     }
 }
 
-/// Ingress messages are filtered by their expiry time.
-///
-/// - 'None' means any message that has not expired.
-///
-/// - 'Some(expiry)' means messages whose expiry time is less than or equal to
-///   'expiry', and not expired.
-///
-/// The notion of "not expired" is with respect to the local time source.
-pub type IngressMessageFilter = Option<Time>;
-
 // -----------------------------------------------------------------------------
 // Certification artifacts
 
@@ -465,7 +451,7 @@ pub struct DkgMessageAttribute {
 // -----------------------------------------------------------------------------
 // ECDSA artifacts
 
-pub type EcdsaMessageId = EcdsaMessageHash;
+pub type EcdsaMessageId = EcdsaArtifactId;
 
 // -----------------------------------------------------------------------------
 // CanisterHttp artifacts
@@ -481,9 +467,6 @@ pub struct StateSyncArtifactId {
     pub height: Height,
     pub hash: CryptoHashOfState,
 }
-
-type GetStateSyncChunk =
-    fn(file_path: std::path::PathBuf, offset: u64, len: u32) -> std::io::Result<Vec<u8>>;
 
 /// State sync message.
 //
@@ -501,9 +484,55 @@ pub struct StateSyncMessage {
     pub checkpoint_root: std::path::PathBuf,
     /// The manifest containing the summary of the content.
     pub manifest: crate::state_sync::Manifest,
+    #[serde(serialize_with = "ic_utils::serde_arc::serialize_arc")]
+    #[serde(deserialize_with = "ic_utils::serde_arc::deserialize_arc")]
+    pub state_sync_file_group: Arc<crate::state_sync::FileGroupChunks>,
+}
 
-    #[serde(skip_serializing, skip_deserializing)]
-    pub get_state_sync_chunk: Option<GetStateSyncChunk>,
+impl ChunkableArtifact for StateSyncMessage {
+    fn get_chunk(self: Box<Self>, _chunk_id: ChunkId) -> Option<ArtifactChunk> {
+        #[cfg(not(target_family = "unix"))]
+        {
+            panic!("This method should only be used when the target OS family is unix.");
+        }
+
+        #[cfg(target_family = "unix")]
+        {
+            use crate::chunkable::ArtifactChunkData;
+            use std::os::unix::fs::FileExt;
+
+            let get_single_chunk = |chunk_index: usize| -> Option<Vec<u8>> {
+                let chunk = self.manifest.chunk_table.get(chunk_index).cloned()?;
+                let path = self
+                    .checkpoint_root
+                    .join(&self.manifest.file_table[chunk.file_index as usize].relative_path);
+                let mut buf = vec![0; chunk.size_bytes as usize];
+                let f = std::fs::File::open(path).ok()?;
+                f.read_exact_at(&mut buf[..], chunk.offset).ok()?;
+                Some(buf)
+            };
+
+            let mut payload: Vec<u8> = Vec::new();
+            if _chunk_id == crate::state_sync::MANIFEST_CHUNK {
+                payload = crate::state_sync::encode_manifest(&self.manifest);
+            } else if _chunk_id.get() < FILE_GROUP_CHUNK_ID_OFFSET
+                || self.state_sync_file_group.get(&_chunk_id.get()).is_none()
+            {
+                payload = get_single_chunk((_chunk_id.get() - 1) as usize)?;
+            } else {
+                let chunk_table_indices = self.state_sync_file_group.get(&_chunk_id.get())?;
+                for chunk_table_index in chunk_table_indices {
+                    payload.extend(get_single_chunk(*chunk_table_index as usize)?);
+                }
+            }
+
+            Some(ArtifactChunk {
+                chunk_id: _chunk_id,
+                witness: Vec::new(),
+                artifact_chunk_data: ArtifactChunkData::SemiStructuredChunkData(payload),
+            })
+        }
+    }
 }
 
 // We need a custom Hash instance to skip checkpoint_root in order
@@ -555,12 +584,6 @@ impl From<ArtifactFilter> for pb::ArtifactFilter {
     fn from(filter: ArtifactFilter) -> Self {
         Self {
             consensus_filter: Some(filter.consensus_filter.into()),
-            ingress_filter: Some(pb::IngressMessageFilter {
-                time: filter
-                    .ingress_filter
-                    .unwrap_or_else(|| Time::from_nanos_since_unix_epoch(0))
-                    .as_nanos_since_unix_epoch(),
-            }),
             certification_message_filter: Some(filter.certification_filter.into()),
             state_sync_filter: Some(filter.state_sync_filter.into()),
         }
@@ -575,14 +598,6 @@ impl TryFrom<pb::ArtifactFilter> for ArtifactFilter {
                 filter.consensus_filter,
                 "ArtifactFilter.consensus_filter",
             )?,
-            ingress_filter: Some(Time::from_nanos_since_unix_epoch(
-                filter
-                    .ingress_filter
-                    .ok_or(ProxyDecodeError::MissingField(
-                        "ArtifactFilter.ingress_filter",
-                    ))?
-                    .time,
-            )),
             certification_filter: try_from_option_field(
                 filter.certification_message_filter,
                 "ArtifactFilter.certification_message_filter",

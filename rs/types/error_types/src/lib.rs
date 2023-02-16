@@ -63,13 +63,16 @@ impl From<ErrorCode> for RejectCode {
         match err {
             SubnetOversubscribed => SysFatal,
             MaxNumberOfCanistersReached => SysFatal,
+            CanisterOutputQueueFull => SysTransient,
+            IngressMessageTimeout => SysTransient,
+            CanisterQueueNotEmpty => SysTransient,
+            IngressHistoryFull => SysTransient,
             CanisterInvalidController => CanisterError,
             CanisterNotFound => DestinationInvalid,
             CanisterMethodNotFound => DestinationInvalid,
             CanisterFunctionNotFound => CanisterError,
             CanisterWasmModuleNotFound => DestinationInvalid,
             CanisterAlreadyInstalled => DestinationInvalid,
-            CanisterEmpty => DestinationInvalid,
             CanisterNonEmpty => CanisterError,
             CanisterOutOfCycles => CanisterError,
             CanisterTrapped => CanisterError,
@@ -78,25 +81,27 @@ impl From<ErrorCode> for RejectCode {
             CanisterInvalidWasm => CanisterError,
             CanisterDidNotReply => CanisterError,
             CanisterOutOfMemory => CanisterError,
-            CanisterOutputQueueFull => SysTransient,
             CanisterStopped => CanisterError,
             CanisterStopping => CanisterError,
             CanisterNotStopped => CanisterError,
             CanisterStoppingCancelled => CanisterError,
-            IngressMessageTimeout => SysTransient,
-            InsufficientTransferFunds => CanisterReject,
             InsufficientCyclesForCreateCanister => CanisterReject,
             CertifiedStateUnavailable => SysTransient,
             InsufficientMemoryAllocation => CanisterReject,
             SubnetNotFound => CanisterReject,
             CanisterRejectedMessage => CanisterReject,
-            InterCanisterQueryLoopDetected => CanisterError,
+            QueryCallGraphLoopDetected => CanisterError,
             UnknownManagementMessage => CanisterReject,
             InvalidManagementPayload => CanisterReject,
             InsufficientCyclesInCall => CanisterError,
             CanisterWasmEngineError => CanisterError,
             CanisterInstructionLimitExceeded => CanisterError,
             CanisterInstallCodeRateLimited => SysTransient,
+            CanisterMemoryAccessLimitExceeded => CanisterError,
+            QueryCallGraphTooDeep => CanisterError,
+            QueryCallGraphTotalInstructionLimitExceeded => CanisterError,
+            CompositeQueryCalledInReplicatedMode => CanisterError,
+            CanisterNotHostedBySubnet => CanisterReject,
         }
     }
 }
@@ -113,15 +118,16 @@ pub enum ErrorCode {
     MaxNumberOfCanistersReached = 102,
     CanisterOutputQueueFull = 201,
     IngressMessageTimeout = 202,
+    CanisterQueueNotEmpty = 203,
+    IngressHistoryFull = 204,
     CanisterNotFound = 301,
     CanisterMethodNotFound = 302,
     CanisterAlreadyInstalled = 303,
     CanisterWasmModuleNotFound = 304,
-    CanisterEmpty = 305,
-    InsufficientTransferFunds = 401,
     InsufficientMemoryAllocation = 402,
     InsufficientCyclesForCreateCanister = 403,
     SubnetNotFound = 404,
+    CanisterNotHostedBySubnet = 405,
     CanisterOutOfCycles = 501,
     CanisterTrapped = 502,
     CanisterCalledTrap = 503,
@@ -138,13 +144,17 @@ pub enum ErrorCode {
     CanisterNonEmpty = 514,
     CertifiedStateUnavailable = 515,
     CanisterRejectedMessage = 516,
-    InterCanisterQueryLoopDetected = 517,
+    QueryCallGraphLoopDetected = 517,
     UnknownManagementMessage = 518,
     InvalidManagementPayload = 519,
     InsufficientCyclesInCall = 520,
     CanisterWasmEngineError = 521,
     CanisterInstructionLimitExceeded = 522,
     CanisterInstallCodeRateLimited = 523,
+    CanisterMemoryAccessLimitExceeded = 524,
+    QueryCallGraphTooDeep = 525,
+    QueryCallGraphTotalInstructionLimitExceeded = 526,
+    CompositeQueryCalledInReplicatedMode = 527,
 }
 
 impl TryFrom<u64> for ErrorCode {
@@ -155,15 +165,16 @@ impl TryFrom<u64> for ErrorCode {
             102 => Ok(ErrorCode::MaxNumberOfCanistersReached),
             201 => Ok(ErrorCode::CanisterOutputQueueFull),
             202 => Ok(ErrorCode::IngressMessageTimeout),
+            203 => Ok(ErrorCode::CanisterQueueNotEmpty),
+            204 => Ok(ErrorCode::IngressHistoryFull),
             301 => Ok(ErrorCode::CanisterNotFound),
             302 => Ok(ErrorCode::CanisterMethodNotFound),
             303 => Ok(ErrorCode::CanisterAlreadyInstalled),
             304 => Ok(ErrorCode::CanisterWasmModuleNotFound),
-            305 => Ok(ErrorCode::CanisterEmpty),
-            401 => Ok(ErrorCode::InsufficientTransferFunds),
             402 => Ok(ErrorCode::InsufficientMemoryAllocation),
             403 => Ok(ErrorCode::InsufficientCyclesForCreateCanister),
             404 => Ok(ErrorCode::SubnetNotFound),
+            405 => Ok(ErrorCode::CanisterNotHostedBySubnet),
             501 => Ok(ErrorCode::CanisterOutOfCycles),
             502 => Ok(ErrorCode::CanisterTrapped),
             503 => Ok(ErrorCode::CanisterCalledTrap),
@@ -180,13 +191,17 @@ impl TryFrom<u64> for ErrorCode {
             514 => Ok(ErrorCode::CanisterNonEmpty),
             515 => Ok(ErrorCode::CertifiedStateUnavailable),
             516 => Ok(ErrorCode::CanisterRejectedMessage),
-            517 => Ok(ErrorCode::InterCanisterQueryLoopDetected),
+            517 => Ok(ErrorCode::QueryCallGraphLoopDetected),
             518 => Ok(ErrorCode::UnknownManagementMessage),
             519 => Ok(ErrorCode::InvalidManagementPayload),
             520 => Ok(ErrorCode::InsufficientCyclesInCall),
             521 => Ok(ErrorCode::CanisterWasmEngineError),
             522 => Ok(ErrorCode::CanisterInstructionLimitExceeded),
             523 => Ok(ErrorCode::CanisterInstallCodeRateLimited),
+            524 => Ok(ErrorCode::CanisterMemoryAccessLimitExceeded),
+            525 => Ok(ErrorCode::QueryCallGraphTooDeep),
+            526 => Ok(ErrorCode::QueryCallGraphTotalInstructionLimitExceeded),
+            527 => Ok(ErrorCode::CompositeQueryCalledInReplicatedMode),
             _ => Err(TryFromError::ValueOutOfRange(err)),
         }
     }
@@ -233,6 +248,52 @@ impl UserError {
 
     pub fn reject_code(&self) -> RejectCode {
         self.code().into()
+    }
+
+    pub fn is_system_error(&self) -> bool {
+        match self.code {
+            ErrorCode::CanisterWasmEngineError => true,
+            ErrorCode::SubnetOversubscribed
+            | ErrorCode::MaxNumberOfCanistersReached
+            | ErrorCode::CanisterOutputQueueFull
+            | ErrorCode::IngressMessageTimeout
+            | ErrorCode::CanisterQueueNotEmpty
+            | ErrorCode::CanisterNotFound
+            | ErrorCode::CanisterMethodNotFound
+            | ErrorCode::CanisterAlreadyInstalled
+            | ErrorCode::CanisterWasmModuleNotFound
+            | ErrorCode::InsufficientMemoryAllocation
+            | ErrorCode::InsufficientCyclesForCreateCanister
+            | ErrorCode::SubnetNotFound
+            | ErrorCode::CanisterNotHostedBySubnet
+            | ErrorCode::CanisterOutOfCycles
+            | ErrorCode::CanisterTrapped
+            | ErrorCode::CanisterCalledTrap
+            | ErrorCode::CanisterContractViolation
+            | ErrorCode::CanisterInvalidWasm
+            | ErrorCode::CanisterDidNotReply
+            | ErrorCode::CanisterOutOfMemory
+            | ErrorCode::CanisterStopped
+            | ErrorCode::CanisterStopping
+            | ErrorCode::CanisterNotStopped
+            | ErrorCode::CanisterStoppingCancelled
+            | ErrorCode::CanisterInvalidController
+            | ErrorCode::CanisterFunctionNotFound
+            | ErrorCode::CanisterNonEmpty
+            | ErrorCode::CertifiedStateUnavailable
+            | ErrorCode::CanisterRejectedMessage
+            | ErrorCode::QueryCallGraphLoopDetected
+            | ErrorCode::UnknownManagementMessage
+            | ErrorCode::IngressHistoryFull
+            | ErrorCode::InvalidManagementPayload
+            | ErrorCode::InsufficientCyclesInCall
+            | ErrorCode::CanisterInstructionLimitExceeded
+            | ErrorCode::CanisterInstallCodeRateLimited
+            | ErrorCode::CanisterMemoryAccessLimitExceeded
+            | ErrorCode::QueryCallGraphTooDeep
+            | ErrorCode::QueryCallGraphTotalInstructionLimitExceeded
+            | ErrorCode::CompositeQueryCalledInReplicatedMode => false,
+        }
     }
 }
 

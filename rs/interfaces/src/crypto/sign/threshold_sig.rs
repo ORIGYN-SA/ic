@@ -1,7 +1,6 @@
-use crate::crypto::Signable;
 use ic_base_types::{NodeId, SubnetId};
 use ic_types::crypto::threshold_sig::ni_dkg::DkgId;
-use ic_types::crypto::{CombinedThresholdSigOf, CryptoResult, ThresholdSigShareOf};
+use ic_types::crypto::{CombinedThresholdSigOf, CryptoResult, Signable, ThresholdSigShareOf};
 use ic_types::RegistryVersion;
 use std::collections::BTreeMap;
 
@@ -84,8 +83,7 @@ pub trait ThresholdSigVerifier<T: Signable> {
     ///   `DkgAlgorithm::load_transcript` must be called prior to calling this
     ///   method.
     /// * `CryptoError::MalformedSignature` if a sig share is malformed.
-    // TODO (DFN-1505): Fix doc once the error handling is improved and some
-    // InvalidArguments lead to panic. (see map_csp_combine_sigs_error_or_panic)
+    /// * `CryptoError::InternalError` if there is an unexpected internal error.
     fn combine_threshold_sig_shares(
         &self,
         shares: BTreeMap<NodeId, ThresholdSigShareOf<T>>,
@@ -104,6 +102,9 @@ pub trait ThresholdSigVerifier<T: Signable> {
     ///   must be called prior to calling this method.
     /// * `CryptoError::MalformedSignature` if the given `signature` is not a
     ///   valid combined threshold signature (e.g., because of invalid length)
+    /// * `CryptoError::MalformedPublicKey ` if the public key from the transcript `dkg_id` is malformed.
+    /// * `CryptoError::InvalidArgument` if the `algorithm_id` of the transcript `dkg_id` is invalid.
+    /// * `CryptoError::InternalError` if there is an unexpected internal error.
     fn verify_threshold_sig_combined(
         &self,
         signature: &CombinedThresholdSigOf<T>,
@@ -127,6 +128,9 @@ pub trait ThresholdSigVerifierByPublicKey<T: Signable> {
     ///   `registry_version`.
     /// * `CryptoError::MalformedSignature` if the given `signature` is not a
     ///   valid combined threshold signature (e.g., because of invalid length)
+    /// * `CryptoError::MalformedPublicKey ` if the public key of `subnet_id` is malformed.
+    /// * `CryptoError::InvalidArgument` if the `algorithm_id` of the `subnet_id`'s public key is invalid.
+    /// * `CryptoError::InternalError` if there is an unexpected internal error.
     fn verify_combined_threshold_sig_by_public_key(
         &self,
         signature: &CombinedThresholdSigOf<T>,

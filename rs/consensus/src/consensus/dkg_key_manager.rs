@@ -7,7 +7,7 @@ use crate::consensus::{
     pool_reader::PoolReader, prelude::threshold_sig::ni_dkg::NiDkgTranscript, prelude::*,
     ConsensusCrypto,
 };
-use ic_interfaces::crypto::{LoadTranscriptResult, NiDkgAlgorithm};
+use ic_interfaces::crypto::{ErrorReproducibility, LoadTranscriptResult, NiDkgAlgorithm};
 use ic_logger::{error, info, warn, ReplicaLogger};
 use ic_metrics::{buckets::decimal_buckets, MetricsRegistry};
 use ic_types::{
@@ -103,8 +103,9 @@ impl DkgKeyManager {
         metrics_registry: MetricsRegistry,
         crypto: Arc<dyn ConsensusCrypto>,
         logger: ReplicaLogger,
+        pool_reader: &PoolReader<'_>,
     ) -> Self {
-        Self {
+        let mut manager = Self {
             crypto,
             metrics: Metrics::new(&metrics_registry),
             logger,
@@ -112,10 +113,17 @@ impl DkgKeyManager {
             last_cup_height: Default::default(),
             pending_transcript_loads: Default::default(),
             pending_key_removal: Default::default(),
-        }
+        };
+
+        // By calling on state change during initialization, we make sure, that the key store is
+        // initialized. Otherwise, other consensus methods would initially fail, and generate warnings.
+        manager.on_state_change(pool_reader);
+
+        manager
     }
 
-    pub(crate) fn on_state_change(&mut self, pool_reader: &PoolReader<'_>) {
+    /// Check and load new transcripts from the latest finalized DKG summary or from a CUP.
+    pub fn on_state_change(&mut self, pool_reader: &PoolReader<'_>) {
         // Check and load new transcripts from the latest finalized DKG summary or from
         // a CUP. Note, we keep track of transcripts being loaded and do not
         // load them more than once.
@@ -182,9 +190,9 @@ impl DkgKeyManager {
         }
     }
 
-    // Inspects the latest CUP height and the height of the latest finalized DKG
-    // summary block. If they are newer than what we have seen, triggers the
-    // loading of transcripts from corresponding summaries.
+    /// Inspects the latest CUP height and the height of the latest finalized DKG
+    /// summary block. If they are newer than what we have seen, triggers the
+    /// loading of transcripts from corresponding summaries.
     fn load_transcripts_if_necessary(&mut self, pool_reader: &PoolReader<'_>) {
         let _timer = self
             .metrics
@@ -228,11 +236,11 @@ impl DkgKeyManager {
         }
     }
 
-    // Ensures that the pending transcripts are loaded BEFORE they are needed. For
-    // that we take the next expected random beacon height and check for every
-    // pending transcript load if we hit its deadline. If yes, we join on the
-    // thread handle by enforcing its execution if it didn't happen yet or by
-    // closing the thread otherwise.
+    /// Ensures that the pending transcripts are loaded BEFORE they are needed. For
+    /// that we take the next expected random beacon height and check for every
+    /// pending transcript load if we hit its deadline. If yes, we join on the
+    /// thread handle by enforcing its execution if it didn't happen yet or by
+    /// closing the thread otherwise.
     fn enforce_transcript_loading(&mut self, pool_reader: &PoolReader<'_>) {
         let _timer = self
             .metrics
@@ -240,7 +248,8 @@ impl DkgKeyManager {
             .with_label_values(&["enforce_transcripts"])
             .start_timer();
         let next_random_beacon_height = pool_reader.get_random_beacon_height().increment();
-        // If there are no expired transcripts, which we expected in the most of rounds,
+
+        // If there are no expired transcripts, which is expected in the most of the rounds,
         // we're done.
         if self
             .pending_transcript_loads
@@ -249,6 +258,7 @@ impl DkgKeyManager {
         {
             return;
         }
+
         let (expired, pending): (Vec<_>, _) = self
             .pending_transcript_loads
             .drain()
@@ -256,8 +266,11 @@ impl DkgKeyManager {
         let number_of_transcripts = expired.len();
         info!(
             self.logger,
-            "Waiting on {} transcripts to be loaded", number_of_transcripts
+            "Waiting on {} transcripts to be loaded for height {}",
+            number_of_transcripts,
+            next_random_beacon_height
         );
+
         for (id, (_, handle)) in expired {
             match handle.recv() {
                 Err(err) => panic!(
@@ -271,29 +284,34 @@ impl DkgKeyManager {
                 _ => (),
             }
         }
+
         info!(
             self.logger,
-            "Finished waiting on {} transcripts to be loaded", number_of_transcripts,
+            "Finished waiting on {} transcripts to be loaded for height {}",
+            number_of_transcripts,
+            next_random_beacon_height,
         );
         // Put the pending loads back.
         self.pending_transcript_loads = pending.into_iter().collect();
     }
 
-    // Gets all available transcripts from a summary (current + next ones) and
-    // spawns threads for every transcript load if it's not among transcripts
-    // being loaded already. Note this functionality relies on the assumption,
-    // that CSP does not re-load transcripts, which were succeffully loaded
-    // before.
+    /// Gets all available transcripts from a summary (current + next ones) and
+    /// spawns threads for every transcript load if it's not among transcripts
+    /// being loaded already. Note this functionality relies on the assumption,
+    /// that CSP does not reload transcripts, which were successfully loaded
+    /// before.
     fn load_transcripts_from_summary(&mut self, summary: Arc<Summary>) {
         let transcripts_to_load: Vec<_> = {
             let current_interval_start = summary.height;
             let next_interval_start = summary.get_next_start_height();
+
             // For current transcripts we take the current summary height as a deadline.
             let current_transcripts_with_load_deadlines = summary
                 .current_transcripts()
                 .iter()
                 .filter(|(_, t)| !self.pending_transcript_loads.contains_key(&t.dkg_id))
                 .map(|(_, t)| (current_interval_start, t.dkg_id));
+
             // For next transcripts, we take the start of the next interval as a deadline.
             let next_transcripts_with_load_deadlines = summary
                 .next_transcripts()
@@ -315,6 +333,8 @@ impl DkgKeyManager {
             let logger = self.logger.clone();
             let summary = summary.clone();
             let (tx, rx) = sync_channel(0);
+            self.pending_transcript_loads.insert(dkg_id, (deadline, rx));
+
             std::thread::spawn(move || {
                 let transcript = summary
                     .current_transcripts()
@@ -324,22 +344,68 @@ impl DkgKeyManager {
                     .expect("No transcript was found")
                     .1;
 
-                let result = NiDkgAlgorithm::load_transcript(&*crypto, transcript);
-                match &result {
-                    Ok(_) => info!(logger, "Finished loading transcript with id={:?}", dkg_id),
-                    Err(err) => warn!(
-                        logger,
-                        "The DKG transcript with id={:?} couldn't be loaded: {:?}", dkg_id, err
-                    ),
-                }
-                tx.send(result)
+                let result = loop {
+                    let result = NiDkgAlgorithm::load_transcript(&*crypto, transcript);
+                    match &result {
+                        // Key loaded successfully
+                        Ok(LoadTranscriptResult::SigningKeyAvailable) => {
+                            info!(logger, "Finished loading transcript with id {:?}", dkg_id);
+                            break result;
+                        }
+
+                        Ok(LoadTranscriptResult::NodeNotInCommittee) => {
+                            info!(
+                                logger,
+                                "Finished loading public parts of transcript with id {:?} \
+                                (signing key unavailable since this node is not part of the committee)", 
+                                dkg_id
+                            );
+                            break result;
+                        }
+
+                        // Arguments passed to crypto are invalid, should never happen
+                        Ok(val) => {
+                            error!(
+                                logger,
+                                "Could only load public parts of transcript with id {:?} \
+                                (signing key unavailable: {:?})",
+                                dkg_id,
+                                val
+                            );
+                            break result;
+                        }
+
+                        // Transient error in crypto, log warning and retry
+                        Err(err) if !err.is_reproducible() => {
+                            warn!(
+                                every_n_seconds => 5,
+                                logger,
+                                "The DKG transcript with id {:?} couldn't be loaded: {:?} Retrying...",
+                                dkg_id,
+                                err
+                            );
+                        }
+
+                        // Permanent error in crypto, log error
+                        Err(err) => {
+                            error!(
+                                logger,
+                                "The DKG transcript with id {:?} couldn't be loaded: {:?}",
+                                dkg_id,
+                                err
+                            );
+                            break result;
+                        }
+                    }
+                };
+
+                tx.send(result).expect("DKG key manager paniced");
             });
-            self.pending_transcript_loads.insert(dkg_id, (deadline, rx));
         }
     }
 
-    // Ask the CSP to drop DKG key material related to transcripts that are no
-    // longer relevant
+    /// Ask the CSP to drop DKG key material related to transcripts that are no
+    /// longer relevant
     fn delete_inactive_keys(&mut self, pool_reader: &PoolReader<'_>) {
         if let Some(handle) = self.pending_key_removal.take() {
             // To make sure we delete all keys sequentially, we check if another key removal
@@ -351,7 +417,7 @@ impl DkgKeyManager {
             // key removal.
             handle
                 .join()
-                .unwrap_or_else(|err| panic!("Couldn't finish the DKG key removal: {:?}", err));
+                .expect("Key removal thread paniced unexpectedly");
         }
 
         // Create list of transcripts that we need to retain, which is all DKG
@@ -384,21 +450,34 @@ impl DkgKeyManager {
         let crypto = self.crypto.clone();
         let logger = self.logger.clone();
         let handle = std::thread::spawn(move || {
-            NiDkgAlgorithm::retain_only_active_keys(&*crypto, transcripts_to_retain)
-                .unwrap_or_else(|err| error!(logger, "Could not delete DKG keys: {:?}", err));
+            match NiDkgAlgorithm::retain_only_active_keys(&*crypto, transcripts_to_retain) {
+                Ok(()) => (),
+                // If we fail due to a transient error, we simply do nothing.
+                // The next delete cycle will remove the keys.
+                Err(err) if !err.is_reproducible() => {
+                    warn!(
+                        logger,
+                        "Could not delete DKG keys (Crypto temporarily unavailable): {:?}", err
+                    )
+                }
+                // On a replicated error, we need to log an error
+                Err(err) => error!(logger, "Could not delete DKG keys: {:?}", err),
+            }
         });
         self.pending_key_removal = Some(handle);
     }
 
-    // Uses the provided summary to update the DKG metrics. Should only be used on
-    // the summary for the last finalized DKG summary block.
+    /// Uses the provided summary to update the DKG metrics. Should only be used on
+    /// the summary for the last finalized DKG summary block.
     fn update_dkg_metrics(&self, summary: &Summary) {
         self.metrics
             .consensus_membership_registry_version
             .set(summary.registry_version.get() as i64);
+
         for tag in [NiDkgTag::LowThreshold, NiDkgTag::HighThreshold].iter() {
             let current_transcript = summary.current_transcript(tag);
             let metric_label = &format!("{:?}", tag);
+
             self.metrics
                 .dkg_instance_id
                 .with_label_values(&[metric_label])
@@ -407,6 +486,7 @@ impl DkgKeyManager {
                 .current_committee_size
                 .with_label_values(&[metric_label])
                 .set(current_transcript.committee.count().get().into());
+
             if summary.next_transcript(tag).is_none() && summary.height > Height::from(0) {
                 warn!(
                     self.logger,
@@ -422,8 +502,7 @@ impl DkgKeyManager {
         }
     }
 
-    /// Joins on all thread handles. It is supposed to be used in testing
-    /// only to avoid race conditions and zombie threads.
+    /// Joins on all thread handles.
     pub(crate) fn sync(&mut self) {
         self.pending_transcript_loads
             .drain()
@@ -439,9 +518,6 @@ impl DkgKeyManager {
     }
 }
 
-// We do not need the drop in production scenario, as the replica does not
-// support a graceful shutdown, but we need it for tests where the components
-// might be dropped.
 impl Drop for DkgKeyManager {
     fn drop(&mut self) {
         self.sync()
@@ -456,8 +532,8 @@ mod tests {
     use ic_test_utilities::{
         crypto::CryptoReturningOk,
         types::ids::{node_test_id, subnet_test_id},
-        with_test_replica_logger,
     };
+    use ic_test_utilities_logger::with_test_replica_logger;
     use ic_test_utilities_registry::SubnetRecordBuilder;
 
     #[test]
@@ -477,8 +553,12 @@ mod tests {
                     )],
                 );
                 let csp = Arc::new(CryptoReturningOk::default());
-                let mut key_manager =
-                    DkgKeyManager::new(MetricsRegistry::new(), csp.clone(), logger);
+                let mut key_manager = DkgKeyManager::new(
+                    MetricsRegistry::new(),
+                    csp.clone(),
+                    logger,
+                    &PoolReader::new(&pool),
+                );
 
                 // Emulate the first invocation of the dkg key manager and make sure all
                 // transcripts (exactly 2) were loaded from the genesis summary.

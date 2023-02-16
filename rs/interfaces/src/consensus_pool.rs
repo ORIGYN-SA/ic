@@ -9,10 +9,10 @@ use ic_protobuf::types::v1 as pb;
 use ic_types::{
     artifact::ConsensusMessageId,
     consensus::{
-        catchup::CUPWithOriginalProtobuf, Block, BlockProposal, CatchUpPackage,
-        CatchUpPackageShare, ConsensusMessage, ContentEq, Finalization, FinalizationShare,
-        HasHeight, HashedBlock, Notarization, NotarizationShare, RandomBeacon, RandomBeaconShare,
-        RandomTape, RandomTapeShare,
+        catchup::CUPWithOriginalProtobuf, ecdsa::EcdsaPayload, Block, BlockProposal,
+        CatchUpPackage, CatchUpPackageShare, ConsensusMessage, ContentEq, Finalization,
+        FinalizationShare, HasHeight, HashedBlock, Notarization, NotarizationShare, RandomBeacon,
+        RandomBeaconShare, RandomTape, RandomTapeShare,
     },
     time::Time,
     Height,
@@ -20,7 +20,9 @@ use ic_types::{
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
-// tag::change_set[]
+/// The height, at which we consider a replica to be behind
+pub const HEIGHT_CONSIDERED_BEHIND: Height = Height::new(20);
+
 pub type ChangeSet = Vec<ChangeAction>;
 
 /// Change actions applicable to the consensus pool.
@@ -35,7 +37,6 @@ pub enum ChangeAction {
     PurgeValidatedBelow(Height),
     PurgeUnvalidatedBelow(Height),
 }
-// end::change_set[]
 
 impl From<ChangeAction> for ChangeSet {
     fn from(action: ChangeAction) -> Self {
@@ -254,8 +255,7 @@ pub trait HeightIndexedPool<T> {
     fn get_highest(&self) -> Result<T, OnlyError>;
 
     /// Return an iterator over instances of artifact of type T at the highest
-    /// height currently in the pool. Returns an error if there isn't one, or
-    /// if there are more than one.
+    /// height currently in the pool.
     fn get_highest_iter(&self) -> Box<dyn Iterator<Item = T>>;
 }
 // end::interface[]
@@ -307,6 +307,15 @@ pub trait ConsensusPoolCache: Send + Sync {
         let catchup_package_height = self.catch_up_package().height();
         certified_height.max(catchup_package_height)
     }
+
+    /// Returns true if the `certified_height` provided is significantly behind the
+    /// `certified_height` referenced by the current finalized block.
+    ///
+    /// This indicates that the node does not have a recent certified state.
+    fn is_replica_behind(&self, certified_height: Height) -> bool {
+        certified_height + HEIGHT_CONSIDERED_BEHIND
+            < self.finalized_block().context.certified_height
+    }
 }
 
 /// Cache of blocks from the block chain.
@@ -319,15 +328,21 @@ pub trait ConsensusBlockCache: Send + Sync {
 /// Snapshot of the block chain
 #[allow(clippy::len_without_is_empty)]
 pub trait ConsensusBlockChain: Send + Sync {
-    /// Returns the highest block in the chain.
-    fn tip(&self) -> Block;
+    /// Returns the height and the ECDSA payload of the tip in the block chain.
+    fn tip(&self) -> (Height, Option<Arc<EcdsaPayload>>);
 
-    /// Returns the block at the given height from the chain. The implementation
-    /// can choose the number of past blocks to cache.
-    fn block(&self, height: Height) -> Option<Block>;
+    /// Returns the ECDSA payload from the block at the given height.
+    /// The implementation can choose the number of past blocks to cache.
+    fn ecdsa_payload(&self, height: Height) -> Result<Arc<EcdsaPayload>, ConsensusBlockChainErr>;
 
     /// Returns the length of the chain.
     fn len(&self) -> usize;
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ConsensusBlockChainErr {
+    BlockNotFound(Height),
+    EcdsaPayloadNotFound(Height),
 }
 
 /// An iterator for block ancestors.

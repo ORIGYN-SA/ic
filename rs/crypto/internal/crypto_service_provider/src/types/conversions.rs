@@ -1,48 +1,26 @@
 //! Type conversion utilities
 
 use super::{
-    CspDealing, CspDkgTranscript, CspPop, CspPublicCoefficients, CspPublicKey, CspSecretKey,
-    CspSignature, MultiBls12_381_Signature, SigConverter, ThresBls12_381_Signature,
+    CspPop, CspPublicKey, CspSecretKey, CspSignature, MultiBls12_381_Signature, SigConverter,
+    ThresBls12_381_Signature,
 };
 use ic_crypto_internal_basic_sig_ecdsa_secp256k1::types as ecdsa_secp256k1_types;
 use ic_crypto_internal_basic_sig_ecdsa_secp256r1::types as ecdsa_secp256r1_types;
 use ic_crypto_internal_basic_sig_ed25519::types as ed25519_types;
 use ic_crypto_internal_basic_sig_rsa_pkcs1 as rsa;
 use ic_crypto_internal_multi_sig_bls12381::types as multi_types;
-use ic_crypto_internal_threshold_sig_bls12381::api::dkg_errors;
-use ic_crypto_internal_threshold_sig_bls12381::dkg::secp256k1::types::EphemeralKeySetBytes;
 use ic_crypto_internal_threshold_sig_bls12381::types as threshold_types;
 use ic_protobuf::registry::crypto::v1::PublicKey as PublicKeyProto;
-use ic_types::crypto::dkg::EncryptionPublicKeyPop;
-use ic_types::crypto::dkg::{Transcript, TranscriptBytes};
-use ic_types::crypto::{AlgorithmId, CryptoError, KeyId, UserPublicKey};
+use ic_types::crypto::{AlgorithmId, CryptoError, UserPublicKey};
 use std::convert::TryFrom;
 use std::fmt;
 
 pub mod dkg_id_to_key_id;
 
-use crate::types::CspEncryptedSecretKey;
 use ic_crypto_internal_multi_sig_bls12381::types::conversions::protobuf::PopBytesFromProtoError;
-use ic_crypto_internal_threshold_sig_bls12381::dkg::secp256k1::types::CLibDealingBytes;
-use ic_crypto_sha::{Context, DomainSeparationContext};
-use openssl::sha::Sha256;
 
 #[cfg(test)]
 mod tests;
-
-/// Create a key identifier from the public coefficients
-// TODO (CRP-821): Tests - take the existing ones from classic DKG.
-pub fn key_id_from_csp_pub_coeffs(csp_public_coefficients: &CspPublicCoefficients) -> KeyId {
-    let mut hash = Sha256::new();
-    hash.update(
-        DomainSeparationContext::new("KeyId from threshold public coefficients").as_bytes(),
-    );
-    hash.update(
-        &serde_cbor::to_vec(&csp_public_coefficients)
-            .expect("Failed to serialize public coefficients"),
-    );
-    KeyId::from(hash.finish())
-}
 
 impl From<&CspPublicKey> for AlgorithmId {
     fn from(public_key: &CspPublicKey) -> Self {
@@ -52,16 +30,6 @@ impl From<&CspPublicKey> for AlgorithmId {
             CspPublicKey::Ed25519(_) => AlgorithmId::Ed25519,
             CspPublicKey::MultiBls12_381(_) => AlgorithmId::MultiBls12_381,
             CspPublicKey::RsaSha256(_) => AlgorithmId::RsaSha256,
-        }
-    }
-}
-
-impl From<&CspDkgTranscript> for CspPublicCoefficients {
-    fn from(csp_dkg_transcript: &CspDkgTranscript) -> Self {
-        match csp_dkg_transcript {
-            CspDkgTranscript::Secp256k1(clib_transcript) => {
-                CspPublicCoefficients::Bls12_381(clib_transcript.public_coefficients.clone())
-            }
         }
     }
 }
@@ -93,10 +61,17 @@ impl TryFrom<PublicKeyProto> for CspPublicKey {
     // TODO (CRP-540): move the key bytes from pk_proto.key_value to the
     //   resulting csp_pk (instead of copying/cloning them).
     fn try_from(pk_proto: PublicKeyProto) -> Result<Self, Self::Error> {
+        Self::try_from(&pk_proto)
+    }
+}
+
+impl TryFrom<&PublicKeyProto> for CspPublicKey {
+    type Error = CryptoError;
+    fn try_from(pk_proto: &PublicKeyProto) -> Result<Self, Self::Error> {
         match AlgorithmId::from(pk_proto.algorithm) {
             AlgorithmId::Ed25519 => {
                 let public_key_bytes =
-                    ed25519_types::PublicKeyBytes::try_from(&pk_proto).map_err(|e| {
+                    ed25519_types::PublicKeyBytes::try_from(pk_proto).map_err(|e| {
                         CryptoError::MalformedPublicKey {
                             algorithm: AlgorithmId::Ed25519,
                             key_bytes: Some(e.key_bytes),
@@ -107,7 +82,7 @@ impl TryFrom<PublicKeyProto> for CspPublicKey {
             }
             AlgorithmId::MultiBls12_381 => {
                 let public_key_bytes =
-                    multi_types::PublicKeyBytes::try_from(&pk_proto).map_err(|e| {
+                    multi_types::PublicKeyBytes::try_from(pk_proto).map_err(|e| {
                         CryptoError::MalformedPublicKey {
                             algorithm: AlgorithmId::MultiBls12_381,
                             key_bytes: Some(e.key_bytes),
@@ -208,7 +183,6 @@ impl AsRef<[u8]> for CspPop {
     fn as_ref(&self) -> &[u8] {
         match self {
             CspPop::MultiBls12_381(sig_bytes) => &sig_bytes.0,
-            CspPop::Secp256k1(sig_bytes) => &sig_bytes.0,
         }
     }
 }
@@ -280,8 +254,8 @@ impl TryFrom<&UserPublicKey> for CspPublicKey {
 impl TryFrom<CspSecretKey> for threshold_types::SecretKeyBytes {
     type Error = CspSecretKeyConversionError;
     fn try_from(value: CspSecretKey) -> Result<Self, Self::Error> {
-        if let CspSecretKey::ThresBls12_381(key) = value {
-            Ok(key)
+        if let CspSecretKey::ThresBls12_381(key) = &value {
+            Ok(key.clone())
         } else {
             // TODO (CRP-822): Add the error type to the error message.
             Err(CspSecretKeyConversionError::WrongSecretKeyType {})
@@ -325,68 +299,10 @@ impl TryFrom<CspSignature> for threshold_types::CombinedSignatureBytes {
     }
 }
 
-impl TryFrom<CspSecretKey> for EphemeralKeySetBytes {
-    type Error = dkg_errors::MalformedSecretKeyError;
-    fn try_from(value: CspSecretKey) -> Result<Self, Self::Error> {
-        if let CspSecretKey::Secp256k1WithPublicKey(key_set) = value {
-            Ok(key_set)
-        } else {
-            Err(dkg_errors::MalformedSecretKeyError {
-                algorithm: AlgorithmId::Secp256k1,
-                internal_error: "Could not parse ephemeral key set".to_string(),
-            })
-        }
-    }
-}
-
-impl From<CLibDealingBytes> for CspDealing {
-    fn from(clib_dealing: CLibDealingBytes) -> CspDealing {
-        CspDealing {
-            common_data: CspPublicCoefficients::Bls12_381(clib_dealing.public_coefficients),
-            receiver_data: clib_dealing
-                .receiver_data
-                .iter()
-                .map(|data_maybe| data_maybe.map(CspEncryptedSecretKey::ThresBls12_381))
-                .collect(),
-        }
-    }
-}
-
 impl SigConverter {
     pub fn for_target(algorithm: AlgorithmId) -> Self {
         SigConverter {
             target_algorithm: algorithm,
         }
-    }
-}
-
-impl From<&CspPop> for EncryptionPublicKeyPop {
-    fn from(csp_pop: &CspPop) -> Self {
-        EncryptionPublicKeyPop(
-            serde_cbor::to_vec(csp_pop).expect("Cannot serialize csp encryption public key pop"),
-        )
-    }
-}
-
-/// Decode the public coefficients from a transcript
-pub fn csp_pub_coeffs_from_transcript(transcript: &Transcript) -> CspPublicCoefficients {
-    let csp_transcript = CspDkgTranscript::from(&transcript.transcript_bytes);
-    CspPublicCoefficients::from(&csp_transcript)
-}
-
-// TODO (CRP-362): implement the conversion properly once we have agreement
-impl From<&TranscriptBytes> for CspDkgTranscript {
-    fn from(transcript_bytes: &TranscriptBytes) -> Self {
-        serde_cbor::from_slice(transcript_bytes.0.as_slice())
-            .expect("cannot deserialize transcript bytes into CSP transcript")
-    }
-}
-
-// TODO (CRP-362): implement the conversion properly once we have agreement
-impl From<&CspDkgTranscript> for TranscriptBytes {
-    fn from(csp_dkg_transcript: &CspDkgTranscript) -> Self {
-        TranscriptBytes(
-            serde_cbor::to_vec(csp_dkg_transcript).expect("Cannot serialize CSP DKG transcript"),
-        )
     }
 }

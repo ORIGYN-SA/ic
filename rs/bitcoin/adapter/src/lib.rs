@@ -6,11 +6,7 @@
 
 use bitcoin::{network::message::NetworkMessage, BlockHash, BlockHeader};
 use parking_lot::RwLock;
-use std::{
-    net::SocketAddr,
-    sync::Arc,
-    time::{Duration, Instant},
-};
+use std::{net::SocketAddr, sync::Arc, time::Instant};
 /// This module contains the AddressManager struct. The struct stores addresses
 /// that will be used to create new connections. It also tracks addresses that
 /// are in current use to encourage use from non-utilized addresses.
@@ -22,17 +18,20 @@ mod addressbook;
 mod blockchainmanager;
 /// This module contains the data structure for storing the current state of the Bitcoin ledger
 mod blockchainstate;
+/// This module contains command line arguments parser.
+pub mod cli;
 /// This module contains constants and types that are shared by many modules.
 mod common;
 /// This module contains the basic configuration struct used to start up an
 /// adapter instance.
-mod config;
+pub mod config;
 /// This module contains code that is used to manage a single connection to a
 /// BTC node.
 mod connection;
 /// This module contains code that is used to manage multiple connections to
 /// BTC nodes.
 mod connectionmanager;
+mod metrics;
 /// The module is responsible for awaiting messages from bitcoin peers and dispaching them
 /// to the correct component.
 mod router;
@@ -42,14 +41,11 @@ mod rpc_server;
 mod stream;
 mod transaction_manager;
 
-mod cli;
 mod get_successors_handler;
 
 pub use blockchainmanager::BlockchainManager;
 pub use blockchainstate::BlockchainState;
-pub use cli::Cli;
 use common::BlockHeight;
-pub use config::{Config, IncomingSource};
 pub use get_successors_handler::GetSuccessorsHandler;
 pub use router::start_router;
 pub use rpc_server::spawn_grpc_server;
@@ -83,7 +79,7 @@ pub enum ChannelError {
     NotAvailable,
 }
 
-/// This trait is to provide an interface so that ti
+/// This trait is to provide an interface so that managers can communicate to BTC nodes.
 pub trait Channel {
     /// This method is used to send a message to a specific connection
     /// or to all connections based on the [Command](Command)'s fields.
@@ -92,6 +88,9 @@ pub trait Channel {
     /// This method is used to retrieve a list of available connections
     /// that have completed the version handshake.
     fn available_connections(&self) -> Vec<SocketAddr>;
+
+    /// Used to disconnect from nodes that are misbehaving.
+    fn discard(&mut self, addr: &SocketAddr);
 }
 
 /// This trait provides an interface to anything that may need to react to a
@@ -131,7 +130,7 @@ pub enum BlockchainManagerRequest {
     /// Inform the adapter to enqueue the next block headers into the syncing queue.
     EnqueueNewBlocksToDownload(Vec<BlockHeader>),
     /// Inform the adapter to prune the following block hashes from the cache.
-    PruneOldBlocks(Vec<BlockHash>),
+    PruneBlocks(BlockHash, Vec<BlockHash>),
 }
 
 /// The transaction manager is owned by a single thread which listens on a channel
@@ -147,7 +146,16 @@ pub enum TransactionManagerRequest {
 #[derive(Clone)]
 pub struct AdapterState {
     /// The field contains instant of the latest received request.
-    last_received_at: Arc<RwLock<Instant>>,
+    /// None means that we haven't reveived a request yet and the adapter should be in idle mode!
+    ///
+    /// !!! BE CAREFUL HERE !!! since the adapter should ALWAYS be idle when starting up.
+    /// This is important because most subnets will have bitcoin integration disabled and we don't want
+    /// to unnecessary download bitcoin data.
+    /// In a previous iteration we set this value to at least 'idle_seconds' in the past on startup.
+    /// This way the adapter would always be in idle when starting since 'elapsed()' is greater than 'idle_seconds'.
+    /// On MacOS this approach caused issues since on MacOS Instant::now() is time since boot and when substracting
+    /// 'idle_seconds' we encountered an underflow and paniced.
+    last_received_at: Arc<RwLock<Option<Instant>>>,
     /// The field contains how long the adapter should wait to before becoming idle.
     idle_seconds: u64,
 }
@@ -156,22 +164,23 @@ impl AdapterState {
     /// Crates new instance of the AdapterState.
     pub fn new(idle_seconds: u64) -> Self {
         Self {
-            // On purpose we pick such time so we are idle when created.
-            last_received_at: Arc::new(RwLock::new(
-                Instant::now() - Duration::from_secs(idle_seconds + 1),
-            )),
+            last_received_at: Arc::new(RwLock::new(None)),
             idle_seconds,
         }
     }
 
     /// Returns if the adapter is idle.
     pub fn is_idle(&self) -> bool {
-        self.last_received_at.read().elapsed().as_secs() > self.idle_seconds
+        match *self.last_received_at.read() {
+            Some(last) => last.elapsed().as_secs() > self.idle_seconds,
+            // Nothing received yet still in idle from startup.
+            None => true,
+        }
     }
 
     /// Updates the current state of the adapter given a request was received.
     pub fn received_now(&self) {
         // Instant::now() is monotonically nondecreasing clock.
-        *self.last_received_at.write() = Instant::now();
+        *self.last_received_at.write() = Some(Instant::now());
     }
 }

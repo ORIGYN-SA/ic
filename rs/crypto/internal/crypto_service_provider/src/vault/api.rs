@@ -1,7 +1,10 @@
 use crate::api::{CspCreateMEGaKeyError, CspThresholdSignError};
-use crate::secret_key_store::{Scope, SecretKeyStoreError};
+use crate::key_id::{KeyId, KeyIdInstantiationError};
+use crate::types::CspPublicCoefficients;
 use crate::types::{CspPop, CspPublicKey, CspSignature};
-use crate::types::{CspPublicCoefficients, CspSecretKey};
+use crate::ExternalPublicKeys;
+use ic_crypto_internal_logmon::metrics::KeyCounts;
+use ic_crypto_internal_seed::Seed;
 use ic_crypto_internal_threshold_sig_bls12381::api::ni_dkg_errors;
 use ic_crypto_internal_threshold_sig_ecdsa::{
     CommitmentOpening, IDkgComplaintInternal, IDkgDealingInternal, IDkgTranscriptInternal,
@@ -13,16 +16,20 @@ use ic_crypto_internal_types::encrypt::forward_secure::{
 use ic_crypto_internal_types::sign::threshold_sig::ni_dkg::{
     CspNiDkgDealing, CspNiDkgTranscript, Epoch,
 };
+use ic_crypto_node_key_validation::ValidNodePublicKeys;
 use ic_crypto_tls_interfaces::TlsPublicKeyCert;
 use ic_types::crypto::canister_threshold_sig::error::{
-    IDkgCreateDealingError, IDkgLoadTranscriptError, IDkgOpenTranscriptError,
+    IDkgCreateDealingError, IDkgLoadTranscriptError, IDkgOpenTranscriptError, IDkgRetainKeysError,
     IDkgVerifyDealingPrivateError, ThresholdEcdsaSignShareError,
 };
 use ic_types::crypto::canister_threshold_sig::ExtendedDerivationPath;
-use ic_types::crypto::{AlgorithmId, KeyId};
+use ic_types::crypto::{AlgorithmId, CryptoError, CurrentNodePublicKeys};
 use ic_types::{NodeId, NodeIndex, NumberOfNodes, Randomness};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
+
+#[cfg(test)]
+mod tests;
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum CspBasicSignatureError {
@@ -35,6 +42,7 @@ pub enum CspBasicSignatureError {
     },
     WrongSecretKeyType {
         algorithm: AlgorithmId,
+        secret_key_variant: String,
     },
     MalformedSecretKey {
         algorithm: AlgorithmId,
@@ -46,8 +54,9 @@ pub enum CspBasicSignatureError {
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum CspBasicSignatureKeygenError {
-    UnsupportedAlgorithm { algorithm: AlgorithmId },
     InternalError { internal_error: String },
+    DuplicateKeyId { key_id: KeyId },
+    TransientInternalError { internal_error: String },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -61,6 +70,7 @@ pub enum CspMultiSignatureError {
     },
     WrongSecretKeyType {
         algorithm: AlgorithmId,
+        secret_key_variant: String,
     },
     InternalError {
         internal_error: String,
@@ -69,15 +79,18 @@ pub enum CspMultiSignatureError {
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum CspMultiSignatureKeygenError {
-    UnsupportedAlgorithm {
-        algorithm: AlgorithmId,
-    },
     MalformedPublicKey {
         algorithm: AlgorithmId,
         key_bytes: Option<Vec<u8>>,
         internal_error: String,
     },
     InternalError {
+        internal_error: String,
+    },
+    DuplicateKeyId {
+        key_id: KeyId,
+    },
+    TransientInternalError {
         internal_error: String,
     },
 }
@@ -90,17 +103,265 @@ pub enum CspThresholdSignatureKeygenError {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub enum CspTlsKeygenError {
+pub enum CspSecretKeyStoreContainsError {
     InternalError { internal_error: String },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub enum CspTlsSignError {
-    SecretKeyNotFound { key_id: KeyId },
-    WrongSecretKeyType { algorithm: AlgorithmId },
-    MalformedSecretKey { error: String },
-    SigningFailed { error: String },
+pub enum CspPublicKeyStoreError {
+    // TODO: CRP-1719 add more error variants if necessary
+    TransientInternalError(String),
+}
+
+impl From<CspPublicKeyStoreError> for CryptoError {
+    fn from(e: CspPublicKeyStoreError) -> CryptoError {
+        match e {
+            CspPublicKeyStoreError::TransientInternalError(details) => {
+                CryptoError::TransientInternalError {
+                    internal_error: format!("Error retrieving public keys: {:?}", details),
+                }
+            }
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum CspTlsKeygenError {
+    InvalidNotAfterDate { message: String, not_after: String },
     InternalError { internal_error: String },
+    DuplicateKeyId { key_id: KeyId },
+    TransientInternalError { internal_error: String },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum CspTlsSignError {
+    SecretKeyNotFound {
+        key_id: KeyId,
+    },
+    WrongSecretKeyType {
+        algorithm: AlgorithmId,
+        secret_key_variant: String,
+    },
+    MalformedSecretKey {
+        error: String,
+    },
+    SigningFailed {
+        error: String,
+    },
+    InternalError {
+        internal_error: String,
+    },
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct NodeKeysErrors {
+    pub node_signing_key_error: Option<NodeKeysError>,
+    pub committee_signing_key_error: Option<NodeKeysError>,
+    pub tls_certificate_error: Option<NodeKeysError>,
+    pub dkg_dealing_encryption_key_error: Option<NodeKeysError>,
+    pub idkg_dealing_encryption_key_error: Option<NodeKeysError>,
+}
+
+impl NodeKeysErrors {
+    pub fn no_error() -> Self {
+        NodeKeysErrors {
+            node_signing_key_error: None,
+            committee_signing_key_error: None,
+            tls_certificate_error: None,
+            dkg_dealing_encryption_key_error: None,
+            idkg_dealing_encryption_key_error: None,
+        }
+    }
+
+    pub fn keys_in_registry_missing_locally(&self) -> bool {
+        self.node_signing_key_error.as_ref().map_or(false, |err| {
+            err.external_public_key_error.is_none()
+                && err.contains_local_public_or_secret_key_error()
+        }) || self
+            .committee_signing_key_error
+            .as_ref()
+            .map_or(false, |err| {
+                err.external_public_key_error.is_none()
+                    && err.contains_local_public_or_secret_key_error()
+            })
+            || self.tls_certificate_error.as_ref().map_or(false, |err| {
+                err.external_public_key_error.is_none()
+                    && err.contains_local_public_or_secret_key_error()
+            })
+            || self
+                .dkg_dealing_encryption_key_error
+                .as_ref()
+                .map_or(false, |err| {
+                    err.external_public_key_error.is_none()
+                        && err.contains_local_public_or_secret_key_error()
+                })
+            || self
+                .idkg_dealing_encryption_key_error
+                .as_ref()
+                .map_or(false, |err| {
+                    err.external_public_key_error.is_none()
+                        && err.contains_local_public_or_secret_key_error()
+                })
+    }
+}
+
+impl From<&NodeKeysErrors> for KeyCounts {
+    fn from(err: &NodeKeysErrors) -> Self {
+        KeyCounts::ZERO
+            + err
+                .node_signing_key_error
+                .as_ref()
+                .map_or(KeyCounts::ONE, KeyCounts::from)
+            + err
+                .committee_signing_key_error
+                .as_ref()
+                .map_or(KeyCounts::ONE, KeyCounts::from)
+            + err
+                .tls_certificate_error
+                .as_ref()
+                .map_or(KeyCounts::ONE, KeyCounts::from)
+            + err
+                .dkg_dealing_encryption_key_error
+                .as_ref()
+                .map_or(KeyCounts::ONE, KeyCounts::from)
+            + err
+                .idkg_dealing_encryption_key_error
+                .as_ref()
+                .map_or(KeyCounts::ONE, KeyCounts::from)
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct NodeKeysError {
+    pub external_public_key_error: Option<ExternalPublicKeyError>,
+    pub local_public_key_error: Option<LocalPublicKeyError>,
+    pub secret_key_error: Option<SecretKeyError>,
+}
+
+impl NodeKeysError {
+    pub fn no_error() -> Self {
+        NodeKeysError {
+            external_public_key_error: None,
+            local_public_key_error: None,
+            secret_key_error: None,
+        }
+    }
+
+    fn contains_local_public_or_secret_key_error(&self) -> bool {
+        self.local_public_key_error.is_some() || self.secret_key_error.is_some()
+    }
+}
+
+/// Calculates a [`KeyCount`] from provided [`NodeKeysError`].
+///
+/// If there is no error for a particular key, it is deemed to be present, and the count is 1.
+/// If there is an error for a particular key, it is deemed to not be present, and the count is 0.
+///
+/// # Example
+///```
+///  # use ic_crypto_internal_csp::vault::api::{ExternalPublicKeyError, LocalPublicKeyError, NodeKeysError, SecretKeyError};
+///  # use ic_crypto_internal_logmon::metrics::KeyCounts;
+///  let all_ok = NodeKeysError {
+///      external_public_key_error: None,
+///      local_public_key_error: None,
+///      secret_key_error: None
+///  };
+///  let ok_key_counts = KeyCounts::from(&all_ok);
+///  assert_eq!(
+///      ok_key_counts,
+///      KeyCounts::ONE
+///  );
+///  let no_keys_present = NodeKeysError {
+///      external_public_key_error: Some(ExternalPublicKeyError(Box::new("malformed external public key".to_string()))),
+///      local_public_key_error: Some(LocalPublicKeyError::Mismatch),
+///      secret_key_error: Some(SecretKeyError::CannotComputeKeyId)
+///  };
+///  let empty_key_counts = KeyCounts::from(&no_keys_present);
+///  assert_eq!(
+///      empty_key_counts,
+///      KeyCounts::new(0, 0, 0)
+///  );
+///  let local_keys_missing = NodeKeysError {
+///      external_public_key_error: None,
+///      local_public_key_error: Some(LocalPublicKeyError::NotFound),
+///      secret_key_error: Some(SecretKeyError::NotFound)
+///  };
+///  let partial_key_count = KeyCounts::from(&local_keys_missing);
+///  assert_eq!(
+///      partial_key_count,
+///      KeyCounts::new(1, 0, 0)
+///  );
+///```
+impl From<&NodeKeysError> for KeyCounts {
+    fn from(err: &NodeKeysError) -> Self {
+        KeyCounts::new(
+            err.external_public_key_error.as_ref().map_or(1, |_err| 0),
+            err.local_public_key_error.as_ref().map_or(1, |_err| 0),
+            err.secret_key_error.as_ref().map_or(1, |_err| 0),
+        )
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct ExternalPublicKeyError(pub Box<String>);
+
+impl From<KeyIdInstantiationError> for ExternalPublicKeyError {
+    fn from(error: KeyIdInstantiationError) -> Self {
+        ExternalPublicKeyError(Box::new(format!("Cannot instantiate KeyId: {:?}", error)))
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum LocalPublicKeyError {
+    /// No local public key exists.
+    NotFound,
+    /// A local public key exists, but it is not the same as the external key passed in.
+    Mismatch,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum SecretKeyError {
+    /// Unable to compute the key ID using the externally provided public key.
+    CannotComputeKeyId,
+    /// A local secret key matching the externally provided public key does not exist
+    NotFound,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum PksAndSksContainsErrors {
+    /// If one or more keys were missing, or were malformed, or did not match the corresponding
+    /// external public key.
+    NodeKeysErrors(NodeKeysErrors),
+    /// If a transient internal error occurs, e.g., an RPC error communicating with the remote vault
+    TransientInternalError(String),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum PksAndSksCompleteError {
+    /// Public key store does not contain any public key
+    EmptyPublicKeyStore,
+    /// Error checking node signing public key and secret key
+    NodeSigningKeyError(PksAndSksCompleteKeyPairError),
+    /// Error checking committee signing public key and secret key
+    CommitteeSigningKeyError(PksAndSksCompleteKeyPairError),
+    /// Error checking TLS certificate and secret key
+    TlsCertificateError(PksAndSksCompleteKeyPairError),
+    /// Error checking dkg dealing encryption public key and secret key
+    DkgDealingEncryptionKeyError(PksAndSksCompleteKeyPairError),
+    /// Error checking one of IDKG dealing encryption public and secret key pairs
+    IdkgDealingEncryptionKeyError(PksAndSksCompleteKeyPairError),
+    /// If a transient internal error occurs, e.g., an RPC error communicating with the remote vault
+    TransientInternalError(String),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum PksAndSksCompleteKeyPairError {
+    /// Expected public key is missing
+    PublicKeyNotFound,
+    /// Public key is somehow malformed or a key ID cannot be computed from it.
+    PublicKeyInvalid,
+    /// Secret key is missing
+    SecretKeyNotFound,
 }
 
 /// `CspVault` offers a selection of operations that involve
@@ -114,8 +375,12 @@ pub trait CspVault:
     + ThresholdEcdsaSignerCspVault
     + SecretKeyStoreCspVault
     + TlsHandshakeCspVault
+    + PublicRandomSeedGenerator
+    + PublicAndSecretKeyStoreCspVault
+    + PublicKeyStoreCspVault
 {
 }
+
 // Blanket implementation of `CspVault` for all types that fulfill the
 // requirements.
 impl<T> CspVault for T where
@@ -127,6 +392,9 @@ impl<T> CspVault for T where
         + ThresholdEcdsaSignerCspVault
         + SecretKeyStoreCspVault
         + TlsHandshakeCspVault
+        + PublicRandomSeedGenerator
+        + PublicAndSecretKeyStoreCspVault
+        + PublicKeyStoreCspVault
 {
 }
 
@@ -156,16 +424,22 @@ pub trait BasicSignatureCspVault {
         key_id: KeyId,
     ) -> Result<CspSignature, CspBasicSignatureError>;
 
-    /// Generates a public/private key pair.
+    /// Generates a node signing public/private key pair.
     ///
-    /// # Arguments
-    /// * `algorithm_id` specifies the signature algorithm
     /// # Returns
-    /// The key ID and the public key of the keypair
-    fn gen_key_pair(
-        &self,
-        algorithm_id: AlgorithmId,
-    ) -> Result<(KeyId, CspPublicKey), CspBasicSignatureKeygenError>;
+    /// Generated public key.
+    ///
+    /// # Errors
+    /// * `CspBasicSignatureKeygenError::InternalError` if there is an internal
+    ///   error (e.g., the public key in the public key store is already set).
+    /// * `CspBasicSignatureKeygenError::DuplicateKeyId` if there already
+    ///   exists a secret key in the store for the secret key ID derived from
+    ///   the public part of the randomly generated key pair. This error
+    ///   most likely indicates a bad randomness source.
+    /// * `CspBasicSignatureKeygenError::TransientInternalError` if there is a
+    ///   transient internal error, e.g., an IO error when writing a key to
+    ///   disk, or an RPC error when calling a remote CSP vault.
+    fn gen_node_signing_key_pair(&self) -> Result<CspPublicKey, CspBasicSignatureKeygenError>;
 }
 
 /// Operations of `CspVault` related to multi-signatures
@@ -191,16 +465,24 @@ pub trait MultiSignatureCspVault {
         key_id: KeyId,
     ) -> Result<CspSignature, CspMultiSignatureError>;
 
-    /// Generates a public/private key pair, with a proof-of-possession.
+    /// Generates a public/private key pair, with a proof of possession.
     ///
-    /// # Arguments
-    /// * `algorithm_id` specifies the signature algorithm
     /// # Returns
-    /// The key ID, the public key of the keypair, and the proof-of-possession.
-    fn gen_key_pair_with_pop(
+    /// The public key of the keypair and the proof of possession.
+    ///
+    /// # Errors
+    /// * `CspMultiignatureKeygenError::InternalError` if there is an internal
+    ///   error (e.g., the public key in the public key store is already set).
+    /// * `CspMultiSignatureKeygenError::DuplicateKeyId` if there already
+    ///   exists a secret key in the store for the secret key ID derived from
+    ///   the public part of the randomly generated key pair. This error
+    ///   most likely indicates a bad randomness source.
+    /// * `CspMultiSignatureKeygenError::TransientInternalError` if there is a
+    ///   transient internal error, e.g,. an IO error when writing a key to
+    ///   disk, or an RPC error when calling a remote CSP vault.
+    fn gen_committee_signing_key_pair(
         &self,
-        algorithm_id: AlgorithmId,
-    ) -> Result<(KeyId, CspPublicKey, CspPop), CspMultiSignatureKeygenError>;
+    ) -> Result<(CspPublicKey, CspPop), CspMultiSignatureKeygenError>;
 }
 
 /// Operations of `CspVault` related to threshold signatures
@@ -215,22 +497,18 @@ pub trait ThresholdSignatureCspVault {
     ///   generation.
     /// * `threshold` is the minimum number of signatures that can be combined
     ///   to make a valid threshold signature.
-    /// * `signatory_eligibility` is a boolean indicating, for each signatory,
-    ///   whether they should receive a key.  The `i`th signatory should receive
-    ///   a key if and only if `signatory_eligibility[i]==true`.
+    /// * `receivers` is the total number of receivers
     /// # Returns
     /// * `CspPublicCoefficients` can be used by the caller to verify
     ///   signatures.
-    /// * `Vec<Option<KeyId>>` contains key identifiers.  The vector has the
-    ///   same length as the input `signatory_eligibility` and the i'th entry
-    ///   contains a secret key if and only if `signatory_eligibility[i]` is
-    ///   `true`.
+    /// * `Vec<KeyId>` contains key identifiers.  The vector has the
+    ///   same length as the number of `receivers`.
     /// # Panics
     /// * An implementation MAY panic if it is unable to access the secret key
     ///   store to save keys or if it cannot access a suitable random number
     ///   generator.
     /// # Errors
-    /// * If `threshold > signatory_eligibility.len()` then it is impossible for
+    /// * If `threshold > receivers` then it is impossible for
     ///   the signatories to create a valid combined signature, so
     ///   implementations MUST return an error.
     /// * An implementation MAY return an error if it is temporarily unable to
@@ -239,8 +517,8 @@ pub trait ThresholdSignatureCspVault {
         &self,
         algorithm_id: AlgorithmId,
         threshold: NumberOfNodes,
-        signatory_eligibility: &[bool],
-    ) -> Result<(CspPublicCoefficients, Vec<Option<KeyId>>), CspThresholdSignatureKeygenError>;
+        receivers: NumberOfNodes,
+    ) -> Result<(CspPublicCoefficients, Vec<KeyId>), CspThresholdSignatureKeygenError>;
 
     /// Signs the given message using the specified algorithm and key ID.
     ///
@@ -265,17 +543,20 @@ pub trait ThresholdSignatureCspVault {
 
 /// Operations of `CspVault` related to NI-DKG (cf. `NiDkgCspClient`).
 pub trait NiDkgCspVault {
-    /// Generates a forward-secure key pair used to encrypt threshold key shares
+    /// Generates a forward-secure dealing encryption key pair used to encrypt threshold key shares
     /// in transmission.
     ///
-    /// # Arguments
-    /// * `algorithm_id` specifies the forward-secure encryption algorithm
     /// # Returns
     /// The public key and the corresponding proof-of-possession.
-    fn gen_forward_secure_key_pair(
+    /// # Errors
+    /// * `ni_dkg_errors::CspDkgCreateFsKeyError::InternalError` if there is an internal
+    ///   error (e.g., the public key in the public key store is already set).
+    /// * `ni_dkg_errors::CspDkgCreateFsKeyError::TransientInternalError` if there is a transient
+    ///   internal error, e.g., an IO error when writing a key to disk, or an
+    ///   RPC error when calling a remote CSP vault.
+    fn gen_dealing_encryption_key_pair(
         &self,
         node_id: NodeId,
-        algorithm_id: AlgorithmId,
     ) -> Result<(CspFsEncryptionPublicKey, CspFsEncryptionPop), ni_dkg_errors::CspDkgCreateFsKeyError>;
 
     /// Updates the forward-secure secret key determined by the key id,
@@ -354,27 +635,95 @@ pub trait NiDkgCspVault {
     /// secret key store, that key will be ignored.
     /// # Arguments
     /// * `active_key_ids` identifies threshold keys that should be retained
-    fn retain_threshold_keys_if_present(&self, active_key_ids: BTreeSet<KeyId>);
+    fn retain_threshold_keys_if_present(
+        &self,
+        active_key_ids: BTreeSet<KeyId>,
+    ) -> Result<(), ni_dkg_errors::CspDkgRetainThresholdKeysError>;
 }
 
 /// Operations of `CspVault` related to querying the secret key store (cf.
 /// `CspSecretKeyStoreChecker`).
 pub trait SecretKeyStoreCspVault {
     /// Checks whether the secret key store contains a key with the given
-    /// `key_id`. # Arguments
+    /// `key_id`.
+    ///
+    /// # Arguments
     /// * `key_id` identifies the key whose presence should be checked.
-    fn sks_contains(&self, key_id: &KeyId) -> bool;
+    fn sks_contains(&self, key_id: &KeyId) -> Result<bool, CspSecretKeyStoreContainsError>;
+}
 
-    // TODO(CRP-1326): remove this method.
-    fn insert_secret_key(
+/// Operations of `CspVault` related to querying the public key store.
+pub trait PublicKeyStoreCspVault {
+    /// Returns the node's current public keys where generation timestamps are stripped.
+    ///
+    /// For keys that are periodically rotated (such as the iDKG dealing encryption key pair) only
+    /// the latest public key locally available will be returned.
+    ///
+    /// # Errors
+    /// * if a transient error (e.g., RPC timeout) occurs when accessing the public key store
+    fn current_node_public_keys(&self) -> Result<CurrentNodePublicKeys, CspPublicKeyStoreError>;
+
+    /// Returns the node's current public keys with its generation timestamps.
+    ///
+    /// If timestamps are not needed, you should use [`Self::current_node_public_keys`].
+    /// For keys that are periodically rotated (such as the iDKG dealing encryption key pair) only
+    /// the latest public key locally available will be returned.
+    ///
+    /// # Errors
+    /// * if a transient error (e.g., RPC timeout) occurs when accessing the public key store
+    fn current_node_public_keys_with_timestamps(
         &self,
-        id: KeyId,
-        key: CspSecretKey,
-        scope: Option<Scope>,
-    ) -> Result<(), SecretKeyStoreError>;
+    ) -> Result<CurrentNodePublicKeys, CspPublicKeyStoreError>;
 
-    // TODO(CRP-1326): remove this method.
-    fn get_secret_key(&self, id: &KeyId) -> Option<CspSecretKey>;
+    /// Returns the number of iDKG dealing encryption public keys stored locally.
+    ///
+    /// # Errors
+    /// * if a transient error (e.g., RPC timeout) occurs when accessing the public key store
+    fn idkg_dealing_encryption_pubkeys_count(&self) -> Result<usize, CspPublicKeyStoreError>;
+}
+
+/// Operations of `CspVault` related to querying both the public and private key stores.
+pub trait PublicAndSecretKeyStoreCspVault {
+    /// Checks whether the keys corresponding to the provided external public keys exist locally.
+    /// In particular, this means the provided public keys themselves are stored locally, as well
+    /// as the corresponding secret keys. Key comparisons will not take timestamps into account.
+    ///
+    /// # Parameters
+    /// The current external node public keys and TLS certificate.
+    ///
+    /// # Returns
+    /// An empty result if all the external public keys, and the corresponding secret keys, were
+    /// all found locally.
+    ///
+    /// # Errors
+    /// * `PksAndSksContainsErrors::NodeKeysErrors` if local public or secret keys were not
+    ///   consistent with the provided external keys.
+    /// * `PksAndSksContainsErrors::TransientInternalError` if a transient internal error, e.g., an RPC
+    ///   error, occurred.
+    fn pks_and_sks_contains(
+        &self,
+        external_public_keys: ExternalPublicKeys,
+    ) -> Result<(), PksAndSksContainsErrors>;
+
+    /// Checks whether the public key store and secret key store are complete:
+    /// * all required public keys are present,
+    /// * all public keys in the public key store (corresponding to all required public keys
+    ///   and potentially additionally stored public keys, like rotated IDKG dealing encryption public keys)
+    ///   have a corresponding secret key in the secret key store,
+    /// * all public keys are valid.
+    /// If all check passes, the current node public keys in validated form is returned.
+    ///
+    /// # Errors
+    /// The method return on the first encountered error and will not check further any other key pairs.
+    /// The order in which checks are performed and keys are checked is not part of the API and should not be relied upon.
+    /// * [`PksAndSksCompleteError::EmptyPublicKeyStore`] if there are no public keys
+    /// * [`PksAndSksCompleteError::NodeSigningKeyError`] if there is a problem with the node signing key pair
+    /// * [`PksAndSksCompleteError::CommitteeSigningKeyError`] if there is a problem with the committee signing key pair
+    /// * [`PksAndSksCompleteError::TlsCertificateError`] if there is a problem with the TLS key material
+    /// * [`PksAndSksCompleteError::DkgDealingEncryptionKeyError`] if there is a problem with the DKG dealing encryption key pair
+    /// * [`PksAndSksCompleteError::IdkgDealingEncryptionKeyError`] if there is a problem with any of the IDKG dealing encryption key pairs
+    /// * [`PksAndSksCompleteError::TransientInternalError`] if a transient internal error, e.g., an RPC error, occurred.
+    fn pks_and_sks_complete(&self) -> Result<ValidNodePublicKeys, PksAndSksCompleteError>;
 }
 
 /// Operations of `CspVault` related to TLS handshakes.
@@ -392,7 +741,7 @@ pub trait TlsHandshakeCspVault: Send + Sync {
     ///
     /// Returns the key ID of the secret key, and the public key certificate.
     ///
-    /// # Panics
+    /// # Errors
     /// * if `not_after` is not specified according to RFC 5280 or if
     /// `not_after` is in the past
     /// * if a malformed X509 certificate is generated
@@ -400,7 +749,7 @@ pub trait TlsHandshakeCspVault: Send + Sync {
         &self,
         node: NodeId,
         not_after: &str,
-    ) -> Result<(KeyId, TlsPublicKeyCert), CspTlsKeygenError>;
+    ) -> Result<TlsPublicKeyCert, CspTlsKeygenError>;
 
     /// Signs the given message using the specified algorithm and key ID.
     ///
@@ -452,7 +801,7 @@ pub trait IDkgProtocolCspVault {
         transcript: &IDkgTranscriptInternal,
     ) -> Result<BTreeMap<NodeIndex, IDkgComplaintInternal>, IDkgLoadTranscriptError>;
 
-    /// See [`CspIDkgProtocol::idkg_load_transcript_with_openings`].
+    /// See [`crate::api::CspIDkgProtocol::idkg_load_transcript_with_openings`].
     fn idkg_load_transcript_with_openings(
         &self,
         dealings: &BTreeMap<NodeIndex, IDkgDealingInternal>,
@@ -464,10 +813,9 @@ pub trait IDkgProtocolCspVault {
     ) -> Result<(), IDkgLoadTranscriptError>;
 
     /// Generate a MEGa keypair, for encrypting/decrypting IDkg dealing shares.
-    fn idkg_gen_mega_key_pair(
-        &self,
-        algorithm_id: AlgorithmId,
-    ) -> Result<MEGaPublicKey, CspCreateMEGaKeyError>;
+    ///
+    /// See [`crate::api::CspIDkgProtocol::idkg_gen_dealing_encryption_key_pair`].
+    fn idkg_gen_dealing_encryption_key_pair(&self) -> Result<MEGaPublicKey, CspCreateMEGaKeyError>;
 
     /// Opens the dealing from dealer specified by `dealer_index`.
     fn idkg_open_dealing(
@@ -478,6 +826,13 @@ pub trait IDkgProtocolCspVault {
         opener_index: NodeIndex,
         opener_key_id: &KeyId,
     ) -> Result<CommitmentOpening, IDkgOpenTranscriptError>;
+
+    /// See [`crate::api::CspIDkgProtocol::idkg_retain_active_keys`].
+    fn idkg_retain_active_keys(
+        &self,
+        active_key_ids: BTreeSet<KeyId>,
+        oldest_public_key: MEGaPublicKey,
+    ) -> Result<(), IDkgRetainKeysError>;
 }
 
 /// Operations of `CspVault` related to threshold-ECDSA (cf.
@@ -497,4 +852,30 @@ pub trait ThresholdEcdsaSignerCspVault {
         key_times_lambda: &IDkgTranscriptInternal,
         algorithm_id: AlgorithmId,
     ) -> Result<ThresholdEcdsaSigShareInternal, ThresholdEcdsaSignShareError>;
+}
+
+/// An error returned by failing to generate a public seed from [`CspVault`].
+#[derive(Serialize, Deserialize, Debug)]
+pub enum PublicRandomSeedGeneratorError {
+    /// Internal error, e.g., an RPC error.
+    InternalError { internal_error: String },
+}
+
+impl From<PublicRandomSeedGeneratorError> for CryptoError {
+    fn from(error: PublicRandomSeedGeneratorError) -> CryptoError {
+        match error {
+            PublicRandomSeedGeneratorError::InternalError { internal_error } => {
+                CryptoError::InternalError { internal_error }
+            }
+        }
+    }
+}
+
+/// Operations of [`CspVault`] for generating public random seed.
+pub trait PublicRandomSeedGenerator {
+    /// Returns a public random [`Seed`].
+    /// Public in this context means that the produced randomness MUST NOT be used in
+    /// any use cases where the security relies on keeping the randomness secret, e.g.,
+    /// generation of cryptographic keys.
+    fn new_public_seed(&self) -> Result<Seed, PublicRandomSeedGeneratorError>;
 }

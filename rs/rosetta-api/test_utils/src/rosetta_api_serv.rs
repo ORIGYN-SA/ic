@@ -1,11 +1,11 @@
 use ic_rosetta_api::models::Error as RosettaError;
 use ic_rosetta_api::models::*;
 use ic_types::CanisterId;
-//use ic_rosetta_api::models::AccountIdentifier as RosettaAccountIdentifier;
 
-use ledger_canister::{AccountIdentifier, BlockHeight};
+use icp_ledger::{AccountIdentifier, BlockIndex};
 
 use crate::store_threshold_sig_pk;
+use ic_rosetta_api::models::operation::Operation;
 use ic_types::messages::Blob;
 use rand::{seq::SliceRandom, thread_rng};
 use reqwest::Client as HttpClient;
@@ -50,7 +50,8 @@ pub struct RosettaApiHandle {
 }
 
 impl RosettaApiHandle {
-    pub async fn start(
+    pub async fn start<P: AsRef<Path>>(
+        rosetta_api_bin_path: P,
         node_url: Url,
         port: u16,
         ledger_can_id: CanisterId,
@@ -103,7 +104,7 @@ impl RosettaApiHandle {
             args.push(String::from(root_key_file_path.to_str().unwrap()));
         }
 
-        let process = std::process::Command::new("ic-rosetta-api")
+        let process = std::process::Command::new(rosetta_api_bin_path.as_ref().as_os_str())
             .args(&args)
             .stdout(std::process::Stdio::inherit())
             .stderr(std::process::Stdio::inherit())
@@ -133,15 +134,15 @@ impl RosettaApiHandle {
     pub fn generate_rosetta_cli_config(&self, cli_json: &Path, cli_ros: &Path) -> String {
         use std::fs::write;
 
-        let ic_address = hex::encode(&self.ledger_can_id);
+        let ic_address = hex::encode(self.ledger_can_id);
         let dst_dir: PathBuf = self.workspace.path().to_owned();
 
         let cli_json = std::fs::read_to_string(cli_json).expect("Reading rosetta cli json failed");
         let cli_ros = std::fs::read_to_string(cli_ros).expect("Reading rosetta cli ros failed");
 
-        let cli_json = (&cli_json).replace("PUT_ROSETTA_API_URL_HERE", &self.api_url.to_string());
-        let cli_json = (&cli_json).replace("PUT_LEDGER_ADDRESS_HERE", &ic_address);
-        let cli_ros = (&cli_ros).replace("PUT_LEDGER_ADDRESS_HERE", &ic_address);
+        let cli_json = cli_json.replace("PUT_ROSETTA_API_URL_HERE", &self.api_url.to_string());
+        let cli_json = cli_json.replace("PUT_LEDGER_ADDRESS_HERE", &ic_address);
+        let cli_ros = cli_ros.replace("PUT_LEDGER_ADDRESS_HERE", &ic_address);
 
         write(dst_dir.join("ros_cli.json"), cli_json).expect("Writing rosetta cli json failed");
         write(dst_dir.join("ros_workflows.ros"), cli_ros).expect("Writing rosetta cli ros failed");
@@ -468,7 +469,7 @@ impl RosettaApiHandle {
         Err(format!("Timeout on waiting for block at {}", idx))
     }
 
-    pub async fn wait_for_tip_sync(&self, tip_idx: BlockHeight) -> Result<(), String> {
+    pub async fn wait_for_tip_sync(&self, tip_idx: BlockIndex) -> Result<(), String> {
         let timeout = std::time::Duration::from_secs(5);
         let now = std::time::SystemTime::now();
 

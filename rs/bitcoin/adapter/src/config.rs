@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
 use std::path::PathBuf;
 
-#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 /// The source of the unix domain socket to be used for inter-process
 /// communication.
 pub enum IncomingSource {
@@ -31,10 +31,12 @@ pub struct Config {
     /// Addresses of nodes to connect to (in case discovery from seeds is not possible/sufficient)
     #[serde(default)]
     pub nodes: Vec<SocketAddr>,
-    /// This field determines whether or not we will be using a SOCKS proxy to communicate with
-    /// the BTC network.
     #[serde(default)]
-    pub socks_proxy: Option<SocketAddr>,
+    /// This field determines whether or not we will be using a SOCKS proxy to communicate with  the BTC network.
+    /// Socks proxy docs: https://gitlab.com/dfinity-lab/public/ic/-/blob/master/ic-os/boundary-guestos/doc/Components.adoc#user-content-socks-proxy
+    /// Testing environment shared socks proxy address: socks5://socks5.testnet.dfinity.network:1080
+    /// Proxy url is validated and needs to have scheme, host and port specified. I.e socks5://socksproxy.com:1080.
+    pub socks_proxy: Option<String>,
     /// The number of seconds that need to pass for the adapter to enter the
     /// `Idle` state.
     #[serde(default = "default_idle_seconds")]
@@ -51,13 +53,14 @@ pub struct Config {
     pub incoming_source: IncomingSource,
 }
 
+/// Set the default idle seconds to one hour.
 fn default_idle_seconds() -> u64 {
-    5
+    3600
 }
 
 impl Config {
     /// This function returns the port to use based on the Bitcoin network provided.
-    pub fn port(&self) -> u16 {
+    pub fn network_port(&self) -> u16 {
         match self.network {
             Network::Bitcoin => 8333,
             Network::Testnet => 18333,
@@ -73,7 +76,7 @@ impl Default for Config {
             network: Network::Bitcoin,
             socks_proxy: Default::default(),
             nodes: vec![],
-            idle_seconds: 5,
+            idle_seconds: default_idle_seconds(),
             ipv6_only: false,
             logger: LoggerConfig::default(),
             incoming_source: Default::default(),
@@ -86,6 +89,7 @@ pub mod test {
 
     use super::*;
 
+    #[derive(Default)]
     pub struct ConfigBuilder {
         config: Config,
     }

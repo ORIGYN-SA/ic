@@ -5,9 +5,10 @@ use p256::elliptic_curve::{
     Field, Group, IsHigh,
 };
 use std::ops::Neg;
-use zeroize::Zeroize;
+use subtle::{Choice, ConditionallySelectable};
+use zeroize::{Zeroize, ZeroizeOnDrop};
 
-#[derive(Copy, Clone, Eq, PartialEq, Zeroize)]
+#[derive(Clone, Eq, PartialEq, Zeroize, ZeroizeOnDrop)]
 pub struct Scalar {
     s: p256::Scalar,
 }
@@ -144,7 +145,7 @@ impl Scalar {
     }
 }
 
-#[derive(Copy, Clone, Eq, PartialEq, Zeroize)]
+#[derive(Clone, Eq, PartialEq, Zeroize, ZeroizeOnDrop)]
 pub struct Point {
     p: p256::ProjectivePoint,
 }
@@ -208,6 +209,11 @@ impl Point {
         Self::new(self.p.double())
     }
 
+    /// Perform point negation
+    pub fn negate(&self) -> Self {
+        Self::new(self.p.neg())
+    }
+
     /// Scalar multiplication
     pub fn mul(&self, scalar: &Scalar) -> Self {
         Self::new(self.p * scalar.s)
@@ -230,5 +236,12 @@ impl Point {
     /// Check if the point is the point at infinity
     pub fn is_infinity(&self) -> bool {
         bool::from(self.p.is_identity())
+    }
+
+    /// Constant time conditional selection
+    pub fn conditional_select(a: &Self, b: &Self, choice: Choice) -> Self {
+        Self {
+            p: p256::ProjectivePoint::conditional_select(&a.p, &b.p, choice),
+        }
     }
 }

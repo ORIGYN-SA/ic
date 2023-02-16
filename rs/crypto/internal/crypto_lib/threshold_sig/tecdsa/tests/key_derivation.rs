@@ -1,6 +1,5 @@
-use ic_crypto_internal_threshold_sig_ecdsa::{
-    DerivationIndex, DerivationPath, EccCurveType, EccPoint, Seed, ThresholdEcdsaError,
-};
+use ic_crypto_internal_threshold_sig_ecdsa::*;
+use ic_crypto_test_utils_reproducible_rng::reproducible_rng;
 use rand::Rng;
 use std::convert::{TryFrom, TryInto};
 
@@ -26,7 +25,7 @@ fn test_index_next_behavior() {
 
 #[test]
 fn test_that_key_derivation_on_secp256r1_currently_fails() -> Result<(), ThresholdEcdsaError> {
-    let mut rng = rand::thread_rng();
+    let mut rng = reproducible_rng();
     let path = DerivationPath::new_bip32(&[1, 2, 3]);
     let master_key = EccPoint::hash_to_point(
         EccCurveType::P256,
@@ -55,7 +54,7 @@ fn verify_bip32_extended_key_derivation() -> Result<(), ThresholdEcdsaError> {
     let master_key = setup.public_key(&DerivationPath::new(vec![]))?;
     assert_eq!(
         hex::encode(master_key.public_key),
-        "038cc78aa6040c5f269351939a05aad3a31f86902d0b8cf3085244bb58b6d4337a"
+        "02bef39a470a0fe179cd18509a791e9c5312c07d1346a223a93f723fd90c9690f2"
     );
     assert_eq!(
         hex::encode(master_key.chain_key),
@@ -68,31 +67,31 @@ fn verify_bip32_extended_key_derivation() -> Result<(), ThresholdEcdsaError> {
     let key = setup.public_key(&DerivationPath::new(vec![index1.clone()]))?;
     assert_eq!(
         hex::encode(key.public_key),
-        "0216ce1e78a8477d41351c31d0a9f70286935a96bdd5544356d8ecf63a4120979c"
+        "026b299d834bbb242a961192ba5a1d5663b5fa8d76d88aff93fd2a6044a524ce70"
     );
     assert_eq!(
         hex::encode(key.chain_key),
-        "0811cb2a510b05fedcfb7ba49a5ceb4d48d9ed1210b6a85839e36c53105d3308"
+        "5b37a4f4f656bbe83497232deab1be3a468535ca55c296f123ee8339d56100f5"
     );
 
     let key = setup.public_key(&DerivationPath::new(vec![index2.clone()]))?;
     assert_eq!(
         hex::encode(key.public_key),
-        "02a9a19dc211db7ec0cbc5883bbc70eedef9d95fed51d950d2fe350e66fbb542aa"
+        "03bbe7150acce76b3d155a840a5096e334cddc6a129bd3d481a200518efa066098"
     );
     assert_eq!(
         hex::encode(key.chain_key),
-        "979ab6baf82d9e4b0793236f61012a48d9b3bfa9b6f30c86a0b5d01c1fab300d"
+        "68db4ee9e71a592c463e70202b4d49f4408530a7e783c43625360956e6180052"
     );
 
     let key = setup.public_key(&DerivationPath::new(vec![index1, index2]))?;
     assert_eq!(
         hex::encode(key.public_key),
-        "0312ea4418122888ddd95b15261053864861f46f6081a0374c73918c3957b7f35b"
+        "02acd25bb5fbd517e5141aa5bc9b58554a96b9e9436bb285abb2090598cdcf850e"
     );
     assert_eq!(
         hex::encode(key.chain_key),
-        "53ab3ab4ba311976dfae6e7f38fe2131dd5cb72ceff178b06a19b8ad92d1f2d3"
+        "8e808ba4caebadca661fd647fcc8ab5e80a1b538b7ffee7bccf3f3a01a35d19e"
     );
 
     Ok(())
@@ -102,13 +101,11 @@ fn verify_bip32_extended_key_derivation() -> Result<(), ThresholdEcdsaError> {
 fn should_bip32_derivation_match_external_lib() -> Result<(), ThresholdEcdsaError> {
     let nodes = 9;
     let threshold = 2;
-    let setup = SignatureProtocolSetup::new(
-        EccCurveType::K256,
-        nodes,
-        threshold,
-        threshold,
-        random_seed(),
-    )?;
+
+    let random_seed = Seed::from_rng(&mut reproducible_rng());
+
+    let setup =
+        SignatureProtocolSetup::new(EccCurveType::K256, nodes, threshold, threshold, random_seed)?;
 
     let key_1 = setup.public_key(&DerivationPath::new_bip32(&[1]))?;
     let key_1_2 = setup.public_key(&DerivationPath::new_bip32(&[1, 2]))?;

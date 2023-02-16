@@ -7,15 +7,15 @@ use ic_crypto_internal_threshold_sig_ecdsa::{
 };
 use ic_types::crypto::canister_threshold_sig::error::{
     IDkgCreateDealingError, IDkgCreateTranscriptError, IDkgLoadTranscriptError,
-    IDkgOpenTranscriptError, IDkgVerifyComplaintError, IDkgVerifyDealingPrivateError,
-    IDkgVerifyDealingPublicError, IDkgVerifyOpeningError, IDkgVerifyTranscriptError,
-    ThresholdEcdsaCombineSigSharesError, ThresholdEcdsaSignShareError,
+    IDkgOpenTranscriptError, IDkgRetainKeysError, IDkgVerifyComplaintError,
+    IDkgVerifyDealingPrivateError, IDkgVerifyDealingPublicError, IDkgVerifyOpeningError,
+    IDkgVerifyTranscriptError, ThresholdEcdsaCombineSigSharesError, ThresholdEcdsaSignShareError,
     ThresholdEcdsaVerifyCombinedSignatureError, ThresholdEcdsaVerifySigShareError,
 };
 use ic_types::crypto::canister_threshold_sig::ExtendedDerivationPath;
 use ic_types::crypto::AlgorithmId;
-use ic_types::{NodeIndex, NumberOfNodes, Randomness};
-use std::collections::BTreeMap;
+use ic_types::{NodeIndex, NumberOfNodes, Randomness, RegistryVersion};
+use std::collections::{BTreeMap, BTreeSet};
 
 pub mod errors;
 pub use errors::*;
@@ -98,12 +98,27 @@ pub trait CspIDkgProtocol {
         transcript: &IDkgTranscriptInternal,
     ) -> Result<(), IDkgLoadTranscriptError>;
 
-    /// Generate a MEGa key pair for encrypting threshold key shares in transmission
-    /// from dealers to receivers.
-    fn idkg_create_mega_key_pair(
-        &mut self,
-        algorithm_id: AlgorithmId,
-    ) -> Result<MEGaPublicKey, CspCreateMEGaKeyError>;
+    /// Generate a MEGa public/private key pair for encrypting threshold key shares in transmission
+    /// from dealers to receivers. The generated public key will be stored in the node's public key store
+    /// while the private key will be stored in the node's secret key store.
+    ///
+    /// # Returns
+    /// Generated public key.
+    ///
+    /// # Errors
+    /// * [`CspCreateMEGaKeyError::FailedKeyGeneration`] if key generation failed.
+    /// * [`CspCreateMEGaKeyError::SerializationError`] if serialization of public or private key
+    ///   before storing it in their respective key store failed.
+    /// * [`CspCreateMEGaKeyError::TransientInternalError`] if there is a
+    ///   transient internal error, e.g,. an IO error when writing a key to
+    ///   disk, or an RPC error when calling a remote CSP vault.
+    /// * [`CspCreateMEGaKeyError::DuplicateKeyId`] if there already
+    ///   exists a secret key in the store for the secret key ID derived from
+    ///   the public part of the randomly generated key pair. This error
+    ///   most likely indicates a bad randomness source.
+    /// * [`CspCreateMEGaKeyError::InternalError`]: if the key ID for the secret key cannot be
+    ///   derived from the generated public key.
+    fn idkg_gen_dealing_encryption_key_pair(&self) -> Result<MEGaPublicKey, CspCreateMEGaKeyError>;
 
     /// Verifies that the given `complaint` about `dealing` is correct/justified.
     /// A complaint is created, e.g., when loading of a transcript fails.
@@ -134,6 +149,19 @@ pub trait CspIDkgProtocol {
         opener_index: NodeIndex,
         opening: CommitmentOpening,
     ) -> Result<(), IDkgVerifyOpeningError>;
+
+    /// Retains IDKG key material for the given transcripts.
+    fn idkg_retain_active_keys(
+        &self,
+        active_transcripts: &BTreeSet<IDkgTranscriptInternal>,
+        oldest_public_key: MEGaPublicKey,
+    ) -> Result<(), IDkgRetainKeysError>;
+
+    /// Make a metrics observation of the minimum registry version in active iDKG transcripts.
+    fn idkg_observe_minimum_registry_version_in_active_idkg_transcripts(
+        &self,
+        registry_version: RegistryVersion,
+    );
 }
 
 /// Crypto service provider (CSP) client for threshold ECDSA signature share

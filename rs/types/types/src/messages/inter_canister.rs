@@ -1,15 +1,22 @@
 use crate::{ingress::WasmResult, CanisterId, CountBytes, Cycles, Funds, NumBytes};
 use ic_error_types::{RejectCode, TryFromError, UserError};
+use ic_ic00_types::{
+    CanisterIdRecord, InstallCodeArgs, Method, Payload as _, ProvisionalTopUpCanisterArgs,
+    SetControllerArgs, UpdateSettingsArgs,
+};
 use ic_protobuf::{
     proxy::{try_from_option_field, ProxyDecodeError},
     state::queues::v1 as pb_queues,
     types::v1 as pb_types,
 };
+use ic_utils::{byte_slice_fmt::truncate_and_format, str::StrTruncate};
 use phantom_newtype::Id;
 use serde::{Deserialize, Serialize};
 use std::{
     convert::{From, TryFrom, TryInto},
     mem::size_of,
+    str::FromStr,
+    sync::Arc,
 };
 
 pub struct CallbackIdTag;
@@ -17,12 +24,18 @@ pub struct CallbackIdTag;
 /// callbacks.
 pub type CallbackId = Id<CallbackIdTag, u64>;
 
+impl CountBytes for CallbackId {
+    fn count_bytes(&self) -> usize {
+        size_of::<CallbackId>()
+    }
+}
+
 pub enum CallContextIdTag {}
 /// Identifies an incoming call.
 pub type CallContextId = Id<CallContextIdTag, u64>;
 
 /// Canister-to-canister request message.
-#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct Request {
     pub receiver: CanisterId,
     pub sender: CanisterId,
@@ -55,6 +68,85 @@ impl Request {
         let bytes = self.method_name.len() + self.method_payload.len();
         NumBytes::from(bytes as u64)
     }
+
+    /// Helper function to extract the effective canister id from the payload.
+    pub fn extract_effective_canister_id(&self) -> Option<CanisterId> {
+        match Method::from_str(&self.method_name) {
+            Ok(Method::ProvisionalCreateCanisterWithCycles) => None,
+            Ok(Method::StartCanister)
+            | Ok(Method::CanisterStatus)
+            | Ok(Method::DeleteCanister)
+            | Ok(Method::UninstallCode)
+            | Ok(Method::DepositCycles)
+            | Ok(Method::StopCanister) => match CanisterIdRecord::decode(&self.method_payload) {
+                Ok(record) => Some(record.get_canister_id()),
+                Err(_) => None,
+            },
+            Ok(Method::UpdateSettings) => match UpdateSettingsArgs::decode(&self.method_payload) {
+                Ok(record) => Some(record.get_canister_id()),
+                Err(_) => None,
+            },
+            Ok(Method::SetController) => match SetControllerArgs::decode(&self.method_payload) {
+                Ok(record) => Some(record.get_canister_id()),
+                Err(_) => None,
+            },
+            Ok(Method::InstallCode) => match InstallCodeArgs::decode(&self.method_payload) {
+                Ok(record) => Some(record.get_canister_id()),
+                Err(_) => None,
+            },
+            Ok(Method::ProvisionalTopUpCanister) => {
+                match ProvisionalTopUpCanisterArgs::decode(&self.method_payload) {
+                    Ok(record) => Some(record.get_canister_id()),
+                    Err(_) => None,
+                }
+            }
+            Ok(Method::CreateCanister)
+            | Ok(Method::SetupInitialDKG)
+            | Ok(Method::HttpRequest)
+            | Ok(Method::RawRand)
+            | Ok(Method::ECDSAPublicKey)
+            | Ok(Method::SignWithECDSA)
+            | Ok(Method::ComputeInitialEcdsaDealings)
+            | Ok(Method::BitcoinGetBalance)
+            | Ok(Method::BitcoinGetUtxos)
+            | Ok(Method::BitcoinSendTransaction)
+            | Ok(Method::BitcoinSendTransactionInternal)
+            | Ok(Method::BitcoinGetSuccessors)
+            | Ok(Method::BitcoinGetCurrentFeePercentiles) => {
+                // No effective canister id.
+                None
+            }
+            Err(_) => None,
+        }
+    }
+}
+
+impl std::fmt::Debug for Request {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{{ receiver: {:?}, ", self.receiver)?;
+        write!(f, "sender: {:?}, ", self.sender)?;
+        write!(
+            f,
+            "sender_reply_callback: {:?}, ",
+            self.sender_reply_callback
+        )?;
+        write!(f, "payment: {:?}, ", self.payment)?;
+        if self.method_name.len() <= 103 {
+            write!(f, "method_name: {:?}, ", self.method_name)?;
+        } else {
+            write!(
+                f,
+                "method_name: {:?}..., ",
+                self.method_name.safe_truncate(100)
+            )?;
+        }
+        write!(
+            f,
+            "method_payload: [{}] }}",
+            truncate_and_format(&self.method_payload, 1024)
+        )?;
+        Ok(())
+    }
 }
 
 /// The context attached when an inter-canister message is rejected.
@@ -69,6 +161,14 @@ impl RejectContext {
         Self { code, message }
     }
 
+    pub fn new_with_message_length_limit(
+        code: RejectCode,
+        message: String,
+        max_msg_len: usize,
+    ) -> Self {
+        Self::new(code, message.safe_truncate(max_msg_len).to_string())
+    }
+
     pub fn code(&self) -> RejectCode {
         self.code
     }
@@ -78,7 +178,7 @@ impl RejectContext {
     }
 
     /// Returns the size of this `RejectContext` in bytes.
-    pub fn size_of(&self) -> NumBytes {
+    fn size_bytes(&self) -> NumBytes {
         let size = std::mem::size_of::<RejectCode>() + self.message.len();
         NumBytes::from(size as u64)
     }
@@ -94,7 +194,7 @@ impl From<UserError> for RejectContext {
 }
 
 /// A union of all possible message payloads.
-#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum Payload {
     /// Opaque payload data of the current message.
     Data(Vec<u8>),
@@ -105,10 +205,37 @@ pub enum Payload {
 
 impl Payload {
     /// Returns the size of this `Payload` in bytes.
-    pub fn size_of(&self) -> NumBytes {
+    fn size_bytes(&self) -> NumBytes {
         match self {
             Payload::Data(data) => NumBytes::from(data.len() as u64),
-            Payload::Reject(context) => context.size_of(),
+            Payload::Reject(context) => context.size_bytes(),
+        }
+    }
+}
+
+impl std::fmt::Debug for Payload {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Data(data) => {
+                write!(f, "Data([")?;
+                write!(f, "{}", truncate_and_format(data, 1024))?;
+                write!(f, "])")
+            }
+            Self::Reject(context) => {
+                const KB: usize = 1024;
+                write!(f, "Reject({{ ")?;
+                write!(f, "code: {:?}, ", context.code)?;
+                if context.message.len() <= 8 * KB {
+                    write!(f, "message: {:?} ", context.message)?;
+                } else {
+                    let mut message = String::with_capacity(8 * KB);
+                    message.push_str(context.message.safe_truncate(5 * KB));
+                    message.push_str("...");
+                    message.push_str(context.message.safe_truncate_right(2 * KB));
+                    write!(f, "message: {:?} ", message)?;
+                }
+                write!(f, "}})")
+            }
         }
     }
 }
@@ -145,11 +272,21 @@ pub struct Response {
     pub response_payload: Payload,
 }
 
+impl Response {
+    /// Returns the size in bytes of this `Response`'s payload.
+    pub fn payload_size_bytes(&self) -> NumBytes {
+        self.response_payload.size_bytes()
+    }
+}
+
 /// Canister-to-canister message.
-#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+///
+/// The underlying request / response is wrapped within an `Arc`, for cheap
+/// cloning.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum RequestOrResponse {
-    Request(Request),
-    Response(Response),
+    Request(Arc<Request>),
+    Response(Arc<Response>),
 }
 
 impl RequestOrResponse {
@@ -166,6 +303,26 @@ impl RequestOrResponse {
             RequestOrResponse::Response(resp) => resp.respondent,
         }
     }
+
+    /// Returns the size of the user-controlled part of this message (payload,
+    /// method name) in bytes.
+    ///
+    /// This is the "payload size" based on which cycle costs are calculated;
+    /// and is (generally) limited to `MAX_INTER_CANISTER_PAYLOAD_IN_BYTES`.
+    pub fn payload_size_bytes(&self) -> NumBytes {
+        match self {
+            RequestOrResponse::Request(req) => req.payload_size_bytes(),
+            RequestOrResponse::Response(resp) => resp.response_payload.size_bytes(),
+        }
+    }
+
+    /// Returns the amount of cycles contained in this message.
+    pub fn cycles(&self) -> Cycles {
+        match self {
+            RequestOrResponse::Request(req) => req.payment,
+            RequestOrResponse::Response(resp) => resp.refund,
+        }
+    }
 }
 
 /// Convenience `CountBytes` implementation that returns the same value as
@@ -173,7 +330,10 @@ impl RequestOrResponse {
 /// `self` into a `RequestOrResponse` only to calculate its estimated byte size.
 impl CountBytes for Request {
     fn count_bytes(&self) -> usize {
-        size_of::<RequestOrResponse>() + self.method_name.len() + self.method_payload.len()
+        size_of::<RequestOrResponse>()
+            + size_of::<Request>()
+            + self.method_name.len()
+            + self.method_payload.len()
     }
 }
 
@@ -186,7 +346,7 @@ impl CountBytes for Response {
             Payload::Data(data) => data.len(),
             Payload::Reject(context) => context.message.len(),
         };
-        size_of::<RequestOrResponse>() + var_fields_size
+        size_of::<RequestOrResponse>() + size_of::<Response>() + var_fields_size
     }
 }
 
@@ -201,13 +361,13 @@ impl CountBytes for RequestOrResponse {
 
 impl From<Request> for RequestOrResponse {
     fn from(req: Request) -> Self {
-        RequestOrResponse::Request(req)
+        RequestOrResponse::Request(Arc::new(req))
     }
 }
 
 impl From<Response> for RequestOrResponse {
     fn from(resp: Response) -> Self {
-        RequestOrResponse::Response(resp)
+        RequestOrResponse::Response(Arc::new(resp))
     }
 }
 
@@ -324,10 +484,14 @@ impl From<&RequestOrResponse> for pb_queues::RequestOrResponse {
     fn from(rr: &RequestOrResponse) -> Self {
         match rr {
             RequestOrResponse::Request(req) => pb_queues::RequestOrResponse {
-                r: Some(pb_queues::request_or_response::R::Request(req.into())),
+                r: Some(pb_queues::request_or_response::R::Request(
+                    req.as_ref().into(),
+                )),
             },
             RequestOrResponse::Response(rep) => pb_queues::RequestOrResponse {
-                r: Some(pb_queues::request_or_response::R::Response(rep.into())),
+                r: Some(pb_queues::request_or_response::R::Response(
+                    rep.as_ref().into(),
+                )),
             },
         }
     }
@@ -342,10 +506,10 @@ impl TryFrom<pb_queues::RequestOrResponse> for RequestOrResponse {
             .ok_or(ProxyDecodeError::MissingField("RequestOrResponse::r"))?
         {
             pb_queues::request_or_response::R::Request(r) => {
-                Ok(RequestOrResponse::Request(r.try_into()?))
+                Ok(RequestOrResponse::Request(Arc::new(r.try_into()?)))
             }
             pb_queues::request_or_response::R::Response(r) => {
-                Ok(RequestOrResponse::Response(r.try_into()?))
+                Ok(RequestOrResponse::Response(Arc::new(r.try_into()?)))
             }
         }
     }

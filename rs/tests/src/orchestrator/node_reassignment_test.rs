@@ -5,11 +5,15 @@ Goal:: Verify that nodes can be removed from a subnet and later assigned to a di
 
 Runbook::
 . Set up two subnets with four nodes each
-. Install a universal canister in both
+. Install a message canister in both
 . Verify that the canisters can be updated and the modifications queried
 . Reassign 2 nodes from nns to app subnet
 . Verify that these two nodes have the state of the app subnet
 . Verify that both subnets are functional by storing new messages.
+. Remove 2 nodes from the app subnet, making them unassigned
+. Replace 2 nns nodes with the two unassigned nodes, using change_subnet_membership
+. Add 2 unassigned nodes (former nns nodes) to the app subnet, using change_subnet_membership
+. Verify that both subnets are functional.
 
 Success:: All mutations to the subnets and installed canisters on them occur
 in the expected way before and after the node reassignment.
@@ -21,20 +25,31 @@ Coverage::
 
 end::catalog[] */
 
-use crate::driver::ic::{InternetComputer, Subnet};
-use crate::nns::{add_nodes_to_subnet, remove_nodes_via_endpoint, NnsExt};
-use crate::util::*;
-use ic_agent::export::Principal;
-use ic_fondue::ic_manager::IcHandle;
 use ic_registry_subnet_type::SubnetType;
 use ic_types::Height;
-use slog::{debug, info};
-use url::Url;
+use slog::info;
+
+use crate::{
+    driver::{
+        ic::{InternetComputer, Subnet},
+        test_env::{SshKeyGen, TestEnv},
+        test_env_api::{HasGroupSetup, HasPublicApiUrl, HasTopologySnapshot, IcNodeContainer},
+    },
+    nns::{add_nodes_to_subnet, change_subnet_membership, remove_nodes_via_endpoint},
+    orchestrator::utils::rw_message::{
+        can_read_msg, can_read_msg_with_retries, install_nns_and_check_progress, store_message,
+    },
+    util::{block_on, get_app_subnet_and_node},
+};
 
 const DKG_INTERVAL: u64 = 14;
 const SUBNET_SIZE: usize = 4;
 
-pub fn config() -> InternetComputer {
+pub fn config(env: TestEnv) {
+    env.ensure_group_setup_created();
+    env.ssh_keygen("admin")
+        .expect("Failed to generate ssh admin keys");
+
     InternetComputer::new()
         .add_subnet(
             Subnet::new(SubnetType::System)
@@ -46,178 +61,272 @@ pub fn config() -> InternetComputer {
                 .add_nodes(SUBNET_SIZE)
                 .with_dkg_interval_length(Height::from(DKG_INTERVAL)),
         )
+        .setup_and_start(&env)
+        .expect("failed to setup IC under test");
+
+    install_nns_and_check_progress(env.topology_snapshot());
 }
 
-pub fn test(handle: IcHandle, ctx: &ic_fondue::pot::Context) {
-    let log = &ctx.logger;
-    ctx.install_nns_canisters(&handle, true);
-    info!(ctx.logger, "NNS canisters installed");
+pub fn test(env: TestEnv) {
+    let log = &env.logger();
+    let topo_snapshot = env.topology_snapshot();
 
-    let mut rng = ctx.rng.clone();
-    // // Take all nns nodes
-    let nodes = &handle
-        .as_permutation(&mut rng)
-        .filter(|ep| ep.is_root_subnet)
-        .collect::<Vec<_>>();
+    // Take all NNS nodes
+    let mut nodes = topo_snapshot.root_subnet().nodes();
 
-    // these nodes will be reassigned
-    let node1 = nodes[0];
-    let node2 = nodes[1];
-    // These nodes will stay
-    let node3 = nodes[2];
-    let node4 = nodes[3];
+    // These nodes will be reassigned from the NNS to the APP subnet
+    let node1 = nodes.next().unwrap();
+    let node2 = nodes.next().unwrap();
+    // These nodes will stay in the NNS subnet
+    let node3 = nodes.next().unwrap();
+    let node4 = nodes.next().unwrap();
 
     // Before we move the nodes, we store a message and make sure the message is shared across
     // NNS nodes.
-    block_on(node1.assert_ready(ctx));
-    block_on(node2.assert_ready(ctx));
-
     let nns_msg = "hello world from nns!";
 
-    let nns_can_id = block_on(store_message(&node1.url, nns_msg));
-    assert!(block_on(can_read_msg(log, &node1.url, nns_can_id, nns_msg)));
-    assert!(block_on(can_read_msg_with_retries(
-        log, &node2.url, nns_can_id, nns_msg, 5
-    )));
+    let nns_can_id = store_message(
+        &node1.get_public_url(),
+        node1.effective_canister_id(),
+        nns_msg,
+    );
+    assert!(can_read_msg(
+        log,
+        &node1.get_public_url(),
+        nns_can_id,
+        nns_msg
+    ));
+    assert!(can_read_msg_with_retries(
+        log,
+        &node2.get_public_url(),
+        nns_can_id,
+        nns_msg,
+        5
+    ));
 
-    info!(ctx.logger, "Message on both nns nodes verified!");
+    info!(log, "Message on both NNS nodes verified!");
 
     // Now we store another message on the app subnet.
-    let app_node = get_random_application_node_endpoint(&handle, &mut rng);
-    block_on(app_node.assert_ready(ctx));
+    let (app_subnet, app_node) = get_app_subnet_and_node(&topo_snapshot);
     let app_msg = "hello world from app subnet!";
-    let app_can_id = block_on(store_message(&app_node.url, app_msg));
-    assert!(block_on(can_read_msg(
+    let app_can_id = store_message(
+        &app_node.get_public_url(),
+        app_node.effective_canister_id(),
+        app_msg,
+    );
+    assert!(can_read_msg(
         log,
-        &app_node.url,
+        &app_node.get_public_url(),
         app_can_id,
         app_msg
-    )));
-    info!(ctx.logger, "Message on app node verified!");
+    ));
+    info!(log, "Message on app node verified!");
 
-    // Unassign 2 nns nodes
-    block_on(node3.assert_ready(ctx));
-    block_on(node4.assert_ready(ctx));
+    // Unassign 2 NNS nodes using remove_nodes_from_subnet operation
+    node3.await_status_is_healthy().unwrap();
+    node4.await_status_is_healthy().unwrap();
     let node_ids: Vec<_> = vec![node1.node_id, node2.node_id];
-    block_on(remove_nodes_via_endpoint(node3.url.clone(), &node_ids)).unwrap();
-    info!(
-        ctx.logger,
-        "Removed node ids {:?} from the NNS subnet", node_ids
-    );
+    block_on(remove_nodes_via_endpoint(node3.get_public_url(), &node_ids)).unwrap();
+    info!(log, "Removed node ids {:?} from the NNS subnet", node_ids);
 
-    let subnet_id = app_node.subnet_id().unwrap();
-    block_on(add_nodes_to_subnet(node3.url.clone(), subnet_id, &node_ids)).unwrap();
+    // Wait until the nodes become unassigned.
+    node1.await_status_is_unavailable().unwrap();
+    node2.await_status_is_unavailable().unwrap();
+
+    block_on(add_nodes_to_subnet(
+        node3.get_public_url(),
+        app_subnet.subnet_id,
+        &node_ids,
+    ))
+    .unwrap();
     info!(
-        ctx.logger,
-        "Added node ids {:?} to subnet {}", node_ids, subnet_id
+        log,
+        "Added node ids {:?} to subnet {}", node_ids, app_subnet.subnet_id
     );
     info!(
-        ctx.logger,
+        log,
         "Waiting for moved nodes to return the app subnet message..."
     );
-    block_on(node1.assert_ready(ctx));
-    block_on(node2.assert_ready(ctx));
-    assert!(block_on(can_read_msg_with_retries(
-        log, &node1.url, app_can_id, app_msg, 50
-    )));
-    assert!(block_on(can_read_msg_with_retries(
-        log, &node2.url, app_can_id, app_msg, 5
-    )));
-    info!(
-        ctx.logger,
-        "App message on former NNS nodes could be retrieved!"
-    );
+    node1.await_status_is_healthy().unwrap();
+    node2.await_status_is_healthy().unwrap();
+    assert!(can_read_msg_with_retries(
+        log,
+        &node1.get_public_url(),
+        app_can_id,
+        app_msg,
+        100
+    ));
+    assert!(can_read_msg_with_retries(
+        log,
+        &node2.get_public_url(),
+        app_can_id,
+        app_msg,
+        5
+    ));
+    info!(log, "App message on former NNS nodes could be retrieved!");
 
-    assert!(block_on(can_read_msg(log, &node3.url, nns_can_id, nns_msg)));
-    assert!(block_on(can_read_msg(log, &node4.url, nns_can_id, nns_msg)));
+    assert!(can_read_msg(
+        log,
+        &node3.get_public_url(),
+        nns_can_id,
+        nns_msg
+    ));
+    assert!(can_read_msg(
+        log,
+        &node4.get_public_url(),
+        nns_can_id,
+        nns_msg
+    ));
     info!(
-        ctx.logger,
+        log,
         "NNS message on remaining NNS nodes could be retrieved!"
     );
 
     // Now make sure the subnets are able to store new messages
-    info!(ctx.logger, "Try to store new messages on NNS...");
-    let nns_msg_2 = "hello again on nns!";
-    let nns_can_id_2 = block_on(store_message(&node3.url, nns_msg_2));
-    assert!(block_on(can_read_msg_with_retries(
+    info!(log, "Try to store new messages on NNS...");
+    let nns_msg_2 = "hello again on NNS!";
+    let nns_can_id_2 = store_message(
+        &node3.get_public_url(),
+        node3.effective_canister_id(),
+        nns_msg_2,
+    );
+    assert!(can_read_msg_with_retries(
         log,
-        &node4.url,
+        &node4.get_public_url(),
         nns_can_id_2,
         nns_msg_2,
         5
-    )));
+    ));
 
-    info!(ctx.logger, "Try to store new messages on app subnet...");
+    info!(log, "Try to store new messages on app subnet...");
     let app_msg_2 = "hello again on app subnet!";
-    let app_can_id_2 = block_on(store_message(&app_node.url, app_msg_2));
-    assert!(block_on(can_read_msg_with_retries(
+    let app_can_id_2 = store_message(
+        &app_node.get_public_url(),
+        app_node.effective_canister_id(),
+        app_msg_2,
+    );
+    assert!(can_read_msg_with_retries(
         log,
-        &node1.url,
+        &node1.get_public_url(),
         app_can_id_2,
         app_msg_2,
         5
-    )));
+    ));
     info!(
-        ctx.logger,
+        log,
         "New messages could be written and retrieved on both subnets!"
     );
 
-    info!(ctx.logger, "Test finished successfully");
-}
+    // From here on, test the change_subnet_membership command
+    // After the previous test, the subnets are:
+    // NNS: [node3, node4]
+    // APP: [node1, node2, <original-app-subnet-nodes>]
+    //
+    // Let's move node1 and node2 back into the NNS subnet, and node3, node4 into the APP subnet
+    // So that we get:
+    // NNS: [node1, node2]
+    // APP: [node3, node4, <original-app-subnet-nodes>]
+    node1.await_status_is_healthy().unwrap();
+    node2.await_status_is_healthy().unwrap();
+    let nns_subnet_id = topo_snapshot.root_subnet().subnet_id;
+    let app_subnet_id = app_subnet.subnet_id;
+    let node_ids_remove: Vec<_> = vec![node1.node_id, node2.node_id];
+    block_on(change_subnet_membership(
+        node3.get_public_url(),
+        app_subnet_id,
+        &[],
+        &node_ids_remove,
+    ))
+    .unwrap();
+    info!(
+        log,
+        "Changed subnet {} membership: added nodes [] removed nodes {:?}",
+        app_subnet_id,
+        node_ids_remove
+    );
 
-pub async fn store_message(url: &Url, msg: &str) -> Principal {
-    let bytes = msg.as_bytes();
-    let agent = assert_create_agent(url.as_str()).await;
-    let ucan = UniversalCanister::new(&agent).await;
-    // send an update call to it
-    ucan.store_to_stable(0, bytes).await;
-    ucan.canister_id()
-}
+    // Wait until the nodes become unassigned.
+    node1.await_status_is_unavailable().unwrap();
+    node2.await_status_is_unavailable().unwrap();
 
-pub async fn can_read_msg(
-    log: &slog::Logger,
-    url: &Url,
-    canister_id: Principal,
-    msg: &str,
-) -> bool {
-    can_read_msg_with_retries(log, url, canister_id, msg, 0).await
-}
+    // Next, add node1 and node2 to the NNS subnet, and remove node3 and node4 at the same time
+    let node_ids_add: Vec<_> = vec![node1.node_id, node2.node_id];
+    let node_ids_remove: Vec<_> = vec![node3.node_id, node4.node_id];
+    block_on(change_subnet_membership(
+        node3.get_public_url(),
+        nns_subnet_id,
+        &node_ids_add,
+        &node_ids_remove,
+    ))
+    .unwrap();
+    info!(
+        log,
+        "Changed subnet {} membership: added nodes {:?} removed nodes {:?}",
+        nns_subnet_id,
+        node_ids_add,
+        node_ids_remove
+    );
+    info!(log, "Waiting for the new nodes to become healthy...");
 
-pub async fn can_read_msg_with_retries(
-    log: &slog::Logger,
-    url: &Url,
-    canister_id: Principal,
-    msg: &str,
-    retries: usize,
-) -> bool {
-    let bytes = msg.as_bytes();
-    for i in 0..retries + 1 {
-        debug!(log, "Try to create agent for node {:?}...", url.as_str());
-        match create_agent(url.as_str()).await {
-            Ok(agent) => {
-                debug!(log, "Try to get canister reference");
-                let ucan = UniversalCanister::from_canister_id(&agent, canister_id);
-                debug!(log, "Success, will try to read next");
-                if ucan.read_stable(0, msg.len() as u32).await == Ok(bytes.to_vec()) {
-                    return true;
-                } else {
-                    info!(
-                        log,
-                        "Could not read expected message, will retry {:?} times",
-                        retries - i
-                    );
-                }
-            }
-            Err(e) => {
-                debug!(
-                    log,
-                    "Could not create agent: {:?}, will retry {:?} times",
-                    e,
-                    retries - i
-                );
-            }
-        };
-        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
-    }
-    false
+    node1.await_status_is_healthy().unwrap();
+    node2.await_status_is_healthy().unwrap();
+    node3.await_status_is_unavailable().unwrap();
+    node4.await_status_is_unavailable().unwrap();
+    assert!(can_read_msg_with_retries(
+        log,
+        &node1.get_public_url(),
+        nns_can_id_2,
+        nns_msg_2,
+        100
+    ));
+    assert!(can_read_msg_with_retries(
+        log,
+        &node2.get_public_url(),
+        nns_can_id_2,
+        nns_msg_2,
+        5
+    ));
+    info!(
+        log,
+        "NNS message on the former APP nodes could be retrieved!"
+    );
+
+    let node_ids_add: Vec<_> = vec![node3.node_id, node4.node_id];
+    block_on(change_subnet_membership(
+        node1.get_public_url(),
+        app_subnet_id,
+        &node_ids_add,
+        &[],
+    ))
+    .unwrap();
+    info!(log, "Added node ids {:?} to the APP subnet", node_ids_add);
+    info!(
+        log,
+        "Changed subnet {} membership: added nodes {:?} removed nodes []",
+        app_subnet_id,
+        node_ids_add
+    );
+    node3.await_status_is_healthy().unwrap();
+    node4.await_status_is_healthy().unwrap();
+
+    assert!(can_read_msg_with_retries(
+        log,
+        &node3.get_public_url(),
+        app_can_id_2,
+        app_msg_2,
+        100
+    ));
+    assert!(can_read_msg_with_retries(
+        log,
+        &node4.get_public_url(),
+        app_can_id_2,
+        app_msg_2,
+        5
+    ));
+    info!(
+        log,
+        "APP message on the former NNS nodes could be retrieved!"
+    );
+
+    info!(log, "Test finished successfully");
 }

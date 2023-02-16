@@ -1,18 +1,25 @@
 use crate::validation::ValidationError;
-
+use ic_interfaces_state_manager::StateManagerError;
 use ic_types::{
     batch::{SelfValidatingPayload, ValidationContext},
     consensus::Payload,
+    registry::RegistryClientError,
     Height, NumBytes, Time,
 };
 
 /// A SelfValidatingPayload error from which it is not possible to recover.
 #[derive(Debug)]
-pub enum InvalidSelfValidatingPayload {}
+pub enum InvalidSelfValidatingPayload {
+    Disabled,
+    PayloadTooBig,
+}
 
 /// A SelfValidatingPayload error from which it may be possible to recover.
 #[derive(Debug)]
-pub enum SelfValidatingTransientValidationError {}
+pub enum SelfValidatingTransientValidationError {
+    GetStateFailed(Height, StateManagerError),
+    GetRegistryFailed(RegistryClientError),
+}
 
 /// A SelfValidationPayload error that results from payload validation.
 pub type SelfValidatingPayloadValidationError =
@@ -29,7 +36,7 @@ pub trait SelfValidatingPayloadBuilder: Send + Sync {
         validation_context: &ValidationContext,
         past_payloads: &[&SelfValidatingPayload],
         byte_limit: NumBytes,
-    ) -> SelfValidatingPayload;
+    ) -> (SelfValidatingPayload, NumBytes);
 
     /// Checks whether the provided `SelfValidatingPayload` is valid given a
     /// `ValidationContext` (certified height and registry version) and
@@ -62,28 +69,5 @@ pub trait SelfValidatingPayloadBuilder: Send + Sync {
                 }
             })
             .collect()
-    }
-}
-
-// TODO: Remove this once a real SelfValidatingPayloadBuilder is ready.
-pub struct NoOpSelfValidatingPayloadBuilder {}
-
-impl SelfValidatingPayloadBuilder for NoOpSelfValidatingPayloadBuilder {
-    fn get_self_validating_payload(
-        &self,
-        _validation_context: &ValidationContext,
-        _past_payloads: &[&SelfValidatingPayload],
-        _byte_limit: NumBytes,
-    ) -> SelfValidatingPayload {
-        SelfValidatingPayload::default()
-    }
-
-    fn validate_self_validating_payload(
-        &self,
-        _payload: &SelfValidatingPayload,
-        _validation_context: &ValidationContext,
-        _past_payloads: &[&SelfValidatingPayload],
-    ) -> Result<NumBytes, SelfValidatingPayloadValidationError> {
-        Ok(0.into())
     }
 }

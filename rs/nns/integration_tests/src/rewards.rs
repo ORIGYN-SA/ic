@@ -1,7 +1,10 @@
 use dfn_candid::candid_one;
 use dfn_protobuf::protobuf;
-use ic_canister_client::Sender;
+use ic_canister_client_sender::Sender;
 use ic_crypto_sha::Sha256;
+use ic_nervous_system_common_test_keys::{
+    TEST_NEURON_1_OWNER_KEYPAIR, TEST_NEURON_1_OWNER_PRINCIPAL,
+};
 use ic_nns_common::{pb::v1::NeuronId, types::ProposalId};
 use ic_nns_governance::pb::v1::{
     add_or_remove_node_provider::Change,
@@ -12,13 +15,13 @@ use ic_nns_governance::pb::v1::{
     AddOrRemoveNodeProvider, ManageNeuron, ManageNeuronResponse, NodeProvider, Proposal,
     ProposalStatus, RewardNodeProvider,
 };
-use ic_nns_test_keys::{TEST_NEURON_1_OWNER_KEYPAIR, TEST_NEURON_1_OWNER_PRINCIPAL};
-use ic_nns_test_utils::ids::TEST_NEURON_1_ID;
 use ic_nns_test_utils::{
+    common::NnsInitPayloadsBuilder,
     governance::wait_for_final_state,
-    itest_helpers::{local_test_on_nns_subnet, NnsCanisters, NnsInitPayloadsBuilder},
+    ids::TEST_NEURON_1_ID,
+    itest_helpers::{local_test_on_nns_subnet, NnsCanisters},
 };
-use ledger_canister::{AccountBalanceArgs, AccountIdentifier, Subaccount, Tokens};
+use icp_ledger::{tokens_from_proto, AccountBalanceArgs, AccountIdentifier, Subaccount, Tokens};
 
 /// Tests that we can add and reward a node provider.
 #[test]
@@ -40,7 +43,8 @@ fn test_node_provider_rewards() {
                     account: AccountIdentifier::from(*TEST_NEURON_1_OWNER_PRINCIPAL),
                 },
             )
-            .await?;
+            .await
+            .map(tokens_from_proto)?;
         assert_eq!(Tokens::from_e8s(0), user_balance);
 
         // Add a node provider
@@ -151,7 +155,8 @@ fn test_node_provider_rewards() {
                     account: to_account,
                 },
             )
-            .await?;
+            .await
+            .map(tokens_from_proto)?;
         assert_eq!(Tokens::from_e8s(23_400_000_000), user_balance);
 
         Ok(())

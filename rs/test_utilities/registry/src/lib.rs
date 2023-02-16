@@ -1,44 +1,21 @@
-use ic_crypto::utils::ni_dkg::initial_ni_dkg_transcript_record_from_transcript;
-use ic_interfaces::registry::{
-    LocalStoreCertifiedTimeReader, RegistryClient, RegistryClientResult,
-    RegistryClientVersionedResult,
-};
 use ic_interfaces::time_source::TimeSource;
-use ic_protobuf::registry::subnet::v1::{CatchUpPackageContents, SubnetListRecord, SubnetRecord};
+use ic_interfaces_registry::{LocalStoreCertifiedTimeReader, RegistryClient};
+use ic_protobuf::registry::subnet::v1::{
+    CatchUpPackageContents, InitialNiDkgTranscriptRecord, SubnetFeatures, SubnetListRecord,
+    SubnetRecord,
+};
 use ic_registry_client_fake::FakeRegistryClient;
 use ic_registry_keys::{
     make_catch_up_package_contents_key, make_subnet_list_record_key, make_subnet_record_key,
 };
 use ic_registry_proto_data_provider::ProtoRegistryDataProvider;
+use ic_registry_subnet_features::EcdsaConfig;
 use ic_registry_subnet_type::SubnetType;
-use ic_types::crypto::threshold_sig::ni_dkg::{NiDkgTag, NiDkgTranscript};
-use ic_types::{registry::RegistryClientError, PrincipalId, Time};
-use ic_types::{NodeId, RegistryVersion, ReplicaVersion, SubnetId};
-use mockall::predicate::*;
-use mockall::*;
+use ic_types::{
+    crypto::threshold_sig::ni_dkg::{NiDkgTag, NiDkgTranscript},
+    NodeId, PrincipalId, RegistryVersion, ReplicaVersion, SubnetId, Time,
+};
 use std::sync::Arc;
-
-mock! {
-    pub RegistryClient {}
-
-    pub trait RegistryClient: Send + Sync {
-        fn get_value(&self, key: &str, version: RegistryVersion) -> RegistryClientResult<Vec<u8>>;
-        fn get_versioned_value(
-            &self,
-            key: &str,
-            version: RegistryVersion,
-        ) -> RegistryClientVersionedResult<Vec<u8>>;
-
-        fn get_key_family(&self,
-            key_prefix: &str,
-            version: RegistryVersion
-        ) -> Result<Vec<String>, RegistryClientError>;
-
-        fn get_latest_version(&self) -> RegistryVersion;
-
-        fn get_version_timestamp(&self, registry_version: RegistryVersion) -> Option<Time>;
-    }
-}
 
 fn empty_ni_dkg_transcripts_with_committee(
     committee: Vec<NodeId>,
@@ -111,19 +88,18 @@ pub fn insert_initial_dkg_transcript(
     record: &SubnetRecord,
     registry_data_provider: &Arc<ProtoRegistryDataProvider>,
 ) {
-    use std::convert::TryFrom;
     let committee = record
         .membership
         .iter()
         .map(|n| NodeId::from(PrincipalId::try_from(&n[..]).unwrap()))
         .collect();
     let mut transcripts = empty_ni_dkg_transcripts_with_committee(committee, version);
-    let high_threshold_transcript = initial_ni_dkg_transcript_record_from_transcript(
+    let high_threshold_transcript = InitialNiDkgTranscriptRecord::from(
         transcripts
             .remove(&NiDkgTag::HighThreshold)
             .expect("Missing HighThreshold Transcript"),
     );
-    let low_threshold_transcript = initial_ni_dkg_transcript_record_from_transcript(
+    let low_threshold_transcript = InitialNiDkgTranscriptRecord::from(
         transcripts
             .remove(&NiDkgTag::LowThreshold)
             .expect("Missing LowThreshold Transcript"),
@@ -247,6 +223,16 @@ impl SubnetRecordBuilder {
 
     pub fn with_subnet_type(mut self, subnet_type: SubnetType) -> Self {
         self.record.subnet_type = subnet_type.into();
+        self
+    }
+
+    pub fn with_features(mut self, features: SubnetFeatures) -> Self {
+        self.record.features = Some(features);
+        self
+    }
+
+    pub fn with_ecdsa_config(mut self, ecdsa_config: EcdsaConfig) -> Self {
+        self.record.ecdsa_config = Some(ecdsa_config.into());
         self
     }
 

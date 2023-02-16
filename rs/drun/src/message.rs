@@ -1,10 +1,9 @@
 use super::CanisterId;
 
 use hex::decode;
+use ic_ic00_types::{self as ic00, CanisterInstallMode, Payload};
 use ic_types::{
-    ic00,
-    ic00::Payload,
-    messages::{CanisterInstallMode, SignedIngress, UserQuery},
+    messages::{SignedIngress, UserQuery},
     time::current_time_and_expiry_time,
     PrincipalId, UserId,
 };
@@ -216,7 +215,7 @@ fn parse_create(nonce: u64) -> Result<Message, String> {
     let signed_ingress = SignedIngressBuilder::new()
         .method_name(ic00::Method::ProvisionalCreateCanisterWithCycles)
         .canister_id(ic00::IC_00)
-        .method_payload(ic00::ProvisionalCreateCanisterWithCyclesArgs::new(None).encode())
+        .method_payload(ic00::ProvisionalCreateCanisterWithCyclesArgs::new(None, None).encode())
         .nonce(nonce)
         .build();
 

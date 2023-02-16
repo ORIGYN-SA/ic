@@ -24,7 +24,7 @@ impl DerivationIndex {
         for w in &mut n {
             let (v, c) = w.overflowing_add(carry);
             *w = v;
-            carry = if c { 1 } else { 0 };
+            carry = u8::from(c);
         }
 
         if carry != 0 {
@@ -98,11 +98,27 @@ impl DerivationPath {
         &self,
         master_public_key: &EccPoint,
     ) -> ThresholdEcdsaResult<(EccScalar, Vec<u8>)> {
+        let zeros = [0u8; 32];
+        self.derive_tweak_with_chain_code(master_public_key, &zeros)
+    }
+
+    pub fn derive_tweak_with_chain_code(
+        &self,
+        master_public_key: &EccPoint,
+        chain_code: &[u8],
+    ) -> ThresholdEcdsaResult<(EccScalar, Vec<u8>)> {
+        if chain_code.len() != 32 {
+            return Err(ThresholdEcdsaError::InvalidArguments(format!(
+                "Invalid chain code length {}",
+                chain_code.len()
+            )));
+        }
+
         let curve_type = master_public_key.curve_type();
 
         if curve_type == EccCurveType::K256 {
-            let mut derived_key = *master_public_key;
-            let mut derived_chain_key = vec![0; 32];
+            let mut derived_key = master_public_key.clone();
+            let mut derived_chain_key = chain_code.to_vec();
             let mut derived_offset = EccScalar::zero(curve_type);
 
             for idx in &self.path {

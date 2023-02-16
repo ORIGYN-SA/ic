@@ -2,19 +2,17 @@
 name = "ic-replica"
 version = "0.8.0"
 authors = ["The Internet Computer Project Developers"]
-edition = "2018"
+edition = "2021"
 
 [dependencies]
 base64 = "0.11.0"
-bitcoin = "0.27.1"
+clap = { version = "3.1.6", features = ["derive"] }
 hex = "0.4.2"
-ic-btc-adapter-service = { path = "../bitcoin/adapter_service" }
-ic-btc-types-internal = { path = "../bitcoin/types/internal" }
 ic-async-utils = { path = "../async_utils" }
+ic-btc-adapter-client = { path = "../bitcoin/client" }
 ic-btc-consensus = { path = "../bitcoin/consensus" }
 ic-config = { path = "../config" }
 ic-consensus = { path = "../consensus" }
-ic-consensus-message = { path = "../consensus/message" }
 ic-crypto = { path = "../crypto" }
 ic-crypto-sha = { path = "../crypto/sha" }
 ic-crypto-tls-interfaces = { path = "../crypto/tls_interfaces" }
@@ -22,48 +20,51 @@ ic-crypto-utils-threshold-sig = { path = "../crypto/utils/threshold_sig" }
 ic-cycles-account-manager = { path = "../cycles_account_manager" }
 ic-error-types = { path = "../types/error_types" }
 ic-execution-environment = { path = "../execution_environment" }
-ic-http-handler = { path = "../http_handler" }
+ic-http-endpoints-public = { path = "../http_endpoints/public" }
+ic-https-outcalls-adapter-client = { path = "../https_outcalls/client" }
 ic-interfaces = { path = "../interfaces" }
 ic-interfaces-bitcoin-adapter-client = { path = "../interfaces/bitcoin_adapter_client" }
+ic-interfaces-certified-stream-store = { path = "../interfaces/certified_stream_store" }
 ic-interfaces-p2p = { path = "../interfaces/p2p" }
+ic-interfaces-registry = { path = "../interfaces/registry" }
 ic-logger = { path = "../monitoring/logger" }
 ic-messaging = { path = "../messaging" }
 ic-metrics = { path = "../monitoring/metrics" }
-ic-metrics-exporter = { path = "../monitoring/metrics_exporter" }
+ic-http-endpoints-metrics = { path = "../http_endpoints/metrics" }
 ic-nns-constants = { path = "../nns/constants" }
 ic-p2p = { path = "../p2p" }
 ic-protobuf = { path = "../protobuf" }
 ic-registry-client = { path = "../registry/client" }
 ic-registry-client-helpers = { path = "../registry/helpers" }
-ic-replica-setup-ic-network =  { path = "./setup_ic_network" }
-ic-registry-common = { path = "../registry/common" }
-ic-registry-proto-data-provider = { path = "../registry/proto_data_provider" }
+ic-registry-local-store = { path = "../registry/local_store" }
 ic-registry-subnet-type = { path = "../registry/subnet_type" }
+ic-replica-setup-ic-network =  { path = "./setup_ic_network" }
 ic-replicated-state = { path = "../replicated_state" }
 ic-state-manager = { path = "../state_manager" }
 ic-sys = { path = "../sys" }
 ic-types = { path = "../types/types" }
 ic-utils = { path = "../utils" }
-jemallocator = "0.3.2"
+ic-xnet-endpoint = { path = "../xnet/endpoint" }
+ic-xnet-payload-builder = { path = "../xnet/payload_builder" }
 jemalloc-ctl = "0.3.3"
+jemallocator = "0.3.2"
 libc = "0.2.91"
 nix = "0.23.0"
-pprof = { version = "0.6.2", default-features = false, features = ["flamegraph", "protobuf"], optional = true }
+num_cpus = "1.13.1"
+pprof = { version = "0.10.1", default-features = false, features = ["flamegraph", "prost-codec"], optional = true }
 prometheus = "0.12.0"
-prost = "0.9.0"
-rand = "0.7.3"
+prost = "0.11.0"
+rand = "0.8"
 regex = "1.3.9"
 serde = { version = "1.0.99", features = [ "derive" ] }
 serde_bytes = "0.11.5"
 serde_cbor = "0.11.1"
-slog = { version = "2.5.2", features = ["nested-values", "max_level_trace", "release_max_level_debug"] }
+slog = { version = "2.5.2", features = ["nested-values", "release_max_level_debug"] }
 slog-async = "2.5.0"
 static_assertions = "0.3.4"
-structopt = "0.3"
 tempfile = "3.1.0"
 thread_profiler = { version = "0.3", optional = true }
 tokio = { version = "1.15.0", features = ["full"] }
-tonic = "0.6.2"
 tracing = "0.1.13"
 tower = { version = "0.4.11", features = ["util"] }
 
@@ -71,10 +72,11 @@ tower = { version = "0.4.11", features = ["util"] }
 assert_cmd = "0.12"
 canister-test = { path = "../rust_canisters/canister_test" }
 criterion = "0.3"
+ic-ic00-types = { path = "../types/ic00_types" }
+ic-interfaces-registry-mocks = { path = "../interfaces/registry/mocks" }
 ic-test-utilities = { path = "../test_utilities" }
-ic-test-utilities-registry = { path = "../test_utilities/registry" }
 predicates = "1.0.1"
-wabt = { git = "https://github.com/dfinity-lab/wabt-rs", tag = "0.10.0-dfinity" }
+wat = "1.0.52"
 
 [[bench]]
 name = "calls"
@@ -93,7 +95,6 @@ path = "src/main.rs"
 profiler = ["thread_profiler/thread_profiler", "pprof"]
 malicious_code = [
   "ic-consensus/malicious_code",
-  "ic-http-handler/malicious_code",
-  "ic-p2p/malicious_code",
+  "ic-http-endpoints-public/malicious_code",
   "ic-state-manager/malicious_code",
 ]

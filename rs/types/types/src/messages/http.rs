@@ -9,8 +9,9 @@ use crate::{
         message_id::hash_of_map, MessageId, ReadState, SignedIngressContent, UserQuery,
         UserSignature,
     },
-    Time, UserId,
+    Height, Time, UserId,
 };
+use derive_more::Display;
 use ic_base_types::{CanisterId, CanisterIdError, PrincipalId};
 use ic_crypto_tree_hash::{MixedHashTree, Path};
 use maplit::btreemap;
@@ -20,7 +21,7 @@ use serde::{Deserialize, Serialize};
 use std::{collections::BTreeSet, convert::TryFrom, error::Error, fmt};
 
 /// Describes the fields of a canister update call as defined in
-/// https://sdk.dfinity.org/docs/interface-spec/index.html#api-update.
+/// `<https://sdk.dfinity.org/docs/interface-spec/index.html#api-update>`.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, Hash)]
 #[cfg_attr(test, derive(Arbitrary))]
 pub struct HttpCanisterUpdate {
@@ -88,7 +89,7 @@ impl HttpCallContent {
 }
 
 /// Describes the fields of a canister query call (a query from a user to a
-/// canister) as defined in https://sdk.dfinity.org/docs/interface-spec/index.html#api-query.
+/// canister) as defined in `<https://sdk.dfinity.org/docs/interface-spec/index.html#api-query>`.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct HttpUserQuery {
     pub canister_id: Blob,
@@ -126,7 +127,7 @@ impl HttpQueryContent {
     }
 }
 
-/// A `read_state` request as defined in https://sdk.dfinity.org/docs/interface-spec/index.html#api-request-read-state.
+/// A `read_state` request as defined in `<https://sdk.dfinity.org/docs/interface-spec/index.html#api-request-read-state>`.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct HttpReadState {
     pub sender: Blob,
@@ -211,7 +212,7 @@ impl HttpReadState {
 }
 
 /// A request envelope as defined in
-/// https://sdk.dfinity.org/docs/interface-spec/index.html#authentication.
+/// `<https://sdk.dfinity.org/docs/interface-spec/index.html#authentication>`.
 ///
 /// The content is either [`HttpCallContent`], [`HttpQueryContent`] or
 /// [`HttpReadStateContent`].
@@ -429,7 +430,7 @@ impl From<CanisterIdError> for HttpRequestError {
 }
 
 /// Describes a delegation map as defined in
-/// https://sdk.dfinity.org/docs/interface-spec/index.html#certification-delegation.
+/// `<https://sdk.dfinity.org/docs/interface-spec/index.html#certification-delegation>`.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
 #[cfg_attr(test, derive(Arbitrary))]
 pub struct Delegation {
@@ -503,7 +504,7 @@ impl SignedBytesWithoutDomainSeparator for Delegation {
 }
 
 /// Describes a delegation as defined in
-/// https://sdk.dfinity.org/docs/interface-spec/index.html#certification-delegation.
+/// `<https://sdk.dfinity.org/docs/interface-spec/index.html#certification-delegation>`.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
 #[cfg_attr(test, derive(Arbitrary))]
 pub struct SignedDelegation {
@@ -541,23 +542,6 @@ pub enum RawHttpRequestVal {
     Array(Vec<RawHttpRequestVal>),
 }
 
-/// The status of an update call.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-#[serde(tag = "status")]
-pub enum HttpResponseStatus {
-    Unknown,
-    Received,
-    Processing,
-    Replied {
-        reply: HttpReply,
-    },
-    Rejected {
-        reject_code: u64,
-        reject_message: String,
-    },
-}
-
 /// The reply to an update call.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(untagged)]
@@ -576,6 +560,7 @@ pub enum HttpQueryResponse {
         reply: HttpQueryResponseReply,
     },
     Rejected {
+        error_code: String,
         reject_code: u64,
         reject_message: String,
     },
@@ -594,7 +579,7 @@ pub struct HttpReadStateResponse {
     pub certificate: Blob,
 }
 
-/// A `Certificate` as defined in https://sdk.dfinity.org/docs/interface-spec/index.html#_certificate
+/// A `Certificate` as defined in `<https://sdk.dfinity.org/docs/interface-spec/index.html#_certificate>`
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Certificate {
     pub tree: MixedHashTree,
@@ -603,21 +588,43 @@ pub struct Certificate {
     pub delegation: Option<CertificateDelegation>,
 }
 
-/// A `CertificateDelegation` as defined in https://smartcontracts.org/docs/interface-spec/index.html#certification-delegation
+/// A `CertificateDelegation` as defined in `<https://smartcontracts.org/docs/interface-spec/index.html#certification-delegation>`
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct CertificateDelegation {
     pub subnet_id: Blob,
     pub certificate: Blob,
 }
 
-/// Different stages required for the full initialization of the HttpHandler.
-/// The fields are listed in order of execution.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+/// Different stages required for the full initialization of the HTTPS endpoint.
+/// The fields are listed in order of execution/transition.
+#[derive(Debug, Display, Copy, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum ReplicaHealthStatus {
+    /// Marks the start state of the HTTPS endpoint. Some requests will fail
+    /// while initialization is on-going.
     Starting,
+    /// Waiting for the first non-empty certifited state available on
+    /// the node.
     WaitingForCertifiedState,
+    /// Waiting for the root delegation in case of non-NNS subnet.
     WaitingForRootDelegation,
+    /// Happens when the replica's finalized height is significantly greater
+    /// than the certified height.
+    /// If the finalized height is significantly greater than the
+    /// certified height, this is a signal that execution is lagging
+    /// consensus, and that consensus needs to be throttled.
+    /// More information can be found in the whitepaper
+    /// `<https://internetcomputer.org/whitepaper.pdf>`
+    /// under "Per-round certified state" section(s).
+    ///
+    /// If execution (or certification) is lagging significantly on this replica,
+    /// then we better not serve queries because we risk returning stale data.
+    /// According to the IC's spec - `<https://internetcomputer.org/docs/current/references/ic-interface-spec#query_call>`,
+    /// we should execute queries on "recent enough" state tree.
+    CertifiedStateBehind,
+    /// Signals that the replica can serve all types of API requests.
+    /// When users programatically access this information they should
+    /// check only if 'ReplicaHealthStatus' is equal to 'Healthy' or not.
     Healthy,
 }
 
@@ -634,13 +641,14 @@ pub struct HttpStatusResponse {
     pub impl_hash: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub replica_health_status: Option<ReplicaHealthStatus>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub certified_height: Option<Height>,
 }
 
 #[cfg(test)]
 mod test {
     use super::*;
-
-    use crate::time::UNIX_EPOCH;
+    use crate::{time::UNIX_EPOCH, AmountOf};
     use pretty_assertions::assert_eq;
     use serde::Serialize;
     use serde_cbor::Value;
@@ -690,76 +698,13 @@ mod test {
             &HttpQueryResponse::Rejected {
                 reject_code: 1,
                 reject_message: "system error".to_string(),
+                error_code: "IC500".to_string(),
             },
             Value::Map(btreemap! {
                 text("status") => text("rejected"),
                 text("reject_code") => int(1),
                 text("reject_message") => text("system error"),
-            }),
-        );
-    }
-
-    #[test]
-    fn encoding_read_request_status_response_received() {
-        assert_cbor_ser_equal(
-            &HttpResponseStatus::Received,
-            Value::Map(btreemap! {
-                text("status") => text("received"),
-            }),
-        );
-    }
-
-    #[test]
-    fn encoding_read_request_status_response_processing() {
-        assert_cbor_ser_equal(
-            &HttpResponseStatus::Processing,
-            Value::Map(btreemap! {
-                text("status") => text("processing"),
-            }),
-        );
-    }
-
-    #[test]
-    fn encoding_read_request_status_response_replied() {
-        assert_cbor_ser_equal(
-            &HttpResponseStatus::Replied {
-                reply: HttpReply::CodeCall {
-                    arg: Blob(vec![0, 0, 0, 0]),
-                },
-            },
-            Value::Map(btreemap! {
-                text("status") => text("replied"),
-                text("reply") => Value::Map(btreemap! {
-                    text("arg") => bytes(&[0,0,0,0])
-                }),
-            }),
-        );
-    }
-
-    #[test]
-    fn encoding_read_request_status_response_replied_empty() {
-        assert_cbor_ser_equal(
-            &HttpResponseStatus::Replied {
-                reply: HttpReply::Empty {},
-            },
-            Value::Map(btreemap! {
-                text("status") => text("replied"),
-                text("reply") => Value::Map(btreemap! {}),
-            }),
-        );
-    }
-
-    #[test]
-    fn encoding_read_request_status_response_rejected() {
-        assert_cbor_ser_equal(
-            &HttpResponseStatus::Rejected {
-                reject_code: 42,
-                reject_message: "foo bar".to_string(),
-            },
-            Value::Map(btreemap! {
-                text("status") => text("rejected"),
-                text("reject_code") => int(42),
-                text("reject_message") => text("foo bar"),
+                text("error_code") => text("IC500"),
             }),
         );
     }
@@ -773,6 +718,7 @@ mod test {
                 impl_version: Some("0.0".to_string()),
                 impl_hash: None,
                 replica_health_status: Some(ReplicaHealthStatus::Starting),
+                certified_height: None,
             },
             Value::Map(btreemap! {
                 text("ic_api_version") => text("foobar"),
@@ -791,6 +737,7 @@ mod test {
                 impl_version: Some("0.0".to_string()),
                 impl_hash: None,
                 replica_health_status: Some(ReplicaHealthStatus::Healthy),
+                certified_height: None,
             },
             Value::Map(btreemap! {
                 text("ic_api_version") => text("foobar"),
@@ -810,11 +757,33 @@ mod test {
                 impl_version: Some("0.0".to_string()),
                 impl_hash: None,
                 replica_health_status: None,
+                certified_height: None,
             },
             Value::Map(btreemap! {
                 text("ic_api_version") => text("foobar"),
                 text("root_key") => bytes(&[1, 2, 3]),
                 text("impl_version") => text("0.0"),
+            }),
+        );
+    }
+
+    #[test]
+    fn encoding_status_with_certified_height() {
+        assert_cbor_ser_equal(
+            &HttpStatusResponse {
+                ic_api_version: "foobar".to_string(),
+                root_key: Some(Blob(vec![1, 2, 3])),
+                impl_version: Some("0.0".to_string()),
+                impl_hash: None,
+                replica_health_status: Some(ReplicaHealthStatus::Healthy),
+                certified_height: Some(AmountOf::new(1)),
+            },
+            Value::Map(btreemap! {
+                text("ic_api_version") => text("foobar"),
+                text("root_key") => bytes(&[1, 2, 3]),
+                text("impl_version") => text("0.0"),
+                text("replica_health_status") => text("healthy"),
+                text("certified_height") => serde_cbor::Value::Integer(1),
             }),
         );
     }

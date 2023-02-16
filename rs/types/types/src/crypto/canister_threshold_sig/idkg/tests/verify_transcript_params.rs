@@ -1,13 +1,15 @@
-use crate::consensus::ecdsa::EcdsaDealing;
+use crate::crypto::canister_threshold_sig::idkg::tests::test_utils::random_transcript_id;
 use crate::crypto::canister_threshold_sig::idkg::{
-    IDkgDealers, IDkgDealing, IDkgMaskedTranscriptOrigin, IDkgMultiSignedDealing, IDkgReceivers,
+    BatchSignedIDkgDealing, IDkgDealers, IDkgDealing, IDkgMaskedTranscriptOrigin, IDkgReceivers,
     IDkgTranscript, IDkgTranscriptId, IDkgTranscriptOperation, IDkgTranscriptParams,
-    IDkgTranscriptType, IDkgUnmaskedTranscriptOrigin,
+    IDkgTranscriptType, IDkgUnmaskedTranscriptOrigin, SignedIDkgDealing,
 };
-use crate::crypto::{AlgorithmId, CombinedMultiSig, CombinedMultiSigOf};
+use crate::crypto::{AlgorithmId, BasicSig, BasicSigOf};
+use crate::signature::{BasicSignature, BasicSignatureBatch};
 use crate::{Height, NodeId, PrincipalId, RegistryVersion, SubnetId};
+use assert_matches::assert_matches;
 use maplit::{btreemap, btreeset};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 type Itt = IDkgTranscriptType;
 type Imto = IDkgMaskedTranscriptOrigin;
@@ -23,12 +25,13 @@ fn should_succeed_on_correct_transcript() {
 #[test]
 fn should_fail_on_mismatching_transcript_ids() {
     let (mut transcript, params) = valid_transcript_and_params();
+
     transcript.transcript_id = transcript.transcript_id.increment();
     assert_ne!(transcript.transcript_id, params.transcript_id());
 
     let result = transcript.verify_consistency_with_params(&params);
 
-    assert!(matches!(result, Err(error) if error.contains("mismatching transcript IDs")));
+    assert_matches!(result, Err(error) if error.contains("mismatching transcript IDs"));
 }
 
 #[test]
@@ -43,7 +46,7 @@ fn should_fail_on_mismatching_receivers() {
 
     let result = transcript.verify_consistency_with_params(&params);
 
-    assert!(matches!(result, Err(error) if error.contains("mismatching receivers")));
+    assert_matches!(result, Err(error) if error.contains("mismatching receivers"));
 }
 
 #[test]
@@ -54,7 +57,7 @@ fn should_fail_on_mismatching_registry_versions() {
 
     let result = transcript.verify_consistency_with_params(&params);
 
-    assert!(matches!(result, Err(error) if error.contains("mismatching registry versions")));
+    assert_matches!(result, Err(error) if error.contains("mismatching registry versions"));
 }
 
 #[test]
@@ -65,7 +68,7 @@ fn should_fail_on_mismatching_algorithm_ids() {
 
     let result = transcript.verify_consistency_with_params(&params);
 
-    assert!(matches!(result, Err(error) if error.contains("mismatching algorithm IDs")));
+    assert_matches!(result, Err(error) if error.contains("mismatching algorithm IDs"));
 }
 
 #[test]
@@ -75,18 +78,18 @@ fn should_fail_on_mismatching_transcript_types_for_operation_type_random() {
 
     transcript.transcript_type = Itt::Unmasked(Iuto::ReshareMasked(dummy_transcript_id()));
     let result = transcript.verify_consistency_with_params(&params);
-    assert!(matches!(result, Err(e) if e.contains("does not match transcript type derived")));
+    assert_matches!(result, Err(e) if e.contains("does not match transcript type derived"));
 
     transcript.transcript_type = Itt::Unmasked(Iuto::ReshareUnmasked(dummy_transcript_id()));
     let result = transcript.verify_consistency_with_params(&params);
-    assert!(matches!(result, Err(e) if e.contains("does not match transcript type derived")));
+    assert_matches!(result, Err(e) if e.contains("does not match transcript type derived"));
 
     transcript.transcript_type = Itt::Masked(Imto::UnmaskedTimesMasked(
         dummy_transcript_id(),
         dummy_transcript_id(),
     ));
     let result = transcript.verify_consistency_with_params(&params);
-    assert!(matches!(result, Err(e) if e.contains("does not match transcript type derived")));
+    assert_matches!(result, Err(e) if e.contains("does not match transcript type derived"));
 }
 
 #[test]
@@ -96,18 +99,18 @@ fn should_fail_on_mismatching_transcript_types_for_operation_type_reshare_of_mas
 
     transcript.transcript_type = Itt::Masked(Imto::Random);
     let result = transcript.verify_consistency_with_params(&params);
-    assert!(matches!(result, Err(e) if e.contains("does not match transcript type derived")));
+    assert_matches!(result, Err(e) if e.contains("does not match transcript type derived"));
 
     transcript.transcript_type = Itt::Unmasked(Iuto::ReshareUnmasked(dummy_transcript_id()));
     let result = transcript.verify_consistency_with_params(&params);
-    assert!(matches!(result, Err(e) if e.contains("does not match transcript type derived")));
+    assert_matches!(result, Err(e) if e.contains("does not match transcript type derived"));
 
     transcript.transcript_type = Itt::Masked(Imto::UnmaskedTimesMasked(
         dummy_transcript_id(),
         dummy_transcript_id(),
     ));
     let result = transcript.verify_consistency_with_params(&params);
-    assert!(matches!(result, Err(e) if e.contains("does not match transcript type derived")));
+    assert_matches!(result, Err(e) if e.contains("does not match transcript type derived"));
 }
 
 #[test]
@@ -117,18 +120,18 @@ fn should_fail_on_mismatching_transcript_types_for_operation_type_reshare_of_unm
 
     transcript.transcript_type = Itt::Masked(Imto::Random);
     let result = transcript.verify_consistency_with_params(&params);
-    assert!(matches!(result, Err(e) if e.contains("does not match transcript type derived")));
+    assert_matches!(result, Err(e) if e.contains("does not match transcript type derived"));
 
     transcript.transcript_type = Itt::Unmasked(Iuto::ReshareMasked(dummy_transcript_id()));
     let result = transcript.verify_consistency_with_params(&params);
-    assert!(matches!(result, Err(e) if e.contains("does not match transcript type derived")));
+    assert_matches!(result, Err(e) if e.contains("does not match transcript type derived"));
 
     transcript.transcript_type = Itt::Masked(Imto::UnmaskedTimesMasked(
         dummy_transcript_id(),
         dummy_transcript_id(),
     ));
     let result = transcript.verify_consistency_with_params(&params);
-    assert!(matches!(result, Err(e) if e.contains("does not match transcript type derived")));
+    assert_matches!(result, Err(e) if e.contains("does not match transcript type derived"));
 }
 
 #[test]
@@ -139,15 +142,15 @@ fn should_fail_on_mismatching_transcript_types_for_operation_type_unmasked_times
 
     transcript.transcript_type = Itt::Masked(Imto::Random);
     let result = transcript.verify_consistency_with_params(&params);
-    assert!(matches!(result, Err(e) if e.contains("does not match transcript type derived")));
+    assert_matches!(result, Err(e) if e.contains("does not match transcript type derived"));
 
     transcript.transcript_type = Itt::Unmasked(Iuto::ReshareMasked(dummy_transcript_id()));
     let result = transcript.verify_consistency_with_params(&params);
-    assert!(matches!(result, Err(e) if e.contains("does not match transcript type derived")));
+    assert_matches!(result, Err(e) if e.contains("does not match transcript type derived"));
 
     transcript.transcript_type = Itt::Unmasked(Iuto::ReshareUnmasked(dummy_transcript_id()));
     let result = transcript.verify_consistency_with_params(&params);
-    assert!(matches!(result, Err(e) if e.contains("does not match transcript type derived")));
+    assert_matches!(result, Err(e) if e.contains("does not match transcript type derived"));
 }
 
 #[test]
@@ -155,11 +158,11 @@ fn should_fail_on_insufficient_num_of_dealings() {
     let (mut transcript, mut params) = valid_transcript_and_params();
     params.dealers = dealers(btreeset! {node_id(1), node_id(2), node_id(3), node_id(4)});
     transcript.verified_dealings =
-        btreemap! {0 => multi_signed_dealing(node_id(42), params.receivers.get().clone())};
+        btreemap! {0 => batch_signed_dealing(node_id(42), params.receivers.get().clone())};
 
     let result = transcript.verify_consistency_with_params(&params);
 
-    assert!(matches!(result, Err(e) if e.contains("insufficient number of dealings (1<2)")));
+    assert_matches!(result, Err(e) if e.contains("insufficient number of dealings (1<2)"));
 }
 
 #[test]
@@ -167,11 +170,11 @@ fn should_fail_on_dealing_from_non_dealer() {
     let (mut transcript, mut params) = valid_transcript_and_params();
     params.dealers = dealers(btreeset! {node_id(1), node_id(2), node_id(3)});
     transcript.verified_dealings =
-        btreemap! {0 => multi_signed_dealing(node_id(999), params.receivers.get().clone())};
+        btreemap! {0 => batch_signed_dealing(node_id(999), params.receivers.get().clone())};
 
     let result = transcript.verify_consistency_with_params(&params);
 
-    assert!(matches!(result, Err(e) if e.contains("transcript contains dealings from non-dealer")));
+    assert_matches!(result, Err(e) if e.contains("transcript contains dealings from non-dealer"));
 }
 
 #[test]
@@ -179,14 +182,14 @@ fn should_fail_on_mismatching_dealer_indexes() {
     let (mut transcript, mut params) = valid_transcript_and_params();
     params.dealers = dealers(btreeset! {node_id(3), node_id(1), node_id(2)});
     transcript.verified_dealings =
-        btreemap! {0 => multi_signed_dealing(node_id(2), params.receivers.get().clone())};
+        btreemap! {0 => batch_signed_dealing(node_id(2), params.receivers.get().clone())};
 
     let result = transcript.verify_consistency_with_params(&params);
 
-    assert!(matches!(result, Err(e)
+    assert_matches!(result, Err(e)
             if e.contains("mismatching dealer indexes in transcript (0) and \
                           params (1) for dealer gfvbo-licaa-aaaaa-aaaap-2ai")
-    ));
+    );
 }
 
 #[test]
@@ -199,19 +202,20 @@ fn should_fail_on_ineligible_signer() {
         .verified_dealings
         .get_mut(&first_dealer_index)
         .unwrap()
-        .signers
-        .insert(non_receiver);
+        .signature
+        .signatures_map
+        .insert(non_receiver, BasicSigOf::from(BasicSig(vec![])));
 
     let result = transcript.verify_consistency_with_params(&params);
 
-    assert!(matches!(result, Err(e)
+    assert_matches!(result, Err(e)
             if e.contains(&format!("ineligible signers (non-receivers) for \
                            dealer index {}: {{{}}}", first_dealer_index, non_receiver))
-    ));
+    );
 }
 
 fn valid_transcript_and_params() -> (IDkgTranscript, IDkgTranscriptParams) {
-    let transcript_id = transcript_id(12, 34);
+    let transcript_id = random_transcript_id();
     let dealers = dealers(btreeset! {node_id(42), node_id(43), node_id(44)});
     let receivers = receivers(btreeset! {node_id(45), node_id(46)});
     let registry_version = RegistryVersion::from(234);
@@ -219,9 +223,9 @@ fn valid_transcript_and_params() -> (IDkgTranscript, IDkgTranscriptParams) {
 
     let transcript = IDkgTranscript {
         verified_dealings: btreemap! {
-            0 => multi_signed_dealing(node_id(42), receivers.get().clone()),
-            1 => multi_signed_dealing(node_id(43), receivers.get().clone()),
-            2 => multi_signed_dealing(node_id(44), receivers.get().clone()),
+            0 => batch_signed_dealing(node_id(42), receivers.get().clone()),
+            1 => batch_signed_dealing(node_id(43), receivers.get().clone()),
+            2 => batch_signed_dealing(node_id(44), receivers.get().clone()),
         },
         transcript_id,
         receivers: receivers.clone(),
@@ -244,29 +248,34 @@ fn valid_transcript_and_params() -> (IDkgTranscript, IDkgTranscriptParams) {
     (transcript, params)
 }
 
-fn multi_signed_dealing(dealer_id: NodeId, signers: BTreeSet<NodeId>) -> IDkgMultiSignedDealing {
-    let ecdsa_dealing = EcdsaDealing {
-        requested_height: dummy_height(),
-        idkg_dealing: IDkgDealing {
-            transcript_id: dummy_transcript_id(),
-            dealer_id,
-            internal_dealing_raw: dummy_internal_dealing_raw(),
+fn batch_signed_dealing(dealer_id: NodeId, signers: BTreeSet<NodeId>) -> BatchSignedIDkgDealing {
+    let dealing = IDkgDealing {
+        transcript_id: dummy_transcript_id(),
+        internal_dealing_raw: dummy_internal_dealing_raw(),
+    };
+    let signed_dealing = SignedIDkgDealing {
+        content: dealing,
+        signature: BasicSignature {
+            signature: BasicSigOf::new(BasicSig(vec![1, 2, 3])),
+            signer: dealer_id,
         },
     };
-
-    IDkgMultiSignedDealing {
-        signature: CombinedMultiSigOf::new(CombinedMultiSig(vec![])),
-        signers,
-        dealing: ecdsa_dealing,
+    let mut signatures_map = BTreeMap::new();
+    for signer in signers {
+        signatures_map.insert(signer, BasicSigOf::from(BasicSig(vec![])));
+    }
+    BatchSignedIDkgDealing {
+        content: signed_dealing,
+        signature: BasicSignatureBatch { signatures_map },
     }
 }
 
 fn dummy_transcript() -> IDkgTranscript {
     IDkgTranscript {
         verified_dealings: btreemap! {
-            0 => multi_signed_dealing(node_id(42), BTreeSet::new()),
-            1 => multi_signed_dealing(node_id(43), BTreeSet::new()),
-            3 => multi_signed_dealing(node_id(45), BTreeSet::new())
+            0 => batch_signed_dealing(node_id(42), BTreeSet::new()),
+            1 => batch_signed_dealing(node_id(43), BTreeSet::new()),
+            3 => batch_signed_dealing(node_id(45), BTreeSet::new())
         },
         transcript_id: dummy_transcript_id(),
         receivers: dummy_receivers(),
@@ -278,11 +287,7 @@ fn dummy_transcript() -> IDkgTranscript {
 }
 
 fn dummy_transcript_id() -> IDkgTranscriptId {
-    IDkgTranscriptId::new(subnet_id(0), 0)
-}
-
-fn transcript_id(subnet: u64, id: usize) -> IDkgTranscriptId {
-    IDkgTranscriptId::new(subnet_id(subnet), id)
+    IDkgTranscriptId::new(subnet_id(0), 0, Height::new(0))
 }
 
 fn dummy_receivers() -> IDkgReceivers {
@@ -315,10 +320,6 @@ fn dummy_internal_transcript_raw() -> Vec<u8> {
 
 fn dummy_internal_dealing_raw() -> Vec<u8> {
     vec![]
-}
-
-fn dummy_height() -> Height {
-    Height::new(0)
 }
 
 fn node_id(id: u64) -> NodeId {

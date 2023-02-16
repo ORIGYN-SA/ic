@@ -1,11 +1,19 @@
 use super::*;
 use crate::lazy_tree::LazyFork;
+use ic_base_types::NumBytes;
 use ic_crypto_tree_hash::{
-    flatmap, lookup_path, FlatMap, HashTreeBuilder, HashTreeBuilderImpl, Label, LabeledTree,
-    MixedHashTree, Witness, WitnessGenerator, WitnessGeneratorImpl,
+    flatmap, FlatMap, HashTreeBuilder, HashTreeBuilderImpl, Label, LabeledTree, MixedHashTree,
+    Witness, WitnessGenerator, WitnessGeneratorImpl,
 };
+use ic_registry_subnet_type::SubnetType;
+use ic_replicated_state::ReplicatedState;
+use ic_test_utilities::{
+    mock_time,
+    state::insert_dummy_canister,
+    types::ids::{canister_test_id, message_test_id, subnet_test_id, user_test_id},
+};
+use ic_types::ingress::{IngressState, IngressStatus, WasmResult};
 use proptest::prelude::*;
-use std::convert::TryInto;
 use std::sync::Arc;
 
 fn arbitrary_leaf() -> impl Strategy<Value = LabeledTree<Vec<u8>>> {
@@ -15,13 +23,13 @@ fn arbitrary_leaf() -> impl Strategy<Value = LabeledTree<Vec<u8>>> {
 fn arbitrary_labeled_tree() -> impl Strategy<Value = LabeledTree<Vec<u8>>> {
     arbitrary_leaf().prop_recursive(
         /* depth= */ 4,
-        /* max_size= */ 256,
-        /* items_per_collection= */ 10,
+        /* max_size= */ 1000,
+        /* items_per_collection= */ 130,
         |inner| {
             prop::collection::btree_map(
                 prop::collection::vec(any::<u8>(), 1..15).prop_map(Label::from),
                 inner,
-                0..10,
+                0..130,
             )
             .prop_map(|children| {
                 LabeledTree::SubTree(FlatMap::from_key_values(children.into_iter().collect()))
@@ -36,14 +44,23 @@ impl<'a> LazyFork<'a> for FlatMapFork<'a> {
     fn edge(&self, l: &Label) -> Option<LazyTree<'a>> {
         self.0.get(l).map(as_lazy)
     }
+
     fn labels(&self) -> Box<dyn Iterator<Item = Label> + '_> {
         Box::new(self.0.keys().iter().cloned())
+    }
+
+    fn children(&self) -> Box<dyn Iterator<Item = (Label, LazyTree<'a>)> + 'a> {
+        Box::new(self.0.iter().map(|(l, t)| (l.clone(), as_lazy(t))))
+    }
+
+    fn len(&self) -> usize {
+        self.0.len()
     }
 }
 
 fn as_lazy(t: &LabeledTree<Vec<u8>>) -> LazyTree<'_> {
     match t {
-        LabeledTree::Leaf(b) => LazyTree::Blob(&b[..]),
+        LabeledTree::Leaf(b) => LazyTree::Blob(&b[..], None),
         LabeledTree::SubTree(cs) => LazyTree::LazyFork(Arc::new(FlatMapFork(cs))),
     }
 }
@@ -80,6 +97,7 @@ fn enumerate_leaves(t: &LabeledTree<Vec<u8>>, mut f: impl FnMut(LabeledTree<Vec<
         match t {
             LabeledTree::Leaf(_) => {
                 let mut subtree = t.clone();
+                #[allow(clippy::unnecessary_to_owned)]
                 for label in path.iter().rev().cloned() {
                     subtree = LabeledTree::SubTree(flatmap! {
                         label.clone() => subtree,
@@ -110,6 +128,21 @@ fn assert_same_witness(ht: &HashTree, wg: &WitnessGeneratorImpl, data: &LabeledT
     )
 }
 
+/// Check that for each leaf, the witness looks the same as with the
+/// old way of generating witnesses
+/// Also check that the new and old way of computing hash trees are equivalent
+fn test_tree(t: &LabeledTree<Vec<u8>>) {
+    let hash_tree = hash_lazy_tree(&as_lazy(t));
+    let witness_gen = build_witness_gen(t);
+    enumerate_leaves(t, |subtree| {
+        assert_same_witness(&hash_tree, &witness_gen, &subtree);
+    });
+
+    let crypto_tree = crypto_hash_lazy_tree(&as_lazy(t));
+
+    assert_eq!(hash_tree, crypto_tree);
+}
+
 #[test]
 fn test_one_level_tree() {
     let t = LabeledTree::SubTree(flatmap! {
@@ -117,9 +150,8 @@ fn test_one_level_tree() {
             Label::from([0]) => LabeledTree::Leaf(vec![0]),
         })
     });
-    let hash_tree = hash_lazy_tree(&as_lazy(&t));
-    let witness_gen = build_witness_gen(&t);
-    assert_same_witness(&hash_tree, &witness_gen, &t);
+
+    test_tree(&t);
 }
 
 #[test]
@@ -134,11 +166,22 @@ fn test_simple_tree() {
         }),
     });
 
-    let hash_tree = hash_lazy_tree(&as_lazy(&t));
-    let witness_gen = build_witness_gen(&t);
-    enumerate_leaves(&t, |subtree| {
-        assert_same_witness(&hash_tree, &witness_gen, &subtree);
-    })
+    test_tree(&t);
+}
+
+#[test]
+fn test_many_children() {
+    let vec: Vec<(Label, LabeledTree<_>)> = (1..1000)
+        .map(|i| Label::from(i.to_string()))
+        .zip(std::iter::repeat(LabeledTree::Leaf(b"abcde".to_vec())))
+        .collect::<Vec<_>>();
+    let large_flatmap = FlatMap::from_key_values(vec);
+    let t = LabeledTree::SubTree(flatmap! {
+        Label::from("a") => LabeledTree::SubTree(large_flatmap.clone()),
+        Label::from("c") => LabeledTree::SubTree(large_flatmap),
+    });
+
+    test_tree(&t);
 }
 
 #[test]
@@ -160,19 +203,18 @@ fn test_non_existence_proof() {
 
     assert_eq!(&ht_witness.digest(), hash_tree.root_hash());
 
-    let t: LabeledTree<_> = ht_witness.clone().try_into().unwrap();
     assert!(
-        lookup_path(&t, &[b"Z"]).is_none(),
+        ht_witness.lookup(&[b"Z"]).is_absent(),
         "witness: {:?}",
         ht_witness
     );
     assert!(
-        lookup_path(&t, &[b"a"]).is_some(),
+        ht_witness.lookup(&[b"a"]).is_found(),
         "witness: {:?}",
         ht_witness
     );
     assert!(
-        lookup_path(&t, &[b"c"]).is_none(),
+        ht_witness.lookup(&[b"c"]).is_unknown(),
         "witness: {:?}",
         ht_witness
     );
@@ -183,19 +225,18 @@ fn test_non_existence_proof() {
 
     assert_eq!(&ht_witness.digest(), hash_tree.root_hash());
 
-    let t: LabeledTree<_> = ht_witness.clone().try_into().unwrap();
     assert!(
-        lookup_path(&t, &[b"a"]).is_some(),
+        ht_witness.lookup(&[b"a"]).is_found(),
         "witness: {:?}",
         ht_witness
     );
     assert!(
-        lookup_path(&t, &[b"b"]).is_none(),
+        ht_witness.lookup(&[b"b"]).is_absent(),
         "witness: {:?}",
         ht_witness
     );
     assert!(
-        lookup_path(&t, &[b"c"]).is_some(),
+        ht_witness.lookup(&[b"c"]).is_found(),
         "witness: {:?}",
         ht_witness
     );
@@ -206,19 +247,18 @@ fn test_non_existence_proof() {
 
     assert_eq!(&ht_witness.digest(), hash_tree.root_hash());
 
-    let t: LabeledTree<_> = ht_witness.clone().try_into().unwrap();
     assert!(
-        lookup_path(&t, &[b"a"]).is_none(),
+        ht_witness.lookup(&[b"a"]).is_unknown(),
         "witness: {:?}",
         ht_witness
     );
     assert!(
-        lookup_path(&t, &[b"c"]).is_some(),
+        ht_witness.lookup(&[b"c"]).is_found(),
         "witness: {:?}",
         ht_witness
     );
     assert!(
-        lookup_path(&t, &[b"d"]).is_none(),
+        ht_witness.lookup(&[b"d"]).is_absent(),
         "witness: {:?}",
         ht_witness
     );
@@ -227,10 +267,75 @@ fn test_non_existence_proof() {
 proptest! {
     #[test]
     fn same_witness_on_all_leaves(t in arbitrary_labeled_tree()) {
-        let hash_tree = hash_lazy_tree(&as_lazy(&t));
-        let witness_gen = build_witness_gen(&t);
-        enumerate_leaves(&t, |subtree| {
-            assert_same_witness(&hash_tree, &witness_gen, &subtree);
-        });
+        test_tree(&t);
     }
+}
+
+#[test]
+fn simple_state_old_vs_new_hashing() {
+    let state = ReplicatedState::new(subnet_test_id(1), SubnetType::Application);
+
+    let hash_tree = hash_lazy_tree(&LazyTree::from(&state));
+    let crypto_hash_tree = crypto_hash_lazy_tree(&LazyTree::from(&state));
+
+    assert_eq!(hash_tree, crypto_hash_tree);
+}
+
+#[test]
+fn many_canister_state_old_vs_new_hashing() {
+    let mut state = ReplicatedState::new(subnet_test_id(1), SubnetType::Application);
+    for i in 1..1000 {
+        insert_dummy_canister(&mut state, canister_test_id(i), user_test_id(24).get());
+    }
+
+    let hash_tree = hash_lazy_tree(&LazyTree::from(&state));
+    let crypto_hash_tree = crypto_hash_lazy_tree(&LazyTree::from(&state));
+
+    assert_eq!(hash_tree, crypto_hash_tree);
+}
+
+#[test]
+fn large_history_state_old_vs_new_hashing() {
+    let mut state = ReplicatedState::new(subnet_test_id(1), SubnetType::Application);
+    for i in 1..1000 {
+        state.set_ingress_status(
+            message_test_id(i),
+            IngressStatus::Known {
+                receiver: canister_test_id(i).get(),
+                user_id: user_test_id(i),
+                time: mock_time(),
+                state: IngressState::Completed(WasmResult::Reply(b"done".to_vec())),
+            },
+            NumBytes::from(u64::MAX),
+        );
+    }
+
+    let hash_tree = hash_lazy_tree(&LazyTree::from(&state));
+    let crypto_hash_tree = crypto_hash_lazy_tree(&LazyTree::from(&state));
+
+    assert_eq!(hash_tree, crypto_hash_tree);
+}
+
+#[test]
+fn large_history_and_canisters_state_old_vs_new_hashing() {
+    let mut state = ReplicatedState::new(subnet_test_id(1), SubnetType::Application);
+    for i in 1..1000 {
+        insert_dummy_canister(&mut state, canister_test_id(i), user_test_id(24).get());
+
+        state.set_ingress_status(
+            message_test_id(i),
+            IngressStatus::Known {
+                receiver: canister_test_id(i).get(),
+                user_id: user_test_id(i),
+                time: mock_time(),
+                state: IngressState::Completed(WasmResult::Reply(b"done".to_vec())),
+            },
+            NumBytes::from(u64::MAX),
+        );
+    }
+
+    let hash_tree = hash_lazy_tree(&LazyTree::from(&state));
+    let crypto_hash_tree = crypto_hash_lazy_tree(&LazyTree::from(&state));
+
+    assert_eq!(hash_tree, crypto_hash_tree);
 }

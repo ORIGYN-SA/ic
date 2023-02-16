@@ -37,8 +37,7 @@ impl SummaryPayload {
         if let Some(ecdsa_version) = self
             .ecdsa
             .as_ref()
-            .map(|payload| payload.get_oldest_registry_version_in_use())
-            .flatten()
+            .and_then(|payload| payload.get_oldest_registry_version_in_use())
         {
             dkg_version.min(ecdsa_version)
         } else {
@@ -62,7 +61,9 @@ impl BlockPayload {
     /// Return true if it is a normal block and empty
     pub fn is_empty(&self) -> bool {
         match self {
-            BlockPayload::Data(data) => data.batch.is_empty() && data.dealings.messages.is_empty(),
+            BlockPayload::Data(data) => {
+                data.batch.is_empty() && data.dealings.messages.is_empty() && data.ecdsa.is_none()
+            }
             _ => false,
         }
     }
@@ -103,6 +104,14 @@ impl BlockPayload {
         match self {
             BlockPayload::Data(data) => data,
             _ => panic!("No data payload available on a summary block."),
+        }
+    }
+
+    /// Returns a reference to EcdsaPayload if it exists.
+    pub fn as_ecdsa(&self) -> Option<&ecdsa::EcdsaPayload> {
+        match self {
+            BlockPayload::Data(data) => data.ecdsa.as_ref(),
+            BlockPayload::Summary(data) => data.ecdsa.as_ref(),
         }
     }
 

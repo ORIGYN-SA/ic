@@ -18,9 +18,9 @@ use std::{
     time::Duration,
 };
 
-use ic_interfaces::registry::{RegistryClient, RegistryClientResult};
+use ic_interfaces_registry::{RegistryClient, RegistryClientResult};
 use ic_protobuf::registry::node::v1::{ConnectionEndpoint as pbConnectionEndpoint, NodeRecord};
-use ic_registry_client::local_registry::{LocalRegistry, LocalRegistryError};
+use ic_registry_local_registry::{LocalRegistry, LocalRegistryError};
 use ic_types::{
     registry::{
         connection_endpoint::{ConnectionEndpoint, ConnectionEndpointTryFromProtoError},
@@ -111,15 +111,14 @@ impl IcServiceDiscoveryImpl {
     ///
     /// If all updates succeed, returns `Ok(())`. Otherwise an error is returned
     /// containing all failed update attempts.
-    pub fn update_registries(&self) -> Result<(), IcServiceDiscoveryError> {
+    pub async fn update_registries(&self) -> Result<(), IcServiceDiscoveryError> {
         let cache = self.registries.read().unwrap();
-        let failures = cache.iter().fold(vec![], |mut a, (ic_name, registry)| {
-            if let Err(e) = registry.sync_with_nns() {
-                a.push((ic_name.to_string(), e));
+        let mut failures = vec![];
+        for (ic_name, registry) in cache.iter() {
+            if let Err(e) = registry.sync_with_nns().await {
+                failures.push((ic_name.to_string(), e));
             }
-            a
-        });
-
+        }
         if !failures.is_empty() {
             return Err(IcServiceDiscoveryError::SyncWithNnsFailed { failures });
         }
@@ -147,9 +146,6 @@ impl IcServiceDiscoveryImpl {
             }
             let ic_name = path.file_name().to_str().unwrap().to_string();
             if let Entry::Vacant(e) = registries_lock_guard.entry(ic_name) {
-                // The LocalRegistry needs to be updated to accept a
-                // tokio::runtime::Handle. For now we accept that each
-                // LocalRegistry will allocate it's own tokio-runtime.
                 let ic_registry = LocalRegistry::new(path.path(), self.registry_query_timeout)?;
                 e.insert(ic_registry);
             }
@@ -278,9 +274,9 @@ impl IcServiceDiscovery for IcServiceDiscoveryImpl {
             HOST_NODE_EXPORTER_JOB_NAME => {
                 Box::new(|sockaddr: SocketAddr| guest_to_host_address((set_port(9100))(sockaddr)))
             }
-            NODE_EXPORTER_JOB_NAME => set_port(9100),
-            ORCHESTRATOR_JOB_NAME => set_port(9091),
-            REPLICA_JOB_NAME => set_port(9090),
+            NODE_EXPORTER_JOB_NAME => some_after(set_port(9100)),
+            ORCHESTRATOR_JOB_NAME => some_after(set_port(9091)),
+            REPLICA_JOB_NAME => some_after(set_port(9090)),
             _ => {
                 return Err(IcServiceDiscoveryError::JobNameNotFound {
                     job_name: job_name.to_string(),
@@ -298,12 +294,23 @@ impl IcServiceDiscovery for IcServiceDiscoveryImpl {
 
         Ok(prometheus_target_list
             .into_iter()
-            .map(|target_group| {
-                let targets: BTreeSet<_> = target_group.targets.into_iter().map(&mapping).collect();
-                PrometheusTargetGroup {
-                    targets,
-                    ..target_group
+            .filter_map(|target_group| {
+                // replica targets are only exposed if they are assigned to a
+                // subnet (i.e. if the subnet id is set)
+                if job_name != REPLICA_JOB_NAME || target_group.subnet_id.is_some() {
+                    let targets: BTreeSet<_> = target_group
+                        .targets
+                        .into_iter()
+                        .filter_map(&mapping)
+                        .collect();
+                    if !targets.is_empty() {
+                        return Some(PrometheusTargetGroup {
+                            targets,
+                            ..target_group
+                        });
+                    }
                 }
+                None
             })
             .collect::<BTreeSet<_>>())
     }
@@ -316,21 +323,28 @@ fn set_port(port: u16) -> Box<dyn Fn(SocketAddr) -> SocketAddr> {
     })
 }
 
+/// Take a function f and return `Some . f`
+fn some_after(
+    f: Box<dyn Fn(SocketAddr) -> SocketAddr>,
+) -> Box<dyn Fn(SocketAddr) -> Option<SocketAddr>> {
+    Box::new(move |s| Some(f(s)))
+}
+
 /// By convention, the first two bytes of the host-part of the replica's IP
 /// address are 0x6801. The corresponding segment for the host is 0x6800.
 ///
 /// (The MAC starts with 0x6a00. The 7'th bit of the first byte is flipped. See
 /// https://en.wikipedia.org/wiki/MAC_address)
-fn guest_to_host_address(sockaddr: SocketAddr) -> SocketAddr {
-    let ip = match sockaddr.ip() {
+fn guest_to_host_address(sockaddr: SocketAddr) -> Option<SocketAddr> {
+    match sockaddr.ip() {
         IpAddr::V6(a) if a.segments()[4] == 0x6801 => {
             let s = a.segments();
             let new_addr = Ipv6Addr::new(s[0], s[1], s[2], s[3], 0x6800, s[5], s[6], s[7]);
-            IpAddr::V6(new_addr)
+            let ip = IpAddr::V6(new_addr);
+            Some(SocketAddr::new(ip, sockaddr.port()))
         }
-        ip => ip,
-    };
-    SocketAddr::new(ip, sockaddr.port())
+        _ip => None,
+    }
 }
 trait MapRegistryClientErr<T> {
     fn map_registry_err(
@@ -445,7 +459,7 @@ mod tests {
             .map(|g| g.targets.iter().next().unwrap().to_string())
             .collect();
 
-        let expected_nns_targets: HashSet<_> = (&[
+        let expected_nns_targets: HashSet<_> = [
             "[2001:920:401a:1706:5000:87ff:fe11:a9a0]:9090",
             "[2001:920:401a:1708:5000:4fff:fe92:48f1]:9090",
             "[2001:920:401a:1708:5000:5fff:fec1:9ddb]:9090",
@@ -483,16 +497,16 @@ mod tests {
             "[2a04:9dc0:0:108:5000:96ff:fe4a:be10]:9090",
             "[2a0f:cd00:2:1:5000:3fff:fe36:cab8]:9090",
             "[2a0f:cd00:2:1:5000:87ff:fe58:ceba]:9090",
-        ])
-            .iter()
-            .map(ToString::to_string)
-            .collect();
+        ]
+        .iter()
+        .map(ToString::to_string)
+        .collect();
 
         assert_eq!(nns_targets.len(), 37);
         assert_eq!(nns_targets, expected_nns_targets);
 
         let subnet_count = target_groups.iter().unique_by(|g| g.subnet_id).count();
         // there are 29 subnets at version 0x6dc1, and unassigned nodes belong to `None`
-        assert_eq!(subnet_count, 30);
+        assert_eq!(subnet_count, 29);
     }
 }

@@ -3,12 +3,11 @@ name = "ic-crypto-internal-csp"
 description = "Secret key store and services"
 version = "0.8.0"
 authors = ["The Internet Computer Project Developers"]
-edition = "2018"
+edition = "2021"
 
 [dependencies]
 async-trait = "0.1.41"
 base64 = "0.11"
-futures = "0.3.6"
 hex = "0.4.2"
 ic-config = { path = "../../../config" }
 ic-crypto-internal-basic-sig-der-utils = { path = "../crypto_lib/basic_sig/der_utils" }
@@ -18,54 +17,59 @@ ic-crypto-internal-basic-sig-ecdsa-secp256r1 = { path = "../crypto_lib/basic_sig
 ic-crypto-internal-basic-sig-ed25519 = { path = "../crypto_lib/basic_sig/ed25519" }
 ic-crypto-internal-basic-sig-rsa-pkcs1 = { path = "../crypto_lib/basic_sig/rsa_pkcs1" }
 ic-crypto-internal-basic-sig-iccsa = { path = "../crypto_lib/basic_sig/iccsa" }
-ic-crypto-internal-bls12381-common = { path = "../crypto_lib/bls12_381/common" }
-ic-crypto-internal-bls12381-serde-miracl = { path = "../crypto_lib/bls12_381/serde/miracl" }
-ic-crypto-internal-fs-ni-dkg = { path = "../crypto_lib/fs_ni_dkg" }
 ic-crypto-internal-logmon = { path = "../logmon" }
 ic-crypto-internal-multi-sig-bls12381 = { path = "../crypto_lib/multi_sig/bls12_381" }
 ic-crypto-secrets-containers = { path = "../../secrets_containers" }
+ic-crypto-internal-seed = { path = "../crypto_lib/seed" }
 ic-crypto-internal-threshold-sig-bls12381 = { path = "../crypto_lib/threshold_sig/bls12_381" }
 ic-crypto-internal-threshold-sig-ecdsa = { path = "../crypto_lib/threshold_sig/tecdsa" }
 ic-crypto-internal-test-vectors = { path = "../test_vectors" }
 ic-crypto-internal-tls = { path = "../crypto_lib/tls" }
 ic-crypto-internal-types = { path = "../crypto_lib/types" }
+ic-crypto-node-key-validation = { path = "../../../crypto/node_key_validation" }
 ic-crypto-sha = { path = "../../sha" }
 ic-crypto-tls-interfaces = { path = "../../tls_interfaces" }
+ic-crypto-utils-time = { path = "../../utils/time" }
 ic-interfaces = { path = "../../../interfaces" }
 ic-logger = { path = "../../../monitoring/logger" }
+ic-metrics = { path = "../../../monitoring/metrics" }
 ic-protobuf = { path = "../../../protobuf" }
 ic-types = { path = "../../../types/types" }
 ic-utils = { path = "../../../utils" }
-lazy_static = "1.4.0"
 openssl = "0.10.38"
-parking_lot = "0.11.1"
-prost = "0.9.0"
-rand = "0.7.3"
-rand_chacha = "0.2.2"
-rand_core = "0.5.1"
-serde = { version = "1.0.99", features = [ "derive" ] }
+parking_lot = "0.12.1"
+prost = "0.11.0"
+rand = "0.8"
+rand_chacha = "0.3"
+serde = { version = "1.0.99", features = ["derive"] }
 serde_cbor = "0.11.1"
-serde_json = "1.0.40"
-simple_asn1 = "0.5.4"
-slog = { version = "2.5.2", features = ["nested-values", "max_level_trace", "release_max_level_debug"] }
+simple_asn1 = "0.6.1"
+slog = { version = "2.5.2", features = ["nested-values", "release_max_level_debug"] }
 strum = "0.23.0"
 strum_macros = "0.23.0"
-tarpc = { version = "0.27", features = ["full"] }
+tarpc = { version = "0.31", features = ["full"] }
+tempfile = "3.1.0"
+threadpool = "1.8.1"
 tokio = { version = "1.15.0", features = ["full"] }
 tokio-openssl = "0.6.0"
 tokio-serde = { version = "0.8", features = ["json", "bincode"] }
-tokio-util = "0.6.8"
+tokio-util = { version = "0.7.4", features = ["codec"] }
 zeroize = { version = "1.4.3", features = ["zeroize_derive"] }
 
-[build-dependencies]
-prost-build = "0.9.0"
-
 [dev-dependencies]
-hex = "0.4.2"
+assert_matches = "1.5.0"
 ic-crypto-internal-csp-test-utils = { path = "../csp_test_utils" }
+ic-crypto-internal-csp-protobuf-generator = { path = "./protobuf_generator" }
+ic-crypto-node-key-generation = { path = "../../node_key_generation" }
 ic-crypto-test-utils = { path = "../../test_utils" }
+ic-crypto-test-utils-local-csp-vault = { path = "../../../crypto/test_utils/local_csp_vault" }
+ic-crypto-test-utils-reproducible-rng = { path = "../../../crypto/test_utils/reproducible_rng" }
+ic-test-utilities = { path = "../../../test_utilities" }
+ic-test-utilities-compare-dirs = { path = "../../../test_utilities/compare_dirs" }
+ic-test-utilities-in-memory-logger = { path = "../../../test_utilities/in_memory_logger" }
 ic-types-test-utils = { path = "../../../types/types_test_utils" }
+lazy_static = "1.4.0"
 mockall = "0.7.2"
-proptest = "0.9.4"
-proptest-derive = "0.1.0"
-tempfile = "3.1.0"
+proptest = "1.0"
+proptest-derive = "0.3.0"
+slog-async = { version = "2.5", features = ["nested-values"] }

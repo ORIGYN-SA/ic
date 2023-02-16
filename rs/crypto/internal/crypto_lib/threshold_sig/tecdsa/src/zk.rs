@@ -17,13 +17,13 @@ pub const PROOF_OF_PRODUCT_DST: &str = "ic-crypto-tecdsa-zk-proof-of-product";
 /// - `a=b`
 ///
 /// Note that this proof does not prove knowledge of `a` and `b`, but just the equality of the openings.
-#[derive(Debug, Copy, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProofOfEqualOpenings {
     challenge: EccScalar,
     response: EccScalar,
 }
 
-#[derive(Debug, Copy, Clone)]
+#[derive(Debug, Clone)]
 struct ProofOfEqualOpeningsInstance {
     curve_type: EccCurveType,
     // Commitment key for simple commitments and first element in the commitment key for Pedersen commitments.
@@ -39,8 +39,8 @@ struct ProofOfEqualOpeningsInstance {
 impl ProofOfEqualOpeningsInstance {
     fn from_witness(secret: &EccScalar, masking: &EccScalar) -> ThresholdEcdsaResult<Self> {
         let curve_type = secret.curve_type();
-        let g = EccPoint::generator_g(curve_type)?;
-        let h = EccPoint::generator_h(curve_type)?;
+        let g = EccPoint::generator_g(curve_type);
+        let h = EccPoint::generator_h(curve_type);
         let a = EccPoint::pedersen(secret, masking)?;
         let b = EccPoint::mul_by_g(secret)?;
         Ok(Self {
@@ -54,14 +54,14 @@ impl ProofOfEqualOpeningsInstance {
 
     fn from_commitments(pedersen: &EccPoint, simple: &EccPoint) -> ThresholdEcdsaResult<Self> {
         let curve_type = pedersen.curve_type();
-        let g = EccPoint::generator_g(curve_type)?;
-        let h = EccPoint::generator_h(curve_type)?;
+        let g = EccPoint::generator_g(curve_type);
+        let h = EccPoint::generator_h(curve_type);
         Ok(Self {
             curve_type,
             g,
             h,
-            a: *pedersen,
-            b: *simple,
+            a: pedersen.clone(),
+            b: simple.clone(),
         })
     }
 
@@ -99,7 +99,7 @@ impl ProofOfEqualOpenings {
 
         // Create the blinding commitment
         let mut rng = seed.into_rng();
-        let r = EccScalar::random(instance.curve_type, &mut rng)?;
+        let r = EccScalar::random(instance.curve_type, &mut rng);
         let r_com = instance.h.scalar_mul(&r)?;
 
         // Create challenge
@@ -149,14 +149,14 @@ impl ProofOfEqualOpenings {
 /// Note: in the IDKG protocol it is not necessary to explicitly prove
 /// knowledge of `b`, as in the security proof this is already known
 /// by the simulator.
-#[derive(Debug, Copy, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProofOfProduct {
     challenge: EccScalar,
     response1: EccScalar,
     response2: EccScalar,
 }
 
-#[derive(Debug, Copy, Clone)]
+#[derive(Debug, Clone)]
 struct ProofOfProductInstance {
     curve_type: EccCurveType,
     g: EccPoint,
@@ -175,12 +175,12 @@ impl ProofOfProductInstance {
         product_masking: &EccScalar,
     ) -> ThresholdEcdsaResult<Self> {
         let curve_type = lhs.curve_type();
-        let g = EccPoint::generator_g(curve_type)?;
-        let h = EccPoint::generator_h(curve_type)?;
+        let g = EccPoint::generator_g(curve_type);
+        let h = EccPoint::generator_h(curve_type);
 
         let lhs_com = g.scalar_mul(lhs)?;
-        let rhs_com = EccPoint::mul_points(&g, rhs, &h, rhs_masking)?;
-        let product_com = EccPoint::mul_points(&g, product, &h, product_masking)?;
+        let rhs_com = EccPoint::mul_2_points(&g, rhs, &h, rhs_masking)?;
+        let product_com = EccPoint::mul_2_points(&g, product, &h, product_masking)?;
 
         Ok(Self {
             curve_type,
@@ -198,15 +198,15 @@ impl ProofOfProductInstance {
         product_com: &EccPoint,
     ) -> ThresholdEcdsaResult<Self> {
         let curve_type = lhs_com.curve_type();
-        let g = EccPoint::generator_g(curve_type)?;
-        let h = EccPoint::generator_h(curve_type)?;
+        let g = EccPoint::generator_g(curve_type);
+        let h = EccPoint::generator_h(curve_type);
         Ok(Self {
             curve_type,
             g,
             h,
-            lhs_com: *lhs_com,
-            rhs_com: *rhs_com,
-            product_com: *product_com,
+            lhs_com: lhs_com.clone(),
+            rhs_com: rhs_com.clone(),
+            product_com: product_com.clone(),
         })
     }
 
@@ -218,7 +218,7 @@ impl ProofOfProductInstance {
             .sub_points(&self.lhs_com.scalar_mul(&proof.challenge)?)?;
 
         let r2_com =
-            EccPoint::mul_points(&self.rhs_com, &proof.response1, &self.h, &proof.response2)?
+            EccPoint::mul_2_points(&self.rhs_com, &proof.response1, &self.h, &proof.response2)?
                 .sub_points(&self.product_com.scalar_mul(&proof.challenge)?)?;
 
         Ok((r1_com, r2_com))
@@ -259,11 +259,11 @@ impl ProofOfProduct {
         // Compute blinding commitments:
         let mut rng = seed.into_rng();
 
-        let r1 = EccScalar::random(instance.curve_type, &mut rng)?;
+        let r1 = EccScalar::random(instance.curve_type, &mut rng);
         let r1_com = instance.g.scalar_mul(&r1)?;
 
-        let r2 = EccScalar::random(instance.curve_type, &mut rng)?;
-        let r2_com = EccPoint::mul_points(&instance.rhs_com, &r1, &instance.h, &r2)?;
+        let r2 = EccScalar::random(instance.curve_type, &mut rng);
+        let r2_com = EccPoint::mul_2_points(&instance.rhs_com, &r1, &instance.h, &r2)?;
 
         // Compute the challenge:
         let challenge = instance.hash_to_challenge(&r1_com, &r2_com, associated_data)?;
@@ -308,13 +308,13 @@ impl ProofOfProduct {
 /// Witness = `x` ∈  Zₚ,
 /// such that:
 /// `A = g*x` and `B = h*x`
-#[derive(Debug, Copy, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProofOfDLogEquivalence {
-    challenge: EccScalar,
-    response: EccScalar,
+    pub(crate) challenge: EccScalar,
+    pub(crate) response: EccScalar,
 }
 
-#[derive(Debug, Copy, Clone)]
+#[derive(Debug, Clone)]
 struct ProofOfDLogEquivalenceInstance {
     curve_type: EccCurveType,
     g: EccPoint,
@@ -330,8 +330,8 @@ impl ProofOfDLogEquivalenceInstance {
         let h_x = h.scalar_mul(x)?;
         Ok(Self {
             curve_type,
-            g: *g,
-            h: *h,
+            g: g.clone(),
+            h: h.clone(),
             g_x,
             h_x,
         })
@@ -346,10 +346,10 @@ impl ProofOfDLogEquivalenceInstance {
         let curve_type = g.curve_type();
         Ok(Self {
             curve_type,
-            g: *g,
-            h: *h,
-            g_x: *g_x,
-            h_x: *h_x,
+            g: g.clone(),
+            h: h.clone(),
+            g_x: g_x.clone(),
+            h_x: h_x.clone(),
         })
     }
 
@@ -397,7 +397,7 @@ impl ProofOfDLogEquivalence {
 
         // Compute blinding commitments:
         let mut rng = seed.into_rng();
-        let r = EccScalar::random(instance.curve_type, &mut rng)?;
+        let r = EccScalar::random(instance.curve_type, &mut rng);
         let r_com_g = g.scalar_mul(&r)?;
         let r_com_h = h.scalar_mul(&r)?;
 
@@ -431,5 +431,12 @@ impl ProofOfDLogEquivalence {
         }
 
         Ok(())
+    }
+
+    pub fn curve_type(&self) -> ThresholdEcdsaResult<EccCurveType> {
+        if self.challenge.curve_type() == self.response.curve_type() {
+            return Ok(self.challenge.curve_type());
+        }
+        Err(ThresholdEcdsaError::CurveMismatch)
     }
 }

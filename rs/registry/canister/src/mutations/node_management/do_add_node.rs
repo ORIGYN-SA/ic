@@ -1,4 +1,4 @@
-use crate::{common::LOG_PREFIX, mutations::common::encode_or_panic, registry::Registry};
+use crate::{common::LOG_PREFIX, registry::Registry};
 
 use std::net::SocketAddr;
 
@@ -9,21 +9,15 @@ use dfn_core::println;
 use ic_base_types::NodeId;
 use ic_crypto_node_key_validation::ValidNodePublicKeys;
 use ic_crypto_utils_basic_sig::conversions as crypto_basicsig_conversions;
-use ic_protobuf::{
-    crypto::v1::NodePublicKeys,
-    registry::{
-        crypto::v1::{PublicKey, X509PublicKeyCert},
-        node::v1::{connection_endpoint::Protocol, ConnectionEndpoint, FlowEndpoint, NodeRecord},
-    },
+use ic_protobuf::registry::{
+    crypto::v1::{PublicKey, X509PublicKeyCert},
+    node::v1::{connection_endpoint::Protocol, ConnectionEndpoint, FlowEndpoint, NodeRecord},
 };
-use ic_registry_keys::{
-    make_crypto_node_key, make_crypto_tls_cert_key, make_node_operator_record_key,
-    make_node_record_key,
-};
-use ic_registry_transport::{insert, update};
-use ic_types::crypto::KeyPurpose;
 
-use crate::mutations::node_management::common::get_node_operator_record;
+use crate::mutations::node_management::common::{
+    get_node_operator_record, make_add_node_registry_mutations, make_update_node_operator_mutation,
+};
+use ic_types::crypto::CurrentNodePublicKeys;
 use prost::Message;
 
 impl Registry {
@@ -70,66 +64,20 @@ impl Registry {
             private_api: vec![],
             prometheus_metrics: vec![],
             xnet_api: vec![],
+            chip_id: vec![],
         };
 
-        // 5. Update registry with the new subnet data
-        let add_node_entry = insert(
-            make_node_record_key(node_id).as_bytes().to_vec(),
-            encode_or_panic(&node_record),
-        );
-
-        // 6. Add the crypto keys
-        let add_committee_signing_key = insert(
-            make_crypto_node_key(node_id, KeyPurpose::CommitteeSigning)
-                .as_bytes()
-                .to_vec(),
-            encode_or_panic(valid_pks.committee_signing_key()),
-        );
-        let add_node_signing_key = insert(
-            make_crypto_node_key(node_id, KeyPurpose::NodeSigning)
-                .as_bytes()
-                .to_vec(),
-            encode_or_panic(valid_pks.node_signing_key()),
-        );
-        let add_dkg_dealing_key = insert(
-            make_crypto_node_key(node_id, KeyPurpose::DkgDealingEncryption)
-                .as_bytes()
-                .to_vec(),
-            encode_or_panic(valid_pks.dkg_dealing_encryption_key()),
-        );
-        let add_tls_certificate = insert(
-            make_crypto_tls_cert_key(node_id).as_bytes().to_vec(),
-            encode_or_panic(valid_pks.tls_certificate()),
-        );
+        // 5. Insert node, public keys, and crypto keys
+        let mut mutations = make_add_node_registry_mutations(node_id, node_record, valid_pks);
 
         // Update the Node Operator record
         let mut node_operator_record = node_operator_record;
         node_operator_record.node_allowance -= 1;
 
-        let node_operator_key = make_node_operator_record_key(caller);
-        let update_node_operator_record = update(
-            node_operator_key.as_bytes().to_vec(),
-            encode_or_panic(&node_operator_record),
-        );
+        let update_node_operator_record =
+            make_update_node_operator_mutation(caller, &node_operator_record);
 
-        let mut mutations = vec![
-            add_node_entry,
-            add_committee_signing_key,
-            add_node_signing_key,
-            add_dkg_dealing_key,
-            add_tls_certificate,
-            update_node_operator_record,
-        ];
-
-        // TODO(NNS1-1197): Refactor this when nodes are provisioned for threshold ECDSA subnets
-        if let Some(idkg_dealing_encryption_key) = valid_pks.idkg_dealing_encryption_key() {
-            mutations.push(insert(
-                make_crypto_node_key(node_id, KeyPurpose::IDkgMEGaEncryption)
-                    .as_bytes()
-                    .to_vec(),
-                encode_or_panic(idkg_dealing_encryption_key),
-            ));
-        }
+        mutations.push(update_node_operator_record);
 
         // Check invariants before applying mutations
         self.maybe_apply_mutation_internal(mutations);
@@ -181,15 +129,14 @@ pub fn connection_endpoint_from_string(endpoint: &str) -> ConnectionEndpoint {
 /// The string is written in form: `flow,ipv4:port` or `flow,[ipv6]:port`.
 pub fn flow_endpoint_from_string(endpoint: &str) -> FlowEndpoint {
     let parts = endpoint.splitn(2, ',').collect::<Vec<&str>>();
+    parts[0].parse::<u32>().unwrap();
     println!("Parts are {:?} and {:?}", parts[0], parts[1]);
-    let flow = parts[0].parse::<u32>().unwrap();
     match parts[1].parse::<SocketAddr>() {
         Err(e) => panic!(
             "Could not convert '{:?}' to a connection endpoint: {:?}",
             endpoint, e
         ),
         Ok(sa) => FlowEndpoint {
-            flow_tag: flow,
             endpoint: Some(ConnectionEndpoint {
                 ip_addr: sa.ip().to_string(),
                 port: sa.port() as u32, // because protobufs don't have u16
@@ -265,21 +212,16 @@ fn valid_keys_from_payload(
     })?;
 
     // 4. get the keys for verification -- for that, we need to create
-    let node_pks = NodePublicKeys {
-        // TODO(NNS1-1197): Remove this match statement when nodes are provisioned for threshold ECDSA subnets
-        version: match idkg_dealing_encryption_pk {
-            Some(_) => 1,
-            None => 0,
-        },
-        node_signing_pk: Some(node_signing_pk),
-        committee_signing_pk: Some(committee_signing_pk),
+    let node_pks = CurrentNodePublicKeys {
+        node_signing_public_key: Some(node_signing_pk),
+        committee_signing_public_key: Some(committee_signing_pk),
         tls_certificate: Some(tls_certificate),
-        dkg_dealing_encryption_pk: Some(dkg_dealing_encryption_pk),
-        idkg_dealing_encryption_pk,
+        dkg_dealing_encryption_public_key: Some(dkg_dealing_encryption_pk),
+        idkg_dealing_encryption_public_key: idkg_dealing_encryption_pk,
     };
 
     // 5. validate the keys and the node_id
-    match ValidNodePublicKeys::try_from(&node_pks, node_id) {
+    match ValidNodePublicKeys::try_from(node_pks, node_id) {
         Ok(valid_pks) => Ok((node_id, valid_pks)),
         Err(e) => Err(format!("Could not validate public keys, due to {:?}", e)),
     }
@@ -289,22 +231,22 @@ fn valid_keys_from_payload(
 mod tests {
     use super::*;
     use ic_base_types::NodeId;
-    use ic_crypto::utils::get_node_keys_or_generate_if_missing;
+    use ic_config::crypto::CryptoConfig;
+    use ic_crypto_node_key_generation::get_node_keys_or_generate_if_missing;
     use ic_nns_common::registry::encode_or_panic;
-    use ic_protobuf::crypto::v1::NodePublicKeys;
-    use ic_test_utilities::crypto::temp_dir::temp_dir;
+    use ic_types::crypto::CurrentNodePublicKeys;
     use lazy_static::lazy_static;
 
     #[derive(Clone)]
     struct TestData {
         _node_id: NodeId,
-        node_pks: NodePublicKeys,
+        node_pks: CurrentNodePublicKeys,
     }
 
     impl TestData {
         fn new() -> Self {
-            let temp_dir = temp_dir();
-            let (node_pks, _node_id) = get_node_keys_or_generate_if_missing(temp_dir.path());
+            let (config, _temp_dir) = CryptoConfig::new_in_temp_dir();
+            let (node_pks, _node_id) = get_node_keys_or_generate_if_missing(&config, None);
             Self { _node_id, node_pks }
         }
     }
@@ -336,7 +278,7 @@ mod tests {
     fn empty_committee_signing_key_is_detected() {
         let mut payload = PAYLOAD.clone();
         let node_signing_pubkey =
-            encode_or_panic(&TEST_DATA.clone().node_pks.node_signing_pk.unwrap());
+            encode_or_panic(&TEST_DATA.clone().node_pks.node_signing_public_key.unwrap());
         payload.node_signing_pk = node_signing_pubkey;
         assert!(valid_keys_from_payload(&payload).is_err());
     }
@@ -345,8 +287,9 @@ mod tests {
     fn empty_dkg_dealing_key_is_detected() {
         let mut payload = PAYLOAD.clone();
         let node_pks = TEST_DATA.clone().node_pks;
-        let node_signing_pubkey = encode_or_panic(&node_pks.node_signing_pk.unwrap());
-        let committee_signing_pubkey = encode_or_panic(&node_pks.committee_signing_pk.unwrap());
+        let node_signing_pubkey = encode_or_panic(&node_pks.node_signing_public_key.unwrap());
+        let committee_signing_pubkey =
+            encode_or_panic(&node_pks.committee_signing_public_key.unwrap());
         payload.node_signing_pk = node_signing_pubkey;
         payload.committee_signing_pk = committee_signing_pubkey;
         assert!(valid_keys_from_payload(&payload).is_err());
@@ -356,10 +299,11 @@ mod tests {
     fn empty_tls_cert_is_detected() {
         let mut payload = PAYLOAD.clone();
         let node_pks = TEST_DATA.clone().node_pks;
-        let node_signing_pubkey = encode_or_panic(&node_pks.node_signing_pk.unwrap());
-        let committee_signing_pubkey = encode_or_panic(&node_pks.committee_signing_pk.unwrap());
+        let node_signing_pubkey = encode_or_panic(&node_pks.node_signing_public_key.unwrap());
+        let committee_signing_pubkey =
+            encode_or_panic(&node_pks.committee_signing_public_key.unwrap());
         let ni_dkg_dealing_encryption_pubkey =
-            encode_or_panic(&node_pks.dkg_dealing_encryption_pk.unwrap());
+            encode_or_panic(&node_pks.dkg_dealing_encryption_public_key.unwrap());
         payload.node_signing_pk = node_signing_pubkey;
         payload.committee_signing_pk = committee_signing_pubkey;
         payload.ni_dkg_dealing_encryption_pk = ni_dkg_dealing_encryption_pubkey;
@@ -370,10 +314,11 @@ mod tests {
     fn empty_idkg_key_is_detected() {
         let mut payload = PAYLOAD.clone();
         let node_pks = TEST_DATA.clone().node_pks;
-        let node_signing_pubkey = encode_or_panic(&node_pks.node_signing_pk.unwrap());
-        let committee_signing_pubkey = encode_or_panic(&node_pks.committee_signing_pk.unwrap());
+        let node_signing_pubkey = encode_or_panic(&node_pks.node_signing_public_key.unwrap());
+        let committee_signing_pubkey =
+            encode_or_panic(&node_pks.committee_signing_public_key.unwrap());
         let ni_dkg_dealing_encryption_pubkey =
-            encode_or_panic(&node_pks.dkg_dealing_encryption_pk.unwrap());
+            encode_or_panic(&node_pks.dkg_dealing_encryption_public_key.unwrap());
         let tls_certificate = encode_or_panic(&node_pks.tls_certificate.unwrap());
         payload.node_signing_pk = node_signing_pubkey;
         payload.committee_signing_pk = committee_signing_pubkey;
@@ -465,7 +410,6 @@ mod tests {
         assert_eq!(
             flow_endpoint_from_string("1337,127.0.0.1:8080"),
             FlowEndpoint {
-                flow_tag: 1337,
                 endpoint: Some(ConnectionEndpoint {
                     ip_addr: "127.0.0.1".to_string(),
                     port: 8080u32,

@@ -2,7 +2,7 @@
 //! distributed consensus.
 
 pub mod batch_delivery;
-mod block_maker;
+pub(crate) mod block_maker;
 mod catchup_package_maker;
 pub(crate) mod crypto;
 pub mod dkg_key_manager;
@@ -11,6 +11,7 @@ mod malicious_consensus;
 pub(crate) mod membership;
 pub(crate) mod metrics;
 mod notary;
+mod payload;
 pub mod payload_builder;
 pub mod pool_reader;
 mod prelude;
@@ -20,11 +21,15 @@ mod random_beacon_maker;
 mod random_tape_maker;
 mod share_aggregator;
 pub mod utils;
-mod validator;
+pub mod validator;
 
-pub use batch_delivery::generate_responses_to_subnet_calls;
+#[cfg(all(test, feature = "proptest"))]
+mod proptests;
+
+pub use block_maker::SubnetRecords;
 pub use crypto::ConsensusCrypto;
 pub use membership::Membership;
+pub use metrics::ValidatorMetrics;
 
 #[cfg(test)]
 pub(crate) mod mocks;
@@ -34,7 +39,7 @@ use crate::consensus::{
     catchup_package_maker::CatchUpPackageMaker,
     dkg_key_manager::DkgKeyManager,
     finalizer::Finalizer,
-    metrics::{ConsensusGossipMetrics, ConsensusMetrics, ValidatorMetrics},
+    metrics::{ConsensusGossipMetrics, ConsensusMetrics},
     notary::Notary,
     payload_builder::PayloadBuilderImpl,
     pool_reader::PoolReader,
@@ -49,17 +54,17 @@ use crate::consensus::{
 };
 use ic_config::consensus::ConsensusConfig;
 use ic_interfaces::{
-    canister_http::CanisterHttpPool,
+    canister_http::CanisterHttpPayloadBuilder,
     consensus::{Consensus, ConsensusGossip},
     consensus_pool::ConsensusPool,
     dkg::DkgPool,
     ecdsa::EcdsaPool,
     ingress_manager::IngressSelector,
     messaging::{MessageRouting, XNetPayloadBuilder},
-    registry::{self, LocalStoreCertifiedTimeReader, RegistryClient},
     self_validating_payload::SelfValidatingPayloadBuilder,
     time_source::TimeSource,
 };
+use ic_interfaces_registry::{LocalStoreCertifiedTimeReader, RegistryClient, POLLING_PERIOD};
 use ic_interfaces_state_manager::StateManager;
 use ic_logger::{debug, error, info, trace, warn, ReplicaLogger};
 use ic_metrics::MetricsRegistry;
@@ -135,9 +140,9 @@ impl ConsensusImpl {
         ingress_selector: Arc<dyn IngressSelector>,
         xnet_payload_builder: Arc<dyn XNetPayloadBuilder>,
         self_validating_payload_builder: Arc<dyn SelfValidatingPayloadBuilder>,
+        canister_http_payload_builder: Arc<dyn CanisterHttpPayloadBuilder>,
         dkg_pool: Arc<RwLock<dyn DkgPool>>,
         ecdsa_pool: Arc<RwLock<dyn EcdsaPool>>,
-        canister_http_pool: Arc<RwLock<dyn CanisterHttpPool>>,
         dkg_key_manager: Arc<Mutex<DkgKeyManager>>,
         message_routing: Arc<dyn MessageRouting>,
         state_manager: Arc<dyn StateManager<State = ReplicatedState>>,
@@ -154,6 +159,7 @@ impl ConsensusImpl {
             ingress_selector.clone(),
             xnet_payload_builder,
             self_validating_payload_builder,
+            canister_http_payload_builder,
             metrics_registry.clone(),
             logger.clone(),
         ));
@@ -188,7 +194,6 @@ impl ConsensusImpl {
                 crypto.clone(),
                 message_routing.clone(),
                 ingress_selector,
-                state_manager.clone(),
                 logger.clone(),
                 metrics_registry.clone(),
             ),
@@ -222,7 +227,6 @@ impl ConsensusImpl {
                 payload_builder.clone(),
                 dkg_pool.clone(),
                 ecdsa_pool.clone(),
-                canister_http_pool.clone(),
                 state_manager.clone(),
                 stable_registry_version_age,
                 metrics_registry.clone(),
@@ -429,6 +433,7 @@ impl Consensus for ConsensusImpl {
         // Log some information about the state of consensus
         // This is useful for testing purposes
         debug!(
+            every_n_seconds => 5,
             self.log,
             "Consensus finalized height: {}, state available: {}, DKG key material available: {}",
             pool_reader.get_finalized_height(),
@@ -620,9 +625,9 @@ pub fn setup(
     ingress_selector: Arc<dyn IngressSelector>,
     xnet_payload_builder: Arc<dyn XNetPayloadBuilder>,
     self_validating_payload_builder: Arc<dyn SelfValidatingPayloadBuilder>,
+    canister_http_payload_builder: Arc<dyn CanisterHttpPayloadBuilder>,
     dkg_pool: Arc<RwLock<dyn DkgPool>>,
     ecdsa_pool: Arc<RwLock<dyn EcdsaPool>>,
-    canister_http_pool: Arc<RwLock<dyn CanisterHttpPool>>,
     dkg_key_manager: Arc<Mutex<DkgKeyManager>>,
     message_routing: Arc<dyn MessageRouting>,
     state_manager: Arc<dyn StateManager<State = ReplicatedState>>,
@@ -643,7 +648,7 @@ pub fn setup(
     // stable.
 
     let stable_registry_version_age =
-        registry::POLLING_PERIOD + Duration::from_millis(registry_poll_delay_duration_ms);
+        POLLING_PERIOD + Duration::from_millis(registry_poll_delay_duration_ms);
     (
         ConsensusImpl::new(
             replica_config,
@@ -654,9 +659,9 @@ pub fn setup(
             ingress_selector,
             xnet_payload_builder,
             self_validating_payload_builder,
+            canister_http_payload_builder,
             dkg_pool,
             ecdsa_pool,
-            canister_http_pool,
             dkg_key_manager,
             message_routing.clone(),
             state_manager,
@@ -681,6 +686,7 @@ mod tests {
     use ic_protobuf::registry::subnet::v1::SubnetRecord;
     use ic_registry_subnet_type::SubnetType;
     use ic_test_utilities::{
+        canister_http::FakeCanisterHttpPayloadBuilder,
         ingress_selector::FakeIngressSelector,
         message_routing::FakeMessageRouting,
         self_validating_payload_builder::FakeSelfValidatingPayloadBuilder,
@@ -723,7 +729,6 @@ mod tests {
             state_manager,
             dkg_pool,
             ecdsa_pool,
-            canister_http_pool,
             ..
         } = dependencies_with_subnet_params(pool_config, subnet_id, vec![(1, record)]);
         state_manager
@@ -746,13 +751,14 @@ mod tests {
             Arc::new(FakeIngressSelector::new()),
             Arc::new(FakeXNetPayloadBuilder::new()),
             Arc::new(FakeSelfValidatingPayloadBuilder::new()),
+            Arc::new(FakeCanisterHttpPayloadBuilder::new()),
             dkg_pool,
             ecdsa_pool,
-            canister_http_pool,
             Arc::new(Mutex::new(DkgKeyManager::new(
                 metrics_registry.clone(),
                 crypto,
                 no_op_logger(),
+                &PoolReader::new(&pool),
             ))),
             Arc::new(FakeMessageRouting::new()),
             state_manager,

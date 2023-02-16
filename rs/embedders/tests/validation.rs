@@ -1,22 +1,38 @@
 use assert_matches::assert_matches;
 use ic_config::embedders::Config as EmbeddersConfig;
-use ic_embedders::wasm_utils::validation::{
-    extract_custom_section_name, validate_custom_section, validate_wasm_binary, WasmImportsDetails,
-    WasmValidationDetails, RESERVED_SYMBOLS,
+use ic_embedders::{
+    wasm_utils::{
+        validate_and_instrument_for_testing,
+        validation::{extract_custom_section_name, RESERVED_SYMBOLS},
+        WasmImportsDetails, WasmValidationDetails,
+    },
+    WasmtimeEmbedder,
 };
+use ic_interfaces::execution_environment::HypervisorError;
+use ic_logger::replica_logger::no_op_logger;
 use ic_wasm_types::{BinaryEncodedWasm, WasmValidationError};
 
-fn wat2wasm(wat: &str) -> Result<BinaryEncodedWasm, wabt::Error> {
-    let mut features = wabt::Features::new();
-    features.enable_multi_value();
-    wabt::wat2wasm_with_features(wat, features).map(BinaryEncodedWasm::new)
-}
 use ic_replicated_state::canister_state::execution_state::{
     CustomSection, CustomSectionType, WasmMetadata,
 };
-use ic_types::NumBytes;
+use ic_types::{NumBytes, NumInstructions};
 use maplit::btreemap;
-use parity_wasm::elements::{CustomSection as WasmCustomSection, Module, Section};
+
+fn wat2wasm(wat: &str) -> Result<BinaryEncodedWasm, wat::Error> {
+    wat::parse_str(wat).map(BinaryEncodedWasm::new)
+}
+
+fn validate_wasm_binary(
+    wasm: &BinaryEncodedWasm,
+    config: &EmbeddersConfig,
+) -> Result<WasmValidationDetails, WasmValidationError> {
+    let embedder = WasmtimeEmbedder::new(config.clone(), no_op_logger());
+    match validate_and_instrument_for_testing(&embedder, wasm) {
+        Ok((validation_details, _)) => Ok(validation_details),
+        Err(HypervisorError::InvalidWasm(err)) => Err(err),
+        Err(other_error) => panic!("unexpected error {}", other_error),
+    }
+}
 
 #[test]
 fn can_validate_valid_import_section() {
@@ -68,15 +84,20 @@ fn can_validate_valid_export_section() {
                   (func $x)
                   (export "canister_init" (func $x))
                   (export "canister_heartbeat" (func $x))
+                  (export "canister_global_timer" (func $x))
                   (export "canister_pre_upgrade" (func $x))
                   (export "canister_post_upgrade" (func $x))
-                  (export "canister_query read" (func $x)))"#,
+                  (export "canister_query read" (func $x))
+                  (export "canister_composite_query query" (func $x)))"#,
     )
     .unwrap();
 
     assert_eq!(
         validate_wasm_binary(&wasm, &EmbeddersConfig::default()),
-        Ok(WasmValidationDetails::default())
+        Ok(WasmValidationDetails {
+            largest_function_instruction_count: NumInstructions::new(1),
+            ..Default::default()
+        })
     );
 }
 
@@ -87,6 +108,7 @@ fn can_validate_valid_export_section_with_reserved_functions() {
                   (func $x)
                   (export "canister_init" (func $x))
                   (export "canister_heartbeat" (func $x))
+                  (export "canister_global_timer" (func $x))
                   (export "canister_pre_upgrade" (func $x))
                   (export "canister_post_upgrade" (func $x))
                   (export "canister_query read" (func $x))
@@ -99,6 +121,7 @@ fn can_validate_valid_export_section_with_reserved_functions() {
         validate_wasm_binary(&wasm, &EmbeddersConfig::default()),
         Ok(WasmValidationDetails {
             reserved_exports: 2,
+            largest_function_instruction_count: NumInstructions::new(1),
             ..Default::default()
         })
     );
@@ -147,11 +170,39 @@ fn can_validate_canister_heartbeat_with_invalid_return() {
 }
 
 #[test]
+fn can_validate_canister_global_timer_with_invalid_return() {
+    let wasm = wat2wasm(
+        r#"(module
+                  (func $x (result i32) (i32.const 0))
+                  (export "canister_global_timer" (func $x)))"#,
+    )
+    .unwrap();
+    assert_matches!(
+        validate_wasm_binary(&wasm, &EmbeddersConfig::default()),
+        Err(WasmValidationError::InvalidFunctionSignature(_))
+    );
+}
+
+#[test]
 fn can_validate_canister_heartbeat_with_invalid_params() {
     let wasm = wat2wasm(
         r#"(module
                   (func $x (param $y i32))
                   (export "canister_heartbeat" (func $x)))"#,
+    )
+    .unwrap();
+    assert_matches!(
+        validate_wasm_binary(&wasm, &EmbeddersConfig::default()),
+        Err(WasmValidationError::InvalidFunctionSignature(_))
+    );
+}
+
+#[test]
+fn can_validate_canister_global_timer_with_invalid_params() {
+    let wasm = wat2wasm(
+        r#"(module
+                  (func $x (param $y i32))
+                  (export "canister_global_timer" (func $x)))"#,
     )
     .unwrap();
     assert_matches!(
@@ -231,12 +282,11 @@ fn can_validate_invalid_canister_query() {
 }
 
 #[test]
-fn can_validate_duplicate_method_for_canister_query_and_canister_update() {
+fn can_validate_invalid_canister_composite_query() {
     let wasm = wat2wasm(
         r#"(module
-                    (func $read (param i64) (drop (i32.const 0)))
-                    (export "canister_query read" (func $read))
-                    (export "canister_update read" (func $read)))"#,
+                    (func $read (param i64 i32) (result i32) (local.get 1))
+                    (export "canister_composite_query read" (func $read)))"#,
     )
     .unwrap();
     assert_matches!(
@@ -246,17 +296,78 @@ fn can_validate_duplicate_method_for_canister_query_and_canister_update() {
 }
 
 #[test]
+fn can_validate_duplicate_update_and_query_methods() {
+    let wasm = wat2wasm(
+        r#"(module
+                    (func $read)
+                    (export "canister_query read" (func $read))
+                    (export "canister_update read" (func $read)))"#,
+    )
+    .unwrap();
+    assert_eq!(
+        validate_wasm_binary(&wasm, &EmbeddersConfig::default()),
+        Err(WasmValidationError::InvalidExportSection(
+            "Duplicate function 'read' exported multiple times \
+             with different call types: update, query, or composite_query."
+                .to_string()
+        ))
+    );
+}
+
+#[test]
+fn can_validate_duplicate_update_and_composite_query_methods() {
+    let wasm = wat2wasm(
+        r#"(module
+                    (func $read)
+                    (export "canister_composite_query read" (func $read))
+                    (export "canister_update read" (func $read)))"#,
+    )
+    .unwrap();
+    assert_eq!(
+        validate_wasm_binary(&wasm, &EmbeddersConfig::default()),
+        Err(WasmValidationError::InvalidExportSection(
+            "Duplicate function 'read' exported multiple times \
+             with different call types: update, query, or composite_query."
+                .to_string()
+        ))
+    );
+}
+
+#[test]
+fn can_validate_duplicate_query_and_composite_query_methods() {
+    let wasm = wat2wasm(
+        r#"(module
+                    (func $read)
+                    (export "canister_composite_query read" (func $read))
+                    (export "canister_query read" (func $read)))"#,
+    )
+    .unwrap();
+    assert_eq!(
+        validate_wasm_binary(&wasm, &EmbeddersConfig::default()),
+        Err(WasmValidationError::InvalidExportSection(
+            "Duplicate function 'read' exported multiple times \
+             with different call types: update, query, or composite_query."
+                .to_string()
+        ))
+    );
+}
+
+#[test]
 fn can_validate_canister_query_update_method_name_with_whitespace() {
     let wasm = wat2wasm(
         r#"(module
                     (func $x)
                     (export "canister_query my_func x" (func $x))
-                    (export "canister_update my_func y" (func $x)))"#,
+                    (export "canister_composite_query my_func y" (func $x))
+                    (export "canister_update my_func z" (func $x)))"#,
     )
     .unwrap();
     assert_eq!(
         validate_wasm_binary(&wasm, &EmbeddersConfig::default()),
-        Ok(WasmValidationDetails::default())
+        Ok(WasmValidationDetails {
+            largest_function_instruction_count: NumInstructions::new(1),
+            ..Default::default()
+        })
     );
 }
 
@@ -331,6 +442,22 @@ fn can_validate_module_with_wrong_import_module_for_func() {
 }
 
 #[test]
+fn reject_wasm_that_imports_global() {
+    let wasm = wat2wasm(
+        r#"
+                (module
+                  (import "test" "adf" (global i64))
+                )
+            "#,
+    )
+    .unwrap();
+    assert_matches!(
+        validate_wasm_binary(&wasm, &EmbeddersConfig::default()),
+        Err(WasmValidationError::InvalidImportSection(_))
+    );
+}
+
+#[test]
 fn can_reject_module_with_too_many_globals() {
     let wasm = wat2wasm(
         r#"
@@ -391,45 +518,59 @@ fn can_reject_module_with_too_many_functions() {
 
 #[test]
 fn can_validate_module_with_custom_sections() {
-    let custom_section =
-        |name: String, content: Vec<u8>| Section::Custom(WasmCustomSection::new(name, content));
-    let custom_sections: Vec<Section> = vec![
-        custom_section("icp:private name1".to_string(), vec![0, 1]),
-        custom_section("icp:public name2".to_string(), vec![0, 2]),
-        custom_section("name3".to_string(), vec![0, 2]),
-    ];
-    let module = Module::new(custom_sections);
+    let mut module = wasm_encoder::Module::new();
+    module.section(&wasm_encoder::CustomSection {
+        name: "icp:private name1",
+        data: &[0, 1],
+    });
+    module.section(&wasm_encoder::CustomSection {
+        name: "icp:public name2",
+        data: &[0, 2],
+    });
+    module.section(&wasm_encoder::CustomSection {
+        name: "name3",
+        data: &[0, 2],
+    });
+    let wasm = BinaryEncodedWasm::new(module.finish());
 
     // Extracts the custom sections that provide the visibility `public/private`.
+    let validation_details = validate_wasm_binary(
+        &wasm,
+        &EmbeddersConfig {
+            max_custom_sections: 4,
+            ..Default::default()
+        },
+    )
+    .unwrap();
     assert_eq!(
-        validate_custom_section(
-            &module,
-            &EmbeddersConfig {
-                max_custom_sections: 4,
-                ..Default::default()
-            }
-        ),
-        Ok(WasmMetadata::new(btreemap! {
-            "name1".to_string() => CustomSection {content: vec![0, 1] , visibility: CustomSectionType::Private},
-            "name2".to_string() => CustomSection {content: vec![0, 2] , visibility: CustomSectionType::Public}
-        }))
+        validation_details.wasm_metadata,
+        WasmMetadata::new(btreemap! {
+            "name1".to_string() => CustomSection::new(CustomSectionType::Private, vec![0, 1]),
+            "name2".to_string() => CustomSection::new(CustomSectionType::Public, vec![0, 2]),
+        })
     );
 }
 
 #[test]
 fn can_reject_module_with_too_many_custom_sections() {
-    let custom_section =
-        |name: String, content: Vec<u8>| Section::Custom(WasmCustomSection::new(name, content));
-    let custom_sections: Vec<Section> = vec![
-        custom_section("icp:private name1".to_string(), vec![0, 1]),
-        custom_section("icp:public name2".to_string(), vec![0, 2]),
-        custom_section("name3".to_string(), vec![0, 2]),
-    ];
-    let module = Module::new(custom_sections);
+    let mut module = wasm_encoder::Module::new();
+    module.section(&wasm_encoder::CustomSection {
+        name: "icp:private name1",
+        data: &[0, 1],
+    });
+    module.section(&wasm_encoder::CustomSection {
+        name: "icp:public name2",
+        data: &[0, 2],
+    });
+    module.section(&wasm_encoder::CustomSection {
+        name: "name3",
+        data: &[0, 2],
+    });
+    let wasm = BinaryEncodedWasm::new(module.finish());
 
     assert_matches!(
-        validate_custom_section(
-            &module,
+        validate_wasm_binary(
+            &wasm,
             &EmbeddersConfig {
                 max_custom_sections: 1,
                 ..Default::default()
@@ -446,51 +587,57 @@ fn can_reject_module_with_too_many_custom_sections() {
 fn can_reject_module_with_custom_sections_too_big() {
     let content = vec![0, 1, 6, 5, 6, 7, 4, 6];
     let size = 2 * content.len() + "name".len() + "custom_section".len();
-    let module = Module::new(vec![
-        // Size of this custom section is 12 bytes.
-        Section::Custom(WasmCustomSection::new(
-            "icp:public name".to_string(),
-            content.clone(),
-        )),
-        // Adding the size of this custom section will exceed the `max_custom_sections_size`.
-        Section::Custom(WasmCustomSection::new(
-            "icp:private custom_section".to_string(),
-            content,
-        )),
-    ]);
+    let mut module = wasm_encoder::Module::new();
+    // Size of this custom section is 12 bytes.
+    module.section(&wasm_encoder::CustomSection {
+        name: "icp:public name",
+        data: &content,
+    });
+    // Adding the size of this custom section will exceed the `max_custom_sections_size`.
+    module.section(&wasm_encoder::CustomSection {
+        name: "icp:private custom_section",
+        data: &content,
+    });
+    let wasm = BinaryEncodedWasm::new(module.finish());
 
     let max_custom_sections_size = NumBytes::new(14);
     assert_eq!(
-        validate_custom_section(
-            &module, &EmbeddersConfig {
+        validate_wasm_binary(
+            &wasm, &EmbeddersConfig {
                 max_custom_sections: 3,
                 max_custom_sections_size,
                 ..Default::default()
             }
         ),
-       Err(WasmValidationError::InvalidCustomSection(format!(
-                        "Invalid custom sections: total size of the custom sections exceeds the maximum allowed: size {} bytes, allowed {} bytes",
-                         size, max_custom_sections_size
-                    )
-       ))
+        Err(WasmValidationError::InvalidCustomSection(format!(
+            "Invalid custom sections: total size of the custom sections exceeds the maximum allowed: size {} bytes, allowed {} bytes",
+            size, max_custom_sections_size
+        )
+        ))
     );
 }
 
 #[test]
 fn can_reject_module_with_duplicate_custom_sections() {
-    let custom_section =
-        |name: String, content: Vec<u8>| Section::Custom(WasmCustomSection::new(name, content));
-    let custom_sections: Vec<Section> = vec![
-        custom_section("icp:private custom1".to_string(), vec![0, 1]),
-        custom_section("icp:public custom2".to_string(), vec![0, 2]),
-        custom_section("icp:public custom1".to_string(), vec![0, 3]),
-    ];
-    let module = Module::new(custom_sections);
+    let mut module = wasm_encoder::Module::new();
+    module.section(&wasm_encoder::CustomSection {
+        name: "icp:private custom1",
+        data: &[0, 1],
+    });
+    module.section(&wasm_encoder::CustomSection {
+        name: "icp:public custom2",
+        data: &[0, 2],
+    });
+    module.section(&wasm_encoder::CustomSection {
+        name: "icp:public custom1",
+        data: &[0, 3],
+    });
+    let wasm = BinaryEncodedWasm::new(module.finish());
 
     // Rejects the module because of duplicate custom section names.
     assert_eq!(
-        validate_custom_section(
-            &module,
+        validate_wasm_binary(
+            &wasm,
             &EmbeddersConfig {
                 max_custom_sections: 5,
                 ..Default::default()
@@ -504,26 +651,32 @@ fn can_reject_module_with_duplicate_custom_sections() {
 
 #[test]
 fn can_reject_module_with_invalid_custom_sections() {
-    let custom_section =
-        |name: String, content: Vec<u8>| Section::Custom(WasmCustomSection::new(name, content));
-    let custom_sections: Vec<Section> = vec![
-        custom_section("icp:private custom1".to_string(), vec![0, 1]),
-        custom_section("icp:public custom2".to_string(), vec![0, 2]),
-        custom_section("icp:dummy custom3".to_string(), vec![0, 3]),
-    ];
-    let module = Module::new(custom_sections);
+    let mut module = wasm_encoder::Module::new();
+    module.section(&wasm_encoder::CustomSection {
+        name: "icp:private custom1",
+        data: &[0, 1],
+    });
+    module.section(&wasm_encoder::CustomSection {
+        name: "icp:public custom2",
+        data: &[0, 2],
+    });
+    module.section(&wasm_encoder::CustomSection {
+        name: "icp:dummy custom3",
+        data: &[0, 3],
+    });
+    let wasm = BinaryEncodedWasm::new(module.finish());
 
     // Only `private` or `public` is allowed if `icp:` prefix is defined.
     assert_eq!(
-        validate_custom_section(
-            &module,
+        validate_wasm_binary(
+            &wasm,
             &EmbeddersConfig {
                 max_custom_sections: 5,
                 ..Default::default()
             }
         ),
         Err(WasmValidationError::InvalidCustomSection(
-            "Invalid custom section: Custom section named custom3 has no public/private scope defined.".to_string()
+            "Invalid custom section: Custom section 'icp:dummy custom3' has no public/private scope defined.".to_string()
         ))
     );
 }
@@ -539,13 +692,13 @@ fn can_extract_custom_section_name() {
     // Valid private section.
     let name = "icp:private    private_name";
     let (name, visibility) = extract_custom_section_name(name).unwrap().unwrap();
-    assert_eq!(name, "private_name");
+    assert_eq!(name, "   private_name");
     assert_eq!(visibility, CustomSectionType::Private);
 
     // No public/private visibility defined.
     let name = "icp:x invalid_custom";
     assert_eq!(extract_custom_section_name(name),  Err(WasmValidationError::InvalidCustomSection(
-            "Invalid custom section: Custom section named invalid_custom has no public/private scope defined.".to_string()
+            "Invalid custom section: Custom section 'icp:x invalid_custom' has no public/private scope defined.".to_string()
         )));
 
     // Ignore custom section. The name does not start with `icp:`.
@@ -558,7 +711,7 @@ fn can_validate_module_with_reserved_symbols() {
     for reserved_symbol in RESERVED_SYMBOLS.iter() {
         // A wasm that exports a global with a reserved name. Should fail validation.
         let wasm_global = BinaryEncodedWasm::new(
-            wabt::wat2wasm(format!(
+            wat::parse_str(format!(
                 r#"
                 (module
                     (global (;0;) (mut i32) (i32.const 0))
@@ -575,7 +728,7 @@ fn can_validate_module_with_reserved_symbols() {
 
         // A wasm that exports a func with a reserved name. Should fail validation.
         let wasm_func = BinaryEncodedWasm::new(
-            wabt::wat2wasm(format!(
+            wat::parse_str(format!(
                 r#"
                 (module
                     (func $x)
@@ -604,35 +757,6 @@ fn can_reject_wasm_with_invalid_global_access() {
     assert_matches!(
         validate_wasm_binary(&wasm, &EmbeddersConfig::default()),
         Err(WasmValidationError::WasmtimeValidation(_))
-    );
-}
-
-#[test]
-fn can_validate_module_with_call_simple_import() {
-    // Instruments import of `call_simple` from `ic0`.
-    let wasm = wat2wasm(
-        r#"(module 
-        (import "ic0" "call_simple" 
-          (func $ic0_call_simple
-            (param i32 i32)
-            (param $method_name_src i32)    (param $method_name_len i32)
-            (param $reply_fun i32)          (param $reply_env i32)
-            (param $reject_fun i32)         (param $reject_env i32)
-            (param $data_src i32)           (param $data_len i32)
-            (result i32))
-    ))"#,
-    )
-    .unwrap();
-
-    assert_eq!(
-        validate_wasm_binary(&wasm, &EmbeddersConfig::default()),
-        Ok(WasmValidationDetails {
-            imports_details: WasmImportsDetails {
-                imports_call_simple: true,
-                ..Default::default()
-            },
-            ..Default::default()
-        })
     );
 }
 
@@ -683,16 +807,68 @@ fn can_validate_module_cycles_u128_related_imports() {
     let wasm = wat2wasm(
         r#"(module
         (import "ic0" "call_cycles_add128" (func $ic0_call_cycles_add128 (param i64 i64)))
-        (import "ic0" "canister_cycle_balance128" (func $ic0_canister_cycles_balance128 (param i32)))
+        (import "ic0" "canister_cycle_balance128" (func $ic0_canister_cycle_balance128 (param i32)))
         (import "ic0" "msg_cycles_available128" (func $ic0_msg_cycles_available128 (param i32)))
         (import "ic0" "msg_cycles_refunded128" (func $ic0_msg_cycles_refunded128 (param i32)))
         (import "ic0" "msg_cycles_accept128" (func $ic0_msg_cycles_accept128 (param i64 i64 i32)))
     )"#,
     )
-        .unwrap();
+    .unwrap();
 
     assert_eq!(
         validate_wasm_binary(&wasm, &EmbeddersConfig::default()),
         Ok(WasmValidationDetails::default())
     );
+}
+
+#[test]
+fn can_validate_performance_counter_import() {
+    let wasm = wat2wasm(
+        r#"(module
+        (import "ic0" "performance_counter" (func $ic0_performance_counter (param i32) (result i64)))
+    )"#,
+    )
+    .unwrap();
+    assert_eq!(
+        validate_wasm_binary(&wasm, &EmbeddersConfig::default()),
+        Ok(WasmValidationDetails::default())
+    );
+}
+
+/// The spec doesn't allow exported functions to have results.
+#[test]
+fn function_with_result_is_invalid() {
+    let wasm = wat2wasm(
+        r#"
+          (module
+            (func $f (export "canister_update f") (result i64)
+              (i64.const 1)
+            )
+          )"#,
+    )
+    .unwrap();
+    assert_eq!(
+        validate_wasm_binary(&wasm, &EmbeddersConfig::default()),
+        Err(WasmValidationError::InvalidFunctionSignature(
+            "Expected return type [] for 'canister_update f', got [I64].".to_string()
+        ))
+    );
+}
+
+#[test]
+fn complex_function_rejected() {
+    let mut wat = "(module (func) (func".to_string();
+    for _ in 0..15_001 {
+        wat.push_str("(loop)");
+    }
+    wat.push_str("))");
+    let wasm = wat2wasm(&wat).unwrap();
+    assert_eq!(
+        validate_wasm_binary(&wasm, &EmbeddersConfig::default()),
+        Err(WasmValidationError::FunctionComplexityTooHigh {
+            index: 1,
+            complexity: 15_001,
+            allowed: 15_000
+        })
+    )
 }

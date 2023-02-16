@@ -1,41 +1,47 @@
 use std::sync::Arc;
 
-use super::{system_api, StoreData, NUM_INSTRUCTION_GLOBAL_NAME};
-use crate::wasm_utils::instrumentation::{instrument, InstructionCostTable};
+use super::{system_api, StoreData, INSTRUCTIONS_COUNTER_GLOBAL_NAME};
+use crate::{wasm_utils::validate_and_instrument_for_testing, WasmtimeEmbedder};
 use ic_config::flag_status::FlagStatus;
-use ic_interfaces::execution_environment::{
-    AvailableMemory, ExecutionMode, ExecutionParameters, SubnetAvailableMemory,
-};
+use ic_config::{embedders::Config as EmbeddersConfig, subnet_config::SchedulerConfig};
+use ic_interfaces::execution_environment::{ExecutionMode, SubnetAvailableMemory};
 use ic_logger::replica_logger::no_op_logger;
 use ic_registry_subnet_type::SubnetType;
-use ic_replicated_state::{Memory, SystemState};
+use ic_replicated_state::{NetworkTopology, SystemState};
 use ic_system_api::{
     sandbox_safe_system_state::SandboxSafeSystemState, ApiType, DefaultOutOfInstructionsHandler,
-    SystemApiImpl,
+    ExecutionParameters, InstructionLimits, SystemApiImpl,
 };
 use ic_test_utilities::{
     cycles_account_manager::CyclesAccountManagerBuilder, types::ids::canister_test_id,
 };
+use ic_test_utilities_execution_environment::default_memory_for_system_api;
 use ic_types::{ComputeAllocation, NumBytes, NumInstructions};
 use ic_wasm_types::BinaryEncodedWasm;
 
 use lazy_static::lazy_static;
-use wasmtime::{Config, Engine, Module, Store, Val};
+use wasmtime::{Engine, Module, Store, Val};
 
 lazy_static! {
     static ref MAX_SUBNET_AVAILABLE_MEMORY: SubnetAvailableMemory =
-        AvailableMemory::new(i64::MAX / 2, i64::MAX / 2).into();
+        SubnetAvailableMemory::new(i64::MAX / 2, i64::MAX / 2);
 }
 const MAX_NUM_INSTRUCTIONS: NumInstructions = NumInstructions::new(1_000_000_000);
 
 #[test]
 fn test_wasmtime_system_api() {
-    let config = Config::default();
-    let engine = Engine::new(&config).expect("Failed to initialize Wasmtime engine");
+    let engine = Engine::new(&WasmtimeEmbedder::initial_wasmtime_config(
+        &EmbeddersConfig::default(),
+    ))
+    .expect("Failed to initialize Wasmtime engine");
     let canister_id = canister_test_id(53);
     let system_state = SystemState::new_for_start(canister_id);
-    let sandbox_safe_system_state =
-        SandboxSafeSystemState::new(&system_state, CyclesAccountManagerBuilder::new().build());
+    let sandbox_safe_system_state = SandboxSafeSystemState::new(
+        &system_state,
+        CyclesAccountManagerBuilder::new().build(),
+        &NetworkTopology::default(),
+        SchedulerConfig::application_subnet().dirty_page_overhead,
+    );
     let canister_memory_limit = NumBytes::from(4 << 30);
     let canister_current_memory_usage = NumBytes::from(0);
     let system_api = SystemApiImpl::new(
@@ -43,15 +49,18 @@ fn test_wasmtime_system_api() {
         sandbox_safe_system_state,
         canister_current_memory_usage,
         ExecutionParameters {
-            total_instruction_limit: MAX_NUM_INSTRUCTIONS,
-            slice_instruction_limit: MAX_NUM_INSTRUCTIONS,
+            instruction_limits: InstructionLimits::new(
+                FlagStatus::Disabled,
+                MAX_NUM_INSTRUCTIONS,
+                MAX_NUM_INSTRUCTIONS,
+            ),
             canister_memory_limit,
-            subnet_available_memory: MAX_SUBNET_AVAILABLE_MEMORY.clone(),
             compute_allocation: ComputeAllocation::default(),
             subnet_type: SubnetType::Application,
             execution_mode: ExecutionMode::Replicated,
         },
-        Memory::default(),
+        *MAX_SUBNET_AVAILABLE_MEMORY,
+        default_memory_for_system_api(),
         Arc::new(DefaultOutOfInstructionsHandler {}),
         no_op_logger(),
     );
@@ -76,19 +85,30 @@ fn test_wasmtime_system_api() {
       (data (i32.const 5) "Hi!")
     )"#;
     let wasm_binary =
-        BinaryEncodedWasm::new(wabt::wat2wasm(&wat).expect("failed to compile Wasm source"));
+        BinaryEncodedWasm::new(wat::parse_str(wat).expect("failed to compile Wasm source"));
     // Exports the global `counter_instructions`.
-    let output_instrumentation = instrument(&wasm_binary, &InstructionCostTable::new()).unwrap();
-    let module = Module::new(&engine, output_instrumentation.binary.as_slice())
+    let config = EmbeddersConfig::default();
+    let (_, instrumentation_output) = validate_and_instrument_for_testing(
+        &WasmtimeEmbedder::new(config.clone(), no_op_logger()),
+        &wasm_binary,
+    )
+    .unwrap();
+    let module = Module::new(&engine, instrumentation_output.binary.as_slice())
         .expect("failed to instantiate module");
 
-    let linker = system_api::syscalls(no_op_logger(), canister_id, &store, FlagStatus::Enabled);
+    let linker = system_api::syscalls(
+        no_op_logger(),
+        canister_id,
+        &store,
+        config.feature_flags,
+        config.stable_memory_dirty_page_limit,
+    );
     let instance = linker
         .instantiate(&mut store, &module)
         .expect("failed to instantiate instance");
 
     let global = instance
-        .get_global(&mut store, NUM_INSTRUCTION_GLOBAL_NAME)
+        .get_global(&mut store, INSTRUCTIONS_COUNTER_GLOBAL_NAME)
         .unwrap();
     store.data_mut().num_instructions_global = Some(global);
     global

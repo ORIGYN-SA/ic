@@ -1,5 +1,6 @@
 use super::*;
 use ic_crypto_internal_csp::api::CspSigner;
+use ic_crypto_internal_csp::key_id::KeyId;
 
 #[cfg(test)]
 mod tests;
@@ -9,7 +10,7 @@ pub struct MultiSigVerifierInternal {}
 impl MultiSigVerifierInternal {
     pub fn verify_multi_sig_individual<S: CspSigner, H: Signable>(
         csp_signer: &S,
-        registry: Arc<dyn RegistryClient>,
+        registry: &dyn RegistryClient,
         signature: &IndividualMultiSigOf<H>,
         message: &H,
         signer: NodeId,
@@ -25,15 +26,18 @@ impl MultiSigVerifierInternal {
     }
 
     /// Combines a non-empty collection of individual signatures into a combined
-    /// signature. Panics if called with zero signatures.
+    /// signature.
     pub fn combine_multi_sig_individuals<S: CspSigner, H: Signable>(
         csp_signer: &S,
-        registry: Arc<dyn RegistryClient>,
+        registry: &dyn RegistryClient,
         signatures: BTreeMap<NodeId, IndividualMultiSigOf<H>>,
         registry_version: RegistryVersion,
     ) -> CryptoResult<CombinedMultiSigOf<H>> {
         if signatures.is_empty() {
-            panic!("At least one signature required");
+            return Err(CryptoError::InvalidArgument {
+                message: "No signatures to combine. At least one signature is needed to combine a multi-signature"
+                    .to_string(),
+            });
         }
 
         let (pubkey_sig_pairs, algorithm) = node_sigs_to_pubkey_sig_pairs(
@@ -51,17 +55,19 @@ impl MultiSigVerifierInternal {
     }
 
     /// Verifies a combined signature from a non-empty set of signers.
-    /// Panics if called with zero signers.
     pub fn verify_multi_sig_combined<S: CspSigner, H: Signable>(
         csp_signer: &S,
-        registry: Arc<dyn RegistryClient>,
+        registry: &dyn RegistryClient,
         signature: &CombinedMultiSigOf<H>,
         message: &H,
         signers: BTreeSet<NodeId>,
         registry_version: RegistryVersion,
     ) -> CryptoResult<()> {
         if signers.is_empty() {
-            panic!("At least one signer required");
+            return Err(CryptoError::InvalidArgument {
+                message: "Empty signers. At least one signer is needed to verify a combined multi-signature"
+                    .to_string()
+            });
         }
 
         let message_bytes = message.as_signed_bytes();
@@ -84,7 +90,7 @@ impl MultiSigVerifierInternal {
 /// - one of the public keys fetched from the registry is invalid
 /// - the public key's algorithms are not all equal
 fn node_ids_to_pubkeys(
-    registry: Arc<dyn RegistryClient>,
+    registry: &dyn RegistryClient,
     nodes: BTreeSet<NodeId>,
     key_purpose: KeyPurpose,
     registry_version: RegistryVersion,
@@ -94,12 +100,8 @@ fn node_ids_to_pubkeys(
         let csp_pubkeys: CryptoResult<Vec<CspPublicKey>> = nodes
             .iter()
             .map(|node_id| {
-                let pk_proto = key_from_registry(
-                    Arc::clone(&registry),
-                    node_id.to_owned(),
-                    key_purpose,
-                    registry_version,
-                )?;
+                let pk_proto =
+                    key_from_registry(registry, node_id.to_owned(), key_purpose, registry_version)?;
                 let algorithm_id = AlgorithmId::from(pk_proto.algorithm);
                 algorithm_set.insert(algorithm_id);
                 CspPublicKey::try_from(pk_proto)
@@ -142,7 +144,7 @@ fn node_ids_to_pubkeys(
 /// - the public key's algorithms are not all equal
 /// - one of the given signatures is not valid
 fn node_sigs_to_pubkey_sig_pairs<H>(
-    registry: Arc<dyn RegistryClient>,
+    registry: &dyn RegistryClient,
     node_sigs: BTreeMap<NodeId, IndividualMultiSigOf<H>>,
     key_purpose: KeyPurpose,
     registry_version: RegistryVersion,
@@ -155,12 +157,8 @@ where
         let pubkey_sig_pairs: CryptoResult<Vec<(CspPublicKey, CspSignature)>> = node_sigs
             .iter()
             .map(|(node_id, individual_sig)| {
-                let pk_proto = key_from_registry(
-                    Arc::clone(&registry),
-                    node_id.to_owned(),
-                    key_purpose,
-                    registry_version,
-                )?;
+                let pk_proto =
+                    key_from_registry(registry, node_id.to_owned(), key_purpose, registry_version)?;
                 let algorithm_id = AlgorithmId::from(pk_proto.algorithm);
                 algorithm_set.insert(algorithm_id);
 
@@ -199,21 +197,16 @@ pub struct MultiSignerInternal {}
 impl MultiSignerInternal {
     pub fn sign_multi<S: CspSigner, H: Signable>(
         csp_signer: &S,
-        registry: Arc<dyn RegistryClient>,
+        registry: &dyn RegistryClient,
         message: &H,
         signer: NodeId,
         registry_version: RegistryVersion,
     ) -> CryptoResult<IndividualMultiSigOf<H>> {
-        let pk_proto = key_from_registry(
-            registry,
-            signer,
-            KeyPurpose::CommitteeSigning,
-            registry_version,
-        )?;
+        let pk_proto = key_from_registry(registry, signer, CommitteeSigning, registry_version)?;
         let algorithm_id = AlgorithmId::from(pk_proto.algorithm);
         let csp_pk = CspPublicKey::try_from(pk_proto)?;
         let message_bytes = message.as_signed_bytes();
-        let key_id = public_key_hash_as_key_id(&csp_pk);
+        let key_id = KeyId::try_from(&csp_pk)?;
         let csp_sig = csp_signer.sign(algorithm_id, &message_bytes, key_id)?;
 
         Ok(IndividualMultiSigOf::new(IndividualMultiSig(

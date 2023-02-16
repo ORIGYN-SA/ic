@@ -12,40 +12,37 @@ use ic_crypto_internal_basic_sig_ecdsa_secp256r1::types as ecdsa_secp256r1_types
 use ic_crypto_internal_basic_sig_ed25519::types as ed25519_types;
 use ic_crypto_internal_basic_sig_rsa_pkcs1 as rsa;
 use ic_crypto_internal_multi_sig_bls12381::types as multi_types;
-use ic_crypto_internal_threshold_sig_bls12381::dkg::secp256k1::types::{
-    CLibResponseBytes, CLibTranscriptBytes, EncryptedShareBytes, EphemeralKeySetBytes,
-    EphemeralPopBytes,
-};
 use ic_crypto_internal_threshold_sig_bls12381::ni_dkg::types::CspFsEncryptionKeySet;
 use ic_crypto_internal_threshold_sig_bls12381::types as threshold_types;
-use ic_crypto_internal_threshold_sig_ecdsa::{
-    CommitmentOpeningBytes, EccScalarBytes, MEGaKeySetK256Bytes,
-};
+#[cfg(test)]
+use ic_crypto_internal_threshold_sig_ecdsa::EccScalarBytes;
+use ic_crypto_internal_threshold_sig_ecdsa::{CommitmentOpeningBytes, MEGaKeySetK256Bytes};
+use ic_protobuf::registry::crypto::v1::{PublicKey, X509PublicKeyCert};
 use ic_types::crypto::AlgorithmId;
 use serde::{Deserialize, Serialize};
-use strum_macros::IntoStaticStr;
-use zeroize::Zeroize;
+use strum_macros::{EnumCount, IntoStaticStr};
+use zeroize::{Zeroize, ZeroizeOnDrop};
 
 pub mod conversions;
 mod external_conversion_utilities;
 
 #[cfg(test)]
 use proptest_derive::Arbitrary;
+
 mod test_utils;
 #[cfg(test)]
 mod tests;
 
 use ic_crypto_internal_tls::keygen::TlsEd25519SecretKeyDerBytes;
-use std::collections::BTreeMap;
+
 #[cfg(test)]
 use test_utils::{
     arbitrary_ecdsa_secp256k1_public_key, arbitrary_ecdsa_secp256r1_public_key,
     arbitrary_ecdsa_secp256r1_signature, arbitrary_ed25519_public_key,
-    arbitrary_ed25519_secret_key, arbitrary_ed25519_signature, arbitrary_ephemeral_key_set,
-    arbitrary_fs_encryption_key_set, arbitrary_mega_k256_encryption_key_set,
-    arbitrary_multi_bls12381_combined_signature, arbitrary_multi_bls12381_individual_signature,
-    arbitrary_multi_bls12381_public_key, arbitrary_multi_bls12381_secret_key,
-    arbitrary_rsa_public_key, arbitrary_secp256k1_signature,
+    arbitrary_ed25519_secret_key, arbitrary_ed25519_signature, arbitrary_fs_encryption_key_set,
+    arbitrary_mega_k256_encryption_key_set, arbitrary_multi_bls12381_combined_signature,
+    arbitrary_multi_bls12381_individual_signature, arbitrary_multi_bls12381_public_key,
+    arbitrary_multi_bls12381_secret_key, arbitrary_rsa_public_key, arbitrary_secp256k1_signature,
     arbitrary_threshold_bls12381_combined_signature,
     arbitrary_threshold_bls12381_individual_signature, arbitrary_threshold_bls12381_secret_key,
     arbitrary_threshold_ecdsa_opening, arbitrary_tls_ed25519_secret_key,
@@ -56,8 +53,9 @@ pub use ic_crypto_internal_types::sign::threshold_sig::public_coefficients::CspP
 /// The secret part of a public/private key pair.
 ///
 /// This enum can be persisted in a `SecretKeyStore`.
-#[derive(Clone, Eq, IntoStaticStr, PartialEq, Zeroize, Serialize, Deserialize)]
-#[zeroize(drop)]
+#[derive(
+    Clone, Eq, IntoStaticStr, PartialEq, Serialize, Deserialize, EnumCount, Zeroize, ZeroizeOnDrop,
+)]
 #[cfg_attr(test, derive(Arbitrary))]
 pub enum CspSecretKey {
     #[cfg_attr(test, proptest(value(arbitrary_ed25519_secret_key)))]
@@ -66,8 +64,6 @@ pub enum CspSecretKey {
     MultiBls12_381(multi_types::SecretKeyBytes),
     #[cfg_attr(test, proptest(value(arbitrary_threshold_bls12381_secret_key)))]
     ThresBls12_381(threshold_types::SecretKeyBytes),
-    #[cfg_attr(test, proptest(value(arbitrary_ephemeral_key_set)))]
-    Secp256k1WithPublicKey(EphemeralKeySetBytes),
     #[cfg_attr(test, proptest(value(arbitrary_tls_ed25519_secret_key)))]
     TlsEd25519(TlsEd25519SecretKeyDerBytes),
     #[cfg_attr(test, proptest(value(arbitrary_fs_encryption_key_set)))]
@@ -79,24 +75,10 @@ pub enum CspSecretKey {
 }
 
 impl CspSecretKey {
-    /// Return the algorithm identifier of this secret key
-    pub fn algorithm_id(&self) -> AlgorithmId {
-        match self {
-            Self::Ed25519(_) => AlgorithmId::Ed25519,
-            Self::MultiBls12_381(_) => AlgorithmId::MultiBls12_381,
-            Self::ThresBls12_381(_) => AlgorithmId::ThresBls12_381,
-            Self::Secp256k1WithPublicKey(_) => AlgorithmId::Secp256k1,
-            Self::TlsEd25519(_) => AlgorithmId::Ed25519,
-            Self::FsEncryption(_) => AlgorithmId::NiDkg_Groth20_Bls12_381,
-            Self::MEGaEncryptionK256(_) => AlgorithmId::ThresholdEcdsaSecp256k1,
-            Self::IDkgCommitmentOpening(CommitmentOpeningBytes::Simple(EccScalarBytes::K256(
-                _,
-            ))) => AlgorithmId::ThresholdEcdsaSecp256k1,
-            Self::IDkgCommitmentOpening(CommitmentOpeningBytes::Pedersen(
-                EccScalarBytes::K256(_),
-                EccScalarBytes::K256(_),
-            )) => AlgorithmId::ThresholdEcdsaSecp256k1,
-        }
+    /// Returns the enum name of this `CspSecretKey` instance as `&'static str`
+    /// e.g. `CspSecretKey::Ed25519` returns "Ed25519"
+    pub fn enum_variant(&self) -> &'static str {
+        self.into()
     }
 }
 
@@ -107,12 +89,6 @@ impl std::fmt::Debug for CspSecretKey {
             CspSecretKey::Ed25519(_) => write!(f, "CspSecretKey::Ed25519 - REDACTED"),
             CspSecretKey::MultiBls12_381(_) => write!(f, "CspSecretKey::MultiBls12_381 - REDACTED"),
             CspSecretKey::ThresBls12_381(_) => write!(f, "CspSecretKey::ThresBls12_381 - REDACTED"),
-            CspSecretKey::Secp256k1WithPublicKey(sk) => write!(
-                f,
-                "CspSecretKey::Secp256k1WithPublicKey secret_key: REDACTED public_key: {} pop: {}",
-                hex::encode(&sk.public_key_bytes.0[..]),
-                hex::encode(&sk.pop_bytes.0[..])
-            ),
             CspSecretKey::TlsEd25519(_) => write!(f, "CspSecretKey::TlsEd25519 - REDACTED"),
             CspSecretKey::FsEncryption(_) => write!(f, "CspSecretKey::FsEncryption - REDACTED"),
             CspSecretKey::MEGaEncryptionK256(_) => {
@@ -134,24 +110,6 @@ impl std::fmt::Debug for CspSecretKey {
                     f,
                     "CspSecretKey::IDkgCommitmentOpening::Pedersen::K256 - REDACTED"
                 )
-            }
-        }
-    }
-}
-
-/// An encrypted threshold BLS12-381 key
-#[derive(Copy, Clone, Eq, PartialEq, Serialize, Deserialize)]
-pub enum CspEncryptedSecretKey {
-    ThresBls12_381(EncryptedShareBytes),
-}
-
-impl std::fmt::Debug for CspEncryptedSecretKey {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            CspEncryptedSecretKey::ThresBls12_381(bytes) => {
-                // this prints no secret key parts
-                // since Debug for EncryptedShareBytes is redacted:
-                write!(f, "CspEncryptedSecretKey::ThresBls12_381: {:?}", bytes)
             }
         }
     }
@@ -225,7 +183,6 @@ impl CspPublicKey {
 #[derive(Copy, Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum CspPop {
     MultiBls12_381(multi_types::PopBytes),
-    Secp256k1(EphemeralPopBytes),
 }
 
 /// A cryptographic signature generated by a private key
@@ -242,6 +199,7 @@ pub enum CspSignature {
     ThresBls12_381(ThresBls12_381_Signature),
     RsaSha256(Vec<u8>),
 }
+
 impl std::fmt::Debug for CspSignature {
     /// Prints in a developer-friendly format.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -282,33 +240,6 @@ pub enum ThresBls12_381_Signature {
     Combined(threshold_types::CombinedSignatureBytes),
 }
 
-/// Data associated with a dealing of the interactive DKG
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct CspDealing {
-    pub common_data: CspPublicCoefficients,
-    pub receiver_data: Vec<Option<CspEncryptedSecretKey>>,
-}
-
-/// A response to a interactive DKG dealing
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub enum CspResponse {
-    Secp256k1(CLibResponseBytes),
-}
-
-impl CspResponse {
-    pub fn new_without_complaints() -> CspResponse {
-        CspResponse::Secp256k1(CLibResponseBytes {
-            complaints: BTreeMap::new(),
-        })
-    }
-}
-
-/// The transcript of a interactive DKG dealing
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub enum CspDkgTranscript {
-    Secp256k1(CLibTranscriptBytes),
-}
-
 impl CspSignature {
     #[cfg(test)]
     pub fn ed25519_bytes(&self) -> Option<&[u8; 64]> {
@@ -337,4 +268,13 @@ impl CspSignature {
 /// from the bytes of a signature to a CspSignature
 pub struct SigConverter {
     target_algorithm: AlgorithmId,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ExternalPublicKeys {
+    pub node_signing_public_key: PublicKey,
+    pub committee_signing_public_key: PublicKey,
+    pub tls_certificate: X509PublicKeyCert,
+    pub dkg_dealing_encryption_public_key: PublicKey,
+    pub idkg_dealing_encryption_public_key: PublicKey,
 }

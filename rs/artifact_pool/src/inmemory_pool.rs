@@ -2,7 +2,6 @@ use crate::{
     consensus_pool::{MutablePoolSection, PoolSectionOp, PoolSectionOps},
     height_index::{HeightIndex, Indexes, SelectIndex},
 };
-use ic_consensus_message::ConsensusMessageHashable;
 use ic_interfaces::{
     artifact_pool::{HasTimestamp, IntoInner},
     consensus_pool::{HeightIndexedPool, HeightRange, OnlyError, PoolSection},
@@ -210,7 +209,7 @@ where
         // returning the iterator directly isn't trusted due to the use of `self` in the
         // closure
         #[allow(clippy::needless_collect)]
-        let vec: Vec<T> = heights.map(|h| self.get_by_height(*h)).flatten().collect();
+        let vec: Vec<T> = heights.flat_map(|h| self.get_by_height(*h)).collect();
         Box::new(vec.into_iter())
     }
 

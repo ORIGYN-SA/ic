@@ -10,13 +10,12 @@ use anyhow::Result;
 use ic_config::subnet_config::SchedulerConfig;
 use thiserror::Error;
 
-use ic_crypto::{
-    threshold_sig_public_key_to_der,
-    utils::ni_dkg::{self, initial_ni_dkg_transcript_record_from_transcript, InitialNiDkgConfig},
-};
+use ic_crypto::threshold_sig_public_key_to_der;
+use ic_crypto_test_utils_ni_dkg::{initial_dkg_transcript, InitialNiDkgConfig};
+use ic_protobuf::registry::subnet::v1::InitialNiDkgTranscriptRecord;
 use ic_protobuf::registry::{
     crypto::v1::PublicKey,
-    subnet::v1::{CatchUpPackageContents, SubnetFeatures, SubnetRecord},
+    subnet::v1::{CatchUpPackageContents, EcdsaConfig, SubnetFeatures, SubnetRecord},
 };
 use ic_registry_subnet_type::SubnetType;
 use ic_types::{
@@ -89,6 +88,9 @@ pub struct SubnetConfig {
 
     /// Flags to mark which features are enabled for this subnet.
     pub features: SubnetFeatures,
+
+    /// Optional ecdsa configuration for this subnet.
+    pub ecdsa_config: Option<EcdsaConfig>,
 
     /// The number of canisters allowed to be created on this subnet.
     pub max_number_of_canisters: u64,
@@ -213,6 +215,7 @@ impl SubnetConfig {
         max_instructions_per_round: Option<u64>,
         max_instructions_per_install_code: Option<u64>,
         features: Option<SubnetFeatures>,
+        ecdsa_config: Option<EcdsaConfig>,
         max_number_of_canisters: Option<u64>,
         ssh_readonly_access: Vec<String>,
         ssh_backup_access: Vec<String>,
@@ -245,6 +248,7 @@ impl SubnetConfig {
             max_instructions_per_install_code: max_instructions_per_install_code
                 .unwrap_or_else(|| scheduler_config.max_instructions_per_install_code.get()),
             features: features.unwrap_or_default(),
+            ecdsa_config,
             max_number_of_canisters: max_number_of_canisters.unwrap_or(0),
             ssh_readonly_access,
             ssh_backup_access,
@@ -300,7 +304,7 @@ impl SubnetConfig {
             max_number_of_canisters: self.max_number_of_canisters,
             ssh_readonly_access: self.ssh_readonly_access,
             ssh_backup_access: self.ssh_backup_access,
-            ecdsa_config: None,
+            ecdsa_config: self.ecdsa_config,
         };
 
         let dkg_dealing_encryption_pubkeys: BTreeMap<_, _> = initialized_nodes
@@ -313,7 +317,7 @@ impl SubnetConfig {
             })
             .collect();
         let random_ni_dkg_target_id = NiDkgTargetId::new(rand::random::<[u8; 32]>());
-        let ni_dkg_transcript_low_threshold = ni_dkg::initial_dkg_transcript(
+        let ni_dkg_transcript_low_threshold = initial_dkg_transcript(
             InitialNiDkgConfig::new(
                 &nodes_in_subnet,
                 SubnetId::from(PrincipalId::new_subnet_test_id(subnet_index)),
@@ -323,7 +327,7 @@ impl SubnetConfig {
             ),
             &dkg_dealing_encryption_pubkeys,
         );
-        let ni_dkg_transcript_high_threshold = ni_dkg::initial_dkg_transcript(
+        let ni_dkg_transcript_high_threshold = initial_dkg_transcript(
             InitialNiDkgConfig::new(
                 &nodes_in_subnet,
                 SubnetId::from(PrincipalId::new_subnet_test_id(subnet_index)),
@@ -338,12 +342,12 @@ impl SubnetConfig {
         ));
 
         let subnet_dkg = CatchUpPackageContents {
-            initial_ni_dkg_transcript_low_threshold: Some(
-                initial_ni_dkg_transcript_record_from_transcript(ni_dkg_transcript_low_threshold),
-            ),
-            initial_ni_dkg_transcript_high_threshold: Some(
-                initial_ni_dkg_transcript_record_from_transcript(ni_dkg_transcript_high_threshold),
-            ),
+            initial_ni_dkg_transcript_low_threshold: Some(InitialNiDkgTranscriptRecord::from(
+                ni_dkg_transcript_low_threshold,
+            )),
+            initial_ni_dkg_transcript_high_threshold: Some(InitialNiDkgTranscriptRecord::from(
+                ni_dkg_transcript_high_threshold,
+            )),
             ..Default::default()
         };
 

@@ -7,8 +7,10 @@ use canister_test::{Canister, Project};
 use dfn_candid::candid_one;
 use dfn_protobuf::protobuf;
 use ic_base_types::{CanisterId, PrincipalId};
-use ic_canister_client::Sender;
+use ic_canister_client_sender::Sender;
+use ic_ledger_core::{block::BlockType, timestamp::TimeStamp};
 use ic_nervous_system_common::ledger;
+use ic_nervous_system_common_test_keys::TEST_USER1_KEYPAIR;
 use ic_nns_common::pb::v1::NeuronId as NeuronIdProto;
 use ic_nns_constants::{
     ALL_NNS_CANISTER_IDS, GENESIS_TOKEN_CANISTER_ID, GOVERNANCE_CANISTER_ID, ROOT_CANISTER_ID,
@@ -24,15 +26,17 @@ use ic_nns_governance::pb::v1::{
     ClaimOrRefreshNeuronFromAccount, ClaimOrRefreshNeuronFromAccountResponse, GovernanceError,
     ManageNeuron, ManageNeuronResponse, Neuron,
 };
-use ic_nns_test_keys::TEST_USER1_KEYPAIR;
-use ic_nns_test_utils::itest_helpers::{
-    local_test_on_nns_subnet, maybe_upgrade_root_controlled_canister_to_self, NnsCanisters,
-    NnsInitPayloadsBuilder, UpgradeTestingScenario,
+use ic_nns_test_utils::{
+    common::NnsInitPayloadsBuilder,
+    itest_helpers::{
+        local_test_on_nns_subnet, maybe_upgrade_root_controlled_canister_to_self, NnsCanisters,
+        UpgradeTestingScenario,
+    },
 };
-use ledger_canister::{
-    protobuf::TipOfChainRequest, AccountBalanceArgs, AccountIdentifier, ArchiveOptions, Block,
-    BlockHeight, LedgerCanisterInitPayload, Memo, SendArgs, TimeStamp, TipOfChainRes, Tokens,
-    Transaction, DEFAULT_TRANSFER_FEE,
+use icp_ledger::{
+    protobuf::TipOfChainRequest, tokens_from_proto, AccountBalanceArgs, AccountIdentifier,
+    ArchiveOptions, Block, BlockIndex, LedgerCanisterInitPayload, Memo, SendArgs, TipOfChainRes,
+    Tokens, Transaction, DEFAULT_TRANSFER_FEE,
 };
 use tokio::time::{timeout_at, Instant};
 
@@ -45,7 +49,12 @@ fn example_block() -> Block {
         Memo(456),
         TimeStamp::new(2_000_000_000, 123_456_789),
     );
-    Block::new_from_transaction(None, transaction, TimeStamp::new(1, 1))
+    Block::new_from_transaction(
+        None,
+        transaction,
+        TimeStamp::new(1, 1),
+        DEFAULT_TRANSFER_FEE,
+    )
 }
 
 async fn perform_transfers(
@@ -59,7 +68,7 @@ async fn perform_transfers(
         let nns_canisters = nns_canisters.clone();
         let user = user.clone();
         join_handles.push(tokio::runtime::Handle::current().spawn(async move {
-            let result: Result<BlockHeight, String> = timeout_at(
+            let result: Result<BlockIndex, String> = timeout_at(
                 Instant::now() + Duration::from_secs(10u64),
                 nns_canisters.ledger.update_from_sender(
                     "send_pb",
@@ -99,7 +108,7 @@ fn test_rosetta1_92() {
         let blocks_per_archive_node = 8usize;
         let blocks_per_archive_call = 3usize;
         let (node_max_memory_size_bytes, max_message_size_bytes): (usize, usize) = {
-            let e = example_block().encode().unwrap();
+            let e = example_block().encode();
             println!("[test] encoded block size: {}", e.size_bytes());
             (
                 e.size_bytes() * blocks_per_archive_node,
@@ -113,12 +122,13 @@ fn test_rosetta1_92() {
             .minting_account(GOVERNANCE_CANISTER_ID.into())
             .initial_values(ledger_init_state)
             .archive_options(ArchiveOptions {
-                node_max_memory_size_bytes: Some(node_max_memory_size_bytes),
-                max_message_size_bytes: Some(max_message_size_bytes),
-                controller_id: ROOT_CANISTER_ID,
+                node_max_memory_size_bytes: Some(node_max_memory_size_bytes as u64),
+                max_message_size_bytes: Some(max_message_size_bytes as u64),
+                controller_id: ROOT_CANISTER_ID.into(),
                 trigger_threshold: blocks_per_archive_node,
                 num_blocks_to_archive: blocks_per_archive_call,
                 cycles_for_archive_creation: Some(0),
+                max_transactions_per_response: None,
             })
             .send_whitelist(ALL_NNS_CANISTER_IDS.iter().map(|&x| *x).collect())
             .build()
@@ -167,11 +177,8 @@ fn test_rosetta1_92() {
         let archive_canister_id = result.unwrap()[0];
         let mut archive_canister = Canister::new(runtime, archive_canister_id);
 
-        let archive_canister_wasm = Project::cargo_bin_maybe_use_path_relative_to_rs(
-            "rosetta-api/ledger_canister",
-            "ledger-archive-node-canister",
-            &[],
-        );
+        let archive_canister_wasm =
+            Project::cargo_bin_maybe_from_env("ledger-archive-node-canister", &[]);
 
         archive_canister.set_wasm(archive_canister_wasm.bytes());
         // Now upgrade the archive to self, it should stop taking blocks from the ledger
@@ -252,7 +259,8 @@ fn test_stake_and_disburse_neuron_with_notification() {
                         account: user.get_principal_id().into(),
                     },
                 )
-                .await?;
+                .await
+                .map(tokens_from_proto)?;
             assert_eq!(alloc, user_balance);
 
             // Stake a neuron by transferring to a subaccount of the neurons
@@ -323,7 +331,8 @@ fn test_stake_and_disburse_neuron_with_notification() {
                         account: user.get_principal_id().into(),
                     },
                 )
-                .await?;
+                .await
+                .map(tokens_from_proto)?;
             // The balance should now be: initial allocation - stake - fee
             assert_eq!(
                 Tokens::from_e8s(
@@ -368,7 +377,8 @@ fn test_stake_and_disburse_neuron_with_notification() {
                     },
                     &user,
                 )
-                .await?;
+                .await
+                .map(tokens_from_proto)?;
 
             // The balance should now be: initial allocation - fee * 2 (one fee for the
             // stake and one for the disburse).
@@ -416,7 +426,8 @@ fn test_stake_and_disburse_neuron_with_account() {
                         account: user.get_principal_id().into(),
                     },
                 )
-                .await?;
+                .await
+                .map(tokens_from_proto)?;
             assert_eq!(alloc, user_balance);
 
             // Stake a neuron by transferring to a subaccount of the neurons
@@ -426,7 +437,7 @@ fn test_stake_and_disburse_neuron_with_account() {
                 ledger::compute_neuron_staking_subaccount(user.get_principal_id(), nonce);
 
             let stake = Tokens::from_tokens(100).unwrap();
-            let _block_height: BlockHeight = nns_canisters
+            let _block_height: BlockIndex = nns_canisters
                 .ledger
                 .update_from_sender(
                     "send_pb",
@@ -457,7 +468,8 @@ fn test_stake_and_disburse_neuron_with_account() {
                         account: user.get_principal_id().into(),
                     },
                 )
-                .await?;
+                .await
+                .map(tokens_from_proto)?;
             // The balance should now be: initial allocation - stake - fee
             assert_eq!(
                 Tokens::from_e8s(
@@ -557,7 +569,8 @@ fn test_stake_and_disburse_neuron_with_account() {
                     },
                     &user,
                 )
-                .await?;
+                .await
+                .map(tokens_from_proto)?;
 
             // The balance should now be: initial allocation - fee * 2;
             assert_eq!(
@@ -600,6 +613,7 @@ fn test_ledger_gtc_sync() {
                 AccountBalanceArgs::new(gtc_user_id.into()),
             )
             .await
+            .map(tokens_from_proto)
             .unwrap();
 
         assert_eq!(gtc_icpt_amt, alloc);

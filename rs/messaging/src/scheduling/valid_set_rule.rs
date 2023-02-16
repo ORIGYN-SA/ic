@@ -4,27 +4,31 @@
 #![allow(clippy::ptr_arg)]
 
 use ic_base_types::NumBytes;
-use ic_cycles_account_manager::{
-    CyclesAccountManager, IngressInductionCost, IngressInductionCostError,
-};
+use ic_constants::{INGRESS_HISTORY_MAX_MESSAGES, SMALL_APP_SUBNET_MAX_SIZE};
+use ic_cycles_account_manager::{CyclesAccountManager, IngressInductionCost};
 use ic_error_types::{ErrorCode, UserError};
+use ic_ic00_types::CanisterStatusType;
 use ic_interfaces::execution_environment::IngressHistoryWriter;
 use ic_logger::{debug, error, trace, ReplicaLogger};
 use ic_metrics::{buckets::decimal_buckets, buckets::linear_buckets, MetricsRegistry};
+use ic_registry_subnet_type::SubnetType;
 use ic_replicated_state::{
     replicated_state::{
         LABEL_VALUE_CANISTER_NOT_FOUND, LABEL_VALUE_CANISTER_OUT_OF_CYCLES,
         LABEL_VALUE_CANISTER_STOPPED, LABEL_VALUE_CANISTER_STOPPING,
-        LABEL_VALUE_INVALID_SUBNET_PAYLOAD, LABEL_VALUE_UNKNOWN_SUBNET_METHOD,
+        LABEL_VALUE_INVALID_SUBNET_PAYLOAD, LABEL_VALUE_QUEUE_FULL,
+        LABEL_VALUE_UNKNOWN_SUBNET_METHOD,
     },
     ReplicatedState, StateError,
 };
-use ic_types::messages::HttpRequestContent;
 use ic_types::{
-    ingress::IngressStatus,
-    messages::{is_subnet_message, SignedIngressContent},
+    ingress::{IngressState, IngressStatus},
+    messages::{
+        extract_effective_canister_id, HttpRequestContent, Ingress, ParseIngressError,
+        SignedIngressContent,
+    },
     time::current_time_and_expiry_time,
-    CanisterStatusType, SubnetId, Time,
+    SubnetId, Time,
 };
 use prometheus::{Histogram, HistogramVec, IntCounterVec, IntGauge};
 use std::sync::Arc;
@@ -39,8 +43,8 @@ struct VsrMetrics {
     /// The latency metric is unreliable because we assume expiry time
     /// was set by 'current_time_and_expiry_time'.
     unreliable_induct_ingress_message_duration: HistogramVec,
-    /// Memory currently used by the ingress history (including reservations
-    /// for statuses that may still change).
+    /// Memory currently used by payloads of statuses in the ingress
+    /// history.
     ingress_history_size: IntGauge,
 }
 
@@ -76,9 +80,7 @@ impl VsrMetrics {
         );
         let ingress_history_size = metrics_registry.int_gauge(
             METRIC_INGRESS_HISTORY_SIZE,
-            "Memory currently used by the ingress history (including \
-            `MAX_RESPONSE_COUNT_BYTES` bytes reservation for each status \
-            that may still change).",
+            "Memory currently used by payloads of statuses in the ingress history",
         );
 
         // Initialize all `inducted_ingress_messages` counters with zero, so they are
@@ -87,6 +89,7 @@ impl VsrMetrics {
             LABEL_VALUE_SUCCESS,
             LABEL_VALUE_DUPLICATE,
             LABEL_VALUE_CANISTER_NOT_FOUND,
+            LABEL_VALUE_QUEUE_FULL,
             LABEL_VALUE_CANISTER_STOPPED,
             LABEL_VALUE_CANISTER_STOPPING,
             LABEL_VALUE_CANISTER_OUT_OF_CYCLES,
@@ -112,9 +115,10 @@ pub(crate) trait ValidSetRule: Send {
 
 pub(crate) struct ValidSetRuleImpl {
     ingress_history_writer: Arc<dyn IngressHistoryWriter<State = ReplicatedState>>,
+    ingress_history_max_messages: usize,
     cycles_account_manager: Arc<CyclesAccountManager>,
-    metrics: VsrMetrics,
     own_subnet_id: SubnetId,
+    metrics: VsrMetrics,
     log: ReplicaLogger,
 }
 
@@ -128,6 +132,7 @@ impl ValidSetRuleImpl {
     ) -> Self {
         Self {
             ingress_history_writer,
+            ingress_history_max_messages: INGRESS_HISTORY_MAX_MESSAGES,
             metrics: VsrMetrics::new(metrics_registry),
             own_subnet_id,
             cycles_account_manager,
@@ -138,7 +143,12 @@ impl ValidSetRuleImpl {
     /// Tries to induct a single ingress message and sets the message status in
     /// `state` accordingly (to `Received` if successful; or to `Failed` with
     /// the relevant error code on failure).
-    fn induct_message(&self, state: &mut ReplicatedState, msg: SignedIngressContent) {
+    fn induct_message(
+        &self,
+        state: &mut ReplicatedState,
+        msg: SignedIngressContent,
+        subnet_size: usize,
+    ) {
         trace!(self.log, "induct_message");
         let message_id = msg.id();
         let source = msg.sender();
@@ -147,16 +157,17 @@ impl ValidSetRuleImpl {
         let time = state.time();
         let ingress_expiry = msg.ingress_expiry();
 
-        let status = match self.enqueue(state, msg) {
+        let status = match self.enqueue(state, msg, subnet_size) {
             Ok(()) => {
                 self.observe_inducted_ingress_payload_size(payload_bytes);
                 self.ingress_history_writer.set_status(
                     state,
                     message_id,
-                    IngressStatus::Received {
+                    IngressStatus::Known {
                         receiver: receiver.get(),
                         user_id: source,
                         time,
+                        state: IngressState::Received,
                     },
                 );
                 LABEL_VALUE_SUCCESS
@@ -177,8 +188,8 @@ impl ValidSetRuleImpl {
                     StateError::CanisterOutOfCycles { .. } => ErrorCode::CanisterOutOfCycles,
                     StateError::UnknownSubnetMethod(_) => ErrorCode::CanisterOutOfCycles,
                     StateError::InvalidSubnetPayload => ErrorCode::CanisterOutOfCycles,
-                    StateError::QueueFull { .. }
-                    | StateError::OutOfMemory { .. }
+                    StateError::QueueFull { .. } => ErrorCode::IngressHistoryFull,
+                    StateError::OutOfMemory { .. }
                     | StateError::InvariantBroken { .. }
                     | StateError::NonMatchingResponse { .. }
                     | StateError::BitcoinStateError(_) => {
@@ -188,11 +199,11 @@ impl ValidSetRuleImpl {
                 self.ingress_history_writer.set_status(
                     state,
                     message_id,
-                    IngressStatus::Failed {
+                    IngressStatus::Known {
                         receiver: receiver.get(),
                         user_id: source,
-                        error: UserError::new(error_code, err.to_string()),
                         time,
+                        state: IngressState::Failed(UserError::new(error_code, err.to_string())),
                     },
                 );
                 err.to_label_value()
@@ -251,28 +262,45 @@ impl ValidSetRuleImpl {
         &self,
         state: &mut ReplicatedState,
         msg: SignedIngressContent,
+        subnet_size: usize,
     ) -> Result<(), StateError> {
-        // Compute the cost of induction.
-        let induction_cost = match self.cycles_account_manager.ingress_induction_cost(&msg) {
-            Ok(induction_cost) => induction_cost,
-            Err(
-                IngressInductionCostError::UnknownSubnetMethod
-                | IngressInductionCostError::SubnetMethodNotAllowed,
-            ) => {
-                return Err(StateError::UnknownSubnetMethod(
-                    msg.method_name().to_string(),
-                ))
-            }
-            Err(IngressInductionCostError::InvalidSubnetPayload(_)) => {
-                return Err(StateError::InvalidSubnetPayload)
-            }
-        };
+        if state.metadata.own_subnet_type != SubnetType::System
+            && state.metadata.ingress_history.len() >= self.ingress_history_max_messages
+        {
+            return Err(StateError::QueueFull {
+                capacity: self.ingress_history_max_messages,
+            });
+        }
 
+        let effective_canister_id =
+            match extract_effective_canister_id(&msg, state.metadata.own_subnet_id) {
+                Ok(effective_canister_id) => effective_canister_id,
+                Err(
+                    ParseIngressError::UnknownSubnetMethod
+                    | ParseIngressError::SubnetMethodNotAllowed,
+                ) => {
+                    return Err(StateError::UnknownSubnetMethod(
+                        msg.method_name().to_string(),
+                    ))
+                }
+                Err(ParseIngressError::InvalidSubnetPayload(_)) => {
+                    return Err(StateError::InvalidSubnetPayload)
+                }
+            };
+
+        // Compute the cost of induction.
+        let induction_cost = self.cycles_account_manager.ingress_induction_cost(
+            &msg,
+            effective_canister_id,
+            subnet_size,
+        );
+
+        let ingress = Ingress::from((msg, effective_canister_id));
         match induction_cost {
             IngressInductionCost::Free => {
                 // Only subnet methods can be free. These are enqueued directly.
-                assert!(is_subnet_message(&msg, self.own_subnet_id));
-                state.push_ingress(msg)
+                assert!(ingress.is_addressed_to_subnet(self.own_subnet_id));
+                state.push_ingress(ingress)
             }
 
             IngressInductionCost::Fee { payer, cost } => {
@@ -283,7 +311,7 @@ impl ValidSetRuleImpl {
                 };
 
                 // Ensure the canister is running if the message isn't to a subnet.
-                if !is_subnet_message(&msg, self.own_subnet_id) {
+                if !ingress.is_addressed_to_subnet(self.own_subnet_id) {
                     match canister.status() {
                         CanisterStatusType::Running => {}
                         CanisterStatusType::Stopping => {
@@ -298,16 +326,17 @@ impl ValidSetRuleImpl {
                 // Withdraw cost of inducting the message.
                 let memory_usage = canister.memory_usage(state.metadata.own_subnet_type);
                 let compute_allocation = canister.scheduler_state.compute_allocation;
-                if let Err(err) = self.cycles_account_manager.consume_cycles(
-                    &mut canister.system_state,
+                if let Err(err) = self.cycles_account_manager.charge_ingress_induction_cost(
+                    canister,
                     memory_usage,
                     compute_allocation,
                     cost,
+                    subnet_size,
                 ) {
                     return Err(StateError::CanisterOutOfCycles(err));
                 }
 
-                state.push_ingress(msg)
+                state.push_ingress(ingress)
             }
         }
     }
@@ -315,10 +344,15 @@ impl ValidSetRuleImpl {
 
 impl ValidSetRule for ValidSetRuleImpl {
     fn induct_messages(&self, state: &mut ReplicatedState, msgs: Vec<SignedIngressContent>) {
+        let subnet_size = state
+            .metadata
+            .network_topology
+            .get_subnet_size(&state.metadata.own_subnet_id)
+            .unwrap_or(SMALL_APP_SUBNET_MAX_SIZE);
         for msg in msgs {
             let message_id = msg.id();
             if !self.is_duplicate(state, &msg) {
-                self.induct_message(state, msg);
+                self.induct_message(state, msg, subnet_size);
             } else {
                 self.observe_inducted_ingress_status(LABEL_VALUE_DUPLICATE);
                 debug!(self.log, "Didn't induct duplicate message {}", message_id);

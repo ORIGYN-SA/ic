@@ -1,15 +1,19 @@
 [package]
 name = "ic-replicated-state"
 version = "0.8.0"
-edition = "2018"
+edition = "2021"
 
 [dependencies]
+bitcoin = "0.28.1"
 cvt = "0.1.1"
 debug_stub_derive = "0.3.0"
+ic-btc-types = { path = "../bitcoin/types/public" }
 ic-btc-types-internal = { path = "../bitcoin/types/internal" }
 ic-base-types = { path = "../types/base_types" }
+ic-certification-version = { path = "../canonical_state/certification_version" }
 ic-config = { path = "../config" }
 ic-constants = { path = "../constants" }
+ic-crypto-sha = { path = "../crypto/sha" }
 ic-error-types = { path = "../types/error_types" }
 ic-ic00-types = { path = "../types/ic00_types" }
 ic-interfaces = { path = "../interfaces" }
@@ -26,20 +30,24 @@ lazy_static = "1.4.0"
 libc = "0.2.91"
 maplit = "1.0.2"
 nix = "0.23.0"
-rand = "0.7.3"
-rand_chacha = "0.2.2"
+rand = "0.8.4"
+rand_chacha = "0.3.0"
 phantom_newtype = { path = "../phantom_newtype" }
 serde = { version = "1.0.99", features = [ "derive" ] }
-slog = { version = "2.5.2", features = ["nested-values", "max_level_trace", "release_max_level_debug"] }
+slog = { version = "2.5.2", features = ["nested-values", "release_max_level_debug"] }
 tempfile = "3.1.0"
+uuid = { version = "1.2.1", features = ["v4", "serde"] }
 
 [dev-dependencies]
+assert_matches = "1.3.0"
 criterion = "0.3"
 criterion-time = { path = "../criterion_time" }
+ic-btc-test-utils = { path = "../bitcoin/test-utils" }
 ic-test-utilities = { path = "../test_utilities" }
 maplit = "1.0.2"
 serde_cbor = "0.11.1"
-proptest = "0.9.4"
+proptest = "1.0"
+prost = "0.11.0"
 scoped_threadpool = "0.1.*"
 
 [[bench]]

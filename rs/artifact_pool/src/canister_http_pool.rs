@@ -16,7 +16,7 @@ use ic_interfaces::{
 use ic_metrics::MetricsRegistry;
 use ic_types::{
     artifact::CanisterHttpResponseId,
-    canister_http::{CanisterHttpResponseContent, CanisterHttpResponseShare},
+    canister_http::{CanisterHttpResponse, CanisterHttpResponseShare},
     crypto::CryptoHashOf,
     time::current_time,
 };
@@ -35,7 +35,7 @@ type UnvalidatedCanisterHttpPoolSection = PoolSection<
 >;
 
 type ContentCanisterHttpPoolSection =
-    PoolSection<CryptoHashOf<CanisterHttpResponseContent>, CanisterHttpResponseContent>;
+    PoolSection<CryptoHashOf<CanisterHttpResponse>, CanisterHttpResponse>;
 
 pub struct CanisterHttpPoolImpl {
     validated: ValidatedCanisterHttpPoolSection,
@@ -72,15 +72,16 @@ impl CanisterHttpPool for CanisterHttpPoolImpl {
 
     fn get_response_content_items(
         &self,
-    ) -> Box<
-        dyn Iterator<
-                Item = (
-                    &CryptoHashOf<CanisterHttpResponseContent>,
-                    &CanisterHttpResponseContent,
-                ),
-            > + '_,
-    > {
+    ) -> Box<dyn Iterator<Item = (&CryptoHashOf<CanisterHttpResponse>, &CanisterHttpResponse)> + '_>
+    {
         Box::new(self.content.iter())
+    }
+
+    fn get_response_content_by_hash(
+        &self,
+        hash: &CryptoHashOf<CanisterHttpResponse>,
+    ) -> Option<CanisterHttpResponse> {
+        self.content.get(hash).cloned()
     }
 
     fn lookup_validated(
@@ -101,7 +102,7 @@ impl CanisterHttpPool for CanisterHttpPoolImpl {
 impl MutableCanisterHttpPool for CanisterHttpPoolImpl {
     fn insert(&mut self, artifact: UnvalidatedArtifact<CanisterHttpResponseShare>) {
         self.unvalidated
-            .insert(ic_crypto::crypto_hash(&artifact.message), artifact);
+            .insert(ic_types::crypto::crypto_hash(&artifact.message), artifact);
     }
 
     fn apply_changes(&mut self, change_set: CanisterHttpChangeSet) {
@@ -109,14 +110,14 @@ impl MutableCanisterHttpPool for CanisterHttpPoolImpl {
             match action {
                 CanisterHttpChangeAction::AddToValidated(share, content) => {
                     self.validated.insert(
-                        ic_crypto::crypto_hash(&share),
+                        ic_types::crypto::crypto_hash(&share),
                         ValidatedArtifact {
                             msg: share,
                             timestamp: current_time(),
                         },
                     );
                     self.content
-                        .insert(ic_crypto::crypto_hash(&content), content);
+                        .insert(ic_types::crypto::crypto_hash(&content), content);
                 }
                 CanisterHttpChangeAction::MoveToValidated(id) => {
                     match self.unvalidated.remove(&id) {
@@ -138,6 +139,9 @@ impl MutableCanisterHttpPool for CanisterHttpPoolImpl {
 
                 CanisterHttpChangeAction::RemoveUnvalidated(id) => {
                     self.unvalidated.remove(&id);
+                }
+                CanisterHttpChangeAction::RemoveContent(id) => {
+                    self.content.remove(&id);
                 }
                 CanisterHttpChangeAction::HandleInvalid(id, _) => {
                     self.unvalidated.remove(&id);

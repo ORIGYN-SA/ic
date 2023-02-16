@@ -76,25 +76,53 @@ fn send_msg_to_host(message: &str, port: u32) -> Result<(), Error> {
     send_msg(message, cid_host, port)
 }
 
-use clap::{App, Arg};
+use clap::{Arg, Command};
 
 fn main() -> Result<(), Error> {
-    let matches = App::new("Host notifier")
+    let matches = Command::new("Host notifier")
         .version("0.1.0")
         .author("DFINITY Stiftung (c) 2021")
         .about("Sends messages to the VM host (Hypervisor) over Vsock")
         .arg(
-            Arg::with_name("attach-hsm")
+            Arg::new("attach-hsm")
                 .long("attach-hsm")
                 .help("Request the HSM device to be attached"),
         )
         .arg(
-            Arg::with_name("detach-hsm")
+            Arg::new("detach-hsm")
                 .long("detach-hsm")
                 .help("Request the HSM device to be detached"),
         )
         .arg(
-            Arg::with_name("port")
+            Arg::new("set-node-id")
+                .long("set-node-id")
+                .value_name("node_id")
+                .help("Set the node ID on the host.")
+                .takes_value(true),
+        )
+        .arg(
+            Arg::new("notify")
+                .long("notify")
+                .value_name("message")
+                .help("Notify the host with a given message.")
+                .takes_value(true),
+        )
+        .arg(
+            Arg::new("count")
+                .long("count")
+                .value_name("count")
+                .help("Number of times to display when using notify.")
+                .takes_value(true),
+        )
+        .arg(
+            Arg::new("upgrade")
+                .long("upgrade")
+                .value_name("info")
+                .help("Request the HostOS to apply upgrade")
+                .takes_value(true),
+        )
+        .arg(
+            Arg::new("port")
                 .long("port")
                 .value_name("PORT")
                 .help("Sets a custom port")
@@ -103,7 +131,7 @@ fn main() -> Result<(), Error> {
         )
         .get_matches();
 
-    let port = clap::value_t_or_exit!(matches.value_of("port"), u32);
+    let port = matches.value_of_t_or_exit("port");
 
     if matches.is_present("attach-hsm") {
         return send_msg_to_host("attach-hsm", port);
@@ -111,6 +139,21 @@ fn main() -> Result<(), Error> {
 
     if matches.is_present("detach-hsm") {
         return send_msg_to_host("detach-hsm", port);
+    }
+
+    if let Some(node_id) = matches.value_of("set-node-id") {
+        return send_msg_to_host(&format!("set-node-id[{}]", node_id), port);
+    }
+
+    if let Some(message) = matches.value_of("notify") {
+        let count = matches.value_of("count").unwrap_or("1");
+        return send_msg_to_host(&format!("notify[{}, {}]", count, message), port);
+    }
+
+    // TODO: Currently `info` is a string of the form `"url sha"`. Instead, we
+    // should use `clap` to present this better.
+    if let Some(info) = matches.value_of("upgrade") {
+        return send_msg_to_host(&format!("upgrade[{}]", info), port);
     }
 
     Ok(())

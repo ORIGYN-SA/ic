@@ -1,19 +1,22 @@
 [package]
 name = "ic-replica-setup-ic-network"
 version = "0.8.0"
-edition = "2018"
+edition = "2021"
 
 [dependencies]
 ic-artifact-manager = { path = "../../artifact_manager" }
 ic-artifact-pool = { path = "../../artifact_pool" }
+ic-https-outcalls-adapter-client = { path = "../../https_outcalls/client" }
 ic-config = { path = "../../config" }
 ic-consensus = { path = "../../consensus" }
 ic-crypto-tls-interfaces = { path = "../../crypto/tls_interfaces" }
 ic-cycles-account-manager = { path = "../../cycles_account_manager" }
 ic-ingress-manager = { path = "../../ingress_manager" }
 ic-interfaces = { path = "../../interfaces" }
-ic-interfaces-state-manager = { path = "../../interfaces/state_manager" }
+ic-interfaces-https-outcalls-adapter-client = { path = "../../interfaces/https_outcalls_adapter_client" }
 ic-interfaces-p2p = { path = "../../interfaces/p2p" }
+ic-interfaces-registry = { path = "../../interfaces/registry" }
+ic-interfaces-state-manager = { path = "../../interfaces/state_manager" }
 ic-interfaces-transport = { path = "../../interfaces/transport" }
 ic-logger = { path = "../../monitoring/logger" }
 ic-metrics = { path = "../../monitoring/metrics" }
@@ -23,7 +26,9 @@ ic-replicated-state = { path = "../../replicated_state" }
 ic-state-manager = { path = "../../state_manager" }
 ic-transport = { path = "../../transport" }
 ic-types = { path = "../../types/types" }
-slog = { version = "2.5.2", features = ["nested-values", "max_level_trace", "release_max_level_debug"] }
+parking_lot = "0.12.1"
+slog = { version = "2.5.2", features = ["nested-values", "release_max_level_debug"] }
+threadpool = "1.8.1"
 tokio = { version = "1.15.0", features = ["full"] }
 tower = { version = "0.4.11", features = ["load-shed", "buffer", "limit", "util"] }
 

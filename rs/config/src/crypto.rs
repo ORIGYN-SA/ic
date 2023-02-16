@@ -132,7 +132,7 @@ impl CryptoConfig {
                 dir.display()
             ));
         }
-        let metadata = fs::metadata(&dir).map_err(|err| {
+        let metadata = fs::metadata(dir).map_err(|err| {
             format!(
                 "Cannot get the metadata of the crypto state directory {}: {:?}",
                 dir.display(),
@@ -193,8 +193,8 @@ mod tests {
     }
 
     proptest! {
-        #[test]
-        #[ignore]
+        #[allow(dead_code)]
+        // #[test]
         // TODO(CRP-323): The current json5 implementation is buggy:
         // Unicode code points U+2028 and U+2029 are not escaped/parsed properly.
         // This test is disabled until issue is fixed.
@@ -217,7 +217,7 @@ mod tests {
     #[test]
     fn should_set_correct_path_permissions() {
         CryptoConfig::run_with_temp_config(|config| {
-            CryptoConfig::check_dir_has_required_permissions(&*config.crypto_root)
+            CryptoConfig::check_dir_has_required_permissions(&config.crypto_root)
                 .expect("Wrong direcotry permissions");
         })
     }

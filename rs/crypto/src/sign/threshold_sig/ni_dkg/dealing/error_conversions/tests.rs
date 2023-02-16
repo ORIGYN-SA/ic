@@ -1,11 +1,12 @@
 mod create_dealing_error_conversions {
+    use assert_matches::assert_matches;
     use ic_crypto_internal_threshold_sig_bls12381::api::dkg_errors::MalformedSecretKeyError;
     use ic_crypto_internal_threshold_sig_bls12381::api::dkg_errors::{
         InvalidArgumentError, KeyNotFoundError, MalformedPublicKeyError, SizeError,
     };
     use ic_types::crypto::threshold_sig::ni_dkg::errors::create_dealing_error::DkgCreateDealingError;
     use ic_types::crypto::threshold_sig::ni_dkg::errors::MalformedFsEncryptionPublicKeyError;
-    use ic_types::crypto::{AlgorithmId, KeyId};
+    use ic_types::crypto::AlgorithmId;
     use ic_types::NumberOfNodes;
 
     mod csp_create_dealing {
@@ -39,7 +40,8 @@ mod create_dealing_error_conversions {
         fn should_return_error_on_reshare_key_not_in_secret_key_store_error() {
             let key_not_found_error = KeyNotFoundError {
                 internal_error: "some error".to_string(),
-                key_id: KeyId::from([0; 32]),
+                key_id: "KeyId(0x0000000000000000000000000000000000000000000000000000000000000000)"
+                    .to_string(),
             };
             let csp_error = CspDkgCreateReshareDealingError::ReshareKeyNotInSecretKeyStoreError(
                 key_not_found_error.clone(),
@@ -47,11 +49,11 @@ mod create_dealing_error_conversions {
 
             let result = DkgCreateDealingError::from(csp_error);
 
-            assert!(matches!(
+            assert_matches!(
                 result,
                 DkgCreateDealingError::ThresholdSigningKeyNotInSecretKeyStore(error)
                 if error == key_not_found_error
-            ));
+            );
         }
 
         #[test]

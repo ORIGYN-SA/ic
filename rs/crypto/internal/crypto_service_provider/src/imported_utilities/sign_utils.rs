@@ -9,14 +9,11 @@ use ic_crypto_internal_basic_sig_iccsa as iccsa;
 use ic_crypto_internal_basic_sig_rsa_pkcs1 as rsa;
 use ic_crypto_internal_threshold_sig_bls12381 as bls12_381;
 use ic_crypto_internal_types::sign::threshold_sig::public_key::bls12_381::PublicKeyBytes as BlsPublicKeyBytes;
-use ic_crypto_internal_types::sign::threshold_sig::public_key::CspThresholdSigPublicKey;
-use ic_interfaces::crypto::Signable;
 use ic_types::crypto::threshold_sig::ThresholdSigPublicKey;
 use ic_types::crypto::{
-    AlgorithmId, BasicSig, CombinedThresholdSig, CombinedThresholdSigOf, CryptoError, CryptoResult,
+    AlgorithmId, BasicSig, CombinedThresholdSigOf, CryptoError, CryptoResult, Signable,
     UserPublicKey,
 };
-use ic_types::{NumberOfNodes, Randomness};
 use std::convert::{TryFrom, TryInto};
 
 #[cfg(test)]
@@ -77,7 +74,7 @@ pub fn user_public_key_from_bytes(
         )
     } else if pkix_algo_id == ecdsa_secp256r1::algorithm_identifier() {
         (
-            ecdsa_secp256r1::api::public_key_from_der(bytes)?.0,
+            ecdsa_secp256r1::public_key_from_der(bytes)?.0,
             AlgorithmId::EcdsaP256,
             KeyBytesContentType::EcdsaP256PublicKeyDer,
         )
@@ -88,7 +85,7 @@ pub fn user_public_key_from_bytes(
         (key_bytes.0.key, alg_id, key_contents_type)
     } else if pkix_algo_id == iccsa::algorithm_identifier() {
         (
-            iccsa::api::public_key_bytes_from_der(bytes)?.0,
+            iccsa::public_key_bytes_from_der(bytes)?.0,
             AlgorithmId::IcCanisterSignature,
             KeyBytesContentType::IcCanisterSignatureAlgPublicKeyDer,
         )
@@ -114,7 +111,7 @@ pub fn user_public_key_from_bytes(
 /// # Errors
 /// * `CryptoError::MalformedSignature`: if the signature cannot be DER decoded.
 pub fn ecdsa_p256_signature_from_der_bytes(bytes: &[u8]) -> CryptoResult<BasicSig> {
-    let ecdsa_sig = ecdsa_secp256r1::api::signature_from_der(bytes)?;
+    let ecdsa_sig = ecdsa_secp256r1::signature_from_der(bytes)?;
     Ok(BasicSig(ecdsa_sig.0.to_vec()))
 }
 
@@ -183,27 +180,4 @@ pub fn verify_combined_threshold_sig<T: Signable>(
     }
     let bls_sig = bls12_381::types::CombinedSignatureBytes::try_from(csp_sig)?;
     bls12_381::api::verify_combined_signature(&msg.as_signed_bytes(), bls_sig, bls_pk)
-}
-
-/// Creates a combined threshold signature together with its public key. This is
-/// only used for testing.
-// TODO(CRP-622): consider turning it into a test_util once crypto has
-// NNS-verfification built in.
-#[allow(dead_code)]
-pub fn combined_threshold_signature_and_public_key<T: Signable>(
-    seed: Randomness,
-    message: &T,
-) -> (CombinedThresholdSigOf<T>, ThresholdSigPublicKey) {
-    let group_size = 1;
-    let threshold = NumberOfNodes::new(1);
-    let (signature, public_key) = bls12_381::api::combined_signature_and_public_key(
-        seed,
-        group_size,
-        threshold,
-        &message.as_signed_bytes(),
-    );
-    (
-        CombinedThresholdSigOf::from(CombinedThresholdSig(signature.0.to_vec())),
-        ThresholdSigPublicKey::from(CspThresholdSigPublicKey::from(public_key)),
-    )
 }

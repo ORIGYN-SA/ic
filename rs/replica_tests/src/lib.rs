@@ -1,13 +1,18 @@
 use core::future::Future;
 use ic_base_types::{PrincipalId, SubnetId};
-use ic_canister_client::Sender;
+use ic_canister_client_sender::Sender;
 use ic_config::Config;
-use ic_config::{crypto::CryptoConfig, transport::TransportFlowConfig};
+use ic_config::{crypto::CryptoConfig, transport::TransportConfig};
 use ic_error_types::{ErrorCode, RejectCode, UserError};
 use ic_execution_environment::IngressHistoryReaderImpl;
+use ic_ic00_types::CanisterInstallMode;
+use ic_ic00_types::{
+    CanisterIdRecord, InstallCodeArgs, Method, Payload, ProvisionalCreateCanisterWithCyclesArgs,
+    IC_00,
+};
 use ic_interfaces::execution_environment::{IngressHistoryReader, QueryHandler};
-use ic_interfaces::registry::RegistryClient;
 use ic_interfaces_p2p::IngressIngestionService;
+use ic_interfaces_registry::RegistryClient;
 use ic_interfaces_state_manager::StateReader;
 use ic_metrics::MetricsRegistry;
 use ic_prep_lib::internet_computer::{IcConfig, TopologyConfig};
@@ -21,17 +26,15 @@ use ic_registry_provisional_whitelist::ProvisionalWhitelist;
 use ic_registry_subnet_type::SubnetType;
 use ic_replica::setup::setup_crypto_provider;
 use ic_replicated_state::{CanisterState, ReplicatedState};
+use ic_state_machine_tests::StateMachine;
 use ic_test_utilities::{
     types::ids::user_anonymous_id, types::messages::SignedIngressBuilder,
-    universal_canister::UNIVERSAL_CANISTER_WASM, with_test_replica_logger,
+    universal_canister::UNIVERSAL_CANISTER_WASM,
 };
+use ic_test_utilities_logger::with_test_replica_logger;
 use ic_types::{
-    ic00::{
-        CanisterIdRecord, InstallCodeArgs, Method, Payload,
-        ProvisionalCreateCanisterWithCyclesArgs, IC_00,
-    },
-    ingress::{IngressStatus, WasmResult},
-    messages::{CanisterInstallMode, SignedIngress, UserQuery},
+    ingress::{IngressState, IngressStatus, WasmResult},
+    messages::{SignedIngress, UserQuery},
     replica_config::NODE_INDEX_DEFAULT,
     time::current_time_and_expiry_time,
     CanisterId, Height, NodeId, RegistryVersion, Time,
@@ -56,6 +59,7 @@ const CYCLES_BALANCE: u128 = 1 << 120;
 /// Note: To ensure that this function does not block forever (in case of bugs),
 /// this function will panic if the process is not finished in some amount of
 /// time.
+#[allow(clippy::await_holding_lock)]
 fn process_ingress(
     ingress_sender_mu: &Mutex<Option<IngressIngestionService>>,
     ingress_hist_reader: &dyn IngressHistoryReader,
@@ -86,23 +90,24 @@ fn process_ingress(
         std::thread::sleep(Duration::from_millis(5));
         let ingress_result = (ingress_hist_reader.get_latest_status())(&msg_id);
         match ingress_result {
-            IngressStatus::Completed { result, .. } => {
-                // Don't forget! Signal the runtime to stop.
-                return Ok(result);
-            }
-            IngressStatus::Failed { error, .. } => {
-                // Don't forget! Signal the runtime to stop.
-                return Err(error);
-            }
-            IngressStatus::Done { .. } => {
-                return Err(UserError::new(
-                    ErrorCode::SubnetOversubscribed,
-                    "The call has completed but the reply/reject data has been pruned.",
-                ));
-            }
-            IngressStatus::Received { .. }
-            | IngressStatus::Processing { .. }
-            | IngressStatus::Unknown => (),
+            IngressStatus::Known { state, .. } => match state {
+                IngressState::Completed(result) => {
+                    // Don't forget! Signal the runtime to stop.
+                    return Ok(result);
+                }
+                IngressState::Failed(error) => {
+                    // Don't forget! Signal the runtime to stop.
+                    return Err(error);
+                }
+                IngressState::Done => {
+                    return Err(UserError::new(
+                        ErrorCode::SubnetOversubscribed,
+                        "The call has completed but the reply/reject data has been pruned.",
+                    ));
+                }
+                IngressState::Received | IngressState::Processing => (),
+            },
+            IngressStatus::Unknown => (),
         }
         if Instant::now().duration_since(start) > time_limit {
             panic!(
@@ -163,6 +168,8 @@ pub struct LocalTestRuntime {
     pub node_id: NodeId,
     nonce: Mutex<u64>,
     pub ingress_time_limit: Duration,
+    pub registry_data_provider: Arc<ProtoRegistryDataProvider>,
+    pub registry_client: Arc<FakeRegistryClient>,
 }
 
 /// This function is here to maintain compatibility with existing tests
@@ -226,17 +233,14 @@ pub fn get_ic_config() -> IcConfig {
     subnet_nodes.insert(
         NODE_INDEX_DEFAULT,
         NodeConfiguration {
-            xnet_api: vec!["http://0.0.0.0:0".parse().expect("can't fail")],
-            public_api: vec!["http://0.0.0.0:0".parse().expect("can't fail")],
+            xnet_api: vec!["http://0.0.0.1:0".parse().expect("can't fail")],
+            public_api: vec!["http://128.0.0.1:10000".parse().expect("can't fail")],
             private_api: vec![],
-            p2p_addr: "org.internetcomputer.p2p1://0.0.0.0:0"
+            p2p_addr: "org.internetcomputer.p2p1://128.0.0.1:10000"
                 .parse()
                 .expect("can't fail"),
             prometheus_metrics: vec![],
-            p2p_num_flows: 1,
-            p2p_start_flow_tag: 0,
             node_operator_principal_id: None,
-            no_idkg_key: false,
             secret_key_store: Some(node_sks),
         },
     );
@@ -257,6 +261,7 @@ pub fn get_ic_config() -> IcConfig {
             Some(Height::from(19)),         // DKG interval length
             None,
             SubnetType::System,
+            None,
             None,
             None,
             None,
@@ -284,6 +289,7 @@ pub fn get_ic_config() -> IcConfig {
         None,
         None,
         /* ssh_readonly_access_to_unassgined_nodes */ vec![],
+        /* guest_launch_measurement_sha256_hex= */ None,
     )
 }
 
@@ -344,11 +350,13 @@ where
         // load the registry file written by ic-prep
         let data_provider =
             ProtoRegistryDataProvider::load_from_file(init_ic.registry_path().as_path());
-        let registry = Arc::new(FakeRegistryClient::new(Arc::new(data_provider)));
-        registry.update_to_latest_version();
-        let registry = registry as Arc<dyn RegistryClient + Send + Sync>;
+        let data_provider = Arc::new(data_provider);
+        let fake_registry_client = Arc::new(FakeRegistryClient::new(data_provider.clone()));
+        fake_registry_client.update_to_latest_version();
+        let registry = fake_registry_client.clone() as Arc<dyn RegistryClient + Send + Sync>;
         let crypto = setup_crypto_provider(
             &config.crypto,
+            rt.handle().clone(),
             registry.clone(),
             logger.clone(),
             Some(&metrics_registry),
@@ -375,12 +383,12 @@ where
 
         let subnet_type = get_subnet_type(&*registry, subnet_id, registry.get_latest_version());
 
-        config.transport.node_ip = "0.0.0.0".to_string();
-        config.transport.p2p_flows = vec![TransportFlowConfig {
-            flow_tag: 0,
-            server_port: 1234,
-            queue_size: 0,
-        }];
+        config.transport = TransportConfig {
+            node_ip: "0.0.0.0".to_string(),
+            listening_port: 1234,
+            send_queue_size: 0,
+            ..Default::default()
+        };
         let temp_node = node_id;
         let (
             _,
@@ -395,6 +403,7 @@ where
             _,
         ) = ic_replica::setup_p2p::construct_ic_stack(
             logger,
+            tokio::runtime::Handle::current(),
             tokio::runtime::Handle::current(),
             config.clone(),
             subnet_config,
@@ -439,6 +448,8 @@ where
             node_id,
             nonce: Mutex::new(0),
             ingress_time_limit: Duration::from_secs(300),
+            registry_data_provider: data_provider,
+            registry_client: fake_registry_client,
         };
         tokio::runtime::Handle::current().block_on(test(runtime))
     })
@@ -471,7 +482,7 @@ impl LocalTestRuntime {
         self.install_canister_helper(InstallCodeArgs::new(
             CanisterInstallMode::Upgrade,
             *canister_id,
-            wabt::wat2wasm(wat).expect("couldn't convert wat -> wasm"),
+            wat::parse_str(wat).expect("couldn't convert wat -> wasm"),
             payload,
             None,
             None,
@@ -504,7 +515,7 @@ impl LocalTestRuntime {
                 .method_name(Method::ProvisionalCreateCanisterWithCycles)
                 .canister_id(IC_00)
                 .method_payload(
-                    ProvisionalCreateCanisterWithCyclesArgs::new(Some(num_cycles)).encode(),
+                    ProvisionalCreateCanisterWithCyclesArgs::new(Some(num_cycles), None).encode(),
                 )
                 .nonce(nonce)
                 .build(),
@@ -530,7 +541,7 @@ impl LocalTestRuntime {
     ) -> Result<WasmResult, UserError> {
         self.install_canister_wasm(
             canister_id,
-            wabt::wat2wasm(wat).expect("couldn't convert wat -> wasm"),
+            wat::parse_str(wat).expect("couldn't convert wat -> wasm"),
             payload,
             None,
             None,
@@ -629,6 +640,7 @@ impl LocalTestRuntime {
         let nonce = self.get_nonce();
         let ingress_time_limit = self.ingress_time_limit;
         // Wrapping the call to process_ingress to avoid blocking current thread
+
         tokio::runtime::Handle::current()
             .spawn_blocking(move || {
                 process_ingress(
@@ -788,11 +800,11 @@ impl LocalTestRuntime {
 
 /// A simple wrapper for bundling the universal canister and the test runtime.
 pub struct UniversalCanister {
-    runtime: LocalTestRuntime,
-    canister_id: CanisterId,
+    pub runtime: LocalTestRuntime,
+    pub canister_id: CanisterId,
 }
 
-impl<'a> UniversalCanister {
+impl UniversalCanister {
     pub fn canister_id(&self) -> CanisterId {
         self.canister_id
     }
@@ -811,6 +823,36 @@ impl<'a> UniversalCanister {
     }
 }
 
+pub struct UniversalCanisterWithStateMachine<'a> {
+    env: &'a StateMachine,
+    canister_id: CanisterId,
+}
+
+impl<'a> UniversalCanisterWithStateMachine<'a> {
+    pub fn canister_id(&self) -> CanisterId {
+        self.canister_id
+    }
+
+    pub fn query<P: Into<Vec<u8>>>(&self, payload: P) -> Result<WasmResult, UserError> {
+        self.env.query(self.canister_id(), "query", payload.into())
+    }
+
+    pub fn update<P: Into<Vec<u8>>>(&self, payload: P) -> Result<WasmResult, UserError> {
+        self.env
+            .execute_ingress(self.canister_id(), "update", payload.into())
+    }
+}
+
+pub fn install_universal_canister<P: Into<Vec<u8>>>(
+    env: &StateMachine,
+    args: P,
+) -> UniversalCanisterWithStateMachine<'_> {
+    let canister_id = env
+        .install_canister(UNIVERSAL_CANISTER_WASM.to_vec(), args.into(), None)
+        .expect("failed to install universal canister");
+    UniversalCanisterWithStateMachine { env, canister_id }
+}
+
 pub fn assert_reject(res: Result<WasmResult, UserError>, reject_code: RejectCode) {
     match res {
         Ok(WasmResult::Reject(rej)) => assert_eq!(rej.as_bytes()[0], reject_code as u8),
@@ -821,6 +863,9 @@ pub fn assert_reject(res: Result<WasmResult, UserError>, reject_code: RejectCode
 pub fn assert_reply(res: Result<WasmResult, UserError>, bytes: &[u8]) {
     match res {
         Ok(WasmResult::Reply(res)) => assert_eq!(res.as_slice(), bytes),
-        _ => unreachable!("Assert reply failed."),
+        other_response => unreachable!(
+            "Assert reply failed. Response received: {:?}",
+            other_response
+        ),
     }
 }

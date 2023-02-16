@@ -2,7 +2,7 @@
 //!
 //! DEPRECATED: After the ongoing switch to using `ic-replay` to modify the
 //! mainnet state in testnets this will be no longer needed.
-use clap::Clap;
+use clap::Parser;
 use ic_agent::{
     agent::http_transport::ReqwestHttpReplicaV2Transport, export::Principal, Agent, AgentError,
 };
@@ -20,7 +20,7 @@ use std::{
 use url::Url;
 
 /// Command line options for the `governance_upgrader` utility.
-#[derive(Clap)]
+#[derive(Parser)]
 #[clap(version = "1.0")]
 struct Opts {
     #[clap(long)]
@@ -79,7 +79,7 @@ async fn main() {
     if !opts.start_only {
         let wasm_bytes = read_file_fully(&opts.wasm);
 
-        let _stopped: () = management_canister
+        management_canister
             .stop_canister(&governance_canister_id)
             .call_and_wait(delay())
             .await
@@ -94,7 +94,7 @@ async fn main() {
         eprintln!("The call to install_code returned: {:?}", upgraded);
     }
 
-    let _started: () = management_canister
+    management_canister
         .start_canister(&governance_canister_id)
         .call_and_wait(delay())
         .await

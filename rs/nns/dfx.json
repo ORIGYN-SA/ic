@@ -3,15 +3,9 @@
   "canisters": {
     "registry": {
       "type": "custom",
-      "candid": "empty.did",
+      "candid": "../registry/canister/canister/registry.did",
       "wasm": "../target/wasm32-unknown-unknown/release/registry-canister.wasm",
       "build": "cargo build --target wasm32-unknown-unknown --release -p registry-canister"
-    },
-    "tokens": {
-      "type": "custom",
-      "candid": "gtc/canister/gtc.did",
-      "wasm": "../target/wasm32-unknown-unknown/release/genesis-token-canister.wasm",
-      "build": "cargo build --target wasm32-unknown-unknown --release -p ic-nns-gtc"
     },
     "governance": {
       "type": "custom",
@@ -19,26 +13,53 @@
       "wasm": "../target/wasm32-unknown-unknown/release/governance-canister.wasm",
       "build": "cargo build --target wasm32-unknown-unknown --release -p ic-nns-governance"
     },
+    "ledger": {
+      "type": "custom",
+      "candid": "../rosetta-api/icp_ledger/ledger.did",
+      "wasm": "../target/wasm32-unknown-unknown/release/ledger-canister.wasm",
+      "build": "cargo build --target wasm32-unknown-unknown --release -p ledger-canister"
+    },
     "root": {
       "type": "custom",
       "candid": "handlers/root/canister/root.did",
       "wasm": "../target/wasm32-unknown-unknown/release/root-canister.wasm",
       "build": "cargo build --target wasm32-unknown-unknown --release -p ic-nns-handler-root"
     },
+    "cycles-minting": {
+      "type": "custom",
+      "candid": "cmc/cmc.did",
+      "wasm": "../target/wasm32-unknown-unknown/release/cycles-minting-canister.wasm",
+      "build": "cargo build --target wasm32-unknown-unknown --release -p cycles-minting-canister"
+    },
     "lifeline": {
-      "candid": "handlers/lifeline/lifeline.did"
+      "type": "custom",
+      "candid": "handlers/lifeline/lifeline.did",
+      "wasm": "../target/wasm32-unknown-unknown/release/lifeline.wasm",
+      "build": "cargo build --target wasm32-unknown-unknown --release -p lifeline"
+    },
+    "genesis-token": {
+      "type": "custom",
+      "candid": "gtc/canister/gtc.did",
+      "wasm": "../target/wasm32-unknown-unknown/release/genesis-token-canister.wasm",
+      "build": "cargo build --target wasm32-unknown-unknown --release -p ic-nns-gtc"
+    },
+    "sns-wasm": {
+      "type": "custom",
+      "candid": "sns-wasm/canister/sns-wasm.did",
+      "wasm": "../target/wasm32-unknown-unknown/release/sns-wasm-canister-opt.wasm",
+      "build": "cargo build --target wasm32-unknown-unknown --release -p ic-sns-wasm && ic-cdk-optimizer ../target/wasm32-unknown-unknown/release/sns-wasm-canister.wasm -o ../target/wasm32-unknown-unknown/release/sns-wasm-canister-opt.wasm"
     }
   },
   "networks": {
-    "mercury": {
+    "mainnet": {
       "providers": [
-        "http://[2a00:fb01:400:100:5000:61ff:fe2c:14ac]:8080"
+        "https://ic0.app"
       ],
       "type": "persistent"
     },
-    "nnstestnet": {
+    "small01": {
       "providers": [
-        "http://dcs-nns-8.dfinity.systems:8080"
+        "http://[2a00:fb01:400:42:5000:3dff:feca:9312]:8080"
       ],
       "type": "persistent"
     },

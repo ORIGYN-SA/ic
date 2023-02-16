@@ -1,17 +1,17 @@
 //! Replica -- Internet Computer
 
-use ic_async_utils::shutdown_signal;
+use ic_async_utils::{abort_on_panic, shutdown_signal};
 use ic_config::registry_client::DataProviderConfig;
 use ic_config::{subnet_config::SubnetConfigs, Config};
 use ic_crypto_sha::Sha256;
 use ic_crypto_tls_interfaces::TlsHandshake;
+use ic_http_endpoints_metrics::MetricsHttpEndpoint;
 use ic_interfaces::crypto::IngressSigVerifier;
-use ic_interfaces::registry::{LocalStoreCertifiedTimeReader, RegistryClient};
+use ic_interfaces_registry::{LocalStoreCertifiedTimeReader, RegistryClient};
 use ic_logger::{info, new_replica_logger_from_config};
 use ic_metrics::MetricsRegistry;
-use ic_metrics_exporter::MetricsRuntimeImpl;
 use ic_registry_client_helpers::subnet::SubnetRegistry;
-use ic_replica::{args::ReplicaArgs, setup};
+use ic_replica::setup;
 use ic_sys::PAGE_SIZE;
 use ic_types::{replica_version::REPLICA_BINARY_HASH, PrincipalId, ReplicaVersion, SubnetId};
 use nix::unistd::{setpgid, Pid};
@@ -23,7 +23,6 @@ use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::signal::unix::{signal, SignalKind};
-use tokio::task;
 
 #[cfg(target_os = "linux")]
 mod jemalloc_metrics;
@@ -36,7 +35,7 @@ use jemallocator::Jemalloc;
 #[cfg(target_os = "linux")]
 static ALLOC: Jemalloc = Jemalloc;
 
-use ic_registry_common::local_store::LocalStoreImpl;
+use ic_registry_local_store::LocalStoreImpl;
 #[cfg(feature = "profiler")]
 use pprof::{protos::Message, ProfilerGuard};
 #[cfg(feature = "profiler")]
@@ -45,14 +44,6 @@ use regex::Regex;
 use std::fs::File;
 #[cfg(feature = "profiler")]
 use std::io::Write;
-
-fn abort_on_panic() {
-    let default_hook = std::panic::take_hook();
-    std::panic::set_hook(Box::new(move |panic_info| {
-        default_hook(panic_info);
-        std::process::abort();
-    }));
-}
 
 /// Determine sha256 hash of the current replica binary
 ///
@@ -71,12 +62,7 @@ fn get_replica_binary_hash() -> std::result::Result<(PathBuf, String), String> {
     Ok((replica_binary_path, hex::encode(hasher.finish())))
 }
 
-#[tokio::main]
-async fn main() {
-    run().await.unwrap();
-}
-
-async fn run() -> io::Result<()> {
+fn main() -> io::Result<()> {
     // We do not support 32 bits architectures and probably never will.
     assert_eq_size!(usize, u64);
 
@@ -99,10 +85,30 @@ async fn run() -> io::Result<()> {
 
     #[cfg(feature = "profiler")]
     let guard = pprof::ProfilerGuard::new(100).unwrap();
-    // Setup temp directory for the configuration.
-    let tmpdir = tempfile::Builder::new()
-        .prefix("ic_config")
-        .tempdir()
+
+    // We create 3 separate Tokio runtimes. The main one is for the most important
+    // IC operations (e.g. transport). Then the `http` is for serving user requests.
+    // This is also crucial because IC upgrades go through this code path.
+    // The 3rd one is for XNet.
+    // In a bug-free system with quotas in place we would use just a single runtime.
+    // We do have 3 currently as risk management measure. We don't want to risk
+    // a potential bug (e.g. blocking some thread) in one component to yield the
+    // Tokio scheduler irresponsive and block progress on other components.
+    let rt_main = tokio::runtime::Runtime::new().unwrap();
+    // Runtime used for serving user requests.
+    let http_rt_worker_threads = std::cmp::max(num_cpus::get() / 2, 1);
+    let rt_http = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(http_rt_worker_threads)
+        .thread_name("HTTP_Thread".to_string())
+        .enable_all()
+        .build()
+        .unwrap();
+
+    let rt_xnet = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(1)
+        .thread_name("XNet_Thread".to_string())
+        .enable_all()
+        .build()
         .unwrap();
 
     // Before setup of execution, we disable SIGPIPEs. In particular,
@@ -129,43 +135,29 @@ async fn run() -> io::Result<()> {
     // And SO_NOSIGPIPE is kernel dependent (>2.2) and has spotty
     // support. (And thus both options lead to sporadic problems
     // commonly if we simply depend on them.)
-    let _sigpipe_handler =
-        signal(SignalKind::pipe()).expect("failed to install SIGPIPE signal handler");
-
+    let sigpipe_handler = rt_main.block_on(async {
+        signal(SignalKind::pipe()).expect("failed to install SIGPIPE signal handler")
+    });
     // Parse command-line args
     let replica_args = setup::parse_args();
     if let Err(e) = &replica_args {
-        eprintln!("Failed to parse command line arguments: {}", e.message);
+        e.print().expect("Failed to print CLI argument error.");
     }
 
     let config_source = setup::get_config_source(&replica_args);
+    // Setup temp directory for the configuration.
+    let tmpdir = tempfile::Builder::new()
+        .prefix("ic_config")
+        .tempdir()
+        .unwrap();
     let config = Config::load_with_tmpdir(config_source, tmpdir.path().to_path_buf());
 
-    let (logger, _async_log_guard) = new_replica_logger_from_config(&config.logger);
-
-    let optional_nns_key_path = match &replica_args {
-        Ok(ReplicaArgs {
-            nns_public_key_file: Some(path_buf),
-            ..
-        }) => Some(path_buf.as_path()),
-        _ => None,
-    };
+    let (logger, async_log_guard) = new_replica_logger_from_config(&config.logger);
 
     let metrics_registry = MetricsRegistry::global();
 
     #[cfg(target_os = "linux")]
     metrics_registry.register(jemalloc_metrics::JemallocMetrics::new());
-
-    let (registry, crypto) = setup::setup_crypto_registry(
-        config.clone(),
-        Some(&metrics_registry),
-        optional_nns_key_path,
-        logger.clone(),
-        |_crypto, _data_provider| (),
-    );
-
-    let node_id = crypto.get_node_id();
-    let cup_with_proto = setup::get_catch_up_package(&replica_args, &logger);
 
     // Set the replica verison and report as metric
     setup::set_replica_version(&replica_args, &logger);
@@ -176,13 +168,24 @@ async fn run() -> io::Result<()> {
             &["ic_active_version", "ic_replica_binary_hash"],
         );
         g.with_label_values(&[
-            &ReplicaVersion::default().to_string(),
+            ReplicaVersion::default().as_ref(),
             &get_replica_binary_hash()
                 .map(|x| x.1)
                 .unwrap_or_else(|_| "na".to_string()),
         ])
         .set(1);
     }
+
+    let (registry, crypto) = setup::setup_crypto_registry(
+        config.clone(),
+        rt_main.handle().clone(),
+        Some(&metrics_registry),
+        logger.clone(),
+    );
+
+    let node_id = crypto.get_node_id();
+    let cup_with_proto = setup::get_catch_up_package(&replica_args, &logger);
+
     let subnet_id = match &replica_args {
         Ok(args) => {
             if let Some(subnet) = args.force_subnet.as_ref() {
@@ -199,29 +202,24 @@ async fn run() -> io::Result<()> {
                         .map(|cup_with_proto| &cup_with_proto.cup),
                     &logger,
                 )
-                .await
             }
         }
-        Err(_) => {
-            setup::get_subnet_id(
-                node_id,
-                registry.as_ref(),
-                cup_with_proto
-                    .as_ref()
-                    .map(|cup_with_proto| &cup_with_proto.cup),
-                &logger,
-            )
-            .await
-        }
+        Err(_) => setup::get_subnet_id(
+            node_id,
+            registry.as_ref(),
+            cup_with_proto
+                .as_ref()
+                .map(|cup_with_proto| &cup_with_proto.cup),
+            &logger,
+        ),
     };
 
     let subnet_type = setup::get_subnet_type(
-        &*registry,
+        registry.as_ref(),
         subnet_id,
         registry.get_latest_version(),
         &logger,
-    )
-    .await;
+    );
 
     let subnet_config = SubnetConfigs::default().own_subnet_config(subnet_type);
 
@@ -249,10 +247,6 @@ async fn run() -> io::Result<()> {
         let _ = REPLICA_BINARY_HASH.set(hash);
     }
 
-    if replica_args.is_err() {
-        info!(logger, "Warning: unlabeled command-line args are deprecated! Please use the flags/labels defined by ReplicaArgs");
-    }
-
     // We abort the whole program with a core dump if a single thread panics.
     // This way we can capture all the context if a critical error
     // happens.
@@ -261,8 +255,8 @@ async fn run() -> io::Result<()> {
     setup::create_consensus_pool_dir(&config);
 
     let crypto = Arc::new(crypto);
-    let _metrics = MetricsRuntimeImpl::new(
-        tokio::runtime::Handle::current(),
+    let _metrics_endpoint = MetricsHttpEndpoint::new(
+        rt_http.handle().clone(),
         config.metrics.clone(),
         metrics_registry.clone(),
         registry.clone(),
@@ -293,7 +287,8 @@ async fn run() -> io::Result<()> {
         _xnet_endpoint,
     ) = ic_replica::setup_p2p::construct_ic_stack(
         logger.clone(),
-        tokio::runtime::Handle::current(),
+        rt_main.handle().clone(),
+        rt_xnet.handle().clone(),
         config.clone(),
         subnet_config,
         node_id,
@@ -309,8 +304,9 @@ async fn run() -> io::Result<()> {
 
     let malicious_behaviour = &config.malicious_behaviour;
 
-    task::spawn(ic_http_handler::start_server(
-        metrics_registry.clone(),
+    ic_http_endpoints_public::start_server(
+        rt_http.handle().clone(),
+        metrics_registry,
         config.http_handler.clone(),
         ingress_message_filter,
         ingress_ingestion_service,
@@ -323,16 +319,14 @@ async fn run() -> io::Result<()> {
         root_subnet_id,
         logger.clone(),
         consensus_pool_cache,
-        config.artifact_pool.backup.map(|config| config.spool_path),
         subnet_type,
         malicious_behaviour.malicious_flags.clone(),
-        tokio::runtime::Handle::current(),
-    ));
+    );
 
-    tokio::time::sleep(Duration::from_millis(5000)).await;
+    std::thread::sleep(Duration::from_millis(5000));
 
     if config.malicious_behaviour.maliciously_seg_fault() {
-        tokio::spawn(async move {
+        rt_main.spawn(async move {
             loop {
                 // Exit roughly every 8 seconds.
                 tokio::time::sleep(Duration::from_millis(500)).await;
@@ -347,14 +341,21 @@ async fn run() -> io::Result<()> {
         });
     }
 
-    shutdown_signal(logger.inner_logger.root.clone()).await;
+    let save_logger = logger.clone();
+    rt_main.block_on(async move {
+        let _drop_async_log_guard = async_log_guard;
+        let _drop_sigpipe_handler = sigpipe_handler;
+        info!(logger, "IC Replica Running");
+        // Blocking on `SIGINT` or `SIGTERM`.
+        shutdown_signal(logger.inner_logger.root.clone()).await
+    });
+    info!(save_logger, "IC Replica Terminating");
 
     #[cfg(feature = "profiler")]
     finalize_report(&guard);
     // Ensure cleanup of the temporary directory is triggered; error
     // otherwise.
     tmpdir.close()?;
-    info!(logger, "IC Replica Terminated");
     Ok(())
 }
 

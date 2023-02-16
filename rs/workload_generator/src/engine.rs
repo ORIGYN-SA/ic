@@ -16,26 +16,20 @@ use ic_types::{
 };
 
 use byte_unit::Byte;
-use leaky_bucket::RateLimiter;
+use itertools::Either;
 use serde::{Deserialize, Serialize};
 use std::{
     collections::HashMap,
     convert::TryFrom,
     env, fs,
-    sync::{
-        atomic::{AtomicUsize, Ordering},
-        Arc,
-    },
-    time::{Duration, Instant, SystemTime},
+    str::FromStr,
+    time::{Duration, Instant},
 };
 use tokio::{
-    sync::{
-        mpsc::{channel, Receiver, Sender},
-        OwnedSemaphorePermit, Semaphore,
-    },
-    time::{sleep, sleep_until},
+    sync::mpsc::{channel, Receiver, Sender},
+    time::sleep_until,
 };
-use url::Url;
+use url::{Host, Url};
 
 use crate::metrics::{
     LATENCY_HISTOGRAM, QUERY_REPLY, UPDATE_SENT, UPDATE_SENT_REPLY, UPDATE_WAIT_REPLY,
@@ -50,13 +44,8 @@ struct WaitRequest {
 // Time to wait until the first request is issued
 const START_OFFSET: Duration = Duration::from_millis(500);
 
-// The initial number of permits = (--rps) * INITIAL_PERMITS_MULTIPLIER.
-// This allows an initial burst @rps for INITIAL_PERMITS_MULTIPLIER secs,
-// so that the ingress pool is sufficiently built up. After that, the
-// permits are scaled down based on the response from the replicas.
-const INITIAL_PERMITS_MULTIPLIER: usize = 10;
-
 const QUERY_TIMEOUT: Duration = Duration::from_secs(60 * 5);
+const INGRESS_TIMEOUT: Duration = Duration::from_secs(60 * 6);
 
 #[derive(PartialEq, Eq, Hash)]
 enum CallFailure {
@@ -86,15 +75,40 @@ impl Engine {
         sender_field: Blob,
         urls: &[String],
         http_client_config: HttpClientConfig,
+        host: Option<String>,
+        query_timeout: Option<Duration>,
+        ingress_timeout: Option<Duration>,
     ) -> Engine {
         let mut agents = Vec::with_capacity(urls.len());
         let current_batch = urls.iter().map(|url| {
+            let mut url = Url::parse(url.as_str()).unwrap();
+            let mut http_client_config = http_client_config.clone();
+            if let Some(new_host) = host.as_ref() {
+                http_client_config.overrides.insert(
+                    new_host.clone(),
+                    match url.host() {
+                        None => panic!("no host found in {}", url),
+                        Some(Host::Domain(host)) => Either::Right(
+                            FromStr::from_str(host).expect("failed to convert host to dns name"),
+                        ),
+                        Some(Host::Ipv4(host)) => {
+                            Either::Left((host, url.port_or_known_default().unwrap()).into())
+                        }
+                        Some(Host::Ipv6(host)) => {
+                            Either::Left((host, url.port_or_known_default().unwrap()).into())
+                        }
+                    },
+                );
+                url.set_host(Some(new_host.as_str()))
+                    .expect("failed to set host");
+            }
             let mut agent = Agent::new_with_http_client_config(
-                Url::parse(url.as_str()).unwrap(),
+                url,
                 agent_sender.clone(),
-                http_client_config,
+                http_client_config.clone(),
             )
-            .with_query_timeout(QUERY_TIMEOUT);
+            .with_query_timeout(query_timeout.unwrap_or(QUERY_TIMEOUT))
+            .with_ingress_timeout(ingress_timeout.unwrap_or(INGRESS_TIMEOUT));
             agent.sender_field = sender_field.clone();
             agent
         });
@@ -120,13 +134,13 @@ impl Engine {
     ///
     ///   Currently, we
     /// use a single runtime. Not specifying this yields better throughput.
-    /// - `rps` - Request rate to issue against the IC
+    /// - `rpms` - Request rate (per milliseconds) to issue against the IC
     /// - `time_secs` - The time in seconds that the workload should be kept up
     /// - `nonce` - Nonce to use for update calls
     #[allow(clippy::too_many_arguments)]
     pub async fn execute_rps(
         &self,
-        rps: usize,
+        rpms: usize,
         request_type: RequestType,
         canister_method_name: String,
         time_secs: usize,
@@ -135,9 +149,18 @@ impl Engine {
         call_payload: Vec<u8>,
         canister_id: &CanisterId,
         periodic_output: bool,
+        random_query_payload: bool,
     ) -> Vec<Fact> {
-        let requests: usize = time_secs * rps;
-        debug!("⏱️  Executing {} requests at {} rps", requests, rps);
+        let requests: usize = ((time_secs * rpms) as f64 / 1000f64).ceil() as usize;
+        if requests == 0 {
+            debug!("Not executing any requests");
+            return vec![];
+        }
+        debug!(
+            "⏱️  Executing {} requests at {} rps",
+            requests,
+            rpms as f64 / 1000f64
+        );
 
         let plan = Plan::new(
             requests,
@@ -156,12 +179,12 @@ impl Engine {
         let rx_handle = tokio::task::spawn(Engine::evaluate_requests(
             rx,
             collector,
-            Some(rps),
+            Some(rpms),
             time_origin,
         ));
 
         // Time between each two consecutive requests
-        let inter_arrival_time = 1. / rps as f64;
+        let inter_arrival_time = 1000. / rpms as f64;
         let mut tx_handles = vec![];
         for n in 0..requests {
             // Calculate the time at which the request should be running from start time
@@ -169,117 +192,16 @@ impl Engine {
             let target_instant =
                 time_origin + START_OFFSET + Duration::from_secs_f64(inter_arrival_time * n as f64);
             sleep_until(tokio::time::Instant::from_std(target_instant)).await;
-            println!("Running {:?}", (Instant::now() - time_origin).as_secs_f64());
             let tx = tx.clone();
             let plan = plan.clone();
             let agent = self.agents[n % self.agents.len()].clone();
             FUTURE_STARTED.inc();
             tx_handles.push(tokio::task::spawn(async move {
                 REQUEST_STARTING.inc();
-                Engine::execute_request(agent, tx, time_origin, &plan, n).await;
+                Engine::execute_request(agent, tx, time_origin, &plan, n, random_query_payload)
+                    .await;
             }));
         }
-        for tx_handle in tx_handles {
-            tx_handle.await.unwrap_or_else(|_| {
-                panic!("Await the tx failed.");
-            });
-        }
-        std::mem::drop(tx);
-        rx_handle.await.unwrap_or_else(|_| {
-            panic!("Await the rx failed.");
-        });
-
-        rec_handle.join().unwrap()
-    }
-
-    /// Finds the max rps currently possible with the given set of replicas.
-    /// - `rps` - Initial estimate of the max rps
-    /// - `time_secs` - The time in seconds that the workload should be kept up
-    /// - `nonce` - Nonce to use for update calls
-    #[allow(clippy::too_many_arguments)]
-    pub async fn evaluate_max_rps(
-        &self,
-        rps: usize,
-        request_type: RequestType,
-        canister_method_name: String,
-        time_secs: usize,
-        nonce: String,
-        call_payload_size: Byte,
-        call_payload: Vec<u8>,
-        canister_id: &CanisterId,
-        periodic_output: bool,
-    ) -> Vec<Fact> {
-        println!(
-            "⏱️  Evaluating rps: initial_rps = {}, duration = {} sec",
-            rps, time_secs
-        );
-
-        let requests: usize = time_secs * rps; // This is just an upper estimate
-        let plan = Plan::new(
-            requests,
-            nonce,
-            call_payload_size,
-            call_payload,
-            *canister_id,
-            request_type,
-            canister_method_name,
-        );
-        let (collector, rec_handle) = collector::start::<Fact>(plan.clone(), periodic_output);
-        let (tx, rx) = channel(requests);
-
-        let rate_limiter = RateLimiter::builder()
-            .initial(rps)
-            .interval(Duration::from_secs(1))
-            .refill(rps)
-            .build();
-        // Initially holds (rps * INITIAL_PERMITS_MULTIPLIER) permits
-        let request_manager = RequestManager::new(rps * INITIAL_PERMITS_MULTIPLIER);
-
-        let time_origin = Instant::now();
-        let rx_handle = tokio::task::spawn(Engine::evaluate_requests(
-            rx,
-            collector,
-            Some(rps),
-            time_origin,
-        ));
-        let end_time = time_origin
-            .checked_add(Duration::from_secs(time_secs as u64))
-            .unwrap();
-        let end_time = tokio::time::Instant::from_std(end_time);
-
-        let mut tx_handles = vec![];
-        let mut n = 0;
-        sleep(START_OFFSET).await;
-        let mut last_print = SystemTime::now();
-        while tokio::time::Instant::now() < end_time {
-            // Wait for the rate limiter to allow the next request
-            rate_limiter.acquire_one().await;
-            // Wait for a free slot based on the current rps estimate
-            let permit =
-                match tokio::time::timeout_at(end_time, request_manager.alloc_permit()).await {
-                    Ok(permit) => permit,
-                    Err(_) => break,
-                };
-
-            let tx = tx.clone();
-            let plan = plan.clone();
-            let request_manager_cl = request_manager.clone();
-            let agent = self.agents[n % self.agents.len()].clone();
-            FUTURE_STARTED.inc();
-            tx_handles.push(tokio::task::spawn(async move {
-                REQUEST_STARTING.inc();
-                let ret = Engine::execute_request(agent, tx, time_origin, &plan, n).await;
-                request_manager_cl.free_permit(permit, ret);
-            }));
-
-            n += 1;
-            if last_print.elapsed().unwrap() > Duration::from_secs(10) {
-                request_manager.show();
-                last_print = SystemTime::now();
-            }
-        }
-        println!("⏱️  Evaluating rps done: {:?}", time_origin.elapsed());
-
         for tx_handle in tx_handles {
             tx_handle.await.unwrap_or_else(|_| {
                 panic!("Await the tx failed.");
@@ -300,8 +222,9 @@ impl Engine {
         time_origin: Instant,
         plan: &Plan,
         n: usize,
+        random_query_payload: bool,
     ) -> bool {
-        match plan.generate_call(n) {
+        match plan.generate_call(n, random_query_payload) {
             EngineCall::Read { method, arg } => {
                 Engine::execute_query(&agent, tx, time_origin, plan, method, arg, n)
                     .await
@@ -324,7 +247,7 @@ impl Engine {
         n: usize,
     ) -> Option<u32> {
         let time_query_start = Instant::now();
-        let response = agent.execute_query(&plan.canister_id, &*method, arg).await;
+        let response = agent.execute_query(&plan.canister_id, &method, arg).await;
         let time_query_end = Instant::now();
         debug!("Sent query ({}). Response was: {:?}", n, response);
 
@@ -567,6 +490,7 @@ impl Engine {
                                         request_id, result
                                     )
                                     .to_string();
+                                    debug!("Error is: {}", err_msg);
                                     tx.send(CallResult {
                                         fact: Fact::record(
                                             ContentLength::new(body.len() as u64),
@@ -640,7 +564,7 @@ impl Engine {
 
         tx.send(CallResult {
             fact: Fact::record(
-                ContentLength::new(resp.unwrap_or_else(Vec::new).len() as u64),
+                ContentLength::new(resp.unwrap_or_default().len() as u64),
                 200_u16,
                 time_query_start,
                 time_query_end,
@@ -661,7 +585,7 @@ impl Engine {
     async fn evaluate_requests(
         mut rx: Receiver<CallResult>,
         collector: std::sync::mpsc::Sender<Message<Fact>>,
-        rps: Option<usize>,
+        rpms: Option<usize>,
         _time_start: Instant,
     ) {
         let mut max_counter = 0;
@@ -689,7 +613,7 @@ impl Engine {
         collector
             .send(Message::Log(format!(
                 "requested: {} - 🚀 Max counter value seen: {} - submit failures: {} - wait failures: {}",
-                rps.unwrap_or(0),
+                rpms.map(|x| x as f64 / 1000f64).unwrap_or(0f64),
                 max_counter,
                 failures.get(&CallFailure::OnSubmit).unwrap_or(&0),
                 failures.get(&CallFailure::OnWait).unwrap_or(&0),
@@ -727,75 +651,13 @@ impl Engine {
             fs::write(f, bytes).unwrap();
         }
 
+        if call_response.status == "rejected" {
+            eprintln!("Reject message is: {:?}", call_response.reject_message);
+        }
         let counter_value = call_response
             .reply
             .as_ref()
             .map(|bytes| Engine::interpret_counter_canister_response(bytes));
         Ok((call_response.status, counter_value))
-    }
-}
-
-// Manages the number of outstanding requests in flight
-#[derive(Clone)]
-struct RequestManager {
-    // Number of requests to start with
-    initial_requests: usize,
-
-    // The semaphore to acquire/release permits
-    permits: Arc<Semaphore>,
-
-    allocs: Arc<AtomicUsize>,
-    success: Arc<AtomicUsize>,
-    errors: Arc<AtomicUsize>,
-}
-
-impl RequestManager {
-    fn new(initial_requests: usize) -> Self {
-        Self {
-            initial_requests,
-            permits: Arc::new(Semaphore::new(initial_requests)),
-            allocs: Arc::new(AtomicUsize::new(0)),
-            success: Arc::new(AtomicUsize::new(0)),
-            errors: Arc::new(AtomicUsize::new(0)),
-        }
-    }
-
-    // Waits for one permit to become available
-    async fn alloc_permit(&self) -> OwnedSemaphorePermit {
-        self.allocs.fetch_add(1, Ordering::SeqCst);
-        self.permits.clone().acquire_owned().await.unwrap()
-    }
-
-    // Called on request completion.
-    // If the request was successful, the token is returned to the
-    // free pool so that more requests can be issued in its place.
-    // If the request failed, the token is dropped without returning
-    // to the pool. This dynamically adjusts the pool size/max
-    // outstanding requests.
-    fn free_permit(&self, permit: OwnedSemaphorePermit, request_success: bool) {
-        if !request_success {
-            // TODO: keep a min threshold, look at the specific
-            // HTTP status code
-            permit.forget();
-            self.errors.fetch_add(1, Ordering::SeqCst);
-        } else {
-            self.success.fetch_add(1, Ordering::SeqCst);
-        }
-    }
-
-    fn show(&self) {
-        let allocs = self.allocs.load(Ordering::SeqCst);
-        let success = self.success.load(Ordering::SeqCst);
-        let errors = self.errors.load(Ordering::SeqCst);
-        println!(
-            "RequestManager: initial_capacity = {}, allocs = {}, success = {}, errors = {},\
-                    current capacity = {}, free permits = {}",
-            self.initial_requests,
-            allocs,
-            success,
-            errors,
-            self.initial_requests - errors,
-            self.permits.available_permits()
-        );
     }
 }

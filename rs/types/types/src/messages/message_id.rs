@@ -10,7 +10,7 @@ use std::{
     fmt,
 };
 
-/// The length of a [`MessageId`] is 32: https://sdk.dfinity.org/docs/interface-spec/index.html#api-request-id)
+/// The length of a [`MessageId`] is 32: `<https://sdk.dfinity.org/docs/interface-spec/index.html#api-request-id>`
 pub const EXPECTED_MESSAGE_ID_LENGTH: usize = 32;
 
 /// The ID used to uniquely identify a user's ingress message.
@@ -74,7 +74,7 @@ impl SignedBytesWithoutDomainSeparator for MessageId {
 
 impl fmt::Display for MessageId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "0x{}", hex::encode(&self.0))
+        write!(f, "0x{}", hex::encode(self.0))
     }
 }
 

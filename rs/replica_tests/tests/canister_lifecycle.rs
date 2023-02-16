@@ -2,21 +2,17 @@ use assert_matches::assert_matches;
 use candid::Encode;
 use ic_config::Config;
 use ic_error_types::{ErrorCode, RejectCode};
+use ic_ic00_types::{
+    self as ic00, CanisterIdRecord, CanisterInstallMode, CanisterSettingsArgs,
+    CanisterStatusResultV2, CanisterStatusType, EmptyBlob, InstallCodeArgs, Method, Payload,
+    UpdateSettingsArgs, IC_00,
+};
 use ic_registry_provisional_whitelist::ProvisionalWhitelist;
 use ic_replica_tests as utils;
 use ic_replica_tests::assert_reject;
 use ic_test_utilities::assert_utils::assert_balance_equals;
 use ic_test_utilities::universal_canister::{call_args, management, wasm, UNIVERSAL_CANISTER_WASM};
-use ic_types::{
-    ic00,
-    ic00::{
-        CanisterIdRecord, CanisterStatusResultV2, EmptyBlob, InstallCodeArgs, Method, Payload,
-        SetControllerArgs, IC_00,
-    },
-    ingress::WasmResult,
-    messages::CanisterInstallMode,
-    CanisterId, CanisterStatusType, ComputeAllocation, Cycles, NumBytes, PrincipalId,
-};
+use ic_types::{ingress::WasmResult, CanisterId, ComputeAllocation, Cycles, NumBytes, PrincipalId};
 use maplit::btreeset;
 use std::{collections::BTreeSet, str::FromStr};
 
@@ -69,7 +65,7 @@ fn full_canister_lifecycle_from_another_canister() {
         // Let the canister stop the newly created canister.
         assert_eq!(
             canister.update(wasm().call(management::stop_canister(expected_canister_id))),
-            Ok(WasmResult::Reply(EmptyBlob::encode())),
+            Ok(WasmResult::Reply(EmptyBlob.encode())),
         );
 
         // Verify that the newly created canister is now stopped.
@@ -83,7 +79,7 @@ fn full_canister_lifecycle_from_another_canister() {
         // Start the canister again.
         assert_eq!(
             canister.update(wasm().call(management::start_canister(expected_canister_id))),
-            Ok(WasmResult::Reply(EmptyBlob::encode())),
+            Ok(WasmResult::Reply(EmptyBlob.encode())),
         );
 
         // Verify that the canister is running again.
@@ -115,7 +111,7 @@ fn full_canister_lifecycle_ingress() {
                 wasm().call_with_cycles(
                     ic00::IC_00,
                     Method::CreateCanister,
-                    call_args().other_side(EmptyBlob::encode()),
+                    call_args().other_side(EmptyBlob.encode()),
                     num_cycles.into_parts(),
                 )
             ),
@@ -128,10 +124,18 @@ fn full_canister_lifecycle_ingress() {
             "update",
             wasm().call_with_cycles(
                 ic00::IC_00,
-                Method::SetController,
+                Method::UpdateSettings,
                 call_args().other_side(
-                    SetControllerArgs::new(expected_canister_id, PrincipalId::new_anonymous())
-                        .encode(),
+                    UpdateSettingsArgs::new(
+                        expected_canister_id,
+                        CanisterSettingsArgs::new(
+                            Some(vec![PrincipalId::new_anonymous()]),
+                            None,
+                            None,
+                            None,
+                        ),
+                    )
+                    .encode(),
                 ),
                 num_cycles.into_parts(),
             ),
@@ -147,7 +151,7 @@ fn full_canister_lifecycle_ingress() {
         // Let ic:00 stop the newly created canister.
         assert_eq!(
             test.ingress(IC_00, Method::StopCanister, canister_id_record.clone()),
-            Ok(WasmResult::Reply(EmptyBlob::encode()))
+            Ok(WasmResult::Reply(EmptyBlob.encode()))
         );
 
         // Verify that the newly created canister is now stopped.
@@ -159,7 +163,7 @@ fn full_canister_lifecycle_ingress() {
         // Start the canister again.
         assert_eq!(
             test.ingress(IC_00, Method::StartCanister, canister_id_record.clone()),
-            Ok(WasmResult::Reply(EmptyBlob::encode()))
+            Ok(WasmResult::Reply(EmptyBlob.encode()))
         );
 
         // Verify that the newly created canister is running.
@@ -202,10 +206,14 @@ fn delete_canister_delete_self_fails() {
         assert_eq!(
             test.ingress(
                 IC_00,
-                Method::SetController,
-                SetControllerArgs::new(canister_id, canister_id.get()).encode()
+                Method::UpdateSettings,
+                UpdateSettingsArgs::new(
+                    canister_id,
+                    CanisterSettingsArgs::new(Some(vec![canister_id.get()]), None, None, None)
+                )
+                .encode()
             ),
-            Ok(WasmResult::Reply(EmptyBlob::encode()))
+            Ok(WasmResult::Reply(EmptyBlob.encode()))
         );
 
         // Canister tries to delete itself. Should fail because a self-controlling
@@ -243,10 +251,14 @@ fn delete_running_canister_fails() {
         assert_eq!(
             test.ingress(
                 IC_00,
-                Method::SetController,
-                ic00::SetControllerArgs::new(canister_b, canister_a.get()).encode()
+                Method::UpdateSettings,
+                UpdateSettingsArgs::new(
+                    canister_b,
+                    CanisterSettingsArgs::new(Some(vec![canister_a.into()]), None, None, None)
+                )
+                .encode()
             ),
-            Ok(WasmResult::Reply(EmptyBlob::encode()))
+            Ok(WasmResult::Reply(EmptyBlob.encode()))
         );
 
         // Delete the canister. Should fail since it's running.
@@ -276,14 +288,18 @@ fn delete_stopped_canister_succeeds() {
         let canister_id_record = CanisterIdRecord::from(canister_b).encode();
         assert_eq!(
             test.ingress(IC_00, "stop_canister", canister_id_record),
-            Ok(WasmResult::Reply(EmptyBlob::encode()))
+            Ok(WasmResult::Reply(EmptyBlob.encode()))
         );
 
         // Set the controller of canister_b to be canister_a
         test.ingress(
             IC_00,
-            Method::SetController,
-            ic00::SetControllerArgs::new(canister_b, canister_a.get()).encode(),
+            Method::UpdateSettings,
+            UpdateSettingsArgs::new(
+                canister_b,
+                CanisterSettingsArgs::new(Some(vec![canister_a.get()]), None, None, None),
+            )
+            .encode(),
         )
         .unwrap();
 
@@ -312,7 +328,7 @@ fn provisional_create_canister_with_cycles_respects_whitelist() {
             test.ingress(
                 IC_00,
                 Method::ProvisionalCreateCanisterWithCycles,
-                ic00::ProvisionalCreateCanisterWithCyclesArgs::new(Some(NUM_CYCLES)).encode(),
+                ic00::ProvisionalCreateCanisterWithCyclesArgs::new(Some(NUM_CYCLES), None).encode(),
             )
             .unwrap();
         });
@@ -330,7 +346,7 @@ fn provisional_create_canister_with_cycles_respects_whitelist() {
                 test.ingress(
                     IC_00,
                     Method::ProvisionalCreateCanisterWithCycles,
-                    ic00::ProvisionalCreateCanisterWithCyclesArgs::new(Some(NUM_CYCLES)).encode(),
+                    ic00::ProvisionalCreateCanisterWithCyclesArgs::new(Some(NUM_CYCLES), None).encode(),
                 ),
                 Err(err) if err.code() == ErrorCode::CanisterMethodNotFound
             );
@@ -359,7 +375,7 @@ fn provisional_create_canister_with_cycles_respects_whitelist() {
                     ic00::IC_00,
                     Method::ProvisionalCreateCanisterWithCycles,
                     call_args().other_side(
-                        ic00::ProvisionalCreateCanisterWithCyclesArgs::new(Some(NUM_CYCLES))
+                        ic00::ProvisionalCreateCanisterWithCyclesArgs::new(Some(NUM_CYCLES), None)
                             .encode(),
                     ),
                 ),
@@ -376,7 +392,7 @@ fn provisional_create_canister_with_cycles_respects_whitelist() {
                     ic00::IC_00,
                     Method::ProvisionalCreateCanisterWithCycles,
                     call_args().other_side(
-                        ic00::ProvisionalCreateCanisterWithCyclesArgs::new(Some(NUM_CYCLES))
+                        ic00::ProvisionalCreateCanisterWithCyclesArgs::new(Some(NUM_CYCLES), None)
                             .encode(),
                     ),
                 ),
@@ -486,7 +502,7 @@ fn can_create_canister_with_cycles_from_another_canister() {
                 wasm().call_with_cycles(
                     IC_00,
                     Method::CreateCanister,
-                    call_args().other_side(EmptyBlob::encode()),
+                    call_args().other_side(EmptyBlob.encode()),
                     cycles_for_new_canister.into_parts(),
                 ),
             )
@@ -556,9 +572,10 @@ fn provisional_create_canister_with_cycles_and_top_up() {
                     IC_00,
                     Method::ProvisionalCreateCanisterWithCycles,
                     call_args().other_side(
-                        ic00::ProvisionalCreateCanisterWithCyclesArgs::new(Some(
-                            canister_b_cycles_init,
-                        ))
+                        ic00::ProvisionalCreateCanisterWithCyclesArgs::new(
+                            Some(canister_b_cycles_init),
+                            None,
+                        )
                         .encode(),
                     ),
                 ),
@@ -619,7 +636,7 @@ fn provisional_create_canister_with_cycles_and_top_up() {
                     IC_00,
                     Method::ProvisionalCreateCanisterWithCycles,
                     call_args().other_side(
-                        ic00::ProvisionalCreateCanisterWithCyclesArgs::new(None).encode(),
+                        ic00::ProvisionalCreateCanisterWithCyclesArgs::new(None, None).encode(),
                     ),
                 ),
             )
@@ -654,10 +671,14 @@ fn can_get_canister_information() {
         assert_eq!(
             test.ingress(
                 IC_00,
-                Method::SetController,
-                ic00::SetControllerArgs::new(canister_b, canister_a.get()).encode()
+                Method::UpdateSettings,
+                UpdateSettingsArgs::new(
+                    canister_b,
+                    CanisterSettingsArgs::new(Some(vec![canister_a.get()]), None, None, None)
+                )
+                .encode()
             ),
-            Ok(WasmResult::Reply(EmptyBlob::encode()))
+            Ok(WasmResult::Reply(EmptyBlob.encode()))
         );
 
         // Request the status of canister_b.
@@ -682,7 +703,8 @@ fn can_get_canister_information() {
                 num_cycles.get(),
                 ComputeAllocation::default().as_percent(),
                 None,
-                2592000
+                2592000,
+                0u128,
             )
         );
 
@@ -732,7 +754,8 @@ fn can_get_canister_information() {
                     num_cycles.get(),
                     ComputeAllocation::default().as_percent(),
                     None,
-                    2592000
+                    259200,
+                    0u128,
                 ),
                 CanisterStatusResultV2::decode(&res).unwrap(),
                 2 * BALANCE_EPSILON,

@@ -1,4 +1,6 @@
 #![allow(clippy::try_err)]
+//! This module encapsulates functions required for validating consensus
+//! artifacts.
 
 use crate::{
     consensus::{
@@ -14,7 +16,7 @@ use crate::{
         },
         ConsensusMessageId,
     },
-    dkg,
+    dkg, ecdsa,
 };
 use ic_interfaces::time_source::TimeSource;
 use ic_interfaces::{
@@ -22,9 +24,9 @@ use ic_interfaces::{
     consensus_pool::*,
     dkg::DkgPool,
     messaging::MessageRouting,
-    registry::RegistryClient,
     validation::{ValidationError, ValidationResult},
 };
+use ic_interfaces_registry::RegistryClient;
 use ic_interfaces_state_manager::{StateHashError, StateManager};
 use ic_logger::{trace, warn, ReplicaLogger};
 use ic_replicated_state::ReplicatedState;
@@ -34,7 +36,7 @@ use ic_types::{
     replica_config::ReplicaConfig,
     ReplicaVersion,
 };
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
@@ -45,6 +47,10 @@ const SECONDS_TO_LOG_UNVALIDATED: u64 = 300;
 /// How often we log an old unvalidated artifact.
 const LOG_EVERY_N_SECONDS: i32 = 60;
 
+/// The time, after which we will load a CUP even if we
+/// where holding it back before, to give recomputation a chance during catch up.
+const CATCH_UP_HOLD_OF_TIME: Duration = Duration::from_secs(150);
+
 /// Possible validator transient errors.
 #[derive(Debug)]
 enum TransientError {
@@ -52,6 +58,7 @@ enum TransientError {
     RegistryClientError(RegistryClientError),
     PayloadValidationError(PayloadTransientError),
     DkgPayloadValidationError(crate::dkg::TransientError),
+    EcdsaPayloadValidationError(crate::ecdsa::TransientError),
     DkgSummaryNotFound(Height),
     RandomBeaconNotFound(Height),
     StateHashError(StateHashError),
@@ -59,6 +66,7 @@ enum TransientError {
     FinalizedBlockNotFound(Height),
     FailedToGetRegistryVersion,
     ValidationContextNotReached(ValidationContext, ValidationContext),
+    CatchUpHeightNegligible,
 }
 
 /// Possible validator permanent errors.
@@ -73,6 +81,7 @@ enum PermanentError {
     SignerNotInMultiSigCommittee(NodeId),
     PayloadValidationError(PayloadPermanentError),
     DkgPayloadValidationError(crate::dkg::PermanentError),
+    EcdsaPayloadValidationError(crate::ecdsa::PermanentError),
     InsufficientSignatures,
     CannotVerifyBlockHeightZero,
     NonEmptyPayloadPastUpgradePoint,
@@ -509,6 +518,9 @@ fn get_min_validated_ranks(
         .collect()
 }
 
+/// Validator holds references to components required for artifact validation.
+/// It implements validation functions for all consensus artifacts which are
+/// called by `on_state_change` in round-robin manner.
 pub struct Validator {
     replica_config: ReplicaConfig,
     membership: Arc<Membership>,
@@ -526,6 +538,7 @@ pub struct Validator {
 
 impl Validator {
     #[allow(clippy::too_many_arguments)]
+    /// The constructor creates a new [`Validator`] instance.
     pub fn new(
         replica_config: ReplicaConfig,
         membership: Arc<Membership>,
@@ -555,6 +568,10 @@ impl Validator {
         }
     }
 
+    /// Invoke each artifact validation function in order.
+    /// Return the first non-empty [ChangeSet] as returned by a function.
+    /// Otherwise return an empty [ChangeSet] if all functions return
+    /// empty.
     pub fn on_state_change(&self, pool_reader: &PoolReader<'_>) -> ChangeSet {
         trace!(self.log, "on_state_change");
         let validate_finalization = || self.validate_finalizations(pool_reader);
@@ -570,17 +587,17 @@ impl Validator {
         let validate_catch_up_package_shares =
             || self.validate_catch_up_package_shares(pool_reader);
         let calls: [&'_ dyn Fn() -> ChangeSet; 11] = [
-            &|| self.call_with_metrics("Finalization", &validate_finalization),
-            &|| self.call_with_metrics("Notarization", &validate_notarization),
-            &|| self.call_with_metrics("BlockProposal", &validate_blocks),
-            &|| self.call_with_metrics("RandomBeacon", &validate_beacons),
-            &|| self.call_with_metrics("RandomTape", &validate_tapes),
-            &|| self.call_with_metrics("CUP", &validate_catch_up_packages),
-            &|| self.call_with_metrics("FinalizationShare", &validate_finalization_shares),
-            &|| self.call_with_metrics("NotarizationShare", &validate_notarization_shares),
-            &|| self.call_with_metrics("RandomBeaconShare", &validate_beacon_shares),
-            &|| self.call_with_metrics("RandomTapeShare", &validate_tape_shares),
-            &|| self.call_with_metrics("CUPShare", &validate_catch_up_package_shares),
+            &|| self.call_with_metrics("Finalization", validate_finalization),
+            &|| self.call_with_metrics("Notarization", validate_notarization),
+            &|| self.call_with_metrics("BlockProposal", validate_blocks),
+            &|| self.call_with_metrics("RandomBeacon", validate_beacons),
+            &|| self.call_with_metrics("RandomTape", validate_tapes),
+            &|| self.call_with_metrics("CUP", validate_catch_up_packages),
+            &|| self.call_with_metrics("FinalizationShare", validate_finalization_shares),
+            &|| self.call_with_metrics("NotarizationShare", validate_notarization_shares),
+            &|| self.call_with_metrics("RandomBeaconShare", validate_beacon_shares),
+            &|| self.call_with_metrics("RandomTapeShare", validate_tape_shares),
+            &|| self.call_with_metrics("CUPShare", validate_catch_up_package_shares),
         ];
         self.schedule.call_next(&calls)
     }
@@ -756,7 +773,6 @@ impl Validator {
         // Collect the min of validated block proposal ranks in the range.
         let mut known_ranks: BTreeMap<Height, Option<Rank>> =
             get_min_validated_ranks(pool_reader, &range);
-        let dkg_pool = &*self.dkg_pool.read().unwrap();
 
         // It is necessary to traverse all the proposals and not only the ones with min
         // rank per height; because proposals for which there is an unvalidated
@@ -837,7 +853,7 @@ impl Validator {
                     continue;
                 }
 
-                match self.check_block_validity(pool_reader, &proposal, dkg_pool) {
+                match self.check_block_validity(pool_reader, &proposal) {
                     Ok(()) => {
                         self.metrics.observe_block(pool_reader, &proposal);
                         known_ranks.insert(proposal.height(), Some(proposal.rank()));
@@ -899,13 +915,14 @@ impl Validator {
         &self,
         pool_reader: &PoolReader<'_>,
         proposal: &BlockProposal,
-        dkg_pool: &dyn DkgPool,
     ) -> ValidationResult<ValidatorError> {
         if proposal.height() == Height::from(0) {
             Err(PermanentError::CannotVerifyBlockHeightZero)?
         }
 
         // If the replica is upgrading, block payload should be empty.
+        // If that is the case, skip_empty_payload_validation becomes true.
+        let mut skip_empty_payload_validation = false;
         match pool_reader
             .registry_version(proposal.height())
             .and_then(|registry_version| {
@@ -922,6 +939,7 @@ impl Validator {
                     if !payload.is_summary() && !payload.is_empty() {
                         Err(PermanentError::NonEmptyPayloadPastUpgradePoint)?
                     }
+                    skip_empty_payload_validation = true;
                 }
             }
             None => Err(TransientError::FailedToGetRegistryVersion)?,
@@ -951,13 +969,23 @@ impl Validator {
             ))?
         }
 
+        if skip_empty_payload_validation {
+            return Ok(());
+        }
+
+        // Below are all the payload validations
         let payloads = pool_reader.get_payloads_from_height(
             proposal.context.certified_height.increment(),
             parent.clone(),
         );
 
         self.payload_builder
-            .validate_payload(&proposal.payload, &payloads, &proposal.context)
+            .validate_payload(
+                proposal.height,
+                &proposal.payload,
+                &payloads,
+                &proposal.context,
+            )
             .map_err(|err| {
                 err.map(
                     PermanentError::PayloadValidationError,
@@ -965,11 +993,30 @@ impl Validator {
                 )
             })?;
 
+        ecdsa::validate_payload(
+            self.replica_config.subnet_id,
+            self.registry_client.as_ref(),
+            self.crypto.as_ref(),
+            pool_reader,
+            self.state_manager.as_ref(),
+            &proposal.context,
+            &parent,
+            proposal.payload.as_ref(),
+            self.metrics.ecdsa_validation_duration.clone(),
+        )
+        .map_err(|err| {
+            err.map(
+                PermanentError::EcdsaPayloadValidationError,
+                TransientError::EcdsaPayloadValidationError,
+            )
+        })?;
+
         let timer = self
             .metrics
             .validation_duration
             .with_label_values(&["Dkg"])
             .start_timer();
+        let dkg_pool = &*self.dkg_pool.read().unwrap();
         let ret = dkg::validate_payload(
             self.replica_config.subnet_id,
             self.registry_client.as_ref(),
@@ -1013,9 +1060,10 @@ impl Validator {
     /// `validate_beacon_artifacts` for details about exactly what is checked.
     fn validate_beacon_shares(&self, pool_reader: &PoolReader<'_>) -> ChangeSet {
         let last_beacon = pool_reader.get_random_beacon_tip();
+
         // Since the parent beacon is required to be already validated, only a single
         // height is checked.
-        self.validate_beacon_artifacts(
+        let ret = self.validate_beacon_artifacts(
             pool_reader,
             &last_beacon,
             pool_reader
@@ -1023,7 +1071,12 @@ impl Validator {
                 .unvalidated()
                 .random_beacon_share()
                 .get_by_height(last_beacon.height().increment()),
-        )
+        );
+        self.metrics
+            .validation_share_batch_size
+            .with_label_values(&["beacon"])
+            .observe(ret.len() as f64);
+        ret
     }
 
     /// Check the validity of a collection of RandomBeacon(/Share)s against the
@@ -1041,27 +1094,51 @@ impl Validator {
     where
         Signed<RandomBeaconContent, S>: SignatureVerify + ConsensusMessageHashable + Clone,
     {
-        let last_hash: CryptoHashOf<RandomBeacon> = ic_crypto::crypto_hash(last_beacon);
+        // we need the current threshold to determine how many validations we should make
+        let threshold = match active_low_threshold_transcript(
+            pool_reader.as_cache(),
+            pool_reader.get_catch_up_height(),
+        ) {
+            Some(transcript) => transcript.threshold.get().get(),
+            None => NodeIndex::MAX,
+        };
+        let mut change_set: ChangeSet = Vec::with_capacity(threshold as usize);
+
+        let last_hash: CryptoHashOf<RandomBeacon> = ic_types::crypto::crypto_hash(last_beacon);
         let last_height = last_beacon.content.height();
-        beacons
-            .filter_map(|beacon| {
-                // This function expects to handle only the following height.
-                debug_assert_eq!(beacon.content.height, last_height.increment());
-                if last_hash != beacon.content.parent {
-                    Some(ChangeAction::HandleInvalid(
-                        beacon.into_message(),
-                        "The parent hash of the beacon was not correct".to_string(),
-                    ))
-                } else {
-                    let verification = self.verify_signature(pool_reader, &beacon);
-                    self.compute_action_from_sig_verification(
-                        pool_reader,
-                        verification,
-                        beacon.into_message(),
-                    )
+        // number of shares during in this iteration
+        let mut existing_shares = pool_reader
+            .get_random_beacon_shares(last_height.increment())
+            .count() as NodeIndex;
+        for beacon in beacons {
+            // This function expects to handle only the following height.
+            debug_assert_eq!(beacon.content.height, last_height.increment());
+            let change_action: Option<ChangeAction> = if last_hash != beacon.content.parent {
+                Some(ChangeAction::HandleInvalid(
+                    beacon.into_message(),
+                    "The parent hash of the beacon was not correct".to_string(),
+                ))
+            } else if existing_shares < threshold {
+                self.metrics.validation_random_beacon_shares_count.add(1);
+                let verification = self.verify_signature(pool_reader, &beacon);
+                let ret = self.compute_action_from_sig_verification(
+                    pool_reader,
+                    verification,
+                    beacon.into_message(),
+                );
+                if ret.is_some() {
+                    existing_shares += 1;
                 }
-            })
-            .collect()
+                ret
+            } else {
+                break;
+            };
+
+            if let Some(inner) = change_action {
+                change_set.push(inner);
+            }
+        }
+        change_set
     }
 
     /// Return a `ChangeSet` of `RandomTape` artifacts. See
@@ -1109,14 +1186,19 @@ impl Validator {
             expected_height,
             max_height.min(finalized_height.increment()),
         );
-        self.validate_tape_artifacts(
-            pool_reader,
-            pool_reader
-                .pool()
-                .unvalidated()
-                .random_tape_share()
-                .get_by_height_range(range),
-        )
+
+        let tapes = pool_reader
+            .pool()
+            .unvalidated()
+            .random_tape_share()
+            .get_by_height_range(range);
+
+        let ret = self.validate_tape_artifacts(pool_reader, tapes);
+        self.metrics
+            .validation_share_batch_size
+            .with_label_values(&["tape"])
+            .observe(ret.len() as f64);
+        ret
     }
 
     /// Check the validity of a Vec of RandomTape artifacts. This function
@@ -1133,28 +1215,58 @@ impl Validator {
     where
         Signed<RandomTapeContent, S>: SignatureVerify + ConsensusMessageHashable + Clone,
     {
-        tapes
-            .filter_map(|tape| {
-                let height = tape.height();
-                if height == Height::from(0) {
-                    // tape of height 0 is considered invalid
-                    Some(ChangeAction::HandleInvalid(
-                        tape.into_message(),
-                        "Tape at height 0".to_string(),
-                    ))
-                } else if pool_reader.get_random_tape(height).is_some() {
-                    // Remove if we already have a validated tape at this height
-                    Some(ChangeAction::RemoveFromUnvalidated(tape.into_message()))
-                } else {
+        // we need the current threshold to determine how many validations we should make
+        let threshold = match active_low_threshold_transcript(
+            pool_reader.as_cache(),
+            pool_reader.get_catch_up_height(),
+        ) {
+            Some(transcript) => transcript.threshold.get().get(),
+            None => NodeIndex::MAX,
+        };
+        let mut height_share_map = HashMap::<u64, u32>::with_capacity(64);
+        let mut change_set: ChangeSet = Vec::with_capacity(threshold as usize);
+        for tape in tapes {
+            let change_action: Option<ChangeAction>;
+            let height = tape.height();
+            if height == Height::from(0) {
+                // tape of height 0 is considered invalid
+                change_action = Some(ChangeAction::HandleInvalid(
+                    tape.into_message(),
+                    "Tape at height 0".to_string(),
+                ));
+            } else if pool_reader.get_random_tape(height).is_some() {
+                // Remove if we already have a validated tape at this height
+                change_action = Some(ChangeAction::RemoveFromUnvalidated(tape.into_message()));
+            } else {
+                let existing_shares =
+                    pool_reader.get_random_tape_shares(height, height).count() as NodeIndex;
+
+                let added_shares = *height_share_map.get(&height.get()).unwrap_or(&0);
+
+                // if # of existing shares + shares validated in this loop exceeds
+                // the threshold, then we don't need to continue validating anymore.
+                change_action = if (existing_shares + added_shares) < threshold {
+                    self.metrics.validation_random_tape_shares_count.add(1);
                     let verification = self.verify_signature(pool_reader, &tape);
-                    self.compute_action_from_sig_verification(
+                    let ret = self.compute_action_from_sig_verification(
                         pool_reader,
                         verification,
                         tape.into_message(),
-                    )
+                    );
+                    // increment counter of validated shares
+                    if ret.is_some() {
+                        height_share_map.insert(height.get(), added_shares + 1);
+                    }
+                    ret
+                } else {
+                    None
                 }
-            })
-            .collect()
+            }
+            if let Some(inner) = change_action {
+                change_set.push(inner);
+            }
+        }
+        change_set
     }
 
     /// Return a `ChangeSet` of `CatchUpPackage` artifacts.
@@ -1203,6 +1315,9 @@ impl Validator {
                         self.registry_client.get_latest_version(),
                     )
                     .map_err(ValidatorError::from);
+
+                let verification =
+                    self.maybe_hold_back_cup(verification, &catch_up_package, pool_reader);
 
                 self.compute_action_from_sig_verification(
                     pool_reader,
@@ -1301,7 +1416,7 @@ impl Validator {
             .get_finalized_block(height)
             .ok_or(TransientError::FinalizedBlockNotFound(height))?;
 
-        if ic_crypto::crypto_hash(&block) != share_content.block {
+        if ic_types::crypto::crypto_hash(&block) != share_content.block {
             warn!(self.log, "Block from received CatchUpShareContent does not match finalized block in the pool: {:?} {:?}", share_content, block);
             Err(PermanentError::MismatchedBlockInCatchUpPackageShare)?
         }
@@ -1380,6 +1495,76 @@ impl Validator {
                     && now - timestamp >= Duration::from_secs(SECONDS_TO_LOG_UNVALIDATED)
             }
             None => false, // should never happen.
+        }
+    }
+
+    /// Under certain conditions, it makes sense to delay validating (and loading) a CUP
+    /// If we are already close to caught up and have all necessary artifacts in the pool
+    /// we might want to hold off loading the cup and try to get there by computation first.
+    /// After a while, if we did not catch up via computing, we will still load the CUP.
+    fn maybe_hold_back_cup(
+        &self,
+        verification: Result<(), ValidationError<PermanentError, TransientError>>,
+        catch_up_package: &CatchUpPackage,
+        pool_reader: &PoolReader<'_>,
+    ) -> Result<(), ValidationError<PermanentError, TransientError>> {
+        match verification {
+            Ok(()) => {
+                let cup_height = catch_up_package.height();
+
+                // Check that this is a CUP that is close to the current state we have
+                // in the state manager, i.e. there is a chance to catch up via recomputing
+                if cup_height
+                    .get()
+                    .saturating_sub(self.state_manager.latest_state_height().get())
+                    //< CATCH_UP_NEGLIGIBLE_HEIGHT
+                    < Self::get_next_interval_length(catch_up_package).get() / 4
+                    // Check that the finalized height is higher than this cup
+                    // In order to validate the finalization of height `h` we need to have a valid random beacon 
+                    // of height `h-1` and a valid block of height `h`.
+                    // In order to have a valid block of height `h` you need to have a valid block of height `h-1`.
+                    // The same is true for the random beacon.
+                    // Thus, if this condition is true, we know that we have all blocks and random beacons between the
+                    // latest CUP height and finalized height and are therefore able to recompute.
+                    && pool_reader.get_finalized_height() >= cup_height
+                {
+                    // Check that this CUP has not been in the pool for too long
+                    // If it has, we validate the CUP nonetheless
+                    // This is a safety measure
+                    let now = self.time_source.get_relative_time();
+                    match pool_reader
+                        .pool()
+                        .unvalidated()
+                        .get_timestamp(&catch_up_package.get_id())
+                    {
+                        Some(timestamp)
+                            if now >= timestamp && now - timestamp > CATCH_UP_HOLD_OF_TIME =>
+                        {
+                            warn!(
+                                self.log,
+                                "Validating CUP after holding it back for {} seconds",
+                                CATCH_UP_HOLD_OF_TIME.as_secs()
+                            );
+                            Ok(())
+                        }
+                        Some(_) => Err(ValidationError::Transient(
+                            TransientError::CatchUpHeightNegligible,
+                        )),
+                        None => Ok(()),
+                    }
+                } else {
+                    Ok(())
+                }
+            }
+            _ => verification,
+        }
+    }
+
+    fn get_next_interval_length(cup: &CatchUpPackage) -> Height {
+        let a = cup.content.block.as_ref().payload.as_ref();
+        match a {
+            BlockPayload::Summary(summary) => summary.dkg.next_interval_length,
+            _ => unreachable!("CatchUpPackage always contains a SummaryBlock"),
         }
     }
 }
@@ -1540,9 +1725,10 @@ pub mod test {
 
             // Manually construct a cup share
             let random_beacon = pool.make_next_beacon();
-            let random_beacon_hash = HashedRandomBeacon::new(ic_crypto::crypto_hash, random_beacon);
+            let random_beacon_hash =
+                HashedRandomBeacon::new(ic_types::crypto::crypto_hash, random_beacon);
             let block = Block::from(pool.make_next_block());
-            let block_hash = HashedBlock::new(ic_crypto::crypto_hash, block);
+            let block_hash = HashedBlock::new(ic_types::crypto::crypto_hash, block);
 
             // The state manager is mocked and the `StateHash` is completely arbitrary. It
             // must just be the same as in the `CatchUpPackageShare`.
@@ -1897,12 +2083,12 @@ pub mod test {
             Arc::get_mut(&mut payload_builder)
                 .unwrap()
                 .expect_validate_payload()
-                .withf(move |_, payloads, _| {
+                .withf(move |_, _, payloads, _| {
                     // Assert that payloads are from blocks between:
                     // `certified_height` and the current height (`prior_height`)
                     payloads.len() as u64 == (prior_height - certified_height).get()
                 })
-                .returning(|_, _, _| Ok(()));
+                .returning(|_, _, _, _| Ok(()));
             state_manager
                 .get_mut()
                 .expect_latest_certified_height()
@@ -2010,7 +2196,7 @@ pub mod test {
             Arc::get_mut(&mut payload_builder)
                 .unwrap()
                 .expect_validate_payload()
-                .returning(|_, _, _| Ok(()));
+                .returning(|_, _, _, _| Ok(()));
             state_manager
                 .get_mut()
                 .expect_latest_certified_height()
@@ -2107,7 +2293,7 @@ pub mod test {
             Arc::get_mut(&mut payload_builder)
                 .unwrap()
                 .expect_validate_payload()
-                .returning(|_, _, _| Ok(()));
+                .returning(|_, _, _, _| Ok(()));
             state_manager
                 .get_mut()
                 .expect_latest_certified_height()
@@ -2229,7 +2415,7 @@ pub mod test {
             Arc::get_mut(&mut payload_builder)
                 .unwrap()
                 .expect_validate_payload()
-                .returning(|_, _, _| Ok(()));
+                .returning(|_, _, _, _| Ok(()));
             state_manager
                 .get_mut()
                 .expect_latest_certified_height()
@@ -2305,7 +2491,7 @@ pub mod test {
             Arc::get_mut(&mut payload_builder)
                 .unwrap()
                 .expect_validate_payload()
-                .returning(|_, _, _| Ok(()));
+                .returning(|_, _, _, _| Ok(()));
             state_manager
                 .get_mut()
                 .expect_latest_certified_height()
@@ -2621,6 +2807,10 @@ pub mod test {
                 .get_mut()
                 .expect_get_state_hash_at()
                 .return_const(Ok(CryptoHashOfState::from(CryptoHash(Vec::new()))));
+            state_manager
+                .get_mut()
+                .expect_latest_state_height()
+                .return_const(Height::new(1));
 
             let validator = Validator::new(
                 replica_config,
@@ -2669,7 +2859,7 @@ pub mod test {
             Arc::get_mut(&mut payload_builder)
                 .unwrap()
                 .expect_validate_payload()
-                .returning(|_, _, _| {
+                .returning(|_, _, _, _| {
                     Err(ValidationError::Transient(
                         PayloadTransientError::XNetPayloadValidationError(
                             XNetTransientValidationError::StateNotCommittedYet(Height::from(0)),
@@ -2709,8 +2899,10 @@ pub mod test {
             block.content.as_mut().rank = Rank(0);
 
             block.update_content();
-            let content =
-                NotarizationContent::new(block.height(), ic_crypto::crypto_hash(block.as_ref()));
+            let content = NotarizationContent::new(
+                block.height(),
+                ic_types::crypto::crypto_hash(block.as_ref()),
+            );
             let mut notarization = Notarization::fake(content);
             notarization.signature.signers =
                 vec![node_test_id(1), node_test_id(2), node_test_id(3)];

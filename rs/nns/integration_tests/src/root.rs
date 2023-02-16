@@ -2,7 +2,10 @@ use candid::{Encode, Nat};
 use canister_test::Runtime;
 use dfn_candid::candid_one;
 use dfn_protobuf::protobuf;
-use ic_canister_client::Sender;
+use ic_canister_client_sender::Sender;
+use ic_nervous_system_common_test_keys::{
+    TEST_NEURON_1_OWNER_KEYPAIR, TEST_NEURON_2_OWNER_KEYPAIR, TEST_USER1_KEYPAIR,
+};
 use ic_nervous_system_root::{AddCanisterProposal, CanisterAction, StopOrStartCanisterProposal};
 use ic_nns_common::{pb::v1::NeuronId, types::ProposalId};
 use ic_nns_constants::{ALL_NNS_CANISTER_IDS, GOVERNANCE_CANISTER_ID, LEDGER_CANISTER_ID};
@@ -13,24 +16,20 @@ use ic_nns_governance::pb::v1::{
     ExecuteNnsFunction, ManageNeuron, ManageNeuronResponse, NnsFunction, Proposal, ProposalStatus,
     Vote,
 };
-use ic_nns_test_keys::{
-    TEST_NEURON_1_OWNER_KEYPAIR, TEST_NEURON_2_OWNER_KEYPAIR, TEST_USER1_KEYPAIR,
-};
-use ic_nns_test_utils::ids::{TEST_NEURON_1_ID, TEST_NEURON_2_ID};
 use ic_nns_test_utils::{
+    common::NnsInitPayloadsBuilder,
     governance::{
         get_pending_proposals, maybe_upgrade_root_controlled_canister_to_self,
         submit_external_update_proposal, wait_for_final_state,
     },
-    itest_helpers::{
-        local_test_on_nns_subnet, NnsCanisters, NnsInitPayloadsBuilder, UpgradeTestingScenario,
-    },
+    ids::{TEST_NEURON_1_ID, TEST_NEURON_2_ID},
+    itest_helpers::{local_test_on_nns_subnet, NnsCanisters, UpgradeTestingScenario},
 };
 use ic_nns_test_utils_macros::parameterized_upgrades;
 use ic_test_utilities::universal_canister::UNIVERSAL_CANISTER_WASM;
-use ledger_canister::{
-    AccountBalanceArgs, AccountIdentifier, BlockHeight, LedgerCanisterInitPayload, Memo, SendArgs,
-    Tokens, DEFAULT_TRANSFER_FEE,
+use icp_ledger::{
+    tokens_from_proto, AccountBalanceArgs, AccountIdentifier, BlockIndex,
+    LedgerCanisterInitPayload, Memo, SendArgs, Tokens, DEFAULT_TRANSFER_FEE,
 };
 use std::collections::HashMap;
 
@@ -50,7 +49,7 @@ async fn add_nns_canister(runtime: &Runtime, upgrade_scenario: UpgradeTestingSce
         wasm_module: UNIVERSAL_CANISTER_WASM.to_vec(),
         arg: vec![],
         query_allocation: Some(Nat::from(34)),
-        memory_allocation: Some(Nat::from(1234567)),
+        memory_allocation: Some(Nat::from(12345678)),
         compute_allocation: Some(Nat::from(12)),
         initial_cycles: 1 << 45,
         authz_changes: vec![],
@@ -131,7 +130,7 @@ fn test_stop_start_nns_canister() {
             let nns_canisters = NnsCanisters::set_up(&runtime, nns_init_payload).await;
 
             // Perform a transfer, should succeed.
-            let _: BlockHeight = nns_canisters
+            let _: BlockIndex = nns_canisters
                 .ledger
                 .update_from_sender(
                     "send_pb",
@@ -196,7 +195,7 @@ fn test_stop_start_nns_canister() {
             );
 
             // Perform a transfer, should fail.
-            let result: Result<BlockHeight, String> = nns_canisters
+            let result: Result<BlockIndex, String> = nns_canisters
                 .ledger
                 .update_from_sender(
                     "send_pb",
@@ -261,7 +260,7 @@ fn test_stop_start_nns_canister() {
             );
 
             // Perform another transfer, should succeed.
-            let _: BlockHeight = nns_canisters
+            let _: BlockIndex = nns_canisters
                 .ledger
                 .update_from_sender(
                     "send_pb",
@@ -289,9 +288,10 @@ fn test_stop_start_nns_canister() {
                     },
                     &user1,
                 )
-                .await?;
+                .await
+                .map(tokens_from_proto)?;
 
-            // The balance of the first user should have been deducted 200 ICPTs from both
+            // The balance of the first user should have been deducted 200 ICPs from both
             // transfers, minus 2 * the transaction fees.
             assert_eq!(
                 user1_balance,
@@ -311,9 +311,10 @@ fn test_stop_start_nns_canister() {
                     },
                     &user2,
                 )
-                .await?;
+                .await
+                .map(tokens_from_proto)?;
 
-            // The balance of the first user should have been deducted 200 ICPTs from both
+            // The balance of the first user should have been deducted 200 ICPs from both
             // transfers.
             assert_eq!(user2_balance, Tokens::from_tokens(200).unwrap());
 

@@ -6,18 +6,14 @@ use dfn_core::{
 };
 use ic_base_types::PrincipalId;
 use ic_nervous_system_root::{
-    change_canister, AddCanisterProposal, ChangeCanisterProposal, StopOrStartCanisterProposal,
-    LOG_PREFIX,
+    change_canister, AddCanisterProposal, CanisterIdRecord, ChangeCanisterProposal,
+    StopOrStartCanisterProposal, LOG_PREFIX,
 };
 use ic_nns_common::access_control::check_caller_is_governance;
 use ic_nns_handler_root::{
     canister_management,
     root_proposals::{GovernanceUpgradeRootProposal, RootProposalBallot},
 };
-
-// Makes expose_build_metadata! available.
-#[macro_use]
-extern crate ic_nervous_system_common;
 
 fn main() {}
 
@@ -43,7 +39,7 @@ fn canister_post_upgrade() {
     stable::set(&[]);
 }
 
-expose_build_metadata! {}
+ic_nervous_system_common_build_metadata::define_get_build_metadata_candid_method! {}
 
 /// Returns the status of the canister specified in the input.
 ///
@@ -55,7 +51,9 @@ expose_build_metadata! {}
 #[export_name = "canister_update canister_status"]
 fn canister_status() {
     println!("{}canister_status", LOG_PREFIX);
-    over_async(candid, ic_nervous_system_root::canister_status)
+    over_async(candid, |(canister_id_record,): (CanisterIdRecord,)| {
+        ic_nervous_system_root::canister_status(canister_id_record)
+    })
 }
 
 #[export_name = "canister_update submit_change_nns_canister_proposal"]

@@ -1,24 +1,24 @@
 use assert_matches::assert_matches;
 use ic_base_types::NumSeconds;
 use ic_config::state_manager::Config;
-use ic_interfaces::certified_stream_store::CertifiedStreamStore;
 use ic_interfaces::{
     certification::{CertificationPermanentError, Verifier, VerifierError},
-    certified_stream_store::DecodeStreamError,
     validation::ValidationResult,
 };
+use ic_interfaces_certified_stream_store::{CertifiedStreamStore, DecodeStreamError};
 use ic_interfaces_state_manager::*;
 use ic_metrics::MetricsRegistry;
 use ic_registry_subnet_type::SubnetType;
 use ic_replicated_state::canister_state::execution_state::WasmBinary;
 use ic_replicated_state::{testing::ReplicatedStateTesting, ReplicatedState, Stream};
-use ic_state_manager::{stream_encoding, StateManagerImpl};
+use ic_state_manager::{state_sync::StateSync, stream_encoding, StateManagerImpl};
 use ic_test_utilities::{
     consensus::fake::{Fake, FakeVerifier},
     state::{initial_execution_state, new_canister_state},
     types::ids::{subnet_test_id, user_test_id},
-    with_test_replica_logger,
 };
+use ic_test_utilities_logger::with_test_replica_logger;
+use ic_test_utilities_tmpdir::tmpdir;
 use ic_types::{
     artifact::{Artifact, StateSyncMessage},
     chunkable::{
@@ -33,13 +33,27 @@ use ic_types::{
 };
 use ic_wasm_types::CanisterModule;
 use std::{collections::HashSet, sync::Arc};
-use tempfile::Builder;
+
+const EMPTY_WASM: &[u8] = &[
+    0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00, 0x00, 0x08, 0x04, 0x6e, 0x61, 0x6d, 0x65, 0x02,
+    0x01, 0x00,
+];
 
 pub fn empty_wasm() -> CanisterModule {
-    CanisterModule::new(vec![
-        0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00, 0x00, 0x08, 0x04, 0x6e, 0x61, 0x6d, 0x65,
-        0x02, 0x01, 0x00,
-    ])
+    CanisterModule::new(EMPTY_WASM.to_vec())
+}
+
+pub fn empty_wasm_size() -> usize {
+    EMPTY_WASM.len()
+}
+
+const ALTERNATE_WASM: &[u8] = &[
+    0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x08, 0x04, 0x6e, 0x61, 0x6d, 0x65,
+    0x02, 0x01, 0x00,
+];
+
+pub fn alternate_wasm() -> CanisterModule {
+    CanisterModule::new(ALTERNATE_WASM.to_vec())
 }
 
 const INITIAL_CYCLES: Cycles = Cycles::new(1 << 36);
@@ -328,6 +342,43 @@ pub fn insert_dummy_canister(state: &mut ReplicatedState, canister_id: CanisterI
     state.put_canister_state(canister_state);
 }
 
+pub fn insert_canister_with_many_controllers(
+    state: &mut ReplicatedState,
+    canister_id: CanisterId,
+    num_controllers: u64,
+) {
+    let wasm = empty_wasm();
+    let mut canister_state = new_canister_state(
+        canister_id,
+        user_test_id(24).get(),
+        INITIAL_CYCLES,
+        NumSeconds::from(100_000),
+    );
+
+    let mut controllers = std::mem::take(&mut canister_state.system_state.controllers);
+    for i in 25..(24 + num_controllers) {
+        controllers.insert(user_test_id(i).get());
+    }
+    canister_state.system_state.controllers = controllers;
+
+    let mut execution_state = initial_execution_state();
+    execution_state.wasm_binary = WasmBinary::new(wasm);
+    canister_state.execution_state = Some(execution_state);
+    state.put_canister_state(canister_state);
+}
+
+pub fn replace_wasm(state: &mut ReplicatedState, canister_id: CanisterId) {
+    let wasm = alternate_wasm();
+
+    state
+        .canister_state_mut(&canister_id)
+        .unwrap()
+        .execution_state
+        .as_mut()
+        .unwrap()
+        .wasm_binary = WasmBinary::new(wasm);
+}
+
 pub fn pipe_state_sync(src: StateSyncMessage, mut dst: Box<dyn Chunkable>) -> StateSyncMessage {
     pipe_partial_state_sync(&src, &mut *dst, &Default::default())
         .expect("State sync not completed.")
@@ -348,13 +399,7 @@ pub fn pipe_manifest(src: &StateSyncMessage, dst: &mut dyn Chunkable) -> Option<
         .unwrap_or_else(|| panic!("Requested unknown chunk {}", id));
 
     match dst.add_chunk(chunk) {
-        Ok(Artifact::StateSync(msg)) => {
-            assert!(
-                dst.is_complete(),
-                "add_chunk returned OK but the artifact is not complete"
-            );
-            Some(msg)
-        }
+        Ok(Artifact::StateSync(msg)) => Some(msg),
         Ok(artifact) => {
             panic!("Unexpected artifact type: {:?}", artifact);
         }
@@ -369,13 +414,13 @@ pub fn pipe_partial_state_sync(
     dst: &mut dyn Chunkable,
     omit: &HashSet<ChunkId>,
 ) -> Option<StateSyncMessage> {
-    while !dst.is_complete() {
+    loop {
         let ids: Vec<_> = dst.chunks_to_download().collect();
 
-        assert!(
-            !ids.is_empty(),
-            "Can't have incomplete artifact that needs no chunks"
-        );
+        if ids.is_empty() {
+            break;
+        }
+
         let mut omitted_chunks = false;
         for id in ids {
             if omit.contains(&id) {
@@ -388,10 +433,6 @@ pub fn pipe_partial_state_sync(
 
             match dst.add_chunk(chunk) {
                 Ok(Artifact::StateSync(msg)) => {
-                    assert!(
-                        dst.is_complete(),
-                        "add_chunk returned OK but the artifact is not complete"
-                    );
                     return Some(msg);
                 }
                 Ok(artifact) => {
@@ -412,7 +453,7 @@ pub fn state_manager_test_with_verifier_result<F: FnOnce(&MetricsRegistry, State
     should_pass_verification: bool,
     f: F,
 ) {
-    let tmp = Builder::new().prefix("test").tempdir().unwrap();
+    let tmp = tmpdir("sm");
     let config = Config::new(tmp.path().into());
     let metrics_registry = MetricsRegistry::new();
     let own_subnet = subnet_test_id(42);
@@ -439,8 +480,90 @@ pub fn state_manager_test_with_verifier_result<F: FnOnce(&MetricsRegistry, State
     })
 }
 
+fn state_manager_test_with_state_sync_and_verifier_result<
+    F: FnOnce(&MetricsRegistry, Arc<StateManagerImpl>, StateSync),
+>(
+    should_pass_verification: bool,
+    f: F,
+) {
+    let tmp = tmpdir("sm");
+    let config = Config::new(tmp.path().into());
+    let metrics_registry = MetricsRegistry::new();
+    let own_subnet = subnet_test_id(42);
+    let verifier: Arc<dyn Verifier> = if should_pass_verification {
+        Arc::new(FakeVerifier::new())
+    } else {
+        Arc::new(RejectingVerifier::default())
+    };
+
+    with_test_replica_logger(|log| {
+        let sm = Arc::new(StateManagerImpl::new(
+            verifier,
+            own_subnet,
+            SubnetType::Application,
+            log.clone(),
+            &metrics_registry,
+            &config,
+            None,
+            ic_types::malicious_flags::MaliciousFlags::default(),
+        ));
+        f(&metrics_registry, sm.clone(), StateSync::new(sm, log));
+    })
+}
+
 pub fn state_manager_test<F: FnOnce(&MetricsRegistry, StateManagerImpl)>(f: F) {
     state_manager_test_with_verifier_result(true, f)
+}
+
+pub fn state_manager_test_with_state_sync<
+    F: FnOnce(&MetricsRegistry, Arc<StateManagerImpl>, StateSync),
+>(
+    f: F,
+) {
+    state_manager_test_with_state_sync_and_verifier_result(true, f)
+}
+
+pub fn state_manager_restart_test_deleting_metadata<Test>(test: Test)
+where
+    Test: FnOnce(
+        &MetricsRegistry,
+        StateManagerImpl,
+        Box<dyn Fn(StateManagerImpl, Option<Height>) -> (MetricsRegistry, StateManagerImpl)>,
+    ),
+{
+    let tmp = tmpdir("sm");
+    let config = Config::new(tmp.path().into());
+    let own_subnet = subnet_test_id(42);
+    let verifier: Arc<dyn Verifier> = Arc::new(FakeVerifier::new());
+
+    with_test_replica_logger(|log| {
+        let make_state_manager = move |starting_height| {
+            let metrics_registry = MetricsRegistry::new();
+
+            let state_manager = StateManagerImpl::new(
+                Arc::clone(&verifier),
+                own_subnet,
+                SubnetType::Application,
+                log.clone(),
+                &metrics_registry,
+                &config,
+                starting_height,
+                ic_types::malicious_flags::MaliciousFlags::default(),
+            );
+
+            (metrics_registry, state_manager)
+        };
+
+        let (metrics_registry, state_manager) = make_state_manager(None);
+
+        let restart_fn = Box::new(move |state_manager, starting_height| {
+            drop(state_manager);
+            std::fs::remove_file(tmp.path().join("states_metadata.pbuf")).unwrap();
+            make_state_manager(starting_height)
+        });
+
+        test(&metrics_registry, state_manager, restart_fn);
+    });
 }
 
 pub fn state_manager_restart_test_with_metrics<Test>(test: Test)
@@ -451,7 +574,7 @@ where
         Box<dyn Fn(StateManagerImpl, Option<Height>) -> (MetricsRegistry, StateManagerImpl)>,
     ),
 {
-    let tmp = Builder::new().prefix("test").tempdir().unwrap();
+    let tmp = tmpdir("sm");
     let config = Config::new(tmp.path().into());
     let own_subnet = subnet_test_id(42);
     let verifier: Arc<dyn Verifier> = Arc::new(FakeVerifier::new());

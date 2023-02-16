@@ -3,6 +3,7 @@ use crate::{
     routing::demux::MockDemux, routing::stream_builder::MockStreamBuilder,
     state_machine::StateMachineImpl,
 };
+use ic_ic00_types::EcdsaKeyId;
 use ic_interfaces::execution_environment::Scheduler;
 use ic_interfaces_state_manager::StateManager;
 use ic_metrics::MetricsRegistry;
@@ -14,15 +15,14 @@ use ic_test_utilities::{
     types::batch::{BatchBuilder, IngressPayloadBuilder, PayloadBuilder},
     types::ids::subnet_test_id,
     types::messages::SignedIngressBuilder,
-    with_test_replica_logger,
 };
+use ic_test_utilities_execution_environment::test_registry_settings;
+use ic_test_utilities_logger::with_test_replica_logger;
 use ic_types::crypto::canister_threshold_sig::MasterEcdsaPublicKey;
 use ic_types::messages::SignedIngress;
 use ic_types::{Height, PrincipalId, SubnetId};
 use mockall::{mock, predicate::*, Sequence};
 use std::collections::{BTreeMap, BTreeSet};
-
-const MAX_NUMBER_OF_CANISTERS: u64 = 0;
 
 mock! {
     pub Scheduler {}
@@ -32,10 +32,10 @@ mock! {
             &self,
             state: ic_replicated_state::ReplicatedState,
             randomness: ic_types::Randomness,
-            ecdsa_subnet_public_key: Option<MasterEcdsaPublicKey>,
+            ecdsa_subnet_public_keys: BTreeMap<EcdsaKeyId, MasterEcdsaPublicKey>,
             current_round: ExecutionRound,
-            provisional_whitelist: ProvisionalWhitelist,
-            max_number_of_canisters: u64,
+            current_round_type: ExecutionRoundType,
+            registry_settings: &RegistryExecutionSettings,
         ) -> ReplicatedState;
     }
 }
@@ -61,8 +61,11 @@ fn test_fixture(provided_batch: &Batch) -> StateMachineTestFixture {
     let metrics = Arc::new(MessageRoutingMetrics::new(&metrics_registry));
 
     let round = ExecutionRound::from(initial_height.get() + 1);
-    let provisional_whitelist = ProvisionalWhitelist::Set(BTreeSet::new());
-    let max_number_of_canisters = 0;
+    let round_type = if provided_batch.requires_full_state_hash {
+        ExecutionRoundType::CheckpointRound
+    } else {
+        ExecutionRoundType::OrdinaryRound
+    };
 
     let mut seq = Sequence::new();
 
@@ -82,10 +85,10 @@ fn test_fixture(provided_batch: &Batch) -> StateMachineTestFixture {
         .with(
             always(),
             eq(provided_batch.randomness),
-            eq(provided_batch.ecdsa_subnet_public_key.clone()),
+            eq(provided_batch.ecdsa_subnet_public_keys.clone()),
             eq(round),
-            eq(provisional_whitelist),
-            eq(max_number_of_canisters),
+            eq(round_type),
+            eq(test_registry_settings()),
         )
         .returning(|state, _, _, _, _, _| state);
 
@@ -105,6 +108,7 @@ fn test_fixture(provided_batch: &Batch) -> StateMachineTestFixture {
             nodes: BTreeMap::new(),
             subnet_type: SubnetType::Application,
             subnet_features: SubnetFeatures::default(),
+            ecdsa_keys_held: BTreeSet::new(),
         },
     );
 
@@ -113,6 +117,7 @@ fn test_fixture(provided_batch: &Batch) -> StateMachineTestFixture {
         routing_table: Default::default(),
         nns_subnet_id: SubnetId::from(PrincipalId::new_subnet_test_id(0)),
         canister_migrations: Default::default(),
+        ..Default::default()
     };
 
     StateMachineTestFixture {
@@ -138,6 +143,7 @@ fn state_machine_populates_network_topology() {
     let fixture = test_fixture(&provided_batch);
 
     with_test_replica_logger(|log| {
+        let _ = &fixture;
         let state_machine = Box::new(StateMachineImpl::new(
             fixture.scheduler,
             fixture.demux,
@@ -155,9 +161,8 @@ fn state_machine_populates_network_topology() {
             fixture.initial_state,
             fixture.network_topology.clone(),
             provided_batch,
-            ProvisionalWhitelist::Set(BTreeSet::new()),
             Default::default(),
-            MAX_NUMBER_OF_CANISTERS,
+            &test_registry_settings(),
         );
 
         assert_eq!(state.metadata.network_topology, fixture.network_topology);
@@ -170,6 +175,7 @@ fn test_delivered_batch(provided_batch: Batch) {
     let fixture = test_fixture(&provided_batch);
 
     with_test_replica_logger(|log| {
+        let _ = &fixture;
         let state_machine = Box::new(StateMachineImpl::new(
             fixture.scheduler,
             fixture.demux,
@@ -182,9 +188,8 @@ fn test_delivered_batch(provided_batch: Batch) {
             fixture.initial_state,
             NetworkTopology::default(),
             provided_batch,
-            ProvisionalWhitelist::Set(BTreeSet::new()),
             Default::default(),
-            MAX_NUMBER_OF_CANISTERS,
+            &test_registry_settings(),
         );
     });
 }

@@ -4,7 +4,7 @@ use crate::{
 };
 use anyhow::{anyhow, ensure, Result};
 use ic_base_types::RegistryVersion;
-use ic_registry_common::local_store::{ChangelogEntry, KeyMutation};
+use ic_registry_local_store::{ChangelogEntry, KeyMutation};
 use serde_json::Value;
 use std::collections::BTreeMap;
 use thiserror::Error;
@@ -73,9 +73,10 @@ pub fn diff_to_changelog_entry(diff: Diff) -> Result<(RegistryVersion, Changelog
     let v = RegistryVersion::from(snapshot_to_version(&diff.0)?);
 
     let mut changelog_entry = ChangelogEntry::default();
-    let obj = diff.0.as_object().ok_or(anyhow!(DiffErr::InvalidJsonValue(
-        "Expected an object.".into()
-    )))?;
+    let obj = diff
+        .0
+        .as_object()
+        .ok_or_else(|| anyhow!(DiffErr::InvalidJsonValue("Expected an object.".into())))?;
     for (k, v) in obj
         .iter()
         .filter(|(k, _)| !k.starts_with(SPECIAL_FIELD_PREFIX))
@@ -94,16 +95,12 @@ pub fn diff_to_changelog_entry(diff: Diff) -> Result<(RegistryVersion, Changelog
 
 pub fn snapshot_to_version(obj: &Value) -> Result<u64> {
     obj.as_object()
-        .ok_or(anyhow!(DiffErr::InvalidJsonValue(
-            "Expected object.".into()
-        )))
+        .ok_or_else(|| anyhow!(DiffErr::InvalidJsonValue("Expected object.".into())))
         .and_then(|obj| {
             obj.get(VERSION_FIELD)
                 .ok_or(DiffErr::VersionMissing)?
                 .as_u64()
-                .ok_or(anyhow!(DiffErr::InvalidJsonValue(
-                    "Version is not a u64".into(),
-                )))
+                .ok_or_else(|| anyhow!(DiffErr::InvalidJsonValue("Version is not a u64".into(),)))
         })
 }
 

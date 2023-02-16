@@ -1,6 +1,25 @@
 use super::*;
 
+use ic_ledger_canister_blocks_synchronizer_test_utils::init_test_logger;
 use log::debug;
+
+fn rosetta_cli() -> String {
+    match std::env::var("ROSETTA_CLI").ok() {
+        Some(binary) => binary,
+        None => String::from("rosetta-cli"),
+    }
+}
+
+fn local(file: &str) -> String {
+    match std::env::var("CARGO_MANIFEST_DIR") {
+        Ok(path) => std::path::PathBuf::from(path)
+            .join(file)
+            .into_os_string()
+            .into_string()
+            .unwrap(),
+        Err(_) => String::from(file),
+    }
+}
 
 #[actix_rt::test]
 async fn rosetta_cli_data_test() {
@@ -18,7 +37,7 @@ async fn rosetta_cli_data_test() {
     }
 
     let ledger = Arc::new(TestLedger::new());
-    let req_handler = RosettaRequestHandler::new(ledger.clone());
+    let req_handler = RosettaRequestHandler::new_with_default_blockchain(ledger.clone());
     for b in &scribe.blockchain {
         ledger.add_block(b.clone()).await.ok();
     }
@@ -37,13 +56,11 @@ async fn rosetta_cli_data_test() {
         debug!("Server thread done");
     }));
 
-    let output = Command::new("timeout")
-        .args(&[
-            "300s",
-            "rosetta-cli",
+    let output = Command::new(rosetta_cli())
+        .args([
             "check:data",
             "--configuration-file",
-            "test/rosetta-cli_data_test.json",
+            local("test/rosetta-cli_data_test.json").as_str(),
         ])
         .output()
         .expect("failed to execute rosetta-cli");
@@ -85,7 +102,7 @@ async fn rosetta_cli_construction_create_account_test() {
     }
 
     let ledger = Arc::new(TestLedger::new());
-    let req_handler = RosettaRequestHandler::new(ledger.clone());
+    let req_handler = RosettaRequestHandler::new_with_default_blockchain(ledger.clone());
     for b in &scribe.blockchain {
         ledger.add_block(b.clone()).await.ok();
     }
@@ -104,13 +121,11 @@ async fn rosetta_cli_construction_create_account_test() {
         debug!("Server thread done");
     }));
 
-    let output = Command::new("timeout")
-        .args(&[
-            "300s",
-            "rosetta-cli",
+    let output = Command::new(rosetta_cli())
+        .args([
             "check:construction",
             "--configuration-file",
-            "test/rosetta-cli_construction_create_account_test.json",
+            local("test/rosetta-cli_construction_create_account_test.json").as_str(),
         ])
         .output()
         .expect("failed to execute rosetta-cli");
@@ -171,7 +186,7 @@ async fn rosetta_cli_construction_test() {
     );
 
     let ledger = Arc::new(TestLedger::new());
-    let req_handler = RosettaRequestHandler::new(ledger.clone());
+    let req_handler = RosettaRequestHandler::new_with_default_blockchain(ledger.clone());
     for b in &scribe.blockchain {
         ledger.add_block(b.clone()).await.ok();
     }
@@ -190,16 +205,12 @@ async fn rosetta_cli_construction_test() {
         debug!("Server thread done");
     }));
 
-    let output = Command::new("timeout")
-        .args(&[
-            "300s",
-            "rosetta-cli",
+    let output = Command::new(rosetta_cli())
+        .args([
             "check:construction",
             "--configuration-file",
-            "test/rosetta-cli_construction_test.json",
+            local("test/rosetta-cli_construction_test.json").as_str(),
         ])
-        //.stdout(std::process::Stdio::inherit())
-        //.stderr(std::process::Stdio::inherit())
         .output()
         .expect("failed to execute rosetta-cli");
 

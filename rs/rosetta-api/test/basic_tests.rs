@@ -1,12 +1,22 @@
 use super::*;
 
-use ic_rosetta_api::models::*;
-
-use ic_rosetta_api::convert::{amount_, block_id, from_hash, timestamp, to_hash};
+use ic_ledger_canister_blocks_synchronizer_test_utils::sample_data::Scribe;
+use ic_ledger_canister_blocks_synchronizer_test_utils::{create_tmp_dir, init_test_logger};
+use ic_ledger_core::block::BlockType;
+use ic_rosetta_api::convert::{block_id, from_hash, to_hash};
 use ic_rosetta_api::ledger_client::LedgerAccess;
+use ic_rosetta_api::models::amount::{tokens_to_amount, Amount};
+use ic_rosetta_api::models::{
+    AccountBalanceResponse, BlockIdentifier, BlockRequest, BlockTransaction,
+    BlockTransactionRequest, ConstructionDeriveRequest, ConstructionDeriveResponse,
+    ConstructionMetadataRequest, ConstructionMetadataResponse, Currency, CurveType,
+    MempoolResponse, MempoolTransactionRequest, MetadataRequest, NetworkListResponse,
+    NetworkRequest, NetworkStatusResponse, SearchTransactionsRequest, SearchTransactionsResponse,
+    SyncStatus,
+};
+use ic_rosetta_api::request_handler::RosettaRequestHandler;
 use ic_rosetta_api::transaction_id::TransactionIdentifier;
-use ic_rosetta_api::{RosettaRequestHandler, API_VERSION, NODE_VERSION};
-
+use ic_rosetta_api::{models, API_VERSION, NODE_VERSION};
 use std::sync::Arc;
 
 #[actix_rt::test]
@@ -27,7 +37,7 @@ async fn smoke_test() {
         transfer_fee: transaction_fee,
         ..Default::default()
     });
-    let req_handler = RosettaRequestHandler::new(ledger.clone());
+    let req_handler = RosettaRequestHandler::new_with_default_blockchain(ledger.clone());
     for b in &scribe.blockchain {
         ledger.add_block(b.clone()).await.ok();
     }
@@ -37,8 +47,7 @@ async fn smoke_test() {
         ledger
             .read_blocks()
             .await
-            .last_verified()
-            .unwrap()
+            .get_latest_verified_hashed_block()
             .unwrap()
             .index
             + 1
@@ -58,13 +67,8 @@ async fn smoke_test() {
         res,
         Ok(NetworkStatusResponse::new(
             block_id(scribe.blockchain.back().unwrap()).unwrap(),
-            timestamp(
-                scribe
-                    .blockchain
-                    .back()
-                    .unwrap()
-                    .block
-                    .decode()
+            models::timestamp::from_system_time(
+                Block::decode(scribe.blockchain.back().unwrap().block.clone())
                     .unwrap()
                     .timestamp()
                     .into()
@@ -89,8 +93,7 @@ async fn smoke_test() {
         ledger
             .read_blocks()
             .await
-            .first_verified()
-            .unwrap()
+            .get_first_verified_hashed_block()
             .unwrap()
             .index as usize,
         expected_first_block
@@ -98,15 +101,13 @@ async fn smoke_test() {
     let b = ledger
         .read_blocks()
         .await
-        .last_verified()
-        .unwrap()
+        .get_latest_verified_hashed_block()
         .unwrap()
         .index;
     let a = ledger
         .read_blocks()
         .await
-        .first_verified()
-        .unwrap()
+        .get_first_verified_hashed_block()
         .unwrap()
         .index;
     assert_eq!(b - a, 10);
@@ -173,7 +174,7 @@ async fn smoke_test() {
         res,
         Ok(AccountBalanceResponse::new(
             block_id(scribe.blockchain.back().unwrap()).unwrap(),
-            vec![amount_(
+            vec![tokens_to_amount(
                 *scribe.balance_book.get(&acc_id(0)).unwrap(),
                 DEFAULT_TOKEN_SYMBOL
             )
@@ -181,9 +182,9 @@ async fn smoke_test() {
         ))
     );
 
-    let (acc_id, _ed_kp, pk, _pid) = ic_rosetta_test_utils::make_user(4);
+    let (acc_id, _ed_kp, pk, _pid) = ic_rosetta_test_utils::make_user_ed25519(4);
     let msg = ConstructionDeriveRequest::new(req_handler.network_id(), pk);
-    let res = req_handler.construction_derive(msg).await;
+    let res = req_handler.construction_derive(msg);
     assert_eq!(
         res,
         Ok(ConstructionDeriveResponse {
@@ -193,10 +194,10 @@ async fn smoke_test() {
         })
     );
 
-    let (_acc_id, _ed_kp, mut pk, _pid) = ic_rosetta_test_utils::make_user(4);
+    let (_acc_id, _ed_kp, mut pk, _pid) = ic_rosetta_test_utils::make_user_ed25519(4);
     pk.curve_type = CurveType::Secp256K1;
     let msg = ConstructionDeriveRequest::new(req_handler.network_id(), pk);
-    let res = req_handler.construction_derive(msg).await;
+    let res = req_handler.construction_derive(msg);
     assert!(res.is_err(), "This pk should not have been accepted");
 
     let msg = ConstructionMetadataRequest::new(req_handler.network_id());
@@ -223,7 +224,7 @@ async fn blocks_test() {
     init_test_logger();
 
     let ledger = Arc::new(TestLedger::new());
-    let req_handler = RosettaRequestHandler::new(ledger.clone());
+    let req_handler = RosettaRequestHandler::new_with_default_blockchain(ledger.clone());
     let mut scribe = Scribe::new();
     let num_transactions: usize = 100;
     let num_accounts = 10;
@@ -357,7 +358,7 @@ async fn balances_test() {
     init_test_logger();
 
     let ledger = Arc::new(TestLedger::new());
-    let req_handler = RosettaRequestHandler::new(ledger.clone());
+    let req_handler = RosettaRequestHandler::new_with_default_blockchain(ledger.clone());
     let mut scribe = Scribe::new();
 
     scribe.gen_accounts(2, 1_000_000);
@@ -430,25 +431,39 @@ async fn balances_test() {
 
 fn verify_balances(scribe: &Scribe, blocks: &Blocks, start_idx: usize) {
     for hb in scribe.blockchain.iter().skip(start_idx) {
-        assert_eq!(*hb, blocks.get_verified_at(hb.index).unwrap());
-        assert_eq!(*hb, blocks.get_verified(hb.hash).unwrap());
+        assert_eq!(
+            *hb,
+            blocks
+                .get_hashed_block(&hb.index)
+                .ok()
+                .ok_or(false)
+                .unwrap()
+        );
+        assert!(blocks.is_verified_by_hash(&hb.hash).unwrap());
         for (account, amount) in scribe.balance_history.get(hb.index as usize).unwrap() {
-            assert_eq!(blocks.get_balance(account, hb.index).unwrap(), *amount);
+            assert_eq!(
+                blocks.get_account_balance(account, &hb.index).unwrap(),
+                *amount
+            );
         }
     }
     let mut sum_icpt = Tokens::ZERO;
+    let latest = blocks.get_latest_verified_hashed_block().unwrap();
     for amount in scribe.balance_history.back().unwrap().values() {
         sum_icpt += *amount;
     }
-    assert_eq!(
-        (Tokens::MAX - sum_icpt).unwrap(),
-        blocks.balance_book.token_pool
-    );
+    let accounts = blocks.get_all_accounts().unwrap();
+    let mut total = Tokens::ZERO;
+    for account in accounts {
+        let amount = blocks.get_account_balance(&account, &latest.index).unwrap();
+        total += amount;
+    }
+    assert_eq!(sum_icpt, total);
 }
 
 async fn query_search_transactions(
     req_handler: &RosettaRequestHandler,
-    acc: &ledger_canister::AccountIdentifier,
+    acc: &icp_ledger::AccountIdentifier,
     max_block: Option<i64>,
     offset: Option<i64>,
     limit: Option<i64>,
@@ -471,18 +486,46 @@ async fn verify_account_search(
     last_verified_idx: u64,
 ) {
     let mut history = BTreeMap::new();
+
+    let mut index = |account: AccountIdentifier, block_index: u64| {
+        history
+            .entry(account)
+            .or_insert_with(Vec::new)
+            .push(block_index);
+    };
+
     for hb in &scribe.blockchain {
-        match hb.block.decode().unwrap().transaction.operation {
-            ledger_canister::Operation::Burn { from, .. } => {
-                history.entry(from).or_insert_with(Vec::new).push(hb.index);
+        match Block::decode(hb.block.clone())
+            .unwrap()
+            .transaction
+            .operation
+        {
+            icp_ledger::Operation::Burn { from, .. } => {
+                index(from, hb.index);
             }
-            ledger_canister::Operation::Mint { to, .. } => {
-                history.entry(to).or_insert_with(Vec::new).push(hb.index);
+            icp_ledger::Operation::Mint { to, .. } => {
+                index(to, hb.index);
             }
-            ledger_canister::Operation::Transfer { from, to, .. } => {
-                history.entry(from).or_insert_with(Vec::new).push(hb.index);
+            icp_ledger::Operation::Transfer { from, to, .. } => {
+                index(from, hb.index);
                 if from != to {
-                    history.entry(to).or_insert_with(Vec::new).push(hb.index);
+                    index(to, hb.index);
+                }
+            }
+            icp_ledger::Operation::Approve { from, spender, .. } => {
+                assert_ne!(from, spender);
+                index(from, hb.index);
+                index(spender, hb.index);
+            }
+            icp_ledger::Operation::TransferFrom {
+                from, to, spender, ..
+            } => {
+                index(from, hb.index);
+                if from != to {
+                    index(to, hb.index);
+                }
+                if spender != from && spender != to {
+                    index(spender, hb.index);
                 }
             }
         }
@@ -490,33 +533,32 @@ async fn verify_account_search(
 
     let middle_idx = (scribe.blockchain.len() as u64 - 1 + oldest_idx) / 2;
     for acc in &scribe.accounts {
-        let h2: Vec<BlockHeight> = history
+        let mut h2: Vec<BlockIndex> = history
             .get(acc)
             .unwrap()
             .clone()
             .into_iter()
-            .rev()
             .filter(|i| *i >= oldest_idx && *i <= last_verified_idx)
             .collect();
 
         let search_res = query_search_transactions(req_handler, acc, None, None, None)
             .await
             .unwrap();
-        let h: Vec<BlockHeight> = search_res
+        let mut h: Vec<BlockIndex> = search_res
             .transactions
             .iter()
-            .map(|t| t.block_identifier.index as BlockHeight)
+            .map(|t| t.block_identifier.index as BlockIndex)
             .collect();
-
+        h.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        h2.sort_by(|a, b| a.partial_cmp(b).unwrap());
         assert_eq!(h, h2);
 
         let limit = 3;
-        let h1: Vec<BlockHeight> = history
+        let h1: Vec<BlockIndex> = history
             .get(acc)
             .unwrap()
             .clone()
             .into_iter()
-            .rev()
             .filter(|i| *i <= middle_idx && *i >= oldest_idx && *i <= last_verified_idx)
             .collect();
 
@@ -529,10 +571,10 @@ async fn verify_account_search(
         )
         .await
         .unwrap();
-        let h: Vec<BlockHeight> = search_res
+        let h: Vec<BlockIndex> = search_res
             .transactions
             .iter()
-            .map(|t| t.block_identifier.index as BlockHeight)
+            .map(|t| t.block_identifier.index as BlockIndex)
             .collect();
 
         let next_offset = if h1.len() > limit {
@@ -543,7 +585,7 @@ async fn verify_account_search(
 
         let mut h1_limit = h1.clone();
         h1_limit.truncate(limit);
-
+        h1_limit.sort_by(|a, b| a.partial_cmp(b).unwrap());
         assert_eq!(h, h1_limit);
         assert_eq!(search_res.next_offset, next_offset);
 
@@ -557,10 +599,10 @@ async fn verify_account_search(
         )
         .await
         .unwrap();
-        let h: Vec<BlockHeight> = search_res
+        let h: Vec<BlockIndex> = search_res
             .transactions
             .iter()
-            .map(|t| t.block_identifier.index as BlockHeight)
+            .map(|t| t.block_identifier.index as BlockIndex)
             .collect();
 
         let next_offset = if h1.len() > limit + offset as usize {
@@ -572,7 +614,7 @@ async fn verify_account_search(
         let mut h1_offset = h1.clone();
         h1_offset = h1_offset.split_off(offset as usize);
         h1_offset.truncate(limit);
-
+        h1_offset.sort_by(|a, b| a.partial_cmp(b).unwrap());
         assert_eq!(h, h1_offset);
         assert_eq!(search_res.next_offset, next_offset);
     }
@@ -585,49 +627,42 @@ async fn load_from_store_test() {
     let location = tmpdir.path();
     let scribe = Scribe::new_with_sample_data(10, 150);
 
-    let mut blocks = Blocks::new_persistent(location);
+    let mut blocks = Blocks::new_persistent(location).unwrap();
     let mut last_verified = 0;
     for hb in &scribe.blockchain {
-        blocks.add_block(hb.clone()).unwrap();
+        blocks.push(hb).unwrap();
         if hb.index < 20 {
-            blocks.block_store.mark_last_verified(hb.index).unwrap();
+            blocks.set_hashed_block_to_verified(&hb.index).unwrap();
             last_verified = hb.index;
         }
     }
 
     let some_acc = scribe.accounts.front().cloned().unwrap();
 
-    assert!(blocks.get_verified_at(10).is_ok());
-    assert!(blocks.get_balance(&some_acc, 10).is_ok());
-    assert!(blocks.get_verified_at(20).is_err());
-    assert!(blocks.get_balance(&some_acc, 20).is_err());
+    assert!(blocks.is_verified_by_idx(&10).unwrap());
+    assert!(blocks.get_account_balance(&some_acc, &10).is_ok());
+    assert!(!blocks.is_verified_by_idx(&20).unwrap());
+    assert!(blocks.get_account_balance(&some_acc, &20).is_err());
 
     let ledger = Arc::new(TestLedger::from_blockchain(blocks));
-    let req_handler = RosettaRequestHandler::new(ledger);
+    let req_handler = RosettaRequestHandler::new_with_default_blockchain(ledger);
     verify_account_search(&scribe, &req_handler, 0, last_verified).await;
 
     drop(req_handler);
 
-    let mut blocks = Blocks::new_persistent(location);
-    blocks.load_from_store().unwrap();
-
-    assert!(blocks.get_verified_at(10).is_ok());
-    assert!(blocks.get_balance(&some_acc, 10).is_ok());
-    assert!(blocks.get_verified_at(20).is_err());
-    assert!(blocks.get_balance(&some_acc, 20).is_err());
+    let blocks = Blocks::new_persistent(location).unwrap();
+    assert!(blocks.is_verified_by_idx(&10).unwrap());
+    assert!(blocks.get_account_balance(&some_acc, &10).is_ok());
+    assert!(!blocks.is_verified_by_idx(&20).unwrap());
+    assert!(blocks.get_account_balance(&some_acc, &20).is_err());
     last_verified = (scribe.blockchain.len() - 1) as u64;
-    blocks
-        .block_store
-        .mark_last_verified(last_verified)
-        .unwrap();
+    blocks.set_hashed_block_to_verified(&last_verified).unwrap();
 
-    assert!(blocks.get_balance(&some_acc, 20).is_ok());
+    assert!(blocks.get_account_balance(&some_acc, &20).is_ok());
 
     drop(blocks);
 
-    let mut blocks = Blocks::new_persistent(location);
-    blocks.load_from_store().unwrap();
-
+    let mut blocks = Blocks::new_persistent(location).unwrap();
     verify_balances(&scribe, &blocks, 0);
 
     // now load pruned
@@ -635,24 +670,22 @@ async fn load_from_store_test() {
         .try_prune(&Some((scribe.blockchain.len() - 11) as u64), 0)
         .unwrap();
 
-    assert!(blocks.get_verified_at(9).is_err());
-    assert!(blocks.get_verified_at(10).is_ok());
+    assert!(blocks.is_verified_by_idx(&9).is_err());
+    assert!(blocks.is_verified_by_idx(&10).unwrap());
     verify_balances(&scribe, &blocks, 10);
     // height 10 is the first block available for balance query, but not for
     // transaction search. Transaction search is available from 11
     let ledger = Arc::new(TestLedger::from_blockchain(blocks));
-    let req_handler = RosettaRequestHandler::new(ledger);
+    let req_handler = RosettaRequestHandler::new_with_default_blockchain(ledger);
     verify_account_search(&scribe, &req_handler, 11, last_verified).await;
 
     drop(req_handler);
 
-    let mut blocks = Blocks::new_persistent(location);
-    blocks.load_from_store().unwrap();
-
+    let blocks = Blocks::new_persistent(location).unwrap();
     verify_balances(&scribe, &blocks, 10);
 
     let ledger = Arc::new(TestLedger::from_blockchain(blocks));
-    let req_handler = RosettaRequestHandler::new(ledger);
+    let req_handler = RosettaRequestHandler::new_with_default_blockchain(ledger);
     verify_account_search(&scribe, &req_handler, 11, last_verified).await;
 
     let resp = req_handler
@@ -682,11 +715,11 @@ async fn load_unverified_test() {
     let location = tmpdir.path();
     let scribe = Scribe::new_with_sample_data(10, 150);
 
-    let mut blocks = Blocks::new_persistent(location);
+    let mut blocks = Blocks::new_persistent(location).unwrap();
     for hb in &scribe.blockchain {
-        blocks.add_block(hb.clone()).unwrap();
+        blocks.push(hb).unwrap();
         if hb.index < 20 {
-            blocks.block_store.mark_last_verified(hb.index).unwrap();
+            blocks.set_hashed_block_to_verified(&hb.index).unwrap();
         }
     }
 
@@ -694,26 +727,22 @@ async fn load_unverified_test() {
         .try_prune(&Some((scribe.blockchain.len() - 51) as u64), 0)
         .unwrap();
 
-    assert!(blocks.get_verified_at(49).is_err());
-    assert!(blocks.get_verified_at(50).is_err());
+    assert!(blocks.is_verified_by_idx(&49).is_err());
+    assert!(!blocks.is_verified_by_idx(&50).unwrap());
 
     drop(blocks);
 
-    let mut blocks = Blocks::new_persistent(location);
-    blocks.load_from_store().unwrap();
+    let blocks = Blocks::new_persistent(location).unwrap();
     let last_verified = (scribe.blockchain.len() - 1) as u64;
-    blocks
-        .block_store
-        .mark_last_verified(last_verified)
-        .unwrap();
+    blocks.set_hashed_block_to_verified(&last_verified).unwrap();
 
-    assert!(blocks.get_verified_at(49).is_err());
-    assert!(blocks.get_verified_at(50).is_ok());
+    assert!(blocks.is_verified_by_idx(&49).is_err());
+    assert!(blocks.is_verified_by_idx(&50).unwrap());
 
     verify_balances(&scribe, &blocks, 50);
 
     let ledger = Arc::new(TestLedger::from_blockchain(blocks));
-    let req_handler = RosettaRequestHandler::new(ledger);
+    let req_handler = RosettaRequestHandler::new_with_default_blockchain(ledger);
     verify_account_search(&scribe, &req_handler, 51, last_verified).await;
 }
 
@@ -724,48 +753,49 @@ async fn store_batch_test() {
     let location = tmpdir.path();
     let scribe = Scribe::new_with_sample_data(10, 150);
 
-    let mut blocks = Blocks::new_persistent(location);
+    let mut blocks = Blocks::new_persistent(location).unwrap();
     for hb in &scribe.blockchain {
         if hb.index < 21 {
-            blocks.add_block(hb.clone()).unwrap();
+            blocks.push(hb).unwrap();
         }
     }
 
     assert_eq!(
-        blocks.block_store.get_at(20).unwrap(),
+        blocks.get_hashed_block(&20).unwrap(),
         *scribe.blockchain.get(20).unwrap()
     );
-    assert!(blocks.block_store.get_at(21).is_err());
+    assert!(blocks.get_hashed_block(&21).ok().is_none());
 
     let mut part2: Vec<HashedBlock> = scribe.blockchain.iter().skip(21).cloned().collect();
 
     let mut part3 = part2.split_off(10);
     part3.push(scribe.blockchain.get(30).unwrap().clone()); // this will cause an error
 
-    blocks.add_blocks_batch(part2).unwrap();
-    assert_eq!(
-        blocks.block_store.get_at(30).unwrap(),
-        *scribe.blockchain.get(30).unwrap()
-    );
-    assert!(blocks.block_store.get_at(31).is_err());
+    blocks.push_batch(part2.clone()).unwrap();
 
-    assert!(blocks.add_blocks_batch(part3.clone()).is_err());
     assert_eq!(
-        blocks.block_store.get_at(30).unwrap(),
+        blocks.get_hashed_block(&30).unwrap(),
         *scribe.blockchain.get(30).unwrap()
     );
-    assert!(blocks.block_store.get_at(31).is_err());
+    assert!(blocks.get_hashed_block(&31).ok().is_none());
+
+    assert!(blocks.push_batch(part3.clone()).is_err());
+    assert_eq!(
+        blocks.get_hashed_block(&30).unwrap(),
+        *scribe.blockchain.get(30).unwrap()
+    );
+    assert!(blocks.get_hashed_block(&31).ok().is_none());
 
     part3.pop();
 
-    blocks.add_blocks_batch(part3).unwrap();
+    blocks.push_batch(part3).unwrap();
     let last_idx = scribe.blockchain.back().unwrap().index;
     assert_eq!(
-        blocks.block_store.get_at(last_idx).unwrap(),
+        blocks.get_hashed_block(&last_idx).unwrap(),
         *scribe.blockchain.back().unwrap()
     );
-    assert!(blocks.block_store.get_at(last_idx + 1).is_err());
+    assert!(blocks.get_hashed_block(&(last_idx + 1)).ok().is_none());
 
-    blocks.block_store.mark_last_verified(last_idx).unwrap();
+    blocks.set_hashed_block_to_verified(&last_idx).unwrap();
     verify_balances(&scribe, &blocks, 0);
 }

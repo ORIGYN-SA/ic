@@ -5,18 +5,17 @@ use ic_replicated_state::ReplicatedState;
 /// Traverses lazy tree using specified visitor.
 fn traverse_lazy_tree<'a, V: Visitor>(t: &LazyTree<'a>, v: &mut V) -> Result<(), V::Output> {
     match t {
-        LazyTree::Blob(b) => v.visit_blob(b),
+        LazyTree::Blob(b, _) => v.visit_blob(b),
         LazyTree::LazyBlob(thunk) => {
             let b = thunk();
             v.visit_blob(&b)
         }
         LazyTree::LazyFork(f) => {
             v.start_subtree()?;
-            for l in f.labels() {
+            for (l, t) in f.children() {
                 match v.enter_edge(l.as_bytes())? {
                     Control::Skip => continue,
                     Control::Continue => {
-                        let t = f.edge(&l).expect("fork edge disappeared");
                         traverse_lazy_tree(&t, v)?;
                     }
                 }
@@ -48,7 +47,8 @@ mod tests {
         test_visitors::{NoopVisitor, TraceEntry as E, TracingVisitor},
         CertificationVersion,
     };
-    use ic_base_types::NumSeconds;
+    use ic_base_types::{NumBytes, NumSeconds};
+    use ic_certification_version::CURRENT_CERTIFICATION_VERSION;
     use ic_registry_routing_table::{CanisterIdRange, RoutingTable};
     use ic_registry_subnet_features::SubnetFeatures;
     use ic_registry_subnet_type::SubnetType;
@@ -93,12 +93,8 @@ mod tests {
 
     #[test]
     fn test_traverse_empty_state() {
-        let tmpdir = tempfile::Builder::new().prefix("test").tempdir().unwrap();
-        let state = ReplicatedState::new_rooted_at(
-            subnet_test_id(1),
-            SubnetType::Application,
-            tmpdir.path().into(),
-        );
+        let mut state = ReplicatedState::new(subnet_test_id(1), SubnetType::Application);
+        state.metadata.certification_version = CURRENT_CERTIFICATION_VERSION;
         let visitor = TracingVisitor::new(NoopVisitor);
         assert_eq!(
             vec![
@@ -108,7 +104,7 @@ mod tests {
                 E::EndSubtree, // canisters
                 edge("metadata"),
                 E::VisitBlob(encode_metadata(SystemMetadata {
-                    id_counter: 0,
+                    id_counter: None,
                     prev_state_hash: None
                 })),
                 edge("request_status"),
@@ -143,12 +139,7 @@ mod tests {
             INITIAL_CYCLES,
             NumSeconds::from(100_000),
         );
-        let tmpdir = tempfile::Builder::new().prefix("test").tempdir().unwrap();
-        let mut state = ReplicatedState::new_rooted_at(
-            subnet_test_id(1),
-            SubnetType::Application,
-            tmpdir.path().into(),
-        );
+        let mut state = ReplicatedState::new(subnet_test_id(1), SubnetType::Application);
         state.put_canister_state(canister_state);
 
         let visitor = TracingVisitor::new(NoopVisitor);
@@ -163,7 +154,7 @@ mod tests {
                 E::EndSubtree, // canisters
                 edge("metadata"),
                 E::VisitBlob(encode_metadata(SystemMetadata {
-                    id_counter: 0,
+                    id_counter: Some(0),
                     prev_state_hash: None
                 })),
                 edge("request_status"),
@@ -183,7 +174,7 @@ mod tests {
         );
 
         // Test new certification version.
-        state.metadata.certification_version = 2;
+        state.metadata.certification_version = CURRENT_CERTIFICATION_VERSION;
         let visitor = TracingVisitor::new(NoopVisitor);
         assert_eq!(
             vec![
@@ -200,7 +191,7 @@ mod tests {
                 E::EndSubtree, // canisters
                 edge("metadata"),
                 E::VisitBlob(encode_metadata(SystemMetadata {
-                    id_counter: 0,
+                    id_counter: None,
                     prev_state_hash: None
                 })),
                 edge("request_status"),
@@ -235,24 +226,14 @@ mod tests {
             INITIAL_CYCLES,
             NumSeconds::from(100_000),
         );
-        let tmpdir = tempfile::Builder::new().prefix("test").tempdir().unwrap();
         let wasm_binary = WasmBinary::new(CanisterModule::new(vec![]));
         let wasm_binary_hash = wasm_binary.binary.module_hash();
-        let wasm_memory = Memory::new(PageMap::default(), NumWasmPages::from(2));
+        let wasm_memory = Memory::new(PageMap::new_for_testing(), NumWasmPages::from(2));
 
         let metadata = btreemap! {
-            String::from("dummy1") => CustomSection {
-                visibility: CustomSectionType::Private,
-                content: vec![0, 2],
-            },
-            String::from("dummy2") => CustomSection {
-                visibility: CustomSectionType::Public,
-                content: vec![2, 1],
-            },
-            String::from("dummy3") => CustomSection {
-                visibility: CustomSectionType::Public,
-                content: vec![8, 9],
-            },
+            String::from("dummy1") => CustomSection::new(CustomSectionType::Private, vec![0, 2]),
+            String::from("dummy2") => CustomSection::new(CustomSectionType::Public, vec![2, 1]),
+            String::from("dummy3") => CustomSection::new(CustomSectionType::Public, vec![8, 9]),
         };
 
         let execution_state = ExecutionState {
@@ -260,7 +241,7 @@ mod tests {
             session_nonce: None,
             wasm_binary,
             wasm_memory,
-            stable_memory: Memory::default(),
+            stable_memory: Memory::new_for_testing(),
             exported_globals: vec![Global::I32(1)],
             exports: ExportedFunctions::new(BTreeSet::new()),
             metadata: WasmMetadata::new(metadata),
@@ -268,11 +249,7 @@ mod tests {
         };
         canister_state.execution_state = Some(execution_state);
 
-        let mut state = ReplicatedState::new_rooted_at(
-            subnet_test_id(1),
-            SubnetType::Application,
-            tmpdir.path().into(),
-        );
+        let mut state = ReplicatedState::new(subnet_test_id(1), SubnetType::Application);
         state.put_canister_state(canister_state);
 
         let visitor = TracingVisitor::new(NoopVisitor);
@@ -289,7 +266,7 @@ mod tests {
                 E::EndSubtree, // canisters
                 edge("metadata"),
                 E::VisitBlob(encode_metadata(SystemMetadata {
-                    id_counter: 0,
+                    id_counter: Some(0),
                     prev_state_hash: None
                 })),
                 edge("request_status"),
@@ -309,7 +286,7 @@ mod tests {
         );
 
         // Test new certification version.
-        state.metadata.certification_version = 2;
+        state.metadata.certification_version = CertificationVersion::V2;
         let visitor = TracingVisitor::new(NoopVisitor);
         assert_eq!(
             vec![
@@ -330,7 +307,7 @@ mod tests {
                 E::EndSubtree, // canisters
                 edge("metadata"),
                 E::VisitBlob(encode_metadata(SystemMetadata {
-                    id_counter: 0,
+                    id_counter: Some(0),
                     prev_state_hash: None
                 })),
                 edge("request_status"),
@@ -350,7 +327,7 @@ mod tests {
         );
 
         // Test new certification version.
-        state.metadata.certification_version = 6;
+        state.metadata.certification_version = CURRENT_CERTIFICATION_VERSION;
         let visitor = TracingVisitor::new(NoopVisitor);
         assert_eq!(
             vec![
@@ -380,7 +357,7 @@ mod tests {
                 E::EndSubtree, // canisters
                 edge("metadata"),
                 E::VisitBlob(encode_metadata(SystemMetadata {
-                    id_counter: 0,
+                    id_counter: None,
                     prev_state_hash: None
                 })),
                 edge("request_status"),
@@ -417,12 +394,8 @@ mod tests {
             StreamIndex::new(11),
         );
 
-        let tmpdir = tempfile::Builder::new().prefix("test").tempdir().unwrap();
-        let mut state = ReplicatedState::new_rooted_at(
-            subnet_test_id(1),
-            SubnetType::Application,
-            tmpdir.path().into(),
-        );
+        let mut state = ReplicatedState::new(subnet_test_id(1), SubnetType::Application);
+        state.metadata.certification_version = CURRENT_CERTIFICATION_VERSION;
         state.modify_streams(move |streams| {
             streams.insert(subnet_test_id(5), stream);
         });
@@ -436,7 +409,7 @@ mod tests {
                 E::EndSubtree, // canisters
                 edge("metadata"),
                 E::VisitBlob(encode_metadata(SystemMetadata {
-                    id_counter: 0,
+                    id_counter: None,
                     prev_state_hash: None
                 })),
                 edge("request_status"),
@@ -449,7 +422,7 @@ mod tests {
                 edge("header"),
                 E::VisitBlob(encode_stream_header(
                     &header,
-                    CertificationVersion::try_from(state.metadata.certification_version).unwrap(),
+                    state.metadata.certification_version,
                 )),
                 edge("messages"),
                 E::StartSubtree,
@@ -472,59 +445,70 @@ mod tests {
         use crate::subtree_visitor::{Pattern, SubtreeVisitor};
         use ic_error_types::{ErrorCode, UserError};
         use ic_test_utilities::types::ids::{message_test_id, subnet_test_id, user_test_id};
-        use ic_types::ingress::{IngressStatus, WasmResult};
+        use ic_types::ingress::{IngressState, IngressStatus, WasmResult};
 
         let user_id = user_test_id(1);
         let canister_id = canister_test_id(1);
         let time = mock_time();
-        let mut state = ReplicatedState::new_rooted_at(
-            subnet_test_id(1),
-            SubnetType::Application,
-            "/test".into(),
+        let mut state = ReplicatedState::new(subnet_test_id(1), SubnetType::Application);
+        state.metadata.certification_version = CURRENT_CERTIFICATION_VERSION;
+        state.set_ingress_status(
+            message_test_id(1),
+            IngressStatus::Unknown,
+            NumBytes::from(u64::MAX),
         );
-        state.set_ingress_status(message_test_id(1), IngressStatus::Unknown);
         state.set_ingress_status(
             message_test_id(2),
-            IngressStatus::Processing {
+            IngressStatus::Known {
                 receiver: canister_id.get(),
                 user_id,
                 time,
+                state: IngressState::Processing,
             },
+            NumBytes::from(u64::MAX),
         );
         state.set_ingress_status(
             message_test_id(3),
-            IngressStatus::Received {
+            IngressStatus::Known {
                 receiver: canister_id.get(),
                 user_id,
                 time,
+                state: IngressState::Received,
             },
+            NumBytes::from(u64::MAX),
         );
         state.set_ingress_status(
             message_test_id(4),
-            IngressStatus::Failed {
+            IngressStatus::Known {
                 receiver: canister_id.get(),
                 user_id,
-                error: UserError::new(ErrorCode::SubnetOversubscribed, "subnet oversubscribed"),
                 time,
+                state: IngressState::Failed(UserError::new(
+                    ErrorCode::SubnetOversubscribed,
+                    "subnet oversubscribed",
+                )),
             },
+            NumBytes::from(u64::MAX),
         );
         state.set_ingress_status(
             message_test_id(5),
-            IngressStatus::Completed {
+            IngressStatus::Known {
                 receiver: canister_id.get(),
                 user_id,
-                result: WasmResult::Reply(b"reply".to_vec()),
                 time,
+                state: IngressState::Completed(WasmResult::Reply(b"reply".to_vec())),
             },
+            NumBytes::from(u64::MAX),
         );
         state.set_ingress_status(
             message_test_id(6),
-            IngressStatus::Completed {
+            IngressStatus::Known {
                 receiver: canister_id.get(),
                 user_id,
-                result: WasmResult::Reject("reject".to_string()),
                 time,
+                state: IngressState::Completed(WasmResult::Reject("reject".to_string())),
             },
+            NumBytes::from(u64::MAX),
         );
 
         let pattern = Pattern::match_only("request_status", Pattern::all());
@@ -590,13 +574,8 @@ mod tests {
 
     #[test]
     fn test_traverse_time() {
-        let tmpdir = tempfile::Builder::new().prefix("test").tempdir().unwrap();
-        let mut state = ReplicatedState::new_rooted_at(
-            subnet_test_id(1),
-            SubnetType::Application,
-            tmpdir.path().into(),
-        );
-
+        let mut state = ReplicatedState::new(subnet_test_id(1), SubnetType::Application);
+        state.metadata.certification_version = CURRENT_CERTIFICATION_VERSION;
         state.metadata.batch_time += Duration::new(1, 123456789);
 
         let visitor = TracingVisitor::new(NoopVisitor);
@@ -608,7 +587,7 @@ mod tests {
                 E::EndSubtree, // canisters
                 edge("metadata"),
                 E::VisitBlob(encode_metadata(SystemMetadata {
-                    id_counter: 0,
+                    id_counter: None,
                     prev_state_hash: None
                 })),
                 edge("request_status"),
@@ -630,12 +609,7 @@ mod tests {
 
     #[test]
     fn test_traverse_subnet() {
-        let tmpdir = tempfile::Builder::new().prefix("test").tempdir().unwrap();
-        let mut state = ReplicatedState::new_rooted_at(
-            subnet_test_id(1),
-            SubnetType::Application,
-            tmpdir.path().into(),
-        );
+        let mut state = ReplicatedState::new(subnet_test_id(1), SubnetType::Application);
 
         state.metadata.network_topology.subnets = btreemap! {
             subnet_test_id(0) => SubnetTopology {
@@ -643,12 +617,14 @@ mod tests {
                 nodes: btreemap!{},
                 subnet_type: SubnetType::Application,
                 subnet_features: SubnetFeatures::default(),
+                ecdsa_keys_held: BTreeSet::new(),
             },
             subnet_test_id(1) => SubnetTopology {
                 public_key: vec![5, 6, 7, 8],
                 nodes: btreemap!{},
                 subnet_type: SubnetType::Application,
                 subnet_features: SubnetFeatures::default(),
+                ecdsa_keys_held: BTreeSet::new(),
             }
         };
         fn id_range(from: u64, to: u64) -> CanisterIdRange {
@@ -667,7 +643,7 @@ mod tests {
         );
 
         let visitor = TracingVisitor::new(NoopVisitor);
-        state.metadata.certification_version = 2;
+        state.metadata.certification_version = CertificationVersion::V2;
         assert_eq!(
             vec![
                 E::StartSubtree,
@@ -676,7 +652,7 @@ mod tests {
                 E::EndSubtree, // canisters
                 edge("metadata"),
                 E::VisitBlob(encode_metadata(SystemMetadata {
-                    id_counter: 0,
+                    id_counter: Some(0),
                     prev_state_hash: None
                 })),
                 edge("request_status"),
@@ -705,9 +681,9 @@ mod tests {
             traverse(&state, visitor).0
         );
 
-        let patter = Pattern::match_only("subnet", Pattern::all());
-        let visitor = SubtreeVisitor::new(&patter, TracingVisitor::new(NoopVisitor));
-        state.metadata.certification_version = 3;
+        let pattern = Pattern::match_only("subnet", Pattern::all());
+        let visitor = SubtreeVisitor::new(&pattern, TracingVisitor::new(NoopVisitor));
+        state.metadata.certification_version = CURRENT_CERTIFICATION_VERSION;
         assert_eq!(
             vec![
                 E::StartSubtree,

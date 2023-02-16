@@ -1,0 +1,22 @@
+load("@rules_rust//rust:defs.bzl", "rust_library", "rust_test")
+
+package(default_visibility = ["//visibility:public"])
+
+DEPENDENCIES = [
+    "//rs/types/types",
+    "@crate_index//:http",
+]
+
+rust_library(
+    name = "uri",
+    srcs = glob(["src/**"]),
+    crate_name = "ic_xnet_uri",
+    version = "0.8.0",
+    deps = DEPENDENCIES,
+)
+
+rust_test(
+    name = "uri_test",
+    crate = ":uri",
+    deps = DEPENDENCIES,
+)

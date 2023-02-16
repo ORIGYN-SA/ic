@@ -1,6 +1,9 @@
 use dfn_candid::candid_one;
 use ic_base_types::NodeId;
-use ic_canister_client::Sender;
+use ic_canister_client_sender::Sender;
+use ic_nervous_system_common_test_keys::{
+    TEST_NEURON_1_OWNER_KEYPAIR, TEST_NEURON_1_OWNER_PRINCIPAL,
+};
 use ic_nns_common::{types::NeuronId, types::ProposalId};
 use ic_nns_governance::pb::v1::{
     add_or_remove_node_provider::Change,
@@ -10,12 +13,13 @@ use ic_nns_governance::pb::v1::{
     AddOrRemoveNodeProvider, ManageNeuron, ManageNeuronResponse, NnsFunction, NodeProvider,
     Proposal, ProposalStatus,
 };
-use ic_nns_test_keys::{TEST_NEURON_1_OWNER_KEYPAIR, TEST_NEURON_1_OWNER_PRINCIPAL};
 use ic_nns_test_utils::{
+    common::NnsInitPayloadsBuilder,
     governance::{submit_external_update_proposal, wait_for_final_state},
     ids::TEST_NEURON_1_ID,
-    itest_helpers::{local_test_on_nns_subnet, NnsCanisters, NnsInitPayloadsBuilder},
-    registry::{get_value, prepare_add_node_payload},
+    itest_helpers::{local_test_on_nns_subnet, NnsCanisters},
+    registry::get_value,
+    registry::{get_value_or_panic, prepare_add_node_payload},
 };
 use ic_protobuf::registry::node::v1::NodeRecord;
 use ic_registry_keys::make_node_record_key;
@@ -91,6 +95,7 @@ fn test_add_and_remove_nodes_from_registry() {
             node_provider_principal_id: Some(*TEST_NEURON_1_OWNER_PRINCIPAL),
             dc_id: "AN1".into(),
             rewardable_nodes: BTreeMap::new(),
+            ipv6: Some("0:0:0:0:0:0:0:0".into()),
         };
 
         submit_external_update_proposal(
@@ -116,7 +121,7 @@ fn test_add_and_remove_nodes_from_registry() {
             .await
             .unwrap();
 
-        let node_record = get_value::<NodeRecord>(
+        let node_record = get_value_or_panic::<NodeRecord>(
             &nns_canisters.registry,
             make_node_record_key(node_id).as_bytes(),
         )
@@ -161,11 +166,7 @@ fn test_add_and_remove_nodes_from_registry() {
         )
         .await;
         // Check if record is removed
-        assert!(
-            node_record.http.is_none(),
-            "node_record : {:?}",
-            node_record
-        );
+        assert!(node_record.is_none(), "node_record : {:?}", node_record);
 
         Ok(())
     });

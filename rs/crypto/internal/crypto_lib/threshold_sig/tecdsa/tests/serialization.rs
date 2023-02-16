@@ -17,12 +17,12 @@ fn verify_data(tag: String, expected: &str, serialized: &[u8]) {
         of the tECDSA artifacts), then comment out the below assert, uncomment
         the println, and then run
 
-        $ cargo test verify_serialization_remains_unchanged_over_time -- --nocapture | grep ^perl | parallel -j1
+        $ cargo test verify_protocol_output_remains_unchanged_over_time -- --nocapture | grep ^perl | parallel -j1
 
         which will update this file with the produced values.
          */
         assert_eq!(hex_encoding, expected, "{}", tag);
-        //println!("perl -pi -e s/{}/{}/g tests/serialization.rs", expected, hex_encoding);
+        // println!("perl -pi -e s/{}/{}/g tests/serialization.rs", expected, hex_encoding);
     }
 }
 
@@ -74,7 +74,7 @@ fn check_shares(
 }
 
 #[test]
-fn verify_serialization_remains_unchanged_over_time() -> Result<(), ThresholdEcdsaError> {
+fn verify_protocol_output_remains_unchanged_over_time() -> Result<(), ThresholdEcdsaError> {
     let nodes = 5;
     let threshold = 2;
 
@@ -91,70 +91,70 @@ fn verify_serialization_remains_unchanged_over_time() -> Result<(), ThresholdEcd
     check_dealings(
         "key",
         &setup.key,
-        "3b1651f91235bea0",
-        "dcb0d33a0444c4da",
+        "807f3b29bcc421d0",
+        "623080845e685b35",
         &[
-            (0, "ec4517ab6561913c"),
-            (1, "56aa35ae8874e3a9"),
-            (2, "da4b52b0e8b28c56"),
-            (3, "ace0b7dc54ce98f9"),
-            (4, "c170456f46da7ef8"),
+            (0, "e7b8624cab606930"),
+            (1, "cddb63df18157ad5"),
+            (2, "0ac600f863097584"),
+            (3, "4dac6c3962e19dce"),
+            (4, "cedbbc9aaaf2d96d"),
         ],
     )?;
 
     check_dealings(
         "key*lambda",
         &setup.key_times_lambda,
-        "00dd83ba807ddb8b",
-        "fb73e2b787bed6a8",
+        "bd4aef1e3a7e276c",
+        "4b7f2a867ae0bcc9",
         &[
-            (0, "2919ed5ef005e24d"),
-            (1, "d13d75c5ba452aa7"),
-            (2, "051966db42301a4f"),
-            (3, "8046613091b60bc4"),
-            (4, "073a46541f43daa5"),
+            (0, "22ac5e63a4173871"),
+            (1, "18886ac194f10ad5"),
+            (2, "d94fdc34c13dd05d"),
+            (3, "08358b27f6b1a468"),
+            (4, "7a98c577d0d60157"),
         ],
     )?;
 
     check_dealings(
         "lambda",
         &setup.lambda,
-        "072e2cc0b419ed05",
-        "12bdfac755057274",
+        "aba9665ec91be63f",
+        "f1ad398f50c227bb",
         &[
-            (0, "983683af4ffedddc"),
-            (1, "f59f3afe3a5734a8"),
-            (2, "808030e98d7f2a65"),
-            (3, "571c30277c76871a"),
-            (4, "4b0a9b482900ae06"),
+            (0, "50263c87c5e40a97"),
+            (1, "b373947bc56351f1"),
+            (2, "89a5675e9da945c1"),
+            (3, "f29909f897055378"),
+            (4, "54dc1c1d08b43c1c"),
         ],
     )?;
 
     check_dealings(
         "kappa",
         &setup.kappa,
-        "2ded0f153929b9f0",
-        "44f5c86382cc479c",
+        "edb74de7f815bac2",
+        "bc499e84a8fcc8f7",
         &[
-            (0, "9cae036e691c746c"),
-            (1, "cae56922b4ffdb34"),
-            (2, "8aa27cb2732f560f"),
-            (3, "0dab338fe09c4b91"),
-            (4, "e8c8dde553e9b676"),
+            (0, "d995b6d7b09b03e5"),
+            (1, "93a704077bfdcee3"),
+            (2, "8142af1b57f13b37"),
+            (3, "d334beb1a1c7eecd"),
+            (4, "83ac317a94224d0b"),
         ],
     )?;
 
     check_dealings(
         "kappa*lambda",
         &setup.kappa_times_lambda,
-        "fead521acec68d9d",
-        "0400f8b432760ed3",
+        "2e1b78f8e8eeed00",
+        "9857c340a75e717a",
         &[
-            (0, "43b424974b8d6ae5"),
-            (1, "21bd4b7f691d8236"),
-            (2, "ac5b0f9cf7ed2ee7"),
-            (3, "062cf5b78c206495"),
-            (4, "4a4c88f1f8fe8ee1"),
+            (0, "a7ea009231aae6d7"),
+            (1, "d915e472ed668d5e"),
+            (2, "f40eba254efcd63d"),
+            (3, "2198c38ec025e544"),
+            (4, "4d3a0efca97fbab1"),
         ],
     )?;
 
@@ -171,11 +171,11 @@ fn verify_serialization_remains_unchanged_over_time() -> Result<(), ThresholdEcd
     check_shares(
         &shares,
         &[
-            (0, "6a61b6e3df84bb14"),
-            (1, "b5ac8f25f0214b8b"),
-            (2, "3e0fe141356581f1"),
-            (3, "dec2319a9f4cb630"),
-            (4, "2742a17e8238f394"),
+            (0, "a5828d246e927eae"),
+            (1, "b5add43f02086e16"),
+            (2, "743a39c677fc02d3"),
+            (3, "d4d7a73a628c8391"),
+            (4, "4dfe21a4e768bda5"),
         ],
     )?;
 
@@ -183,9 +183,67 @@ fn verify_serialization_remains_unchanged_over_time() -> Result<(), ThresholdEcd
 
     verify_data(
         "signature".to_string(),
-        "1aac78183716fd7c",
+        "ebe9b02e33da8224",
         &sig.serialize(),
     );
+
+    Ok(())
+}
+
+#[test]
+fn verify_fixed_serialization_continues_to_be_accepted() -> Result<(), ThresholdEcdsaError> {
+    let dealing_bits = [
+        include_str!("data/dealing_random.hex"),
+        include_str!("data/dealing_reshare_of_masked.hex"),
+        include_str!("data/dealing_reshare_of_unmasked.hex"),
+        include_str!("data/dealing_multiply.hex"),
+    ];
+
+    for dealing_encoding in dealing_bits {
+        let dealing_encoding = hex::decode(dealing_encoding).expect("Invalid hex");
+        let _dealing = IDkgDealingInternal::deserialize(&dealing_encoding)
+            .expect("Was unable to deserialize a fixed dealing encoding");
+    }
+
+    let transcript_bits = [
+        include_str!("data/transcript_random.hex"),
+        include_str!("data/transcript_reshare_of_masked.hex"),
+        include_str!("data/transcript_reshare_of_unmasked.hex"),
+        include_str!("data/transcript_multiply.hex"),
+    ];
+
+    for transcript_encoding in transcript_bits {
+        let transcript_encoding = hex::decode(transcript_encoding).expect("Invalid hex");
+        let _transcript = IDkgTranscriptInternal::deserialize(&transcript_encoding)
+            .expect("Was unable to deserialize a fixed transcript encoding");
+    }
+
+    let opening_bits = [
+        include_str!("data/opening_simple.hex"),
+        include_str!("data/opening_pedersen.hex"),
+    ];
+
+    for opening_encoding in opening_bits {
+        let opening_encoding = hex::decode(opening_encoding).expect("Invalid hex");
+        let _opening = CommitmentOpening::deserialize(&opening_encoding)
+            .expect("Was unable to deserialize a fixed opening encoding");
+    }
+
+    let complaint_bits = [include_str!("data/complaint.hex")];
+
+    for complaint_encoding in complaint_bits {
+        let complaint_encoding = hex::decode(complaint_encoding).expect("Invalid hex");
+        let _complaint = IDkgComplaintInternal::deserialize(&complaint_encoding)
+            .expect("Was unable to deserialize a fixed complaint encoding");
+    }
+
+    let sig_share_bits = [include_str!("data/sig_share.hex")];
+
+    for sig_share_encoding in sig_share_bits {
+        let sig_share_encoding = hex::decode(sig_share_encoding).expect("Invalid hex");
+        let _sig_share = ThresholdEcdsaSigShareInternal::deserialize(&sig_share_encoding)
+            .expect("Was unable to deserialize a fixed sig_share encoding");
+    }
 
     Ok(())
 }

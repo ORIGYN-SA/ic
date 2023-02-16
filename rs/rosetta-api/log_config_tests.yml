@@ -16,5 +16,7 @@ loggers:
   # Raise the log level for our logs
   ic_rosetta_api:
     level: warn
+  ic_ledger_canister_blocks_synchronizer:
+    level: warn
   rosetta_api_tests:
     level: warn

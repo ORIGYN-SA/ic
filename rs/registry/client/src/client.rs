@@ -1,27 +1,22 @@
 //! Implementation of the registry client. Calls to the API always return
 //! immediately. The provided data provider is polled periodically in the
 //! background when start_polling() is called.
+use crossbeam_channel::{RecvTimeoutError, Sender, TrySendError};
 pub use ic_config::registry_client::DataProviderConfig;
-pub use ic_interfaces::registry::{
+pub use ic_interfaces_registry::{
     empty_zero_registry_record, RegistryClient, RegistryClientVersionedResult,
     RegistryDataProvider, RegistryTransportRecord, POLLING_PERIOD, ZERO_REGISTRY_VERSION,
 };
 use ic_metrics::MetricsRegistry;
-use ic_registry_common::local_store::LocalStoreImpl;
-use ic_registry_common::{
-    data_provider::{CertifiedNnsDataProvider, NnsDataProvider},
-    registry::RegistryCanister,
-};
-use ic_registry_proto_data_provider::ProtoRegistryDataProvider;
 pub use ic_types::{
     crypto::threshold_sig::ThresholdSigPublicKey,
     registry::{RegistryClientError, RegistryDataProviderError},
     time::current_time,
     RegistryVersion, Time,
 };
-use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicBool, Ordering};
+use ic_utils::thread::JoinOnDrop;
 use std::sync::{Arc, RwLock, RwLockReadGuard};
+use std::{collections::BTreeMap, thread::JoinHandle};
 
 use crate::metrics::Metrics;
 
@@ -30,12 +25,10 @@ pub struct RegistryClientImpl {
     cache: Arc<RwLock<CacheState>>,
     data_provider: Arc<dyn RegistryDataProvider>,
     metrics: Arc<Metrics>,
-    started: Arc<AtomicBool>,
-    cancelled: Arc<AtomicBool>,
+    poll_thread: Arc<RwLock<Option<PollThread>>>,
 }
 
-/// RegistryClientImpl polls the registry on the NNS subnet and caches the
-/// responses.
+/// RegistryClientImpl polls the data provider and caches the received results.
 impl RegistryClientImpl {
     /// Creates a new instance of the RegistryClient.
     pub fn new(
@@ -51,8 +44,7 @@ impl RegistryClientImpl {
             cache: Arc::new(RwLock::new(CacheState::new())),
             data_provider,
             metrics,
-            started: Arc::new(AtomicBool::new(false)),
-            cancelled: Arc::new(AtomicBool::new(false)),
+            poll_thread: Arc::new(RwLock::new(None)),
         }
     }
 
@@ -60,20 +52,27 @@ impl RegistryClientImpl {
     /// spawned that continuously polls for updates.
     /// The background task is stopped when the object is dropped.
     pub fn fetch_and_start_polling(&self) -> Result<(), RegistryClientError> {
-        if self.started.swap(true, Ordering::Relaxed) {
+        let mut cancel_sig_lock = self.poll_thread.write().unwrap();
+        if cancel_sig_lock.is_some() {
             return Err(RegistryClientError::PollLockFailed {
                 error: "'fetch_and_start_polling' already called".to_string(),
             });
         }
         self.poll_once()?;
-        let cancelled = Arc::clone(&self.cancelled);
+
+        let (cancel_sig_sender, cancel_sig_receiver) = crossbeam_channel::bounded::<()>(1);
         let self_ = self.clone();
-        tokio::spawn(async move {
-            while !cancelled.load(Ordering::Relaxed) {
-                tokio::time::sleep(POLLING_PERIOD).await;
-                if let Ok(()) = self_.poll_once() {}
-            }
-        });
+        let join_handle = std::thread::Builder::new()
+            .name("RegistryClient_Thread".to_string())
+            .spawn(move || {
+                while Err(RecvTimeoutError::Timeout)
+                    == cancel_sig_receiver.recv_timeout(POLLING_PERIOD)
+                {
+                    if let Ok(()) = self_.poll_once() {}
+                }
+            })
+            .expect("Could not spawn background thread.");
+        *cancel_sig_lock = Some(PollThread::new(cancel_sig_sender, join_handle));
 
         Ok(())
     }
@@ -153,36 +152,28 @@ impl RegistryClientImpl {
     }
 }
 
-impl Drop for RegistryClientImpl {
-    fn drop(&mut self) {
-        self.cancelled.fetch_or(true, Ordering::Relaxed);
+struct PollThread {
+    cancel_sig_sender: Sender<()>,
+    _join_handle: JoinOnDrop<()>,
+}
+
+impl PollThread {
+    fn new(cancel_sig_sender: Sender<()>, join_handle: JoinHandle<()>) -> Self {
+        Self {
+            cancel_sig_sender,
+            _join_handle: JoinOnDrop::new(join_handle),
+        }
     }
 }
 
-/// Instantiate a data provider from a `DataProviderConfig`. In case of
-/// `DataProviderConfig::Bootstrap` and
-/// `DataProviderConfig::RegistryCanisterUrl`, a corresponding
-/// `ThresholdSigPublicKey` can be provided to verify certified updates provided
-/// by the registry canister.
-pub fn create_data_provider(
-    data_provider_config: &DataProviderConfig,
-    optional_nns_public_key: Option<ThresholdSigPublicKey>,
-) -> Arc<dyn RegistryDataProvider> {
-    match data_provider_config {
-        DataProviderConfig::RegistryCanisterUrl(url) => {
-            let registry_canister = RegistryCanister::new(url.clone());
-            match optional_nns_public_key {
-                Some(nns_pk) => Arc::new(CertifiedNnsDataProvider::new(registry_canister, nns_pk)),
-                None => Arc::new(NnsDataProvider::new(registry_canister)),
-            }
-        }
-        DataProviderConfig::ProtobufFile(path) => {
-            Arc::new(ProtoRegistryDataProvider::load_from_file(path))
-        }
-        DataProviderConfig::Bootstrap { .. } => {
-            panic!("The Bootstrap Registry Data Provider is deprecated!")
-        }
-        DataProviderConfig::LocalStore(path) => Arc::new(LocalStoreImpl::new(path)),
+impl Drop for PollThread {
+    // The drop handler of PollThread gets called before the drop handler of its
+    // fields. Hence, the thread is joined after the signal is sent.
+    fn drop(&mut self) {
+        match self.cancel_sig_sender.try_send(()) {
+            Ok(()) | Err(TrySendError::Disconnected(_)) => {}
+            e => e.expect("Could not send cancellation signal."),
+        };
     }
 }
 
@@ -365,12 +356,12 @@ impl RegistryDataProvider for EmptyRegistryDataProvider {
 mod tests {
     use super::*;
     use assert_matches::assert_matches;
-    use ic_interfaces::registry::ZERO_REGISTRY_VERSION;
+    use ic_interfaces_registry::ZERO_REGISTRY_VERSION;
     use ic_registry_client_helpers::test_proto::TestProtoHelper;
     use ic_registry_common_proto::pb::test_protos::v1::TestProto;
     use ic_registry_proto_data_provider::ProtoRegistryDataProvider;
     use std::collections::HashSet;
-    use std::sync::atomic::AtomicUsize;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, RwLock};
     use std::time::Duration;
 
@@ -527,8 +518,8 @@ mod tests {
         assert!(get("B2", 7).is_err());
     }
 
-    #[tokio::test]
-    async fn start_polling_actually_polls_data_provider() {
+    #[test]
+    fn start_polling_actually_polls_data_provider() {
         let data_provider = Arc::new(FakeDataProvider {
             poll_counter: Arc::new(AtomicUsize::new(0)),
         });
@@ -537,7 +528,7 @@ mod tests {
         if let Err(e) = registry.fetch_and_start_polling() {
             panic!("fetch_and_start_polling failed: {}", e);
         }
-        tokio::time::sleep(Duration::from_secs(1)).await;
+        std::thread::sleep(Duration::from_secs(1));
         std::mem::drop(registry);
 
         assert!(data_provider.poll_counter.load(Ordering::Relaxed) > 0);
@@ -625,7 +616,7 @@ mod tests {
     }
     #[cfg(test)]
     mod metrics {
-        use ic_test_utilities::metrics::fetch_int_gauge;
+        use ic_test_utilities_metrics::fetch_int_gauge;
 
         use super::*;
 

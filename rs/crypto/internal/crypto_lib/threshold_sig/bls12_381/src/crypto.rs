@@ -5,20 +5,15 @@ use super::types::{
     Polynomial, PublicCoefficients, SecretKey, Signature,
 };
 use crate::api::dkg_errors::InvalidArgumentError;
-use ic_crypto_internal_bls12381_common::hash_to_g1;
 
 use crate::types::PublicKey;
-use bls12_381::{Bls12, G1Projective, G2Affine, G2Projective, Scalar};
+use ic_crypto_internal_bls12_381_type::{verify_bls_signature, G1Projective, G2Affine, Scalar};
+use ic_crypto_internal_seed::Seed;
 use ic_crypto_internal_types::sign::threshold_sig::public_key::bls12_381::PublicKeyBytes;
 use ic_types::{
     crypto::{AlgorithmId, CryptoError, CryptoResult},
-    NodeIndex, NumberOfNodes, Randomness,
+    NodeIndex, NumberOfNodes,
 };
-use pairing::Engine;
-use rand_chacha::ChaChaRng;
-use rand_core::SeedableRng;
-use std::convert::TryFrom;
-use std::ops::AddAssign;
 
 /// Domain separator for Hash-to-G1 to be used for signature generation as
 /// as specified in the Basic ciphersuite in https://tools.ietf.org/html/draft-irtf-cfrg-bls-signature-04#section-4.2.1
@@ -26,8 +21,8 @@ const DOMAIN_HASH_MSG_TO_G1_BLS12381_SIG: &[u8; 43] =
     b"BLS_SIG_BLS12381G1_XMD:SHA-256_SSWU_RO_NUL_";
 
 /// Hashes `msg` to a point in `G1`.
-pub fn hash_message_to_g1(msg: &[u8]) -> G1Projective {
-    hash_to_g1(&DOMAIN_HASH_MSG_TO_G1_BLS12381_SIG[..], msg)
+fn hash_message_to_g1(msg: &[u8]) -> G1Projective {
+    G1Projective::hash(&DOMAIN_HASH_MSG_TO_G1_BLS12381_SIG[..], msg)
 }
 
 #[cfg(test)]
@@ -43,12 +38,9 @@ pub fn public_key_from_secret_key(secret_key: &SecretKey) -> PublicKey {
 ///
 /// The polynomial `f(x)` is computed at a value `x` for every share of a
 /// threshold key. Shares are ordered and numbered `0...N`.
-pub fn x_for_index(index: NodeIndex) -> Scalar {
+pub(crate) fn x_for_index(index: NodeIndex) -> Scalar {
     // It is important that this is never zero and that values are unique.
-    let value: [u64; 4] = [index as u64, 0, 0, 0];
-    let mut ans = Scalar::from_raw(value);
-    ans += Scalar::one();
-    ans
+    Scalar::from_u64(u64::from(index)) + Scalar::one()
 }
 
 /// Generates keys for a (t,n)-threshold signature scheme.
@@ -71,30 +63,29 @@ pub fn x_for_index(index: NodeIndex) -> Scalar {
 ///   It must be treated as a secret.
 /// * `threshold` - the minimum number of individual signatures that can be
 ///   combined into a valid threshold signature.
-/// * `share_indices` - a vector with one entry per receiver.  The entry is true
-///   iff the receiver is eligible to receive a threshold key.
+/// * `receivers` - the number of receivers
 ///
 /// # Errors
 /// * `InvalidArgumentError` if
-///   - The number of share indices is too large to be stored as type
+///   - The number of receivers is too large to be stored as type
 ///     `NumberOfNodes`.
 ///   - The number of eligible receivers is below the threshold; under these
 ///     circumstances the receivers could never generate a valid threshold key.
-pub fn keygen(
-    seed: Randomness,
+pub(crate) fn generate_threshold_key(
+    seed: Seed,
     threshold: NumberOfNodes,
-    share_indices: &[bool],
-) -> Result<(PublicCoefficients, Vec<Option<SecretKey>>), InvalidArgumentError> {
-    verify_keygen_args(threshold, share_indices)?;
-    let mut rng = ChaChaRng::from_seed(seed.get());
+    receivers: NumberOfNodes,
+) -> Result<(PublicCoefficients, Vec<SecretKey>), InvalidArgumentError> {
+    verify_keygen_args(threshold, receivers)?;
+    let mut rng = seed.into_rng();
     let polynomial = Polynomial::random(threshold.get() as usize, &mut rng);
-    Ok(keygen_from_polynomial(polynomial, share_indices))
+    Ok(keygen_from_polynomial(polynomial, receivers))
 }
 
-/// Generates keys for a (t,n)-threshold signature scheme, using an existing
+/// Generates keys for a (t,n)-threshold signature scheme, resharing an existing
 /// secret key.
 ///
-/// This method is identical to `keygen(..)` except that the threshold secret
+/// This method is identical to `generate_threshold_key(..)` except that the threshold secret
 /// key is specified (i.e. the constant term of the randomly-generated
 /// polynomial is set to `secret`).
 ///
@@ -102,9 +93,8 @@ pub fn keygen(
 /// * `seed` - randomness used to seed the PRNG for generating the polynomial.
 ///   It must be treated as a secret.
 /// * `threshold` - the minimum number of individual signatures that can be
-///   combined into a valid threshold signature.
-/// * `share_indices` - a vector with one entry per receiver.  The entry is true
-///   iff the receiver is eligible to receive a threshold key.
+///   combined into a valid threshold signature. (aka, t)
+/// * `receivers` - the number of receivers (aka, n)
 /// * `secret` - an existing secret key, which is to be shared.
 ///
 /// # Errors
@@ -114,14 +104,13 @@ pub fn keygen(
 /// * The number of eligible receivers is below the threshold; under these
 ///   circumstances the receivers could never generate a valid threshold key.
 /// * The `threshold` is `0`.
-#[allow(unused)]
-pub fn keygen_with_secret(
-    seed: Randomness,
+pub(crate) fn threshold_share_secret_key(
+    seed: Seed,
     threshold: NumberOfNodes,
-    share_indices: &[bool],
+    receivers: NumberOfNodes,
     secret: &SecretKey,
-) -> Result<(PublicCoefficients, Vec<Option<SecretKey>>), InvalidArgumentError> {
-    verify_keygen_args(threshold, share_indices)?;
+) -> Result<(PublicCoefficients, Vec<SecretKey>), InvalidArgumentError> {
+    verify_keygen_args(threshold, receivers)?;
     // If a secret is provided we have one additional constraint:
     if threshold == NumberOfNodes::from(0) {
         return Err(InvalidArgumentError {
@@ -132,51 +121,34 @@ pub fn keygen_with_secret(
         });
     }
 
-    let mut rng = ChaChaRng::from_seed(seed.get());
+    let mut rng = seed.into_rng();
     let polynomial = {
         let mut polynomial = Polynomial::random(threshold.get() as usize, &mut rng);
-        polynomial.coefficients[0] = *secret;
+        polynomial.coefficients[0] = secret.clone();
         polynomial
     };
-    Ok(keygen_from_polynomial(polynomial, share_indices))
+    Ok(keygen_from_polynomial(polynomial, receivers))
 }
 
 /// Verifies that the keygen args are satisfiable.
 ///
 /// # Arguments
-/// * `share_indices` - a vector with one entry per receiver.  The entry is true
-///   iff the receiver is eligible to receive a threshold key.
 /// * `threshold` - the minimum number of individual signatures that can be
 ///   combined into a valid threshold signature.
+/// * `receivers` - the total number of shares that are created
 /// # Errors
 /// This returns an error if:
-/// * The number of share indices is too large to be stored as type
-///   NumberOfNodes.
 /// * The number of eligible receivers is below the threshold; under these
 ///   circumstances the receivers could never generate a valid threshold key.
 fn verify_keygen_args(
     threshold: NumberOfNodes,
-    share_indices: &[bool],
+    receivers: NumberOfNodes,
 ) -> Result<(), InvalidArgumentError> {
-    if NodeIndex::try_from(share_indices.len()).is_err() {
-        return Err(InvalidArgumentError {
-            message: format!(
-                "Too many share indices: (share_indices.len()={} !<= {}=max)",
-                share_indices.len(),
-                NodeIndex::max_value()
-            ),
-        });
-    }
-    let number_of_eligible_nodes = NumberOfNodes::from(
-        NodeIndex::try_from(share_indices.iter().filter(|x| **x).count())
-            .expect("Cannot fail because this is less than the total number of nodes"),
-    );
-    if threshold > number_of_eligible_nodes {
+    if threshold > receivers {
         return Err(InvalidArgumentError {
             message: format!(
                 "Threshold too high: (threshold={} !<= {}=num_shares)",
-                threshold.get(),
-                number_of_eligible_nodes,
+                threshold, receivers,
             ),
         });
     }
@@ -186,26 +158,18 @@ fn verify_keygen_args(
 /// Generates keys from a polynomial
 fn keygen_from_polynomial(
     polynomial: Polynomial,
-    share_indices: &[bool],
-) -> (PublicCoefficients, Vec<Option<SecretKey>>) {
+    receivers: NumberOfNodes,
+) -> (PublicCoefficients, Vec<SecretKey>) {
     let public_coefficients = PublicCoefficients::from(&polynomial);
-    let shares: Vec<Option<SecretKey>> = share_indices
-        .iter()
-        .zip(0_u32..)
-        .map(|(needs_share, index)| {
-            if *needs_share {
-                Some(polynomial.evaluate_at(&x_for_index(index)))
-            } else {
-                None
-            }
-        })
+    let shares = (0..receivers.get())
+        .map(|idx| polynomial.evaluate_at(&x_for_index(idx)))
         .collect();
     (public_coefficients, shares)
 }
 
 /// Computes the public key of the `index`'th share from the given
 /// public coefficients of the polynomial.
-pub fn individual_public_key(
+pub(crate) fn individual_public_key(
     public_coefficients: &PublicCoefficients,
     index: NodeIndex,
 ) -> PublicKey {
@@ -220,7 +184,6 @@ pub fn individual_public_key(
 /// element of the public coefficients.
 ///
 /// Note: polynomial.evaluated_at(0) != polynomial.evaluated_at(x_for_index(0)).
-#[allow(unused)]
 pub fn combined_public_key(public_coefficients: &PublicCoefficients) -> PublicKey {
     PublicKey::from(public_coefficients)
 }
@@ -231,7 +194,7 @@ pub fn combined_public_key(public_coefficients: &PublicCoefficients) -> PublicKe
 /// signing large chunks of data or streaming data.  For large chunks of data
 /// it is better to hash the data separately and provide the digest to
 ///   sign_hash(digest: [u8: 32], secret_key: &SecretKey) // unimplemented.
-pub fn sign_message(message: &[u8], secret_key: &SecretKey) -> Signature {
+pub(crate) fn sign_message(message: &[u8], secret_key: &SecretKey) -> Signature {
     hash_message_to_g1(message) * secret_key
 }
 
@@ -246,7 +209,7 @@ pub fn sign_message(message: &[u8], secret_key: &SecretKey) -> Signature {
 /// # Errors
 /// * `CryptoError::InvalidArgument` if the given signature shares are lower
 ///   than the given threshold.
-pub fn combine_signatures(
+pub(crate) fn combine_signatures(
     signatures: &[Option<Signature>],
     threshold: NumberOfNodes,
 ) -> CryptoResult<Signature> {
@@ -264,6 +227,7 @@ pub fn combine_signatures(
     }
     let signatures: Vec<(Scalar, Signature)> = signatures
         .iter()
+        .cloned()
         .zip(0_u32..)
         .filter_map(|(signature, index)| signature.map(|signature| (x_for_index(index), signature)))
         .collect();
@@ -275,10 +239,10 @@ pub fn combine_signatures(
 /// # Returns
 /// * OK, if `signature` is a valid BLS signature on `message`
 /// * Err, otherwise
-pub fn verify_individual_sig(
+pub(crate) fn verify_individual_sig(
     message: &[u8],
-    signature: IndividualSignature,
-    public_key: PublicKey,
+    signature: &IndividualSignature,
+    public_key: &PublicKey,
 ) -> CryptoResult<()> {
     verify(message, signature, public_key).map_err(|_| CryptoError::SignatureVerification {
         algorithm: AlgorithmId::ThresBls12_381,
@@ -293,10 +257,10 @@ pub fn verify_individual_sig(
 /// # Returns
 /// * OK, if `signature` is a valid BLS signature on `message`
 /// * Err, otherwise
-pub fn verify_combined_sig(
+pub(crate) fn verify_combined_sig(
     message: &[u8],
-    signature: CombinedSignature,
-    public_key: PublicKey,
+    signature: &CombinedSignature,
+    public_key: &PublicKey,
 ) -> CryptoResult<()> {
     verify(message, signature, public_key).map_err(|_| CryptoError::SignatureVerification {
         algorithm: AlgorithmId::ThresBls12_381,
@@ -311,36 +275,13 @@ pub fn verify_combined_sig(
 // TODO(DFN-1408): Optimize signature verification by combining the miller
 // loops inside the pairings, thus performing only a single final
 // exponentiation.
-fn verify(message: &[u8], signature: Signature, public_key: PublicKey) -> Result<(), ()> {
-    let point = hash_message_to_g1(message);
-    if Bls12::pairing(&signature.into(), &G2Affine::generator())
-        == Bls12::pairing(&point.into(), &public_key.0.into())
-    {
+fn verify(message: &[u8], signature: &Signature, public_key: &PublicKey) -> Result<(), ()> {
+    let point = hash_message_to_g1(message).to_affine();
+    let pk = public_key.0.to_affine();
+
+    if verify_bls_signature(&signature.into(), &pk, &point) {
         Ok(())
     } else {
         Err(())
     }
-}
-
-/// Verifies that a threshold secret key is consistent with the given public
-/// coefficients.
-///
-/// # Returns
-/// true iff the threshold secret key is consistent, i.e. if the public key
-/// corresponding to the secret key is on the polynomial defined by the public
-/// coefficients.
-pub fn secret_key_is_consistent(
-    secret: SecretKey,
-    public_coefficients: &PublicCoefficients,
-    index: NodeIndex,
-) -> bool {
-    // According to the public coefficients:
-    let x = x_for_index(index);
-    let mut y = public_coefficients.evaluate_at(&x);
-    // According to the secret share:
-    let neg_secret = secret.neg();
-    let neg_pub = G2Projective::generator() * neg_secret;
-    // Compare:
-    y.add_assign(&neg_pub);
-    bool::from(y.is_identity())
 }

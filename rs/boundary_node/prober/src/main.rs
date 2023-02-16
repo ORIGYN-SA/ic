@@ -1,994 +1,969 @@
-//! Internet Computer Boundary Node Prober
-//!
-//! See README.md for details.
-
-extern crate slog;
-extern crate slog_scope;
-
-use anyhow::Result;
-use async_trait::async_trait;
-use boundary_node_control_plane::{NodeRoute, Routes, SubnetRoute};
-use candid::{CandidType, Principal};
-use garcon::Delay;
-use hyper::{server::conn::Http, service::service_fn, Body, Response};
-use ic_agent::Agent;
-use ic_utils::call::AsyncCall;
-use ic_utils::interfaces::management_canister::builders::{CanisterInstall, InstallMode};
-use ic_utils::interfaces::management_canister::MgmtMethod;
-use ic_utils::interfaces::ManagementCanister;
-use lazy_static::lazy_static;
-use openssl::ssl::{Ssl, SslAcceptor, SslMethod, SslVerifyMode, SslVersion};
-use openssl::x509::store::{X509Store, X509StoreBuilder};
-use openssl::{
-    asn1::Asn1Time,
-    hash::MessageDigest,
-    nid::Nid,
-    pkey::{PKey, Private},
-    x509::{X509Name, X509},
-};
-use prometheus::{
-    register_int_counter, register_int_gauge_vec, Encoder, IntCounter, IntGaugeVec, TextEncoder,
-};
-use serde::{Deserialize, Serialize};
-use slog::*;
 use std::{
+    cmp::{max, min},
     collections::HashMap,
-    convert::TryInto,
-    fs,
-    io::{BufWriter, Write},
+    fs::{self, File},
     net::SocketAddr,
     path::{Path, PathBuf},
-    pin::Pin,
+    str::FromStr,
+    sync::Arc,
     time::Duration,
 };
-use tokio::{
-    net::{TcpListener, TcpStream},
-    time::Instant,
-    try_join,
+
+use candid::{CandidType, Principal};
+use garcon::Delay;
+use ic_agent::{
+    agent::http_transport::ReqwestHttpReplicaV2Transport, identity::BasicIdentity, Agent,
 };
-use tokio_openssl::SslStream;
+use ic_utils::{
+    canister::Argument,
+    interfaces,
+    interfaces::{
+        management_canister::{
+            builders::{CanisterInstall, InstallMode},
+            MgmtMethod,
+        },
+        wallet::CreateResult,
+    },
+};
 
-const COUNTER_CANISTER_WAT: &[u8] = include_bytes!("counter.wat");
-const ROUTES: &str = ".routes";
-const WALLETS: &str = ".wallets";
-const CANISTER: &str = ".canisters";
-const IDENTITY_FILE: &str = "identity.pem";
-const CYCLES: u64 = 190_000_000_000_u64;
-const PROBE_INTERVAL: Duration = Duration::from_secs(300);
-const CANISTER_CREATE_INTERVAL: Duration = Duration::from_secs(21600);
+use anyhow::{anyhow, Context, Error};
+use async_trait::async_trait;
+use axum::{handler::Handler, routing::get, Extension, Router};
+use clap::Parser;
+use futures::{future::TryFutureExt, stream::FuturesUnordered};
+use glob::glob;
+use hyper::{Body, Request, Response, StatusCode};
+use mockall::automock;
+use opentelemetry::baggage::BaggageExt;
+use opentelemetry::{global, sdk::Resource, KeyValue};
+use opentelemetry_prometheus::PrometheusExporter;
+use prometheus::{Encoder, TextEncoder};
+use serde::Deserialize;
+use tokio::{task, time::Instant};
+use tracing::info;
 
-#[derive(Serialize, Deserialize, Clone)]
-struct Canisters {
-    subnet: HashMap<String, String>,
-}
+mod metrics;
+use metrics::{MetricParams, WithMetrics};
 
-#[derive(CandidType)]
-struct In {
-    canister_id: Principal,
-}
+mod retry;
+use retry::WithRetry;
 
-#[derive(Clone)]
-struct ProberDefinition {
-    canisters: Canisters,
-    wallets: Canisters,
-    routes: Routes,
+const SERVICE_NAME: &str = "prober";
+
+const MILLISECOND: Duration = Duration::from_millis(1);
+const MINUTE: Duration = Duration::from_secs(60);
+
+const BILLION: u128 = 1_000_000_000;
+
+const CANISTER_WAT: &str = include_str!("canister.wat");
+
+#[derive(Parser)]
+#[clap(name = SERVICE_NAME)]
+#[clap(author = "Boundary Node Team <boundary-nodes@dfinity.org>")]
+struct Cli {
+    #[clap(long, default_value = "routes")]
     routes_dir: PathBuf,
-    wallets_dir: PathBuf,
+
+    #[clap(long, default_value = "wallets.json")]
+    wallets_path: PathBuf,
+
+    #[clap(long, default_value = "identity.pem")]
     identity_path: PathBuf,
-}
 
-#[async_trait]
-trait ProberLoader: ProberClone + Send + Sync {
-    fn reload(&mut self);
-    fn get_canisters(&self) -> HashMap<String, String>;
-    fn remove_canister(&mut self, subnet: &str);
-    fn add_canister(&mut self, subnet: String, canister: String);
-    fn get_wallet(&self, subnet: &str) -> Option<&String>;
-    fn get_routes(&self) -> Vec<SubnetRoute>;
-    fn export_canister_data(&self, canisters: &Canisters);
-    async fn create_agent_and_waiter(&self, url: &str, mainnet: bool) -> BoxResult<(Agent, Delay)>;
-    async fn create_canister(
-        &self,
-        url: String,
-        wallet_id: String,
-        mainnet: bool,
-    ) -> Result<Principal, String>;
-    async fn cleanup_old_canisters(
-        &self,
-        url: String,
-        canister: String,
-        wallet_canister: String,
-        mainnet: bool,
-    ) -> Result<(), String>;
-    async fn execute_probe(
-        &self,
-        url: &str,
-        canister_id: &Principal,
-        mainnet: bool,
-    ) -> Result<(), String>;
-}
+    #[clap(long)]
+    root_key_path: Option<PathBuf>,
 
-trait ProberClone {
-    fn clone_box(&self) -> Box<dyn ProberLoader>;
-}
+    #[clap(long, default_value_t = 200 * BILLION)]
+    canister_cycles_amount: u128,
 
-impl<T> ProberClone for T
-where
-    T: 'static + ProberLoader + Clone,
-{
-    fn clone_box(&self) -> Box<dyn ProberLoader> {
-        Box::new(self.clone())
-    }
-}
+    #[clap(long, default_value = "24h")]
+    canister_ttl: humantime::Duration,
 
-impl Clone for Box<dyn ProberLoader> {
-    fn clone(&self) -> Box<dyn ProberLoader> {
-        self.clone_box()
-    }
-}
+    #[clap(long, default_value = "1m")]
+    probe_interval: humantime::Duration,
 
-type BoxResult<T> = Result<T, Box<dyn std::error::Error>>;
-
-lazy_static! {
-    pub static ref PROBES_COMPLETED: IntCounter =
-        register_int_counter!("probes_completed", "Number of probes completed").unwrap();
-    pub static ref CREATE_CANISTER_FAILURE: IntGaugeVec = register_int_gauge_vec!(
-        "create_canister_failure",
-        "Create canister failure on a given subnet.",
-        &["subnet_id"]
-    )
-    .unwrap();
-    pub static ref CLEANUP_CANISTER_FAILURE: IntGaugeVec = register_int_gauge_vec!(
-        "cleanup_canister_failure",
-        "Cleanup canister failure on a given subnet.",
-        &["subnet_id"]
-    )
-    .unwrap();
-    pub static ref CREATE_CANISTER_SUCCESS: IntGaugeVec = register_int_gauge_vec!(
-        "create_canister_success",
-        "Create canister success on a given subnet.",
-        &["subnet_id"]
-    )
-    .unwrap();
-    pub static ref NODE_PROBE_FAILURE: IntGaugeVec = register_int_gauge_vec!(
-        "node_probe_failure",
-        "Probe failure on a particular node",
-        &["node_id"]
-    )
-    .unwrap();
-    pub static ref NODE_PROBE_SUCCESS: IntGaugeVec = register_int_gauge_vec!(
-        "node_probe_success",
-        "Probe success on a particular node",
-        &["node_id"]
-    )
-    .unwrap();
-    pub static ref NODE_PROBE_LATENCY: IntGaugeVec = register_int_gauge_vec!(
-        "node_probe_latency",
-        "Probe latency on a particular node",
-        &["node_id"]
-    )
-    .unwrap();
-    pub static ref SUBNET_PROBE_FAILURE: IntGaugeVec = register_int_gauge_vec!(
-        "subnet_probe_failure",
-        "Probe failure on a particular subnet",
-        &["subnet_id"]
-    )
-    .unwrap();
-}
-
-gflags::define! {
-    --routes_dir: &Path
-}
-gflags::define! {
-    --wallets_dir: &Path
-}
-gflags::define! {
-    --metrics_port: u16
-}
-gflags::define! {
-    --mainnet = false
+    #[clap(long, default_value = "127.0.0.1:9090")]
+    metrics_addr: SocketAddr,
 }
 
 #[tokio::main]
-async fn main() -> Result<()> {
-    let args = gflags::parse();
-    if !args.is_empty() {
-        eprintln!("error: extra arguments on the command line");
-        std::process::exit(1);
-    }
-    if !ROUTES_DIR.is_present() {
-        eprintln!("error: routes_dir flag missing");
-        std::process::exit(1);
-    }
-    let plain = slog_term::PlainSyncDecorator::new(std::io::stdout());
-    let log = slog::Logger::root(slog_term::FullFormat::new(plain).build().fuse(), slog_o!());
-    let _guard = slog_scope::set_global_logger(log.clone());
+async fn main() -> Result<(), Error> {
+    let cli = Cli::parse();
 
-    let metrics_join_handle = if METRICS_PORT.is_present() {
-        // Start metrics server.
-        let (public_key, private_key) = generate_tls_key_pair();
-        let metrics_service = service_fn(move |_req| {
-            let metrics_registry = ic_metrics::MetricsRegistry::global();
-            let encoder = TextEncoder::new();
+    let subscriber = tracing_subscriber::fmt()
+        .json()
+        .flatten_event(true)
+        .finish();
 
-            async move {
-                let metric_families = metrics_registry.prometheus_registry().gather();
-                let mut buffer = vec![];
-                encoder.encode(&metric_families, &mut buffer).unwrap();
-                Ok::<_, hyper::Error>(Response::new(Body::from(buffer)))
-            }
-        });
-        let mut addr = "[::]:9090".parse::<SocketAddr>().unwrap();
-        addr.set_port(METRICS_PORT.flag);
-        let metrics_join_handle = tokio::spawn(async move {
-            let listener = match TcpListener::bind(addr).await {
-                Err(e) => {
-                    error!(log, "HTTP exporter server error: {}", e);
-                    return;
-                }
-                Ok(listener) => listener,
+    tracing::subscriber::set_global_default(subscriber).expect("failed to set global subscriber");
+
+    let exporter = opentelemetry_prometheus::exporter()
+        .with_resource(Resource::new(vec![KeyValue::new("service", SERVICE_NAME)]))
+        .init();
+    let meter = global::meter(SERVICE_NAME);
+
+    let metrics_handler = metrics_handler.layer(Extension(MetricsHandlerArgs { exporter }));
+    let metrics_router = Router::new().route("/metrics", get(metrics_handler));
+
+    let loader = RoutesLoader::new(cli.routes_dir.clone());
+    let loader = WithMetrics(loader, MetricParams::new(&meter, SERVICE_NAME, "load"));
+    let loader = Arc::new(loader);
+
+    let f = File::open(&cli.wallets_path)
+        .with_context(|| format!("failed to open file {}", &cli.wallets_path.display()))?;
+    let wallets: Wallets = serde_json::from_reader(f).context("failed to parse json")?;
+
+    let creator = Creator::new(cli.canister_cycles_amount);
+    let creator = WithMetrics(
+        creator,
+        MetricParams::new(&meter, SERVICE_NAME, "canister_op"),
+    );
+    let creator = WithRetry::new(creator, 1);
+
+    let wasm_module = wat::parse_str(CANISTER_WAT).context("failed convert wat to wasm")?;
+
+    let installer = Installer::new(wasm_module);
+    let installer = WithMetrics(
+        installer,
+        MetricParams::new(&meter, SERVICE_NAME, "canister_op"),
+    );
+    let installer = WithRetry::new(installer, 1);
+
+    let prober = Prober {};
+    let prober = WithMetrics(
+        prober,
+        MetricParams::new(&meter, SERVICE_NAME, "canister_op"),
+    );
+
+    let stopper = Stopper {};
+    let stopper = WithMetrics(
+        stopper,
+        MetricParams::new(&meter, SERVICE_NAME, "canister_op"),
+    );
+    let stopper = WithRetry::new(stopper, 1);
+
+    let deleter = Deleter {};
+    let deleter = WithMetrics(
+        deleter,
+        MetricParams::new(&meter, SERVICE_NAME, "canister_op"),
+    );
+    let deleter = WithRetry::new(deleter, 1);
+
+    let canister_ops = Arc::new(CanisterOps {
+        creator,
+        installer,
+        prober,
+        stopper,
+        deleter,
+    });
+
+    let f = File::open(cli.identity_path).context("failed to open identity file")?;
+    let identity = Arc::new(BasicIdentity::from_pem(f).context("failed to create basic identity")?);
+
+    let root_key = cli
+        .root_key_path
+        .map(fs::read)
+        .transpose()
+        .context("failed to open root key")?;
+
+    info!(
+        msg = "Starting prober",
+        routes = cli.routes_dir.to_str(),
+        wallets = cli.wallets_path.to_str(),
+        metrics_addr = cli.metrics_addr.to_string().as_str(),
+    );
+
+    let futs = FuturesUnordered::new();
+
+    for (subnet_id, wallet_id) in wallets.subnet.into_iter() {
+        let st_runner = SubnetTestRunner::new(
+            loader.clone(),
+            create_agent_fn(identity.clone(), root_key.clone()),
+            canister_ops.clone(),
+            cli.canister_ttl.into(),
+            cli.probe_interval.into(),
+        );
+        let st_runner = WithMetrics(st_runner, MetricParams::new(&meter, SERVICE_NAME, "run"));
+        let mut st_runner = WithThrottle(st_runner, ThrottleParams::new(1 * MINUTE));
+
+        futs.push(task::spawn(async move {
+            let context = TestContext {
+                wallet_id,
+                subnet_id,
             };
-            let http = Http::new();
             loop {
-                let log = log.clone();
-                let http = http.clone();
-                let public_key = public_key.clone();
-                let private_key = private_key.clone();
-                if let Ok((stream, _)) = listener.accept().await {
-                    tokio::spawn(async move {
-                        let mut b = [0_u8; 1];
-                        if stream.peek(&mut b).await.is_ok() {
-                            if b[0] == 22 {
-                                // TLS
-                                match perform_tls_server_handshake(
-                                    stream,
-                                    &public_key,
-                                    &private_key,
-                                    Vec::new(),
-                                )
-                                .await
-                                {
-                                    Err(e) => warn!(log, "TLS error: {}", e),
-                                    Ok((stream, _peer_id)) => {
-                                        if let Err(e) =
-                                            http.serve_connection(stream, metrics_service).await
-                                        {
-                                            trace!(log, "Connection error: {}", e);
-                                        }
-                                    }
-                                };
-                            } else {
-                                // HTTP
-                                if let Err(e) = http.serve_connection(stream, metrics_service).await
-                                {
-                                    trace!(log, "Connection error: {}", e);
-                                }
-                            }
-                        }
-                    });
-                }
+                let _ = st_runner.run(&context).await;
             }
-        });
-        Some(metrics_join_handle)
-    } else {
-        None
-    };
-    let routes = read_file_data(&ROUTES_DIR.flag.to_path_buf(), ROUTES);
-    let wallets = read_file_data(&WALLETS_DIR.flag.to_path_buf(), WALLETS);
-    let routes: Routes = match routes {
-        Ok(routes_data) => serde_json::from_value(routes_data).unwrap(),
-        Err(_) => {
-            panic!("Could not load routes data");
-        }
-    };
+        }));
+    }
 
-    let wallets: Canisters = match wallets {
-        Ok(wallets_data) => serde_json::from_value(wallets_data).unwrap(),
-        Err(_) => {
-            panic!("Could not load wallets data");
-        }
-    };
-    let canisters = read_file_data(&WALLETS_DIR.flag.to_path_buf(), CANISTER);
-    let canisters: Canisters = match canisters {
-        Ok(canisters) => serde_json::from_value(canisters).unwrap(),
-        Err(_) => {
-            let subnet = HashMap::new();
-            Canisters { subnet }
-        }
-    };
-    let mut identity_path = WALLETS_DIR.flag.to_path_buf();
-    identity_path.push(IDENTITY_FILE);
-    eprintln!("Wallets and subnet mapping : {:?}", wallets.subnet);
-    let prober_definition = ProberDefinition {
-        canisters,
-        wallets,
-        routes,
-        routes_dir: ROUTES_DIR.flag.to_path_buf(),
-        wallets_dir: WALLETS_DIR.flag.to_path_buf(),
-        identity_path,
-    };
-    start_probe_event_loop(Box::new(prober_definition), MAINNET.flag).await;
+    futs.push(task::spawn(
+        axum::Server::bind(&cli.metrics_addr)
+            .serve(metrics_router.into_make_service())
+            .map_err(|err| anyhow!("server failed: {:?}", err)),
+    ));
 
-    if let Some(metrics_join_handle) = metrics_join_handle {
-        if let Err(error) = try_join!(metrics_join_handle) {
-            eprintln!("error: {}", error);
-        }
+    for fut in futs {
+        let _ = fut.await?;
     }
 
     Ok(())
 }
 
-async fn start_probe_event_loop(mut prober_definition: Box<dyn ProberLoader>, mainnet: bool) {
-    // Flag which defines whether canisters need to be deleted
-    let mut cleanup_canisters = HashMap::new();
-    for subnet in prober_definition.get_canisters().keys() {
-        cleanup_canisters.insert(subnet.clone(), true);
-    }
-    // Flag which defines whether canisters should be created in the upcoming
-    // event-loop iteration.
-    let mut create_canisters = HashMap::new();
-    let canister_start = Instant::now();
-    // When canisters should be recreated
-    let mut canister_refresh = canister_start + CANISTER_CREATE_INTERVAL;
-    loop {
-        let probe_start = Instant::now();
-        let probe_end = probe_start + PROBE_INTERVAL;
-        let subnets = &prober_definition.get_routes();
-        let mut futures = HashMap::new();
-        // Cleanup old canisters
-        for subnet in subnets {
-            let subnet_id = &subnet.subnet_id;
-            let subnet_wallet = prober_definition.get_wallet(subnet_id);
-            let url = subnet.nodes[0].socket_addr.clone();
-            // Cleanup canister only if wallet exists
-            let wallet = match subnet_wallet {
-                Some(wallet) => wallet.clone(),
-                None => continue,
-            };
+#[async_trait]
+trait Run: Sync + Send {
+    async fn run(&mut self, context: &TestContext) -> Result<(), Error>;
+}
 
-            // If this canister cleanup flag is true, and exists, delete it.
-            if **cleanup_canisters.get(subnet_id).get_or_insert(&false)
-                && prober_definition.get_canisters().get(subnet_id).is_some()
-            {
-                let canister_id = prober_definition
-                    .get_canisters()
-                    .get(subnet_id)
-                    .unwrap()
-                    .clone();
-                eprintln!("Cleaning up canister {}", canister_id);
-                let prober_def = prober_definition.clone();
-                let future = tokio::spawn(async move {
-                    prober_def
-                        .cleanup_old_canisters(url, canister_id, wallet, mainnet)
-                        .await
-                });
-                futures.insert(subnet_id.clone(), future);
-            }
-        }
+struct CanisterOps<C, I, P, S, D> {
+    creator: C,
+    installer: I,
+    prober: P,
+    stopper: S,
+    deleter: D,
+}
 
-        // Await cleanup result and handle success or failure cases.
-        for (subnet_id, future) in futures {
-            let result = future.await;
-            match result {
-                Ok(_) => {
-                    // Canister has been cleaned up
-                    prober_definition.remove_canister(&*subnet_id);
-                    // A new canister must be created on this subnet
-                    create_canisters.insert(subnet_id.clone(), true);
-                    // No canisters need to be cleaned on this subnet.
-                    cleanup_canisters.insert(subnet_id.clone(), false);
-                    CLEANUP_CANISTER_FAILURE
-                        .with_label_values(&[&*subnet_id])
-                        .set(0);
-                }
-                Err(e) => {
-                    eprintln!("Failed to delete old canister with error: {:?}", e);
-                    CLEANUP_CANISTER_FAILURE
-                        .with_label_values(&[&*subnet_id])
-                        .set(1);
-                }
-            }
-        }
+struct SubnetTestRunner<L, C, I, P, S, D> {
+    loader: Arc<L>,
+    create_agent: Box<dyn CreateAgentFn>,
+    canister_ops: Arc<CanisterOps<C, I, P, S, D>>,
+    canister_ttl: Duration,
+    probe_interval: Duration,
+}
 
-        let mut futures = HashMap::new();
-        // Create new canisters if needed
-        for subnet in subnets {
-            let subnet_id = &subnet.subnet_id;
-            // Create canisters if needed
-            if **create_canisters.get(subnet_id).get_or_insert(&true)
-                && prober_definition.get_canisters().get(subnet_id).is_none()
-            {
-                eprintln!("Creating canister with subnet {}", subnet_id);
-                let subnet_wallet = prober_definition.get_wallet(subnet_id);
-                let url = subnet.nodes[0].socket_addr.clone();
-                // Create canister only if wallet exists.
-                let future = match subnet_wallet {
-                    Some(wallet) => {
-                        let wallet = wallet.clone();
-                        let prober_def = prober_definition.clone();
-                        tokio::spawn(async move {
-                            prober_def.create_canister(url, wallet, mainnet).await
-                        })
-                    }
-                    None => continue,
-                };
-                futures.insert(subnet_id.clone(), future);
-            }
-        }
-
-        // Await and handle canister creation success and error cases
-        for (subnet_id, future) in futures {
-            let result = future.await;
-            match result {
-                Ok(Ok(canister)) => {
-                    create_canisters.insert(subnet_id.clone(), false);
-                    prober_definition.add_canister(subnet_id.clone(), canister.clone().to_text());
-                    // Create canister succeeded.
-                    CREATE_CANISTER_FAILURE
-                        .with_label_values(&[&subnet_id])
-                        .set(0);
-                    CREATE_CANISTER_SUCCESS
-                        .with_label_values(&[&subnet_id])
-                        .set(1);
-                }
-                Ok(Err(e)) => {
-                    eprintln!("Canister creation failed with error {:?}", e);
-                    // Set canister creation failure metric.
-                    CREATE_CANISTER_FAILURE
-                        .with_label_values(&[&subnet_id])
-                        .set(1);
-                    CREATE_CANISTER_SUCCESS
-                        .with_label_values(&[&subnet_id])
-                        .set(0);
-                    continue;
-                }
-                Err(e) => {
-                    eprintln!("Canister creation failed with error {:?}", e);
-                    // Set canister creation failure metric.
-                    CREATE_CANISTER_FAILURE
-                        .with_label_values(&[&subnet_id])
-                        .set(1);
-                    CREATE_CANISTER_SUCCESS
-                        .with_label_values(&[&subnet_id])
-                        .set(0);
-                    continue;
-                }
-            }
-        }
-
-        // Export canister data to persist information about the new canisters
-        prober_definition.export_canister_data(&Canisters {
-            subnet: prober_definition.get_canisters().clone(),
-        });
-
-        let mut futures = Vec::new();
-        for subnet in subnets {
-            let subnet_id = &subnet.subnet_id;
-            eprintln!("Executing probe on subnet {}", subnet_id);
-            if prober_definition.get_canisters().get(subnet_id).is_none() {
-                continue;
-            }
-            let canister_id =
-                Principal::from_text(prober_definition.get_canisters().get(subnet_id).unwrap())
-                    .unwrap();
-            let nodes = subnet.nodes.clone();
-            let subnet_id = subnet.subnet_id.clone();
-            let prober_def = prober_definition.clone();
-            futures.push(tokio::spawn(async move {
-                probe_subnet(nodes, prober_def, subnet_id, canister_id, mainnet).await
-            }));
-        }
-        for future in futures {
-            let result = future.await;
-            match result {
-                Ok(_) => {}
-                Err(_) => eprintln!("Probe tasks failed to join"),
-            }
-        }
-        let now = Instant::now();
-        // If it is time to refresh canisters, set all subnets to cleanup canisters.
-        if now > canister_refresh {
-            for subnet in subnets {
-                eprintln!("Deleting and recreating new canisters");
-                cleanup_canisters.insert(subnet.subnet_id.clone(), true);
-                canister_refresh = now + CANISTER_CREATE_INTERVAL;
-            }
-        }
-        prober_definition.reload();
-        // Sleep until probe interval expires
-        if now < probe_end {
-            eprintln!("Sleep until next iteration");
-            tokio::time::sleep(probe_end.duration_since(now)).await;
+impl<L, C, I, P, S, D> SubnetTestRunner<L, C, I, P, S, D> {
+    fn new(
+        loader: Arc<L>,
+        create_agent: impl CreateAgentFn,
+        canister_ops: Arc<CanisterOps<C, I, P, S, D>>,
+        canister_ttl: Duration,
+        probe_interval: Duration,
+    ) -> Self {
+        Self {
+            loader,
+            create_agent: Box::new(create_agent),
+            canister_ops,
+            canister_ttl,
+            probe_interval,
         }
     }
 }
 
 #[async_trait]
-impl ProberLoader for ProberDefinition {
-    fn reload(&mut self) {
-        let routes = read_file_data(&self.routes_dir, ROUTES);
-        let wallets = read_file_data(&self.wallets_dir, WALLETS);
-        if let Ok(initial_routes) = routes {
-            self.routes = serde_json::from_value(initial_routes).unwrap()
+impl<L, C, I, P, S, D> Run for SubnetTestRunner<L, C, I, P, S, D>
+where
+    L: Load,
+    C: Create,
+    I: Install,
+    P: Probe,
+    S: Stop,
+    D: Delete,
+{
+    async fn run(&mut self, context: &TestContext) -> Result<(), Error> {
+        // Create an agent for each node in the subnet
+        use opentelemetry::trace::FutureExt;
+
+        let routes = self.loader.load().await?;
+
+        let subnet = routes
+            .subnets
+            .iter()
+            .find(|subnet| subnet.subnet_id == context.subnet_id)
+            .ok_or_else(|| anyhow!("Subnet not found"))?;
+
+        let agents = subnet
+            .nodes
+            .iter()
+            .cloned()
+            .map(&self.create_agent)
+            .collect::<Result<Vec<(String, String, Agent)>, Error>>()
+            .context("failed to create agent")?;
+
+        let subnet_id = context.subnet_id.as_str();
+        let canister_ops = Arc::clone(&self.canister_ops);
+        let wallet_id = context.wallet_id.as_str();
+
+        let (node_id, socket_addr, agent) = &agents[0];
+
+        let _ctx = opentelemetry::Context::current_with_baggage(vec![
+            KeyValue::new("subnet_id", subnet_id.to_string()),
+            KeyValue::new("node_id", node_id.to_string()),
+            KeyValue::new("socket_addr", socket_addr.to_string()),
+        ]);
+
+        let canister_id = canister_ops
+            .creator
+            .create(agent, wallet_id)
+            .with_context(_ctx.clone())
+            .await?;
+
+        canister_ops
+            .installer
+            .install(agent, wallet_id, canister_id)
+            .with_context(_ctx.clone())
+            .await?;
+
+        let start_time = Instant::now();
+        let end_time = start_time + self.canister_ttl;
+
+        for (node_id, socket_addr, agent) in agents.iter().cycle() {
+            let _ctx = opentelemetry::Context::current_with_baggage(vec![
+                KeyValue::new("subnet_id", subnet_id.to_string()),
+                KeyValue::new("node_id", node_id.to_string()),
+                KeyValue::new("socket_addr", socket_addr.to_string()),
+            ]);
+
+            // Continue probing continuously, even if probing fails
+            let _ = canister_ops
+                .prober
+                .probe(agent, canister_id)
+                .with_context(_ctx.clone())
+                .await;
+
+            tokio::time::sleep(max(
+                Duration::ZERO,
+                min(self.probe_interval, end_time - Instant::now()),
+            ))
+            .await;
+
+            if Instant::now() > end_time {
+                break;
+            }
         }
-        if let Ok(initial_wallets) = wallets {
-            self.wallets = serde_json::from_value(initial_wallets).unwrap()
-        }
-    }
 
-    fn get_canisters(&self) -> HashMap<String, String> {
-        self.canisters.subnet.clone()
-    }
+        canister_ops
+            .stopper
+            .stop(agent, wallet_id, canister_id)
+            .with_context(_ctx.clone())
+            .await?;
 
-    fn remove_canister(&mut self, subnet: &str) {
-        self.canisters.subnet.remove(subnet);
+        canister_ops
+            .deleter
+            .delete(agent, wallet_id, canister_id)
+            .with_context(_ctx.clone())
+            .await?;
+        Ok(())
     }
+}
 
-    fn add_canister(&mut self, subnet: String, canister: String) {
-        self.canisters.subnet.insert(subnet, canister);
-    }
+trait CreateAgentFn:
+    'static + Fn(NodeRoute) -> Result<(String, String, Agent), Error> + Sync + Send
+{
+}
+impl<F: 'static + Fn(NodeRoute) -> Result<(String, String, Agent), Error> + Sync + Send>
+    CreateAgentFn for F
+{
+}
 
-    fn get_wallet(&self, subnet: &str) -> Option<&String> {
-        self.wallets.subnet.get(subnet)
-    }
+fn create_agent_fn(identity: Arc<BasicIdentity>, root_key: Option<Vec<u8>>) -> impl CreateAgentFn {
+    move |node_route: NodeRoute| {
+        let NodeRoute {
+            node_id,
+            socket_addr,
+        } = node_route;
 
-    fn get_routes(&self) -> Vec<SubnetRoute> {
-        self.routes.subnets.clone()
-    }
+        let transport = ReqwestHttpReplicaV2Transport::create(format!("http://{}", socket_addr))
+            .context("failed to create transport")?;
 
-    fn export_canister_data(&self, canisters: &Canisters) {
-        let mut filepath = self.wallets_dir.to_path_buf();
-        filepath.push("current.canisters");
-        let file = fs::File::create(filepath.to_str().expect("Missing canister filename"))
-            .expect("unable to open canister configuration file for write");
-        let mut writer = BufWriter::new(&file);
-        let routes_json = serde_json::to_string(canisters).expect("failed json conversion");
-        writer
-            .write_all(routes_json.as_bytes())
-            .expect("write failure");
-    }
+        let identity = Arc::clone(&identity);
 
-    async fn create_agent_and_waiter(&self, url: &str, mainnet: bool) -> BoxResult<(Agent, Delay)> {
-        let url = format!("{}{}", "http://", url);
-        let identity =
-            ic_agent::identity::BasicIdentity::from_pem_file(&self.identity_path).unwrap();
         let agent = Agent::builder()
-            .with_transport(
-                ic_agent::agent::http_transport::ReqwestHttpReplicaV2Transport::create(url)
-                    .unwrap(),
-            )
-            .with_identity(identity)
+            .with_transport(transport)
+            .with_arc_identity(identity)
             .build()
-            .unwrap();
-        if !mainnet {
-            agent.fetch_root_key().await?;
+            .context("failed to build agent")?;
+
+        if let Some(root_key) = &root_key {
+            agent
+                .set_root_key(root_key.clone())
+                .context("failed to set root key")?;
         }
-        let waiter = garcon::Delay::builder()
-            .throttle(std::time::Duration::from_millis(500))
-            .timeout(std::time::Duration::from_secs(60 * 5))
-            .build();
-        Ok((agent, waiter))
+
+        Ok((node_id, socket_addr, agent))
     }
+}
 
-    async fn create_canister(
-        &self,
-        url: String,
-        wallet_id: String,
-        mainnet: bool,
-    ) -> Result<Principal, String> {
-        let wallet_id =
-            Principal::from_text(wallet_id).map_err(|_| "Wallet ID could not be parsed")?;
-        let (agent, waiter) = self
-            .create_agent_and_waiter(&*url, mainnet)
-            .await
-            .map_err(|e| format!("Agent could not be created {:?}", e))?;
-        let wallet = ic_utils::Canister::builder()
-            .with_agent(&agent)
-            .with_canister_id(wallet_id)
-            .with_interface(ic_utils::interfaces::Wallet)
-            .build()
+#[derive(Clone)]
+struct MetricsHandlerArgs {
+    exporter: PrometheusExporter,
+}
+
+async fn metrics_handler(
+    Extension(MetricsHandlerArgs { exporter }): Extension<MetricsHandlerArgs>,
+    _: Request<Body>,
+) -> Response<Body> {
+    let metric_families = exporter.registry().gather();
+
+    let encoder = TextEncoder::new();
+
+    let mut metrics_text = Vec::new();
+    if encoder.encode(&metric_families, &mut metrics_text).is_err() {
+        return Response::builder()
+            .status(StatusCode::INTERNAL_SERVER_ERROR)
+            .body("Internal Server Error".into())
             .unwrap();
-        let result = wallet
-            .wallet_create_canister(CYCLES, None, None, None, None, waiter.clone())
-            .await
-            .map_err(|e| format!("Canister creation call failed with err {:?}", e))?;
-        let canister_id = result.canister_id;
-        let wasm_module = wabt::wat2wasm(COUNTER_CANISTER_WAT).unwrap();
+    };
 
-        let install_args = CanisterInstall {
-            mode: InstallMode::Install,
-            canister_id,
-            wasm_module,
-            arg: vec![],
-        };
-        let mgr = ManagementCanister::create(&agent);
-        wallet
-            .call_forward(
-                mgr.update_("install_code").with_arg(install_args).build(),
-                0,
-            )
-            .unwrap()
-            .call_and_wait(waiter)
+    Response::builder()
+        .status(200)
+        .body(metrics_text.into())
+        .unwrap()
+}
+
+#[derive(Debug, Deserialize, PartialEq, Clone)]
+struct Wallets {
+    subnet: HashMap<String, String>,
+}
+
+#[derive(Debug, Deserialize, PartialEq, Clone)]
+struct NodeRoute {
+    node_id: String,
+    socket_addr: String,
+}
+
+#[derive(Debug, Deserialize, PartialEq, Clone)]
+struct SubnetRoute {
+    subnet_id: String,
+    nodes: Vec<NodeRoute>,
+}
+
+#[derive(Debug, Deserialize, PartialEq, Clone)]
+struct Routes {
+    subnets: Vec<SubnetRoute>,
+}
+
+#[derive(Debug, PartialEq, Clone)]
+struct TestContext {
+    wallet_id: String,
+    subnet_id: String,
+}
+
+#[automock]
+#[async_trait]
+trait Load: Sync + Send {
+    async fn load(&self) -> Result<Routes, Error>;
+}
+
+struct RoutesLoader {
+    routes_dir: PathBuf,
+}
+
+impl RoutesLoader {
+    fn new(routes_dir: PathBuf) -> Self {
+        Self { routes_dir }
+    }
+}
+
+#[async_trait]
+impl Load for RoutesLoader {
+    async fn load(&self) -> Result<Routes, Error> {
+        // Routes
+        let glob_pattern = Path::new(&self.routes_dir).join("*.routes");
+
+        let mut paths: Vec<_> = glob(glob_pattern.to_str().unwrap())
+            .context("failed to read glob pattern")?
+            .flat_map(Result::ok)
+            .collect();
+
+        paths.sort();
+
+        let path = paths.last();
+        if path.is_none() {
+            return Err(anyhow!("no routes file"));
+        }
+        let path = path.unwrap();
+
+        let f =
+            File::open(path).with_context(|| format!("failed to open file {}", &path.display()))?;
+        let routes: Routes = serde_json::from_reader(f).context("failed to parse json")?;
+
+        Ok(routes)
+    }
+}
+
+#[automock]
+#[async_trait]
+trait Create: 'static + Sync + Send {
+    async fn create(&self, agent: &Agent, wallet_id: &str) -> Result<Principal, Error>;
+}
+
+struct Creator {
+    canister_cycles_amount: u128,
+}
+
+impl Creator {
+    fn new(canister_cycles_amount: u128) -> Self {
+        Self {
+            canister_cycles_amount,
+        }
+    }
+}
+
+#[async_trait]
+impl Create for Creator {
+    async fn create(&self, agent: &Agent, wallet_id: &str) -> Result<Principal, Error> {
+        let principal = Principal::from_str(wallet_id).unwrap();
+        let wallet = interfaces::WalletCanister::create(agent, principal)
             .await
-            .map_err(|e| format!("Canister Installation failed with err {:?}", e))?;
+            .context("failed to build wallet")?;
+
+        let waiter = Delay::builder()
+            .throttle(500 * MILLISECOND)
+            .timeout(5 * MINUTE)
+            .build();
+
+        let CreateResult { canister_id } = wallet
+            .wallet_create_canister(
+                self.canister_cycles_amount, // cycles
+                None,                        // controllers
+                None,                        // compute_allocation
+                None,                        // memory_allocation
+                None,                        // freezing_threshold
+                waiter,                      // waiter
+            )
+            .await
+            .context("failed to create canister")?;
+
         Ok(canister_id)
     }
+}
 
-    async fn cleanup_old_canisters(
+#[automock]
+#[async_trait]
+trait Install: 'static + Sync + Send {
+    async fn install(
         &self,
-        url: String,
-        canister: String,
-        wallet_canister: String,
-        mainnet: bool,
-    ) -> Result<(), String> {
-        let canister_id =
-            Principal::from_text(canister).map_err(|_| "Canister ID could not be parsed")?;
-        let wallet_canister =
-            Principal::from_text(wallet_canister).map_err(|_| "Wallet ID could not be parsed")?;
-        let (agent, waiter) = self
-            .create_agent_and_waiter(&*url, mainnet)
+        agent: &Agent,
+        wallet_id: &str,
+        canister_id: Principal,
+    ) -> Result<(), Error>;
+}
+
+struct Installer {
+    wasm_module: Vec<u8>,
+}
+
+impl Installer {
+    fn new(wasm_module: Vec<u8>) -> Self {
+        Self { wasm_module }
+    }
+}
+
+#[async_trait]
+impl Install for Installer {
+    async fn install(
+        &self,
+        agent: &Agent,
+        wallet_id: &str,
+        canister_id: Principal,
+    ) -> Result<(), Error> {
+        let mut install_args = Argument::new();
+        install_args.push_idl_arg(CanisterInstall {
+            mode: InstallMode::Install,
+            canister_id,
+            wasm_module: self.wasm_module.clone(),
+            arg: vec![],
+        });
+
+        let principal = Principal::from_str(wallet_id).unwrap();
+        let wallet = interfaces::WalletCanister::create(agent, principal)
             .await
-            .map_err(|_| "Agent could not be created")?;
-        let wallet = ic_utils::Canister::builder()
-            .with_agent(&agent)
-            .with_canister_id(wallet_canister)
-            .with_interface(ic_utils::interfaces::Wallet)
-            .build()
-            .unwrap();
-        let mgr = ManagementCanister::create(&agent);
-        let cycles: u64 = 0;
-        wallet
-            .call_forward(
-                mgr.update_(MgmtMethod::StopCanister.as_ref())
-                    .with_arg(In { canister_id })
-                    .build(),
-                cycles,
-            )
-            .unwrap()
-            .call_and_wait(waiter.clone())
-            .await
-            .map_err(|_| "Canister could not be stopped")?;
-        wallet
-            .call_forward(
-                mgr.update_(MgmtMethod::DeleteCanister.as_ref())
-                    .with_arg(In { canister_id })
-                    .build(),
-                cycles,
-            )
-            .unwrap()
+            .context("failed to build wallet")?;
+
+        let install_call = wallet.call(
+            Principal::management_canister(),
+            MgmtMethod::InstallCode.as_ref(),
+            install_args,
+            0,
+        );
+
+        let waiter = Delay::builder()
+            .throttle(500 * MILLISECOND)
+            .timeout(5 * MINUTE)
+            .build();
+
+        install_call
             .call_and_wait(waiter)
             .await
-            .map_err(|_| "Canister could not be uninstalled")?;
+            .context("failed to install canister")?;
+
         Ok(())
     }
+}
 
-    // Probes a canister on a given node. Returns Ok() if query and update succeed.
-    // Returns true if update succeeds logically (computation is an expected value).
-    async fn execute_probe(
-        &self,
-        url: &str,
-        canister_id: &Principal,
-        mainnet: bool,
-    ) -> Result<(), String> {
-        let (agent, waiter): (Agent, Delay) = self
-            .create_agent_and_waiter(url, mainnet)
-            .await
-            .map_err(|_| "Couldn't create agent")?;
-        let result = agent
-            .query(canister_id, "read")
+#[automock]
+#[async_trait]
+trait Probe: 'static + Sync + Send {
+    async fn probe(&self, agent: &Agent, canister_id: Principal) -> Result<(), Error>;
+}
+
+struct Prober {}
+
+#[async_trait]
+impl Probe for Prober {
+    async fn probe(&self, agent: &Agent, canister_id: Principal) -> Result<(), Error> {
+        let read_result = agent
+            .query(&canister_id, "read")
             .with_arg(vec![0; 100])
             .call()
-            .await;
-        let read_result = u32::from_le_bytes(
-            result
-                .map_err(|_| "could not convert result to u32")?
-                .try_into()
-                .map_err(|_| "could not convert result to u32")?,
-        );
-        eprintln!("READ");
-        eprintln!("{:?}", read_result);
-        let result = agent
-            .update(canister_id, "write")
+            .await
+            .context("failed to query canister")?;
+
+        let read_result: [u8; 4] = read_result
+            .try_into()
+            .map_err(|_| anyhow!("failed to extract read result"))?;
+
+        let read_result = u32::from_le_bytes(read_result);
+
+        let waiter = Delay::builder()
+            .throttle(500 * MILLISECOND)
+            .timeout(5 * MINUTE)
+            .build();
+
+        let write_result = agent
+            .update(&canister_id, "write")
             .with_arg(vec![0; 100])
             .call_and_wait(waiter)
-            .await;
-        let write_result = u32::from_le_bytes(
-            result
-                .map_err(|_| "could not convert result to u32")?
-                .try_into()
-                .map_err(|_| "could not convert result to u32")?,
-        );
-        eprintln!("UPDATE");
-        eprintln!("{:?}", write_result);
-        if (read_result + 1) != write_result {
-            return Err("Update call result did not match expected result.".to_string());
+            .await
+            .context("failed to update canister")?;
+
+        let write_result: [u8; 4] = write_result
+            .try_into()
+            .map_err(|_| anyhow!("failed to extract write result"))?;
+
+        let write_result = u32::from_le_bytes(write_result);
+
+        if write_result != read_result + 1 {
+            return Err(anyhow!(
+                "wrong output: {} != {}",
+                write_result,
+                read_result + 1
+            ));
         }
+
         Ok(())
     }
 }
 
-fn read_file_data(dir: &Path, file_type: &str) -> BoxResult<serde_json::Value> {
-    let dir = fs::read_dir(dir)?;
-    let mut entries: Vec<PathBuf> = dir
-        .filter(Result::is_ok)
-        .map(|e| e.unwrap().path())
-        .filter(|e| e.to_str().unwrap().ends_with(file_type))
-        .collect();
-    entries.sort();
-    let file_name = entries.last().ok_or("No file found")?;
-    eprintln!("filename: {:?}", file_name);
-    let file = fs::File::open(file_name).expect("file should open read only");
-    let json: serde_json::Value =
-        serde_json::from_reader(file).expect("file should be proper JSON");
-    Ok(json)
+#[automock]
+#[async_trait]
+trait Stop: 'static + Sync + Send {
+    async fn stop(
+        &self,
+        agent: &Agent,
+        wallet_id: &str,
+        canister_id: Principal,
+    ) -> Result<(), Error>;
 }
 
-async fn probe_subnet(
-    nodes: Vec<NodeRoute>,
-    prober_definition: Box<dyn ProberLoader>,
-    subnet_id: String,
-    canister_id: Principal,
-    mainnet: bool,
-) {
-    for node in nodes {
-        let url = &node.socket_addr;
-        let instant = Instant::now();
-        let prober_def = prober_definition.clone();
-        let probe_result = prober_def.execute_probe(url, &canister_id, mainnet).await;
-        NODE_PROBE_LATENCY
-            .with_label_values(&[&*node.node_id])
-            .set(instant.elapsed().as_secs() as i64);
-        PROBES_COMPLETED.inc();
-        // If there is a probe error, probe fails so emit a 1 metric.
-        // If success, probe succeeded, so emit a 0 metric.
-        let failure_metric = match probe_result {
-            Ok(_) => 0,
-            Err(_) => 1,
-        };
-        NODE_PROBE_FAILURE
-            .with_label_values(&[&*node.node_id])
-            .set(failure_metric);
-        SUBNET_PROBE_FAILURE
-            .with_label_values(&[&*subnet_id])
-            .set(failure_metric);
-        // Inverse failure metric for success metrics.
-        if failure_metric == 1 {
-            NODE_PROBE_SUCCESS
-                .with_label_values(&[&*node.node_id])
-                .set(0);
-        } else {
-            NODE_PROBE_SUCCESS
-                .with_label_values(&[&*node.node_id])
-                .set(1);
+struct Stopper {}
+
+#[async_trait]
+impl Stop for Stopper {
+    async fn stop(
+        &self,
+        agent: &Agent,
+        wallet_id: &str,
+        canister_id: Principal,
+    ) -> Result<(), Error> {
+        #[derive(CandidType)]
+        struct In {
+            canister_id: Principal,
+        }
+
+        let mut stop_args = Argument::new();
+        stop_args.push_idl_arg(In { canister_id });
+
+        let principal = Principal::from_str(wallet_id).unwrap();
+        let wallet = interfaces::WalletCanister::create(agent, principal)
+            .await
+            .context("failed to build wallet")?;
+
+        let stop_call = wallet.call(
+            Principal::management_canister(),
+            MgmtMethod::StopCanister.as_ref(),
+            stop_args,
+            0,
+        );
+
+        let waiter = Delay::builder()
+            .throttle(500 * MILLISECOND)
+            .timeout(5 * MINUTE)
+            .build();
+
+        stop_call
+            .call_and_wait(waiter)
+            .await
+            .context("failed to stop canister")?;
+
+        Ok(())
+    }
+}
+
+#[automock]
+#[async_trait]
+trait Delete: 'static + Sync + Send {
+    async fn delete(
+        &self,
+        agent: &Agent,
+        wallet_id: &str,
+        canister_id: Principal,
+    ) -> Result<(), Error>;
+}
+
+struct Deleter {}
+
+#[async_trait]
+impl Delete for Deleter {
+    async fn delete(
+        &self,
+        agent: &Agent,
+        wallet_id: &str,
+        canister_id: Principal,
+    ) -> Result<(), Error> {
+        #[derive(CandidType)]
+        struct In {
+            canister_id: Principal,
+        }
+
+        let mut delete_args = Argument::new();
+        delete_args.push_idl_arg(In { canister_id });
+
+        let principal = Principal::from_str(wallet_id).unwrap();
+        let wallet = interfaces::WalletCanister::create(agent, principal)
+            .await
+            .context("failed to build wallet")?;
+
+        let delete_call = wallet.call(
+            Principal::management_canister(),
+            MgmtMethod::DeleteCanister.as_ref(),
+            delete_args,
+            0,
+        );
+
+        let waiter = Delay::builder()
+            .throttle(500 * MILLISECOND)
+            .timeout(5 * MINUTE)
+            .build();
+
+        delete_call
+            .call_and_wait(waiter)
+            .await
+            .context("failed to delete canister")?;
+
+        Ok(())
+    }
+}
+
+struct ThrottleParams {
+    throttle_duration: Duration,
+    next_time: Option<Instant>,
+}
+
+impl ThrottleParams {
+    fn new(throttle_duration: Duration) -> Self {
+        Self {
+            throttle_duration,
+            next_time: None,
         }
     }
 }
 
-const MIN_PROTOCOL_VERSION: Option<SslVersion> = Some(SslVersion::TLS1_3);
-const ALLOWED_CIPHER_SUITES: &str = "TLS_AES_128_GCM_SHA256:TLS_AES_256_GCM_SHA384";
-const ALLOWED_SIGNATURE_ALGORITHMS: &str = "ed25519";
+struct WithThrottle<T>(T, ThrottleParams);
 
-pub fn tls_acceptor(
-    private_key: &PKey<Private>,
-    server_cert: &X509,
-    trusted_client_certs: Vec<X509>,
-) -> core::result::Result<SslAcceptor, openssl::ssl::Error> {
-    let mut builder = SslAcceptor::mozilla_modern_v5(SslMethod::tls_server())
-        .expect("Failed to initialize the acceptor.");
-    builder.set_min_proto_version(MIN_PROTOCOL_VERSION)?;
-    builder.set_ciphersuites(ALLOWED_CIPHER_SUITES)?;
-    builder.set_sigalgs_list(ALLOWED_SIGNATURE_ALGORITHMS)?;
-    builder.set_verify(SslVerifyMode::NONE);
-    builder.set_verify(SslVerifyMode::PEER);
-    builder.set_verify_cert_store(cert_store(trusted_client_certs)?)?;
-    builder.set_verify_depth(2);
-    builder.set_private_key(private_key)?;
-    builder.set_certificate(server_cert)?;
-    builder.check_private_key()?;
-    Ok(builder.build())
-}
+#[async_trait]
+impl<T: Run + Send + Sync> Run for WithThrottle<T> {
+    async fn run(&mut self, context: &TestContext) -> Result<(), Error> {
+        let current_time = Instant::now();
+        let next_time = self.1.next_time.unwrap_or(current_time);
 
-async fn perform_tls_server_handshake(
-    tcp_stream: TcpStream,
-    self_cert: &X509,
-    private_key: &PKey<Private>,
-    trusted_client_certs: Vec<X509>,
-) -> core::result::Result<(SslStream<TcpStream>, Option<X509>), String> {
-    let tls_acceptor = tls_acceptor(private_key, self_cert, trusted_client_certs.clone())
-        .map_err(|e| e.to_string())?;
-    let ssl = Ssl::new(tls_acceptor.context()).unwrap();
-    let mut tls_stream = SslStream::new(ssl, tcp_stream).unwrap();
-    Pin::new(&mut tls_stream).accept().await.unwrap();
-    let peer_cert = tls_stream.ssl().peer_certificate();
-    Ok((tls_stream, peer_cert))
-}
+        if next_time > current_time {
+            tokio::time::sleep(next_time - current_time).await;
+        }
+        self.1.next_time = Some(Instant::now() + self.1.throttle_duration);
 
-pub fn generate_tls_key_pair() -> (X509, PKey<Private>) {
-    let private_key = PKey::generate_ed25519().expect("failed to create Ed25519 key pair");
-    let mut name = X509Name::builder().unwrap();
-    name.append_entry_by_nid(Nid::COMMONNAME, "boundary-node-prober.dfinity.org")
-        .unwrap();
-    let name = name.build();
-    let mut builder = X509::builder().unwrap();
-    builder.set_version(2).unwrap();
-    builder.set_subject_name(&name).unwrap();
-    builder.set_issuer_name(&name).unwrap();
-    builder.set_pubkey(&private_key).unwrap();
-    builder.sign(&private_key, MessageDigest::null()).unwrap();
-    builder
-        .set_not_before(&Asn1Time::days_from_now(0).unwrap())
-        .unwrap();
-    let not_after =
-        Asn1Time::from_str_x509("99991231235959Z").expect("unable to parse not after as ASN1Time");
-    builder.set_not_after(&not_after).unwrap();
-    let certificate: X509 = builder.build();
-    (certificate, private_key)
-}
-
-fn cert_store(certs: Vec<X509>) -> core::result::Result<X509Store, openssl::ssl::Error> {
-    let mut cert_store_builder =
-        X509StoreBuilder::new().expect("Failed to init X509 store builder.");
-    for cert in certs {
-        cert_store_builder.add_cert(cert.clone())?;
+        self.0.run(context).await
     }
-    Ok(cert_store_builder.build())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[derive(Clone)]
-    struct FakeProber {
-        canisters: Canisters,
-        wallets: Canisters,
-        routes: Routes,
-    }
+    use mockall::predicate;
 
-    #[async_trait]
-    impl ProberLoader for FakeProber {
-        fn reload(&mut self) {}
+    #[tokio::test]
+    async fn it_loads() -> Result<(), Error> {
+        use indoc::indoc;
+        use std::fs::File;
+        use std::io::Write;
+        use tempfile::tempdir;
 
-        fn get_canisters(&self) -> HashMap<String, String> {
-            self.canisters.subnet.clone()
+        // Create route files
+        let routes_dir = tempdir()?;
+
+        for (name, content) in &[
+            ("001.routes", "{}"),
+            ("002.routes", "{}"),
+            (
+                "003.routes",
+                indoc! {r#"{
+                    "canister_routes": [{ "subnet_id": "subnet-1" }],
+                    "subnets": [
+                        {
+                            "subnet_id": "subnet-1",
+                            "nodes": [{ "node_id": "node-1", "socket_addr": "socket-1" }]
+                        }
+                    ]
+                }"#},
+            ),
+        ] {
+            let file_path = routes_dir.path().join(name);
+            let mut file = File::create(file_path)?;
+            writeln!(file, "{}", content)?;
         }
 
-        fn remove_canister(&mut self, subnet: &str) {
-            self.canisters.subnet.remove(subnet);
-        }
+        // Create loader
+        let loader = RoutesLoader::new(routes_dir.path().to_path_buf());
 
-        fn add_canister(&mut self, subnet: String, canister: String) {
-            self.canisters.subnet.insert(subnet, canister);
-        }
+        let out = loader.load().await?;
+        assert_eq!(
+            out,
+            Routes {
+                subnets: vec![SubnetRoute {
+                    subnet_id: String::from("subnet-1"),
+                    nodes: vec![NodeRoute {
+                        node_id: String::from("node-1"),
+                        socket_addr: String::from("socket-1"),
+                    }],
+                }],
+            },
+        );
 
-        fn get_wallet(&self, subnet: &str) -> Option<&String> {
-            self.wallets.subnet.get(subnet)
-        }
-
-        fn get_routes(&self) -> Vec<SubnetRoute> {
-            self.routes.subnets.clone()
-        }
-
-        fn export_canister_data(&self, _canisters: &Canisters) {}
-
-        async fn create_agent_and_waiter(
-            &self,
-            url: &str,
-            _mainnet: bool,
-        ) -> BoxResult<(Agent, Delay)> {
-            let url = format!("{}{}", "http://", url);
-            let agent = Agent::builder()
-                .with_transport(
-                    ic_agent::agent::http_transport::ReqwestHttpReplicaV2Transport::create(url)
-                        .unwrap(),
-                )
-                .build()
-                .unwrap();
-            let waiter = garcon::Delay::builder()
-                .throttle(std::time::Duration::from_millis(500))
-                .timeout(std::time::Duration::from_secs(60 * 5))
-                .build();
-            Ok((agent, waiter))
-        }
-
-        async fn create_canister(
-            &self,
-            _url: String,
-            _wallet_id: String,
-            _mainnet: bool,
-        ) -> Result<Principal, String> {
-            Ok(Principal::management_canister())
-        }
-
-        async fn cleanup_old_canisters(
-            &self,
-            _url: String,
-            _canister: String,
-            _wallet_canister: String,
-            _mainnet: bool,
-        ) -> Result<(), String> {
-            Ok(())
-        }
-
-        async fn execute_probe(
-            &self,
-            _url: &str,
-            _canister_id: &Principal,
-            _mainnet: bool,
-        ) -> Result<(), String> {
-            tokio::time::sleep(Duration::from_secs(1)).await;
-            Ok(())
-        }
-    }
-
-    fn create_mock_prober(sample_principal: &str) -> Box<dyn ProberLoader> {
-        let canisters = HashMap::new();
-        let canisters = Canisters { subnet: canisters };
-        let mut wallets = HashMap::new();
-        wallets.insert(sample_principal.to_string(), sample_principal.to_string());
-        let wallets = Canisters { subnet: wallets };
-
-        let node_route = NodeRoute {
-            node_id: sample_principal.to_string(),
-            socket_addr: "example.com".parse().unwrap(),
-            tls_certificate_pem: "".parse().unwrap(),
-        };
-
-        let subnet = SubnetRoute {
-            subnet_id: sample_principal.to_string(),
-            nodes: vec![node_route],
-        };
-
-        let routes = Routes {
-            registry_version: 1,
-            nns_subnet_id: sample_principal.to_string(),
-            canister_routes: vec![],
-            subnets: vec![subnet],
-        };
-
-        Box::new(FakeProber {
-            canisters,
-            wallets,
-            routes,
-        })
+        Ok(())
     }
 
     #[tokio::test]
-    async fn event_loop_test() {
-        let sample_principal = Principal::management_canister().to_text();
-        let mock_prober = create_mock_prober(&sample_principal);
-        tokio::spawn(async move {
-            start_probe_event_loop(mock_prober, false).await;
+    async fn it_runs() -> Result<(), Error> {
+        let mut loader = MockLoad::new();
+        loader.expect_load().times(1).returning(|| {
+            Ok(Routes {
+                subnets: vec![SubnetRoute {
+                    subnet_id: String::from("subnet-1"),
+                    nodes: vec![NodeRoute {
+                        node_id: String::from("node-1"),
+                        socket_addr: String::from("socket-1"),
+                    }],
+                }],
+            })
         });
-        tokio::time::sleep(Duration::from_secs(2)).await;
-        assert_eq!(
-            NODE_PROBE_SUCCESS
-                .get_metric_with_label_values(&[&sample_principal])
-                .unwrap()
-                .get(),
-            1
+        let wallets = Wallets {
+            subnet: HashMap::from([(String::from("subnet-1"), String::from("wallet-1"))]),
+        };
+
+        let mut creator = MockCreate::new();
+        creator
+            .expect_create()
+            .times(1)
+            .with(
+                predicate::always(),       // agent
+                predicate::eq("wallet-1"), // wallet_id
+            )
+            .returning(|_, _| {
+                Ok(Principal::from_text(String::from(
+                    "rwlgt-iiaaa-aaaaa-aaaaa-cai",
+                ))?)
+            });
+
+        let mut installer = MockInstall::new();
+        installer
+            .expect_install()
+            .times(1)
+            .with(
+                predicate::always(),       // agent
+                predicate::eq("wallet-1"), // wallet_id
+                predicate::function(|id: &Principal| {
+                    id.to_string() == "rwlgt-iiaaa-aaaaa-aaaaa-cai"
+                }), // canister_id
+            )
+            .returning(|_, _, _| Ok(()));
+
+        let mut prober = MockProbe::new();
+        prober
+            .expect_probe()
+            // .times(1)
+            .with(
+                predicate::always(), // agent
+                predicate::function(|id: &Principal| {
+                    id.to_string() == "rwlgt-iiaaa-aaaaa-aaaaa-cai"
+                }), // canister_id
+            )
+            .returning(|_, _| Ok(()));
+
+        let mut stopper = MockStop::new();
+        stopper
+            .expect_stop()
+            .times(1)
+            .with(
+                predicate::always(),       // agent
+                predicate::eq("wallet-1"), // wallet_id
+                predicate::function(|id: &Principal| {
+                    id.to_string() == "rwlgt-iiaaa-aaaaa-aaaaa-cai"
+                }), // canister_id
+            )
+            .returning(|_, _, _| Ok(()));
+
+        let mut deleter = MockDelete::new();
+        deleter
+            .expect_delete()
+            .times(1)
+            .with(
+                predicate::always(),       // agent
+                predicate::eq("wallet-1"), // wallet_id
+                predicate::function(|id: &Principal| {
+                    id.to_string() == "rwlgt-iiaaa-aaaaa-aaaaa-cai"
+                }), // canister_id
+            )
+            .returning(|_, _, _| Ok(()));
+
+        let create_agent = |route: NodeRoute| -> Result<(String, String, Agent), Error> {
+            assert_eq!(route.node_id, "node-1");
+            assert_eq!(route.socket_addr, "socket-1");
+
+            let transport = ReqwestHttpReplicaV2Transport::create("http://test")
+                .context("failed to create transport")?;
+
+            let agent = Agent::builder().with_transport(transport).build()?;
+
+            Ok((route.node_id, route.socket_addr, agent))
+        };
+
+        let mut runner = SubnetTestRunner::new(
+            Arc::new(loader),
+            create_agent, // create_agent
+            Arc::new(CanisterOps {
+                creator,
+                installer,
+                prober,
+                stopper,
+                deleter,
+            }),
+            Duration::ZERO, // canister_ttl
+            1 * MINUTE,     // probe_interval
         );
-        assert_eq!(PROBES_COMPLETED.get(), 1);
-        assert_eq!(
-            CREATE_CANISTER_SUCCESS
-                .get_metric_with_label_values(&[&sample_principal])
-                .unwrap()
-                .get(),
-            1
-        );
-        assert_eq!(
-            CREATE_CANISTER_FAILURE
-                .get_metric_with_label_values(&[&sample_principal])
-                .unwrap()
-                .get(),
-            0
-        );
-        assert!(
-            NODE_PROBE_LATENCY
-                .get_metric_with_label_values(&[&sample_principal])
-                .unwrap()
-                .get()
-                > 0
-        )
+
+        let subnet_service_context = wallets
+            .subnet
+            .into_iter()
+            .map(|(subnet_id, wallet_id)| TestContext {
+                wallet_id,
+                subnet_id,
+            })
+            .next()
+            .expect("Loader didn't find a subnet");
+
+        runner.run(&subnet_service_context).await?;
+
+        Ok(())
     }
 }

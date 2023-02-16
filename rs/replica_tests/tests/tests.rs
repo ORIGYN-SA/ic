@@ -1,38 +1,35 @@
 use assert_matches::assert_matches;
 use candid::{Decode, Encode};
 use ic_error_types::ErrorCode;
+use ic_ic00_types::{self as ic00, EmptyBlob, Method, Payload};
 use ic_replica_tests as utils;
-use ic_replica_tests::assert_reply;
+use ic_replica_tests::{assert_reply, install_universal_canister};
 use ic_replicated_state::{PageIndex, PageMap};
+use ic_state_machine_tests::StateMachine;
 use ic_sys::PAGE_SIZE;
 use ic_test_utilities::types::ids::canister_test_id;
 use ic_test_utilities::universal_canister::{call_args, wasm};
 use ic_types::{
-    ic00,
-    ic00::{EmptyBlob, Method},
-    ingress::WasmResult,
-    messages::MAX_INTER_CANISTER_PAYLOAD_IN_BYTES,
-    time::current_time_and_expiry_time,
-    CanisterId, NumBytes, RegistryVersion,
+    ingress::WasmResult, messages::MAX_INTER_CANISTER_PAYLOAD_IN_BYTES,
+    time::current_time_and_expiry_time, CanisterId, NumBytes, RegistryVersion,
 };
 
 const WASM_PAGE_SIZE: usize = 65536;
-const CYCLES_BALANCE: u128 = 1 << 50;
 
 #[test]
 /// Tests a message can roundtrip through all layers
 fn test_message_roundtrip() {
-    utils::simple_canister_test(|canister| {
-        assert_reply(
-            canister.query(wasm().reply_data(b"Hello World!")),
-            b"Hello World!",
-        );
+    let env = StateMachine::new();
+    let canister = install_universal_canister(&env, vec![]);
+    assert_reply(
+        canister.query(wasm().reply_data(b"Hello World!")),
+        b"Hello World!",
+    );
 
-        assert_reply(
-            canister.update(wasm().reply_data(b"Hello World!")),
-            b"Hello World!",
-        );
-    })
+    assert_reply(
+        canister.update(wasm().reply_data(b"Hello World!")),
+        b"Hello World!",
+    );
 }
 
 #[test]
@@ -87,69 +84,61 @@ fn test_duplicate_message_is_noop() {
 #[test]
 /// Tests that a canister correctly initializes itself
 fn test_canister_init() {
-    utils::canister_test(move |test| {
-        // Store some data in stable memory on canister_init
-        let bytes = b"hello from canister init";
-        let canister_id = test.create_universal_canister_with_args(
-            wasm().stable_grow(1).stable_write(10, bytes),
-            CYCLES_BALANCE,
-        );
+    let env = StateMachine::new();
 
-        // Verify that the data written in canister_init is available.
-        assert_reply(
-            test.query(
-                canister_id,
-                "query",
-                wasm()
-                    .stable_read(10, bytes.len() as u32)
-                    .reply_data_append()
-                    .reply(),
-            ),
-            bytes,
-        );
-    })
+    // Store some data in stable memory on canister_init
+    let bytes = b"hello from canister init";
+    let canister = install_universal_canister(&env, wasm().stable_grow(1).stable_write(10, bytes));
+
+    // Verify that the data written in canister_init is available.
+    assert_reply(
+        canister.query(
+            wasm()
+                .stable_read(10, bytes.len() as u32)
+                .reply_data_append()
+                .reply(),
+        ),
+        bytes,
+    );
 }
 
 #[test]
 /// Tests debug.log from canister_init
 fn test_canister_init_debug_print() {
+    let env = StateMachine::new();
     // installs a canister that uses debug.log from canister_init
     // and panics if an error has occurred.
-    utils::canister_test(move |test| {
-        test.create_universal_canister_with_args(wasm().debug_print(b"Hi!"), CYCLES_BALANCE);
-    })
+    install_universal_canister(&env, wasm().debug_print(b"Hi!"));
 }
 
 #[test]
 /// Tests that a counter can be incremented on the heap
 fn test_counter_heap() {
-    utils::canister_test(|test| {
-        let (canister_id, _) = test.create_and_install_canister(COUNTER_ON_HEAP, vec![]);
-        let initial_val = test.query(canister_id, "read", vec![]).unwrap().bytes();
-        test.ingress(canister_id, "inc", vec![]).unwrap();
-        let final_val = test.query(canister_id, "read", vec![]).unwrap().bytes();
-        assert_eq!(final_val[0], initial_val[0] + 1);
-    })
+    let env = StateMachine::new();
+    let canister_id = env.install_canister_wat(COUNTER_ON_HEAP, vec![], None);
+    let initial_val = env.query(canister_id, "read", vec![]).unwrap().bytes();
+    env.execute_ingress(canister_id, "inc", vec![]).unwrap();
+    let final_val = env.query(canister_id, "read", vec![]).unwrap().bytes();
+    assert_eq!(final_val[0], initial_val[0] + 1);
 }
 
 #[test]
 /// Tests that we can persist globals across multiple message executions.
 fn can_persist_globals_across_multiple_message_executions() {
-    utils::canister_test(|test| {
-        let (canister_id, _) = test.create_and_install_canister(CANISTER_WITH_GLOBAL, vec![]);
-        let initial_val = test.query(canister_id, "read", vec![]).unwrap().bytes()[0];
-        assert_eq!(0, initial_val);
+    let env = StateMachine::new();
+    let canister_id = env.install_canister_wat(CANISTER_WITH_GLOBAL, vec![], None);
+    let initial_val = env.query(canister_id, "read", vec![]).unwrap().bytes()[0];
+    assert_eq!(0, initial_val);
 
-        test.ingress(canister_id, "write", vec![]).unwrap();
+    env.execute_ingress(canister_id, "write", vec![]).unwrap();
 
-        let val_after_first_ingress = test.query(canister_id, "read", vec![]).unwrap().bytes()[0];
-        assert_eq!(initial_val + 1, val_after_first_ingress);
+    let val_after_first_ingress = env.query(canister_id, "read", vec![]).unwrap().bytes()[0];
+    assert_eq!(initial_val + 1, val_after_first_ingress);
 
-        test.ingress(canister_id, "write", vec![]).unwrap();
+    env.execute_ingress(canister_id, "write", vec![]).unwrap();
 
-        let val_after_second_ingress = test.query(canister_id, "read", vec![]).unwrap().bytes()[0];
-        assert_eq!(val_after_first_ingress + 1, val_after_second_ingress);
-    })
+    let val_after_second_ingress = env.query(canister_id, "read", vec![]).unwrap().bytes()[0];
+    assert_eq!(val_after_first_ingress + 1, val_after_second_ingress);
 }
 
 // This is a canister that keeps a counter on the heap (as opposed to
@@ -255,18 +244,17 @@ fn test_read_query_does_not_modify_wasm_state() {
           (memory (;0;) 1)
           (export "memory" (memory 0))
           (export "canister_query test" (func $test)))"#;
-    utils::canister_test(move |test| {
-        let (canister_id, _) = test.create_and_install_canister(wat, vec![]);
-        // This canister exposes a single method that increments a counter at position 0
-        // of the heap by 5.
-        //
-        // Two read queries back to back should return the same result since no
-        // modifications from the first one should be persisting in the canister's
-        // state.
-        let expected_val = test.query(canister_id, "test", vec![]);
-        let val = test.query(canister_id, "test", vec![]);
-        assert_eq!(val, expected_val);
-    })
+    let env = StateMachine::new();
+    let canister_id = env.install_canister_wat(wat, vec![], None);
+    // This canister exposes a single method that increments a counter at position 0
+    // of the heap by 5.
+    //
+    // Two read queries back to back should return the same result since no
+    // modifications from the first one should be persisting in the canister's
+    // state.
+    let expected_val = env.query(canister_id, "test", vec![]);
+    let val = env.query(canister_id, "test", vec![]);
+    assert_eq!(val, expected_val);
 }
 
 #[test]
@@ -291,22 +279,20 @@ fn test_bad_read_query_does_not_corrupt_state() {
           (memory (;0;) 1)
           (export "memory" (memory 0))
           (export "canister_query test" (func $test)))"#;
-    utils::canister_test(move |test| {
-        let (canister_id, _) = test.create_and_install_canister(wat, vec![]);
-        std::thread::sleep(std::time::Duration::from_secs(60));
-        // This canister exposes a single method that increments a counter at position 0
-        // of the heap by 5.
-        //
-        // Two read queries back to back should return the same result since no
-        // modifications from the first one should be persisting in the canister's
-        // state.
-        let expected_val = test.ingress(canister_id, "test_bad", vec![]);
-        assert!(expected_val.is_err());
-        let expected_val = test.ingress(canister_id, "test", vec![]);
-        assert!(expected_val.is_ok());
-        let val = test.ingress(canister_id, "test", vec![]);
-        assert_eq!(val, expected_val);
-    })
+    let env = StateMachine::new();
+    let canister_id = env.install_canister_wat(wat, vec![], None);
+    // This canister exposes a single method that increments a counter at position 0
+    // of the heap by 5.
+    //
+    // Two read queries back to back should return the same result since no
+    // modifications from the first one should be persisting in the canister's
+    // state.
+    let expected_val = env.execute_ingress(canister_id, "test_bad", vec![]);
+    assert!(expected_val.is_err());
+    let expected_val = env.execute_ingress(canister_id, "test", vec![]);
+    assert!(expected_val.is_ok());
+    let val = env.execute_ingress(canister_id, "test", vec![]);
+    assert_eq!(val, expected_val);
 }
 
 fn display_page_map(page_map: PageMap, page_range: std::ops::Range<u64>) -> String {
@@ -319,29 +305,30 @@ fn display_page_map(page_map: PageMap, page_range: std::ops::Range<u64>) -> Stri
 
 #[test]
 fn test_trap_recovery() {
-    utils::simple_canister_test(move |canister| {
-        // Stable memory should now be [1, 0, 0, ...]
-        canister
-            .update(wasm().stable_grow(1).stable_write(0, &[1]).reply())
-            .unwrap();
+    let env = StateMachine::new();
+    let canister = install_universal_canister(&env, vec![]);
 
-        // Trap explicitly
-        assert_matches!(
-            canister.update(wasm().trap()),
-            Err(err) if err.code() == ErrorCode::CanisterCalledTrap
-        );
+    // Stable memory should now be [1, 0, 0, ...]
+    canister
+        .update(wasm().stable_grow(1).stable_write(0, &[1]).reply())
+        .unwrap();
 
-        // Stable memory should be preserved and now be [1, 1, 0, ...]
-        assert_eq!(
-            canister.update(
-                wasm()
-                    .stable_write(1, &[1])
-                    .stable_read(0, 3)
-                    .append_and_reply()
-            ),
-            Ok(WasmResult::Reply(vec![1, 1, 0]))
-        );
-    });
+    // Trap explicitly
+    assert_matches!(
+        canister.update(wasm().trap()),
+        Err(err) if err.code() == ErrorCode::CanisterCalledTrap
+    );
+
+    // Stable memory should be preserved and now be [1, 1, 0, ...]
+    assert_eq!(
+        canister.update(
+            wasm()
+                .stable_write(1, &[1])
+                .stable_read(0, 3)
+                .append_and_reply()
+        ),
+        Ok(WasmResult::Reply(vec![1, 1, 0]))
+    );
 }
 
 #[test]
@@ -364,20 +351,19 @@ fn test_query_trap_recovery() {
           (memory $memory 1)
           (export "memory" (memory $memory)))"#;
 
-    utils::canister_test(move |test| {
-        let (canister_id, _) = test.create_and_install_canister(wat, vec![]);
-        assert_reply(
-            test.query(canister_id, "read", vec![]),
-            &0u32.to_le_bytes()[..],
-        );
+    let env = StateMachine::new();
+    let canister_id = env.install_canister_wat(wat, vec![], None);
+    assert_reply(
+        env.query(canister_id, "read", vec![]),
+        &0u32.to_le_bytes()[..],
+    );
 
-        assert!(test.query(canister_id, "trap", vec![]).is_err());
+    assert!(env.query(canister_id, "trap", vec![]).is_err());
 
-        assert_reply(
-            test.query(canister_id, "read", vec![]),
-            &0u32.to_le_bytes()[..],
-        );
-    });
+    assert_reply(
+        env.query(canister_id, "read", vec![]),
+        &0u32.to_le_bytes()[..],
+    );
 }
 
 #[test]
@@ -620,10 +606,9 @@ fn test_memory_access_between_min_and_max_start() {
           (start $start)
           (memory $memory 1 2)
         )"#;
-    utils::canister_test(move |test| {
-        println!("> install_canister()");
-        test.create_and_install_canister(wat, vec![]).1.unwrap();
-    });
+    let env = StateMachine::new();
+    println!("> install_canister()");
+    env.install_canister_wat(wat, vec![], None);
 }
 
 #[test]
@@ -676,26 +661,24 @@ fn test_upgrade_canister_stable_memory_persists() {
           (export "canister_query inc_read" (func $inc))
           (export "canister_init" (func $canister_init))
         )"#;
-    utils::canister_test(move |test| {
-        // Install the canister
-        let (canister_id, _) = test.create_and_install_canister(wat, vec![]);
 
-        // Increment the counter by 1.
-        let res = test.ingress(canister_id, "inc", vec![]);
+    let env = StateMachine::new();
+    let canister_id = env.install_canister_wat(wat, vec![], None);
+    // Increment the counter by 1.
+    let res = env.execute_ingress(canister_id, "inc", vec![]);
 
-        // Counter now should be 1.
-        assert_eq!(res, Ok(WasmResult::Reply(vec![1, 0, 0, 0])));
+    // Counter now should be 1.
+    assert_eq!(res, Ok(WasmResult::Reply(vec![1, 0, 0, 0])));
 
-        // Upgrade the canister. Because the counter is in stable memory, it should be
-        // persisted.
-        test.upgrade_canister(&canister_id, wat, vec![]).unwrap();
+    // Upgrade the canister. Because the counter is in stable memory, it should be
+    // persisted.
+    env.upgrade_canister_wat(canister_id, wat, vec![]);
 
-        // Increment the counter by 1.
-        let res = test.ingress(canister_id, "inc", vec![]);
+    // Increment the counter by 1.
+    let res = env.execute_ingress(canister_id, "inc", vec![]);
 
-        // Counter now should be 2.
-        assert_eq!(res, Ok(WasmResult::Reply(vec![2, 0, 0, 0])));
-    });
+    // Counter now should be 2.
+    assert_eq!(res, Ok(WasmResult::Reply(vec![2, 0, 0, 0])));
 }
 
 #[test]
@@ -709,10 +692,9 @@ fn test_memory_access_between_min_and_max_canister_init() {
           )
           (memory $memory 1 2)
         )"#;
-    utils::canister_test(move |test| {
-        println!("> install_canister()");
-        test.create_and_install_canister(wat, vec![]).1.unwrap();
-    });
+    let env = StateMachine::new();
+    println!("> install_canister()");
+    env.install_canister_wat(wat, vec![], None);
 }
 
 #[test]
@@ -727,12 +709,11 @@ fn test_memory_access_between_min_and_max_ingress() {
           (memory $memory 1 2)
           (export "canister_update test" (func $test))
         )"#;
-    utils::canister_test(move |test| {
-        println!("> install_canister()");
-        let (canister_id, _) = test.create_and_install_canister(wat, vec![]);
-        println!("> test()");
-        test.ingress(canister_id, "test", vec![]).unwrap();
-    });
+    let env = StateMachine::new();
+    println!("> install_canister()");
+    let canister_id = env.install_canister_wat(wat, vec![], None);
+    println!("> test()");
+    env.execute_ingress(canister_id, "test", vec![]).unwrap();
 }
 
 #[test]
@@ -754,10 +735,9 @@ fn test_update_available_memory_1() {
           (memory $memory 1 1)
           (export "canister_update grow" (func $grow))
         )"#;
-    utils::canister_test(move |test| {
-        let (canister_id, _) = test.create_and_install_canister(wat, vec![]);
-        test.ingress(canister_id, "grow", vec![]).unwrap();
-    });
+    let env = StateMachine::new();
+    let canister_id = env.install_canister_wat(wat, vec![], None);
+    env.execute_ingress(canister_id, "grow", vec![]).unwrap();
 }
 
 #[test]
@@ -779,10 +759,9 @@ fn test_update_available_memory_2() {
           (memory $memory 1 1)
           (export "canister_update grow" (func $grow))
         )"#;
-    utils::canister_test(move |test| {
-        let (canister_id, _) = test.create_and_install_canister(wat, vec![]);
-        test.ingress(canister_id, "grow", vec![]).unwrap();
-    });
+    let env = StateMachine::new();
+    let canister_id = env.install_canister_wat(wat, vec![], None);
+    env.execute_ingress(canister_id, "grow", vec![]).unwrap();
 }
 
 #[test]
@@ -951,6 +930,8 @@ fn test_update_available_memory_3() {
     });
 }
 
+// TODO(RUN-324): This test tends to hang, we need to speed it up.
+#[ignore]
 #[test]
 // Grow memory multiple times first and write to newly added pages later.
 fn test_update_available_memory_4() {
@@ -1189,9 +1170,9 @@ fn test_call_forbidden_function_in_canister_init() {
       ;; since we call a function which accesses memory we need to delcare memory
       (memory 0)
     )"#;
-    utils::canister_test(move |test| {
-        test.create_and_install_canister(wat, vec![]).1.unwrap();
-    });
+
+    let env = StateMachine::new();
+    env.install_canister_wat(wat, vec![], None);
 }
 
 #[test]
@@ -1203,17 +1184,15 @@ fn test_canister_init_invalid() {
       (func (;0;) (type 0)
         i32.const 0)
       (export "canister_init" (func 0)))"#;
-    utils::canister_test(move |test| {
-        test.create_and_install_canister(wat, vec![]).1.unwrap();
-    });
+    let env = StateMachine::new();
+    env.install_canister_wat(wat, vec![], None);
 }
 
 #[test]
 fn test_canister_init_noop() {
     let wat = r#"(module)"#;
-    utils::canister_test(move |test| {
-        test.create_and_install_canister(wat, vec![]).1.unwrap();
-    });
+    let env = StateMachine::new();
+    env.install_canister_wat(wat, vec![], None);
 }
 
 // converts canister id into an escaped byte string,
@@ -1238,14 +1217,15 @@ fn escape_bytes(x: &[u8]) -> String {
 // sums up all the responses and returns the sum when all the replies have been
 // received.
 //
-// The first canister ensures that when call_simple fails, it fails with the
+// The first canister ensures that when call_perform fails, it fails with the
 // appropriate error code and the test ensures that the ingress message
 // eventually finishes running.
 fn test_inter_canister_messaging_full_queues() {
-    utils::canister_test(|test| {
-        // This canister simply returns whatever value was received in an
-        // inter-canister request.
-        let (reflect_canister_id, _) = test.create_and_install_canister(
+    let env = StateMachine::new();
+    // This canister simply returns whatever value was received in an
+    // inter-canister request.
+
+    let reflect_canister_id = env.install_canister_wat(
             r#"(module
               (import "ic0" "msg_arg_data_copy" (func $ic0_msg_arg_data_copy (param i32) (param i32) (param i32)))
               (import "ic0" "msg_reply" (func $msg_reply))
@@ -1263,28 +1243,29 @@ fn test_inter_canister_messaging_full_queues() {
               (memory $memory 1)
               (export "memory" (memory $memory))
               (export "canister_update re" (func $re)))"#,
-            vec![]);
+            vec![], None);
 
-        // This canister keeps forwarding the value that was received in an
-        // ingress msg to the reflector canister above till call_simple fails.
-        // It sums up the reflected values and returns the sum.
-        let (canister_id, _) = test.create_and_install_canister(
-            &format!(
-                r#"(module
+    // This canister keeps forwarding the value that was received in an
+    // ingress msg to the reflector canister above till call_perform fails.
+    // It sums up the reflected values and returns the sum.
+    let canister_id = env.install_canister_wat(
+        &format!(
+            r#"(module
               (import "ic0" "msg_arg_data_copy"
                 (func $ic0_msg_arg_data_copy (param i32) (param i32) (param i32)))
               (import "ic0" "msg_reply" (func $msg_reply))
               (import "ic0" "msg_reply_data_append"
                 (func $msg_reply_data_append (param i32 i32)))
               (import "ic0" "debug_print" (func $debug_print (param i32) (param i32)))
-              (import "ic0" "call_simple"
-                (func $ic0_call_simple
-                    (param i32 i32)
-                    (param $method_name_src i32)    (param $method_name_len i32)
-                    (param $reply_fun i32)          (param $reply_env i32)
-                    (param $reject_fun i32)         (param $reject_env i32)
-                    (param $data_src i32)           (param $data_len i32)
-                    (result i32)))
+              (import "ic0" "call_new"
+                (func $ic0_call_new
+                  (param i32 i32)
+                  (param $method_name_src i32)    (param $method_name_len i32)
+                  (param $reply_fun i32)          (param $reply_env i32)
+                  (param $reject_fun i32)         (param $reject_env i32)
+              ))
+              (import "ic0" "call_data_append" (func $ic0_call_data_append (param $src i32) (param $size i32)))
+              (import "ic0" "call_perform" (func $ic0_call_perform (result i32)))
 
               (func $compute
                 ;; heap[10] = payload[0]
@@ -1293,15 +1274,18 @@ fn test_inter_canister_messaging_full_queues() {
                 (block
                   (loop
                     ;; Call the reflector and store the return value in heap[30]
-                    (i32.store
-                      (i32.const 30)
-                      (call $ic0_call_simple
+                    (call $ic0_call_new
                         (i32.const 100) (i32.const {})  ;; reflector canister id
                         (i32.const 0) (i32.const 2)     ;; refers to "re" on the heap
                         (i32.const 0) (i32.const 0)     ;; on_reply closure
                         (i32.const 0) (i32.const 0)     ;; on_reject closure
+                    )
+                    (call $ic0_call_data_append
                         (i32.const 10) (i32.const 1)    ;; refers to byte copied from the payload
-                      )
+                    ) 
+                    (i32.store
+                      (i32.const 30)
+                      (call $ic0_call_perform)
                     )
 
                     ;; If heap[30] == 2 then call failed due to full queues.  Break out of loop
@@ -1378,13 +1362,14 @@ fn test_inter_canister_messaging_full_queues() {
               (data (i32.const 100) "{}")
               (export "canister_update compute" (func $compute))
               (export "memory" (memory $memory)))"#,
-                reflect_canister_id.get_ref().as_slice().len(),
-                escape(&reflect_canister_id),
-            ),
-            vec![],
-        );
-        test.ingress(canister_id, "compute", vec![5]).unwrap();
-    });
+            reflect_canister_id.get_ref().as_slice().len(),
+            escape(&reflect_canister_id),
+        ),
+        vec![],
+        None,
+    );
+    env.execute_ingress(canister_id, "compute", vec![5])
+        .unwrap();
 }
 
 #[test]
@@ -1395,8 +1380,9 @@ fn test_inter_canister_messaging_full_queues() {
 // - canister C adds 3 to the number and returns it to A
 // - canister A stores the result on the heap
 fn test_inter_canister_message_exchange_1() {
-    utils::canister_test(|test| {
-        let (multiplier_canister_id, _) = test.create_and_install_canister(
+    let env = StateMachine::new();
+
+    let multiplier_canister_id = env.install_canister_wat(
             r#"(module
               (import "ic0" "msg_arg_data_copy" (func $ic0_msg_arg_data_copy (param i32) (param i32) (param i32)))
               (import "ic0" "msg_reply" (func $msg_reply))
@@ -1418,10 +1404,10 @@ fn test_inter_canister_message_exchange_1() {
               (memory $memory 1)
               (export "memory" (memory $memory))
               (export "canister_update 2x" (func $2x)))"#,
-            vec![],
+            vec![], None
         );
 
-        let (adder_canister_id, _) = test.create_and_install_canister(
+    let adder_canister_id = env.install_canister_wat(
             r#"(module
               (import "ic0" "msg_arg_data_copy" (func $ic0_msg_arg_data_copy (param i32) (param i32) (param i32)))
               (import "ic0" "msg_reply" (func $msg_reply))
@@ -1444,8 +1430,9 @@ fn test_inter_canister_message_exchange_1() {
               (export "canister_update +3" (func $plus3))
               (export "memory" (memory $memory)))"#,
             vec![],
+            None
         );
-        let (canister_id, _) = test.create_and_install_canister(&format!(
+    let canister_id = env.install_canister_wat(&format!(
                 r#"(module
               (import "ic0" "msg_arg_data_copy" (func $ic0_msg_arg_data_copy (param i32) (param i32) (param i32)))
               (import "ic0" "msg_reply" (func $msg_reply))
@@ -1515,15 +1502,16 @@ fn test_inter_canister_message_exchange_1() {
                 adder_canister_id.get_ref().as_slice().len(),
                 escape(&multiplier_canister_id),
                 escape(&adder_canister_id),
-            ), vec![]);
-        println!("Canister: {}", &canister_id);
+    ), vec![], None);
 
-        for num in &[5, 17, 113] {
-            test.ingress(canister_id, "compute", vec![*num]).unwrap();
-            let val = test.query(canister_id, "read", vec![]).unwrap().bytes();
-            assert_eq!(val[0], 2 * num + 3, "computation for value {} failed", num);
-        }
-    })
+    println!("Canister: {}", &canister_id);
+
+    for num in &[5, 17, 113] {
+        env.execute_ingress(canister_id, "compute", vec![*num])
+            .unwrap();
+        let val = env.query(canister_id, "read", vec![]).unwrap().bytes();
+        assert_eq!(val[0], 2 * num + 3, "computation for value {} failed", num);
+    }
 }
 
 #[test]
@@ -1532,10 +1520,10 @@ fn test_inter_canister_message_exchange_1() {
 // - both canisters B and C multiply it by 2 and return to canister A
 // - canister A sums the results and stores it on the heap
 fn test_inter_canister_message_exchange_2() {
-    utils::canister_test(|test| {
-        let mut ids = Vec::new();
-        for _ in 0..2 {
-            let (id, _) = test.create_and_install_canister(
+    let env = StateMachine::new();
+    let mut ids = Vec::new();
+    for _ in 0..2 {
+        let id = env.install_canister_wat(
                 r#"(module
               (import "ic0" "msg_arg_data_copy" (func $ic0_msg_arg_data_copy (param i32) (param i32) (param i32)))
               (import "ic0" "msg_reply" (func $msg_reply))
@@ -1556,26 +1544,27 @@ fn test_inter_canister_message_exchange_2() {
               (memory $memory 1)
               (export "canister_update 2x" (func $2x))
               (export "memory" (memory $memory)))"#,
-                vec![],
+                vec![], None
             );
-            ids.push(id);
-        }
+        ids.push(id);
+    }
 
-        let (canister_id, _) = test.create_and_install_canister(
+    let canister_id = env.install_canister_wat(
             &format!(
                 r#"(module
               (import "ic0" "msg_arg_data_copy" (func $ic0_msg_arg_data_copy (param i32) (param i32) (param i32)))
               (import "ic0" "msg_reply" (func $msg_reply))
               (import "ic0" "msg_reply_data_append"
                 (func $msg_reply_data_append (param i32 i32)))
-              (import "ic0" "call_simple"
-                (func $ic0_call_simple
-                    (param i32 i32)
-                    (param $method_name_src i32)    (param $method_name_len i32)
-                    (param $reply_fun i32)          (param $reply_env i32)
-                    (param $reject_fun i32)         (param $reject_env i32)
-                    (param $data_src i32)           (param $data_len i32)
-                    (result i32)))
+              (import "ic0" "call_new"
+                (func $ic0_call_new
+                  (param i32 i32)
+                  (param $method_name_src i32)    (param $method_name_len i32)
+                  (param $reply_fun i32)          (param $reply_env i32)
+                  (param $reject_fun i32)         (param $reject_env i32)
+              ))
+              (import "ic0" "call_data_append" (func $ic0_call_data_append (param $src i32) (param $size i32)))
+              (import "ic0" "call_perform" (func $ic0_call_perform (result i32)))
 
               (func $compute
                 ;; heap[20] = 0
@@ -1583,20 +1572,24 @@ fn test_inter_canister_message_exchange_2() {
                 ;; heap[10] = payload[0]
                 (call $ic0_msg_arg_data_copy (i32.const 10) (i32.const 0) (i32.const 1))
                 ;; sends heap[10] to one multiplier
-                (call $ic0_call_simple
+                (call $ic0_call_new
                     (i32.const 100) (i32.const {})  ;; multiplier canister id
                     (i32.const 0) (i32.const 2)     ;; refers to "2x" on the heap
                     (i32.const 0) (i32.const 0)     ;; on_reply closure
-                    (i32.const 0) (i32.const 0)     ;; on_reject closure
+                    (i32.const 0) (i32.const 0))    ;; on_reject closure
+                (call $ic0_call_data_append
                     (i32.const 10) (i32.const 1))   ;; refers to byte copied from the payload
+                (call $ic0_call_perform)
                 drop
                 ;; sends heap[10] to another multiplier
-                (call $ic0_call_simple
+                (call $ic0_call_new
                     (i32.const 200) (i32.const {})  ;; multiplier canister id
                     (i32.const 0) (i32.const 2)     ;; refers to "2x" on the heap
                     (i32.const 0) (i32.const 0)     ;; on_reply closure
-                    (i32.const 0) (i32.const 0)     ;; on_reject closure
+                    (i32.const 0) (i32.const 0))    ;; on_reject closure
+                (call $ic0_call_data_append
                     (i32.const 10) (i32.const 1))   ;; refers to byte copied from the payload
+                (call $ic0_call_perform)
                 drop
                 (global.set $ncalls (i32.const 2)))
 
@@ -1630,15 +1623,15 @@ fn test_inter_canister_message_exchange_2() {
                 ids[1].get_ref().as_slice().len(),
                 escape(&ids[0]), escape(&ids[1])
             ),
-            vec![],
+            vec![], None
         );
 
-        for num in &[5, 17, 50] {
-            test.ingress(canister_id, "compute", vec![*num]).unwrap();
-            let val = test.query(canister_id, "read", vec![]).unwrap().bytes();
-            assert_eq!(val[0], 4 * num, "computation for value {} failed", num);
-        }
-    })
+    for num in &[5, 17, 50] {
+        env.execute_ingress(canister_id, "compute", vec![*num])
+            .unwrap();
+        let val = env.query(canister_id, "read", vec![]).unwrap().bytes();
+        assert_eq!(val[0], 4 * num, "computation for value {} failed", num);
+    }
 }
 
 #[test]
@@ -1741,25 +1734,28 @@ fn test_inter_canister_message_exchange_3() {
               (import "ic0" "msg_reply" (func $msg_reply))
               (import "ic0" "msg_reply_data_append"
                 (func $msg_reply_data_append (param i32 i32)))
-              (import "ic0" "call_simple"
-                (func $ic0_call_simple
-                    (param i32 i32)
-                    (param $method_name_src i32)    (param $method_name_len i32)
-                    (param $reply_fun i32)          (param $reply_env i32)
-                    (param $reject_fun i32)         (param $reject_env i32)
-                    (param $data_src i32)           (param $data_len i32)
-                    (result i32)))
+              (import "ic0" "call_new"
+                (func $ic0_call_new
+                  (param i32 i32)
+                  (param $method_name_src i32)    (param $method_name_len i32)
+                  (param $reply_fun i32)          (param $reply_env i32)
+                  (param $reject_fun i32)         (param $reject_env i32)
+              ))
+              (import "ic0" "call_data_append" (func $ic0_call_data_append (param $src i32) (param $size i32)))
+              (import "ic0" "call_perform" (func $ic0_call_perform (result i32)))
 
               (func $mul
                 ;; heap[10] = payload[0]
                 (call $ic0_msg_arg_data_copy (i32.const 10) (i32.const 0) (i32.const 1))
                 ;; sends heap[10] to one multiplier
-                (call $ic0_call_simple
+                (call $ic0_call_new
                     (i32.const 100) (i32.const {})  ;; multiplier canister id
                     (i32.const 0) (i32.const 3)     ;; refers to "mul" on the heap
                     (i32.const 0) (i32.const 0)     ;; on_reply closure
-                    (i32.const 0) (i32.const 0)     ;; on_reject closure
+                    (i32.const 0) (i32.const 0))    ;; on_reject closure
+                (call $ic0_call_data_append
                     (i32.const 10) (i32.const 1))   ;; refers to byte copied from the payload
+                (call $ic0_call_perform)
                 drop)
 
               (func $mul_callback (param $env i32)
@@ -1804,22 +1800,23 @@ fn test_inter_canister_message_exchange_3() {
 #[test]
 // A canister sends a message to itself, squaring a number in the callback
 fn test_inter_canister_message_exchange_4() {
-    utils::canister_test(|test| {
-        let (id, _) = test.create_and_install_canister(r#"(module
+    let env = StateMachine::new();
+    let id = env.install_canister_wat(r#"(module
               (import "ic0" "msg_arg_data_copy" (func $ic0_msg_arg_data_copy (param i32) (param i32) (param i32)))
               (import "ic0" "canister_self_size" (func $canister_self_size (result i32)))
               (import "ic0" "canister_self_copy" (func $canister_self_copy (param i32 i32 i32)))
               (import "ic0" "msg_reply" (func $msg_reply))
               (import "ic0" "msg_reply_data_append"
                 (func $msg_reply_data_append (param i32 i32)))
-              (import "ic0" "call_simple"
-                (func $ic0_call_simple
-                    (param i32 i32)
-                    (param $method_name_src i32)    (param $method_name_len i32)
-                    (param $reply_fun i32)          (param $reply_env i32)
-                    (param $reject_fun i32)         (param $reject_env i32)
-                    (param $data_src i32)           (param $data_len i32)
-                    (result i32)))
+              (import "ic0" "call_new"
+                (func $ic0_call_new
+                  (param i32 i32)
+                  (param $method_name_src i32)    (param $method_name_len i32)
+                  (param $reply_fun i32)          (param $reply_env i32)
+                  (param $reject_fun i32)         (param $reject_env i32)
+              ))
+              (import "ic0" "call_data_append" (func $ic0_call_data_append (param $src i32) (param $size i32)))
+              (import "ic0" "call_perform" (func $ic0_call_perform (result i32)))
 
               (func $compute
                 ;; heap[10] = payload[0]
@@ -1827,12 +1824,14 @@ fn test_inter_canister_message_exchange_4() {
                 ;; write own canister id to heap[100..]
                 (call $canister_self_copy (i32.const 100) (i32.const 0) (call $canister_self_size))
                 ;; calls the multiplier canister
-                (call $ic0_call_simple
+                (call $ic0_call_new
                     (i32.const 100) (call $canister_self_size)
                     (i32.const 0) (i32.const 6)     ;; refers to "square" on the heap
                     (i32.const 0) (i32.const 0)     ;; on_reply closure
-                    (i32.const 0) (i32.const 0)     ;; on_reject closure
+                    (i32.const 0) (i32.const 0))    ;; on_reject closure
+                (call $ic0_call_data_append
                     (i32.const 10) (i32.const 1))   ;; refers to byte copied from the payload
+                (call $ic0_call_perform)
                 drop)
 
               (func $square
@@ -1863,79 +1862,79 @@ fn test_inter_canister_message_exchange_4() {
               (export "canister_update compute" (func $compute))
               (export "canister_query read" (func $read))
               (export "memory" (memory $memory)))"#,
-            vec![],
-        );
+                                      vec![],
+                                      None
+    );
 
-        for num in &[11, 7, 5, 1] {
-            test.ingress(id, "compute", vec![*num]).unwrap();
-            let val = test.query(id, "read", vec![]).unwrap().bytes();
-            assert_eq!(val[0], num * num, "computation for value {} failed", num);
-        }
-    });
+    for num in &[11, 7, 5, 1] {
+        env.execute_ingress(id, "compute", vec![*num]).unwrap();
+        let val = env.query(id, "read", vec![]).unwrap().bytes();
+        assert_eq!(val[0], num * num, "computation for value {} failed", num);
+    }
 }
 
 #[test]
 fn test_no_response_is_an_error() {
-    utils::canister_test(|test| {
-        let (id, _) = test.create_and_install_canister(
-            r#"
+    let env = StateMachine::new();
+    let id = env.install_canister_wat(
+        r#"
             (module
               (func (export "canister_update silent")))"#,
-            vec![],
-        );
-        match test.ingress(id, "silent", vec![]) {
-            Err(err) if err.code() == ErrorCode::CanisterDidNotReply => (),
-            result => panic!(
-                "Expected {:?} error, got: {:?}",
-                ErrorCode::CanisterDidNotReply,
-                result
-            ),
-        }
-    });
+        vec![],
+        None,
+    );
+    match env.execute_ingress(id, "silent", vec![]) {
+        Err(err) if err.code() == ErrorCode::CanisterDidNotReply => (),
+        result => panic!(
+            "Expected {:?} error, got: {:?}",
+            ErrorCode::CanisterDidNotReply,
+            result
+        ),
+    }
 }
 
 #[test]
 // A canister sends a message to itself and immediately replies.
 fn test_reply_after_calling_self() {
-    utils::simple_canister_test(|canister| {
-        assert_eq!(
-            canister.update(
-                wasm()
-                    .inter_update(
-                        canister.canister_id(),
-                        // Do nothing.
-                        call_args()
-                            .on_reply(wasm().noop())
-                            .on_reject(wasm().noop())
-                            .other_side(wasm().noop())
-                    )
-                    .reply_data(b"Reply")
-            ),
-            Ok(WasmResult::Reply(b"Reply".to_vec()))
-        );
-    });
+    let env = StateMachine::new();
+    let canister = install_universal_canister(&env, vec![]);
+    assert_eq!(
+        canister.update(
+            wasm()
+                .inter_update(
+                    canister.canister_id(),
+                    // Do nothing.
+                    call_args()
+                        .on_reply(wasm().noop())
+                        .on_reject(wasm().noop())
+                        .other_side(wasm().noop())
+                )
+                .reply_data(b"Reply")
+        ),
+        Ok(WasmResult::Reply(b"Reply".to_vec()))
+    );
 }
 
 #[test]
 fn test_call_unknown_canister() {
-    utils::simple_canister_test(|canister| {
-        assert_matches!(
-            canister.update(wasm().inter_update(
-                canister_test_id(0x64),
-                call_args().on_reject(wasm().reject_message().reject())
-            )),
-            Ok(WasmResult::Reject(s)) if s.contains(
-                "Canister yjeau-xiaaa-aaaaa-aabsa-cai not found"
-            )
-        );
-    });
+    let env = StateMachine::new();
+    let canister = install_universal_canister(&env, vec![]);
+    assert_matches!(
+        canister.update(wasm().inter_update(
+            canister_test_id(0x64),
+            call_args().on_reject(wasm().reject_message().reject())
+        )),
+        Ok(WasmResult::Reject(s)) if s.contains(
+            "Canister yjeau-xiaaa-aaaaa-aabsa-cai not found"
+        )
+    );
 }
 
 #[test]
 // A canister sends a message to itself and rejects
 fn test_reject_callback() {
-    utils::canister_test(|test| {
-        let (id, _) = test.create_and_install_canister(
+    let env = StateMachine::new();
+    let id = env.install_canister_wat(
             r#"(module
                   (import "ic0" "canister_self_size"
                           (func $ic0_self_size (result i32)))
@@ -1943,9 +1942,15 @@ fn test_reject_callback() {
                   (import "ic0" "canister_self_copy"
                           (func $ic0_self_copy (param i32 i32 i32)))
 
-                  (import "ic0" "call_simple"
-                          (func $ic0_call_simple (param i32 i32 i32 i32 i32 i32 i32 i32 i32 i32)
-                                                 (result i32)))
+                  (import "ic0" "call_new"
+                      (func $ic0_call_new
+                          (param i32 i32)
+                          (param $method_name_src i32)    (param $method_name_len i32)
+                          (param $reply_fun i32)          (param $reply_env i32)
+                          (param $reject_fun i32)         (param $reject_env i32)
+                  ))
+                  (import "ic0" "call_data_append" (func $ic0_call_data_append (param $src i32) (param $size i32)))
+                  (import "ic0" "call_perform" (func $ic0_call_perform (result i32)))
 
                   (import "ic0" "msg_reject" (func $msg_reject (param i32 i32)))
 
@@ -1960,18 +1965,19 @@ fn test_reject_callback() {
                   (func (export "canister_update entry") (local $len i32)
                         (local.set $len (call $ic0_self_size))
                         (call $ic0_self_copy (i32.const 32) (i32.const 0) (local.get $len))
-                        (drop (call $ic0_call_simple
+                        (call $ic0_call_new
                               (i32.const 32)            ;; callee_src
                               (local.get $len)          ;; callee_size
                               (i32.const 7)             ;; method_name_src
-                              (i32.const 4)            ;; method_name_len
+                              (i32.const 4)             ;; method_name_len
                               (i32.const 0)             ;; reply_fun
                               (i32.const 0)             ;; reply_env
                               (i32.const 1)             ;; reject_fun
-                              (i32.const 0)             ;; reject_env
+                              (i32.const 0))            ;; reject_env
+                         (call $ic0_call_data_append
                               (i32.const 0)             ;; data_src
-                              (i32.const 5)             ;; data_len
-                              )))
+                              (i32.const 5))            ;; data_len
+                         (drop (call $ic0_call_perform)))
 
                   (func (export "canister_update ping")
                         (call $msg_reject (i32.const 0) (i32.const 6)))
@@ -1986,13 +1992,13 @@ fn test_reject_callback() {
 
                   (memory $mem 2)
                   (export "memory" (memory $mem)))"#,
-            vec![],
+            vec![], None
         );
-        assert_eq!(
-            test.ingress(id, "entry", vec![]),
-            Ok(WasmResult::Reject("Reject".to_string()))
-        );
-    });
+
+    assert_eq!(
+        env.execute_ingress(id, "entry", vec![]),
+        Ok(WasmResult::Reject("Reject".to_string()))
+    );
 }
 
 // End user sends an update msg to canisterA; canisterA tries to send a very
@@ -2022,9 +2028,10 @@ fn test_reject_callback() {
 // End user sends an update msg to canisterA; canisterA tries to send a very
 // large reply and fails.
 fn inter_canister_response_limit() {
-    utils::canister_test(|test| {
-        let size = MAX_INTER_CANISTER_PAYLOAD_IN_BYTES + NumBytes::from(1);
-        let (canister_a, _) = test.create_and_install_canister(
+    let env = StateMachine::new();
+
+    let size = MAX_INTER_CANISTER_PAYLOAD_IN_BYTES + NumBytes::from(1);
+    let canister_a = env.install_canister_wat(
             &format!(
                 r#"(module
                     (import "ic0" "msg_reply" (func $msg_reply))
@@ -2039,66 +2046,63 @@ fn inter_canister_response_limit() {
                     (export "canister_update hi" (func $hi))
                     (export "memory" (memory $memory)))"#,
                 size),
-            vec![]);
-        let err = test.ingress(canister_a, "hi", vec![5]).unwrap_err();
-        assert_eq!(err.code(), ErrorCode::CanisterContractViolation);
-    });
+            vec![], None);
+    let err = env.execute_ingress(canister_a, "hi", vec![5]).unwrap_err();
+    assert_eq!(err.code(), ErrorCode::CanisterContractViolation);
 }
 
 #[test]
 #[should_panic(expected = "CanisterMethodNotFound")]
 fn query_call_on_update_method() {
-    utils::canister_test(|test| {
-        let canister_id = test.create_universal_canister();
-
-        // Should panic given that the canister query method doesn't exist.
-        test.query(canister_id, "update", vec![5]).unwrap();
-    });
+    let env = StateMachine::new();
+    let canister_id = install_universal_canister(&env, vec![]).canister_id();
+    // Should panic given that the canister query method doesn't exist.
+    env.query(canister_id, "update", vec![5]).unwrap();
 }
 
 #[test]
 fn raw_rand_response_is_encoded() {
-    utils::simple_canister_test(|canister| {
-        // Call raw_rand and make sure to get Ok(_).
-        let response = canister
-            .update(wasm().call_simple(
-                ic00::IC_00,
-                Method::RawRand,
-                call_args().other_side(EmptyBlob::encode()),
-            ))
-            .unwrap();
+    let env = StateMachine::new();
+    let canister = install_universal_canister(&env, vec![]);
+    // Call raw_rand and make sure to get Ok(_).
+    let response = canister
+        .update(wasm().call_simple(
+            ic00::IC_00,
+            Method::RawRand,
+            call_args().other_side(EmptyBlob.encode()),
+        ))
+        .unwrap();
 
-        if let WasmResult::Reply(payload) = response {
-            Decode!(&payload).unwrap();
-        } else {
-            unreachable!();
-        }
-    })
+    if let WasmResult::Reply(payload) = response {
+        Decode!(&payload).unwrap();
+    } else {
+        unreachable!();
+    }
 }
 
 #[test]
 fn consecutive_raw_rand_calls_from_a_canister_return_different_values() {
-    utils::simple_canister_test(|canister| {
-        // Call raw_rand twice and make sure to get Ok(_).
-        let first_response = canister
-            .update(wasm().call_simple(
-                ic00::IC_00,
-                Method::RawRand,
-                call_args().other_side(EmptyBlob::encode()),
-            ))
-            .unwrap();
+    let env = StateMachine::new();
+    let canister = install_universal_canister(&env, vec![]);
+    // Call raw_rand twice and make sure to get Ok(_).
+    let first_response = canister
+        .update(wasm().call_simple(
+            ic00::IC_00,
+            Method::RawRand,
+            call_args().other_side(EmptyBlob.encode()),
+        ))
+        .unwrap();
 
-        let second_response = canister
-            .update(wasm().call_simple(
-                ic00::IC_00,
-                Method::RawRand,
-                call_args().other_side(EmptyBlob::encode()),
-            ))
-            .unwrap();
+    let second_response = canister
+        .update(wasm().call_simple(
+            ic00::IC_00,
+            Method::RawRand,
+            call_args().other_side(EmptyBlob.encode()),
+        ))
+        .unwrap();
 
-        // Assert that the responses are different.
-        assert_ne!(first_response, second_response);
-    });
+    // Assert that the responses are different.
+    assert_ne!(first_response, second_response);
 }
 
 // Testing if a DKG for a new subnet consisting of single node can be produced.

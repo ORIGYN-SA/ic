@@ -45,18 +45,6 @@ pub mod ic0 {
         pub fn msg_reply();
         pub fn msg_reply_data_append(offset: u32, size: u32);
         pub fn trap(offset: u32, size: u32);
-        pub fn call_simple(
-            callee_src: u32,
-            callee_size: u32,
-            name_src: u32,
-            name_size: u32,
-            reply_fun: usize,
-            reply_env: u32,
-            reject_fun: usize,
-            reject_env: u32,
-            data_src: u32,
-            data_size: u32,
-        ) -> i32;
         pub fn call_new(
             callee_src: u32,
             callee_size: u32,
@@ -81,6 +69,7 @@ pub mod ic0 {
         pub fn stable64_read(dst: u64, offset: u64, size: u64);
         pub fn stable64_write(offset: u64, src: u64, size: u64);
         pub fn time() -> u64;
+        pub fn performance_counter(counter_type: u32) -> u64;
         pub fn canister_cycle_balance() -> u64;
         pub fn canister_cycle_balance128(dst: i32);
         pub fn msg_cycles_available() -> u64;
@@ -94,6 +83,7 @@ pub mod ic0 {
         pub fn data_certificate_size() -> u32;
         pub fn data_certificate_copy(dst: u32, offset: u32, size: u32);
         pub fn canister_status() -> u32;
+        pub fn canister_version() -> u64;
         pub fn mint_cycles(amount: u64) -> u64;
     }
 }
@@ -163,20 +153,6 @@ pub mod ic0 {
 
     pub unsafe fn trap(_offset: u32, _size: u32) {
         wrong_arch("trap")
-    }
-    pub unsafe fn call_simple(
-        _callee_src: u32,
-        _callee_size: u32,
-        _name_src: u32,
-        _name_size: u32,
-        _reply_fun: usize,
-        _reply_env: u32,
-        _reject_fun: usize,
-        _reject_env: u32,
-        _data_src: u32,
-        _data_size: u32,
-    ) -> i32 {
-        wrong_arch("call_simple")
     }
 
     pub unsafe fn call_new(
@@ -251,6 +227,10 @@ pub mod ic0 {
             .as_nanos() as u64
     }
 
+    pub unsafe fn performance_counter(_counter_type: u32) -> u64 {
+        wrong_arch("performance_counter")
+    }
+
     pub unsafe fn canister_cycle_balance() -> u64 {
         wrong_arch("canister_cycle_balance")
     }
@@ -303,6 +283,10 @@ pub mod ic0 {
         wrong_arch("canister_status")
     }
 
+    pub unsafe fn canister_version() -> u64 {
+        wrong_arch("canister_version")
+    }
+
     pub unsafe fn mint_cycles(_amount: u64) -> u64 {
         wrong_arch("mint_cycles")
     }
@@ -310,7 +294,7 @@ pub mod ic0 {
 
 // Convenience wrappers around the DFINTY System API
 
-/// A thin wrapper around `call_simple`.  Calls another canisters and invokes
+/// A thin wrapper around `call_new`, `call_data_append`, and `call_perform`.  Calls another canisters and invokes
 /// on_reply/on_reject with the given `env` once reply/reject is received.
 #[allow(clippy::too_many_arguments)]
 pub fn call_raw(
@@ -428,7 +412,7 @@ pub fn call_bytes(
         future_ptr as *mut (),
         funds,
     );
-    // 0 is a special error code, meaning call_simple call succeeded
+    // 0 is a special error code, meaning call_perform call succeeded
     if err_code != 0 {
         // Decrease the refcount as the closure will not be called.
         std::mem::drop(unsafe { RefCounted::from_raw(future_ptr) });
@@ -494,7 +478,7 @@ pub fn call_bytes_with_cleanup(
         future_ptr as *mut (),
         funds,
     );
-    // 0 is a special error code, meaning call_simple call succeeded
+    // 0 is a special error code, meaning call_perform call succeeded
     if err_code != 0 {
         // Decrease the refcount as the closure will not be called.
         unsafe { RefCounted::from_raw(future_ptr) };
@@ -769,10 +753,16 @@ pub enum TokenUnit {
 impl From<TokenUnit> for Vec<u8> {
     fn from(val: TokenUnit) -> Self {
         match val {
-            TokenUnit::Cycles => hex::decode("00").unwrap(),
-            TokenUnit::Icp => hex::decode("01").unwrap(),
+            TokenUnit::Cycles => vec![0x00],
+            TokenUnit::Icp => vec![0x01],
         }
     }
+}
+
+/// Returns a deterministic monotonically increasing integer approximating the amount of
+/// work the canister has done since the beginning of the current execution.
+pub fn performance_counter(counter_type: u32) -> u64 {
+    unsafe { ic0::performance_counter(counter_type) }
 }
 
 /// Returns the amount of cycles in the canister's account.
@@ -877,6 +867,10 @@ pub fn canister_status() -> CanisterStatus {
         3 => CanisterStatus::Stopped,
         other => panic!("Weird canister status: {}", other),
     }
+}
+
+pub fn canister_version() -> u64 {
+    unsafe { ic0::canister_version() }
 }
 
 pub fn mint_cycles(amount: u64) -> u64 {

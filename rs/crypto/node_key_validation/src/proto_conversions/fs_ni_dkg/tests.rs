@@ -1,8 +1,7 @@
 use super::*;
-use crate::tests::node_id;
-use ic_crypto::utils::generate_dkg_dealing_encryption_keys;
+use ic_config::crypto::CryptoConfig;
+use ic_crypto_node_key_generation::get_node_keys_or_generate_if_missing;
 use ic_protobuf::registry::crypto::v1::PublicKey as PublicKeyProto;
-use ic_test_utilities::crypto::temp_dir::temp_dir;
 
 #[test]
 fn should_fail_if_pubkey_conversion_fails() {
@@ -48,16 +47,17 @@ fn should_fail_if_internal_conversion_fails() {
 }
 
 fn valid_dkg_dealing_encryption_key() -> PublicKeyProto {
-    let temp_dir = temp_dir();
-    let node_id = node_id(1);
-    generate_dkg_dealing_encryption_keys(temp_dir.path(), node_id)
+    let (config, _temp_dir) = CryptoConfig::new_in_temp_dir();
+    let (pks, _node_id) = get_node_keys_or_generate_if_missing(&config, None);
+    pks.dkg_dealing_encryption_public_key
+        .expect("missing dkg dealing encryption public key")
 }
 
 fn assert_malformed_fs_encryption_pubkey_error_containing(
     result: &Result<ClibFsNiDkgPublicKey, FsNiDkgPubkeyFromPubkeyProtoError>,
     substring: &str,
 ) {
-    let error = result.clone().unwrap_err();
+    let error = result.clone().expect_err("Unexpected success.");
     if let FsNiDkgPubkeyFromPubkeyProtoError::PublicKeyConversion { error } = error {
         assert!(error.contains(substring))
     } else {
@@ -72,7 +72,7 @@ fn assert_malformed_fs_encryption_pop_error_containing(
     result: &Result<ClibFsNiDkgPublicKey, FsNiDkgPubkeyFromPubkeyProtoError>,
     substring: &str,
 ) {
-    let error = result.clone().unwrap_err();
+    let error = result.clone().expect_err("Unexpected success.");
     if let FsNiDkgPubkeyFromPubkeyProtoError::PopConversion { error } = error {
         assert!(error.contains(substring))
     } else {
@@ -84,7 +84,7 @@ fn assert_malformed_fs_encryption_pop_error_containing(
 fn assert_internal_conversion_error(
     result: &Result<ClibFsNiDkgPublicKey, FsNiDkgPubkeyFromPubkeyProtoError>,
 ) {
-    let error = result.clone().unwrap_err();
+    let error = result.clone().expect_err("Unexpected success.");
     if let FsNiDkgPubkeyFromPubkeyProtoError::InternalConversion = error {
         assert!(true)
     } else {

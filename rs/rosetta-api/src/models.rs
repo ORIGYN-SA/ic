@@ -1,18 +1,32 @@
-use crate::request_types::TransactionOperationResults;
+pub mod amount;
+pub mod operation;
+pub mod seconds;
+pub mod timestamp;
+
+use crate::models::amount::Amount;
+use crate::models::operation::Operation;
+use crate::models::timestamp::Timestamp;
+use crate::request::transaction_operation_results::TransactionOperationResults;
 use crate::{
     convert::from_hex, errors, errors::ApiError, request_types::RequestType,
     transaction_id::TransactionIdentifier,
 };
+pub use ic_canister_client_sender::Ed25519KeyPair as EdKeypair;
+use ic_canister_client_sender::{ed25519_public_key_from_der, Secp256k1KeyPair};
+use ic_crypto_ecdsa_secp256k1;
+use ic_types::PrincipalId;
 use ic_types::{
     messages::{HttpCallContent, HttpCanisterUpdate, HttpReadStateContent, HttpRequestEnvelope},
     CanisterId,
 };
+use rand::rngs::StdRng;
+use rand::SeedableRng;
 use serde::{Deserialize, Serialize};
+use std::sync::Arc;
 use std::{
     convert::{TryFrom, TryInto},
     fmt::Display,
 };
-use strum_macros::{Display, EnumIter};
 
 // This file is generated from https://github.com/coinbase/rosetta-specifications using openapi-generator
 // Then heavily tweaked because openapi-generator no longer generates valid rust
@@ -20,7 +34,7 @@ use strum_macros::{Display, EnumIter};
 
 pub type Object = serde_json::map::Map<String, serde_json::Value>;
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ConstructionSubmitResponse {
     /// Transfers produce a real transaction identifier,
     /// Neuron management requests produce a constant (pseudo) identifier.
@@ -32,7 +46,7 @@ pub struct ConstructionSubmitResponse {
     pub metadata: TransactionOperationResults,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ConstructionHashResponse {
     pub transaction_identifier: TransactionIdentifier,
     pub metadata: Object,
@@ -41,7 +55,7 @@ pub struct ConstructionHashResponse {
 /// An AccountBalanceRequest is utilized to make a balance request on the
 /// /account/balance endpoint. If the block_identifier is populated, a
 /// historical balance query should be performed.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "conversion", derive(LabelledGeneric))]
 pub struct AccountBalanceRequest {
     #[serde(rename = "network_identifier")]
@@ -77,7 +91,7 @@ impl AccountBalanceRequest {
 /// an account has a balance for each AccountIdentifier describing it (ex: an
 /// ERC-20 token balance on a few smart contracts), an account balance request
 /// must be made with each AccountIdentifier.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "conversion", derive(LabelledGeneric))]
 pub struct AccountBalanceResponse {
     #[serde(rename = "block_identifier")]
@@ -108,7 +122,7 @@ impl AccountBalanceResponse {
 /// The account_identifier uniquely identifies an account within a network. All
 /// fields in the account_identifier are utilized to determine this uniqueness
 /// (including the metadata field, if populated).
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "conversion", derive(LabelledGeneric))]
 pub struct AccountIdentifier {
     /// The address may be a cryptographic public key (or some encoding of it)
@@ -143,7 +157,7 @@ impl AccountIdentifier {
 /// the correctness of a Rosetta Server implementation. It is expected that
 /// these clients will error if they receive some response that contains any of
 /// the above information that is not specified here.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "conversion", derive(LabelledGeneric))]
 pub struct Allow {
     /// All Operation.Status this implementation supports. Any status that is
@@ -186,42 +200,13 @@ impl Allow {
     }
 }
 
-/// Amount is some Value of a Currency. It is considered invalid to specify a
-/// Value without a Currency.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[cfg_attr(feature = "conversion", derive(LabelledGeneric))]
-pub struct Amount {
-    /// Value of the transaction in atomic units represented as an
-    /// arbitrary-sized signed integer.  For example, 1 BTC would be represented
-    /// by a value of 100000000.
-    #[serde(rename = "value")]
-    pub value: String,
-
-    #[serde(rename = "currency")]
-    pub currency: Currency,
-
-    #[serde(rename = "metadata")]
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub metadata: Option<Object>,
-}
-
-impl Amount {
-    pub fn new(value: String, currency: Currency) -> Amount {
-        Amount {
-            value,
-            currency,
-            metadata: None,
-        }
-    }
-}
-
 /// Blocks contain an array of Transactions that occurred at a particular
 /// BlockIdentifier.  A hard requirement for blocks returned by Rosetta
 /// implementations is that they MUST be _inalterable_: once a client has
 /// requested and received a block identified by a specific BlockIndentifier,
 /// all future calls for that same BlockIdentifier must return the same block
 /// contents.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "conversion", derive(LabelledGeneric))]
 pub struct Block {
     #[serde(rename = "block_identifier")]
@@ -259,7 +244,7 @@ impl Block {
 }
 
 /// The block_identifier uniquely identifies a block in a particular network.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "conversion", derive(LabelledGeneric))]
 pub struct BlockIdentifier {
     /// This is also known as the block height.
@@ -277,7 +262,7 @@ impl BlockIdentifier {
 }
 
 /// A BlockRequest is utilized to make a block request on the /block endpoint.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "conversion", derive(LabelledGeneric))]
 pub struct BlockRequest {
     #[serde(rename = "network_identifier")]
@@ -308,7 +293,7 @@ impl BlockRequest {
 /// connected chain of blocks where each block has a unique index. In other
 /// words, the `PartialBlockIdentifier` of a block after an omitted block should
 /// reference the last non-omitted block.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[cfg_attr(feature = "conversion", derive(LabelledGeneric))]
 pub struct BlockResponse {
     #[serde(rename = "block")]
@@ -336,7 +321,7 @@ impl BlockResponse {
 
 /// A BlockTransactionRequest is used to fetch a Transaction included in a block
 /// that is not returned in a BlockResponse.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "conversion", derive(LabelledGeneric))]
 pub struct BlockTransactionRequest {
     #[serde(rename = "network_identifier")]
@@ -364,7 +349,7 @@ impl BlockTransactionRequest {
 }
 
 /// A BlockTransactionResponse contains information about a block transaction.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "conversion", derive(LabelledGeneric))]
 pub struct BlockTransactionResponse {
     #[serde(rename = "transaction")]
@@ -374,26 +359,6 @@ pub struct BlockTransactionResponse {
 impl BlockTransactionResponse {
     pub fn new(transaction: Transaction) -> BlockTransactionResponse {
         BlockTransactionResponse { transaction }
-    }
-}
-
-/// Coin contains its unique identifier and the amount it represents.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[cfg_attr(feature = "conversion", derive(LabelledGeneric))]
-pub struct Coin {
-    #[serde(rename = "coin_identifier")]
-    pub coin_identifier: CoinIdentifier,
-
-    #[serde(rename = "amount")]
-    pub amount: Amount,
-}
-
-impl Coin {
-    pub fn new(coin_identifier: CoinIdentifier, amount: Amount) -> Coin {
-        Coin {
-            coin_identifier,
-            amount,
-        }
     }
 }
 
@@ -440,7 +405,7 @@ impl ::std::str::FromStr for CoinAction {
 /// UTXOs allows for supporting both account-based transfers and UTXO-based
 /// transfers on the same blockchain (when a transfer is account-based, don't
 /// populate this model).
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "conversion", derive(LabelledGeneric))]
 pub struct CoinChange {
     #[serde(rename = "coin_identifier")]
@@ -460,7 +425,7 @@ impl CoinChange {
 }
 
 /// CoinIdentifier uniquely identifies a Coin.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "conversion", derive(LabelledGeneric))]
 pub struct CoinIdentifier {
     /// Identifier should be populated with a globally unique identifier of a
@@ -479,7 +444,7 @@ impl CoinIdentifier {
 /// endpoint. It contains the unsigned transaction blob returned by
 /// `/construction/payloads` and all required signatures to create a network
 /// transaction.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "conversion", derive(LabelledGeneric))]
 pub struct ConstructionCombineRequest {
     #[serde(rename = "network_identifier")]
@@ -514,7 +479,7 @@ impl ConstructionCombineRequest {
 
 /// ConstructionCombineResponse is returned by `/construction/combine`. The
 /// network payload will be sent directly to the `construction/submit` endpoint.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "conversion", derive(LabelledGeneric))]
 pub struct ConstructionCombineResponse {
     #[serde(rename = "signed_transaction")]
@@ -546,7 +511,7 @@ pub type Request = (RequestType, Vec<EnvelopePair>);
 
 /// A signed IC update call and the corresponding read-state call for
 /// a particular ingress window.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EnvelopePair {
     pub update: HttpRequestEnvelope<HttpCallContent>,
     pub read_state: HttpRequestEnvelope<HttpReadStateContent>,
@@ -560,7 +525,7 @@ impl EnvelopePair {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 #[serde(tag = "account_type")]
 pub enum AccountType {
@@ -577,7 +542,7 @@ impl Default for AccountType {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ConstructionDeriveRequestMetadata {
     #[serde(flatten)]
     pub account_type: AccountType,
@@ -601,7 +566,7 @@ fn test_construction_derive_request_metadata() {
 /// address formats for different networks. Metadata is provided in the request
 /// because some blockchains allow for multiple address types (i.e. different
 /// address for validators vs normal accounts).
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "conversion", derive(LabelledGeneric))]
 pub struct ConstructionDeriveRequest {
     #[serde(rename = "network_identifier")]
@@ -630,7 +595,7 @@ impl ConstructionDeriveRequest {
 
 /// ConstructionDeriveResponse is returned by the `/construction/derive`
 /// endpoint.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[cfg_attr(feature = "conversion", derive(LabelledGeneric))]
 pub struct ConstructionDeriveResponse {
     /// [DEPRECATED by `account_identifier` in `v1.4.4`] Address in
@@ -659,7 +624,7 @@ impl ConstructionDeriveResponse {
 }
 
 /// ConstructionHashRequest is the input to the `/construction/hash` endpoint.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "conversion", derive(LabelledGeneric))]
 pub struct ConstructionHashRequest {
     #[serde(rename = "network_identifier")]
@@ -696,7 +661,7 @@ impl ConstructionHashRequest {
 /// implementers.  Optionally, the request can also include an array of
 /// PublicKeys associated with the AccountIdentifiers returned in
 /// ConstructionPreprocessResponse.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "conversion", derive(LabelledGeneric))]
 pub struct ConstructionMetadataRequest {
     #[serde(rename = "network_identifier")]
@@ -718,7 +683,7 @@ pub struct ConstructionMetadataRequest {
     pub public_keys: Option<Vec<PublicKey>>,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ConstructionMetadataRequestOptions {
     pub request_types: Vec<RequestType>,
 }
@@ -740,7 +705,7 @@ impl ConstructionMetadataRequest {
 /// transaction with a different account that can pay the suggested fee.
 /// Suggested fee is an array in case fee payment must occur in multiple
 /// currencies.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "conversion", derive(LabelledGeneric))]
 pub struct ConstructionMetadataResponse {
     #[serde(rename = "metadata")]
@@ -754,7 +719,7 @@ pub struct ConstructionMetadataResponse {
 
 /// ConstructionParseRequest is the input to the `/construction/parse` endpoint.
 /// It allows the caller to parse either an unsigned or signed transaction.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "conversion", derive(LabelledGeneric))]
 pub struct ConstructionParseRequest {
     #[serde(rename = "network_identifier")]
@@ -812,7 +777,7 @@ impl ConstructionParseRequest {
 /// ConstructionParseResponse contains an array of operations that occur in a
 /// transaction blob. This should match the array of operations provided to
 /// `/construction/preprocess` and `/construction/payloads`.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "conversion", derive(LabelledGeneric))]
 pub struct ConstructionParseResponse {
     #[serde(rename = "operations")]
@@ -846,7 +811,7 @@ impl ConstructionParseResponse {
 }
 
 /// Typed metadata of ConstructionPayloadsRequest.
-#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ConstructionPayloadsRequestMetadata {
     /// The memo to use for a ledger transfer.
     /// A random number is used by default.
@@ -876,7 +841,7 @@ pub struct ConstructionPayloadsRequestMetadata {
 /// returned by the call to `/construction/metadata`.  Optionally, the request
 /// can also include an array of PublicKeys associated with the
 /// AccountIdentifiers returned in ConstructionPreprocessResponse.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "conversion", derive(LabelledGeneric))]
 pub struct ConstructionPayloadsRequest {
     #[serde(rename = "network_identifier")]
@@ -912,7 +877,7 @@ impl ConstructionPayloadsRequest {
 /// contains an unsigned transaction blob (that is usually needed to construct
 /// the a network transaction from a collection of signatures) and an array of
 /// payloads that must be signed by the caller.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "conversion", derive(LabelledGeneric))]
 pub struct ConstructionPayloadsResponse {
     #[serde(rename = "unsigned_transaction")]
@@ -1002,7 +967,7 @@ impl ConstructionPreprocessRequest {
 /// `required_public_keys` with the AccountIdentifiers associated with the
 /// desired PublicKeys. If it is not necessary to retrieve any PublicKeys for
 /// construction, `required_public_keys` should be omitted.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[cfg_attr(feature = "conversion", derive(LabelledGeneric))]
 pub struct ConstructionPreprocessResponse {
     /// The options that will be sent directly to `/construction/metadata` by
@@ -1026,7 +991,7 @@ impl ConstructionPreprocessResponse {
 }
 
 /// The transaction submission request includes a signed transaction.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "conversion", derive(LabelledGeneric))]
 pub struct ConstructionSubmitRequest {
     #[serde(rename = "network_identifier")]
@@ -1060,7 +1025,7 @@ impl ConstructionSubmitRequest {
 /// Currency is composed of a canonical Symbol and Decimals. This Decimals value
 /// is used to convert an Amount.Value from atomic units (Satoshis) to standard
 /// units (Bitcoins).
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "conversion", derive(LabelledGeneric))]
 pub struct Currency {
     /// Canonical symbol associated with a currency.
@@ -1139,7 +1104,7 @@ impl ::std::str::FromStr for CurveType {
 /// do not have a good analog), rich errors are returned using this object.
 /// Both the code and message fields can be individually used to correctly
 /// identify an error. Implementations MUST use unique values for both fields.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "conversion", derive(LabelledGeneric))]
 pub struct Error {
     /// Code is a network-specific error code. If desired, this code can be
@@ -1189,7 +1154,7 @@ impl Display for Error {
 }
 
 impl actix_web::ResponseError for Error {
-    fn status_code(&self) -> ic_canister_client::HttpStatusCode {
+    fn status_code(&self) -> actix_web::http::StatusCode {
         self.code
             .try_into()
             .ok()
@@ -1200,7 +1165,7 @@ impl actix_web::ResponseError for Error {
 
 /// A MempoolResponse contains all transaction identifiers in the mempool for a
 /// particular network_identifier.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "conversion", derive(LabelledGeneric))]
 pub struct MempoolResponse {
     #[serde(rename = "transaction_identifiers")]
@@ -1217,7 +1182,7 @@ impl MempoolResponse {
 
 /// A MempoolTransactionRequest is utilized to retrieve a transaction from the
 /// mempool.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "conversion", derive(LabelledGeneric))]
 pub struct MempoolTransactionRequest {
     #[serde(rename = "network_identifier")]
@@ -1242,7 +1207,7 @@ impl MempoolTransactionRequest {
 /// A MempoolTransactionResponse contains an estimate of a mempool transaction.
 /// It may not be possible to know the full impact of a transaction in the
 /// mempool (ex: fee paid).
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "conversion", derive(LabelledGeneric))]
 pub struct MempoolTransactionResponse {
     #[serde(rename = "transaction")]
@@ -1264,7 +1229,7 @@ impl MempoolTransactionResponse {
 
 /// A MetadataRequest is utilized in any request where the only argument is
 /// optional metadata.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[cfg_attr(feature = "conversion", derive(LabelledGeneric))]
 pub struct MetadataRequest {
     #[serde(rename = "metadata")]
@@ -1280,7 +1245,7 @@ impl MetadataRequest {
 
 /// The network_identifier specifies which network a particular object is
 /// associated with.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "conversion", derive(LabelledGeneric))]
 pub struct NetworkIdentifier {
     #[serde(rename = "blockchain")]
@@ -1310,8 +1275,6 @@ impl NetworkIdentifier {
 impl TryInto<CanisterId> for &NetworkIdentifier {
     type Error = ApiError;
     fn try_into(self) -> Result<CanisterId, Self::Error> {
-        use ic_types::PrincipalId;
-
         let principal_bytes = hex::decode(&self.network)
             .map_err(|_| ApiError::InvalidNetworkId(false, "not hex".into()))?;
         let principal_id = PrincipalId::try_from(&principal_bytes)
@@ -1323,7 +1286,7 @@ impl TryInto<CanisterId> for &NetworkIdentifier {
 
 /// A NetworkListResponse contains all NetworkIdentifiers that the node can
 /// serve information for.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "conversion", derive(LabelledGeneric))]
 pub struct NetworkListResponse {
     #[serde(rename = "network_identifiers")]
@@ -1340,7 +1303,7 @@ impl NetworkListResponse {
 
 /// NetworkOptionsResponse contains information about the versioning of the node
 /// and the allowed operation statuses, operation types, and errors.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "conversion", derive(LabelledGeneric))]
 pub struct NetworkOptionsResponse {
     #[serde(rename = "version")]
@@ -1358,7 +1321,7 @@ impl NetworkOptionsResponse {
 
 /// A NetworkRequest is utilized to retrieve some data specific exclusively to a
 /// NetworkIdentifier.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "conversion", derive(LabelledGeneric))]
 pub struct NetworkRequest {
     #[serde(rename = "network_identifier")]
@@ -1389,7 +1352,7 @@ impl NetworkRequest {
 /// populated so that clients can still monitor healthiness. Without this field,
 /// it may appear that the implementation is stuck syncing and needs to be
 /// terminated.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "conversion", derive(LabelledGeneric))]
 pub struct NetworkStatusResponse {
     #[serde(rename = "current_block_identifier")]
@@ -1436,168 +1399,9 @@ impl NetworkStatusResponse {
     }
 }
 
-#[derive(Display, Debug, Clone, PartialEq, EnumIter, Serialize, Deserialize)]
-#[cfg_attr(feature = "conversion", derive(LabelledGeneric))]
-pub enum OperationType {
-    #[serde(rename = "TRANSACTION")]
-    #[strum(serialize = "TRANSACTION")]
-    Transaction,
-    #[serde(rename = "MINT")]
-    #[strum(serialize = "MINT")]
-    Mint,
-    #[serde(rename = "BURN")]
-    #[strum(serialize = "BURN")]
-    Burn,
-    #[serde(rename = "FEE")]
-    #[strum(serialize = "FEE")]
-    Fee,
-    #[serde(rename = "STAKE")]
-    #[strum(serialize = "STAKE")]
-    Stake,
-    #[serde(rename = "START_DISSOLVING")]
-    #[strum(serialize = "START_DISSOLVING")]
-    StartDissolving,
-    #[serde(rename = "STOP_DISSOLVING")]
-    #[strum(serialize = "STOP_DISSOLVING")]
-    StopDissolving,
-    #[serde(rename = "SET_DISSOLVE_TIMESTAMP")]
-    #[strum(serialize = "SET_DISSOLVE_TIMESTAMP")]
-    SetDissolveTimestamp,
-    #[serde(rename = "DISBURSE")]
-    #[strum(serialize = "DISBURSE")]
-    Disburse,
-    #[serde(rename = "ADD_HOTKEY")]
-    #[strum(serialize = "ADD_HOTKEY")]
-    AddHotkey,
-    #[serde(rename = "REMOVE_HOTKEY")]
-    #[strum(serialize = "REMOVE_HOTKEY")]
-    RemoveHotkey,
-    #[serde(rename = "SPAWN")]
-    #[strum(serialize = "SPAWN")]
-    Spawn,
-    #[serde(rename = "MERGE_MATURITY")]
-    #[strum(serialize = "MERGE_MATURITY")]
-    MergeMaturity,
-    #[serde(rename = "NEURON_INFO")]
-    #[strum(serialize = "NEURON_INFO")]
-    NeuronInfo,
-    #[serde(rename = "FOLLOW")]
-    #[strum(serialize = "FOLLOW")]
-    Follow,
-}
-
-/// Operations contain all balance-changing information within a transaction.
-/// They are always one-sided (only affect 1 AccountIdentifier) and can succeed
-/// or fail independently from a Transaction.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[cfg_attr(feature = "conversion", derive(LabelledGeneric))]
-pub struct Operation {
-    #[serde(rename = "operation_identifier")]
-    pub operation_identifier: OperationIdentifier,
-
-    /// Restrict referenced related_operations to identifier indexes < the
-    /// current operation_identifier.index. This ensures there exists a clear
-    /// DAG-structure of relations.  Since operations are one-sided, one could
-    /// imagine relating operations in a single transfer or linking operations
-    /// in a call tree.
-    #[serde(rename = "related_operations")]
-    #[serde(skip_serializing_if = "Option::is_none")]
-    #[serde(default)]
-    pub related_operations: Option<Vec<OperationIdentifier>>,
-
-    /// The network-specific type of the operation. Ensure that any type that
-    /// can be returned here is also specified in the NetworkOptionsResponse.
-    /// This can be very useful to downstream consumers that parse all block
-    /// data.
-    #[serde(rename = "type")]
-    pub _type: OperationType,
-
-    /// The network-specific status of the operation. Status is not defined on
-    /// the transaction object because blockchains with smart contracts may have
-    /// transactions that partially apply.  Blockchains with atomic transactions
-    /// (all operations succeed or all operations fail) will have the same
-    /// status for each operation.
-    #[serde(rename = "status")]
-    pub status: Option<String>,
-
-    #[serde(rename = "account")]
-    #[serde(skip_serializing_if = "Option::is_none")]
-    #[serde(default)]
-    pub account: Option<AccountIdentifier>,
-
-    #[serde(rename = "amount")]
-    #[serde(skip_serializing_if = "Option::is_none")]
-    #[serde(default)]
-    pub amount: Option<Amount>,
-
-    #[serde(rename = "coin_change")]
-    #[serde(skip_serializing_if = "Option::is_none")]
-    #[serde(default)]
-    pub coin_change: Option<CoinChange>,
-
-    #[serde(rename = "metadata")]
-    #[serde(skip_serializing_if = "Option::is_none")]
-    #[serde(default)]
-    pub metadata: Option<Object>,
-}
-
-impl Operation {
-    pub fn new(
-        op_id: i64,
-        _type: OperationType,
-        status: Option<String>,
-        account: Option<AccountIdentifier>,
-        amount: Option<Amount>,
-        metadata: Option<Object>,
-    ) -> Operation {
-        Operation {
-            operation_identifier: OperationIdentifier::new(op_id),
-            related_operations: None,
-            _type,
-            status,
-            account,
-            amount,
-            coin_change: None,
-            metadata,
-        }
-    }
-}
-
-/// The operation_identifier uniquely identifies an operation within a
-/// transaction.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[cfg_attr(feature = "conversion", derive(LabelledGeneric))]
-pub struct OperationIdentifier {
-    /// The operation index is used to ensure each operation has a unique
-    /// identifier within a transaction. This index is only relative to the
-    /// transaction and NOT GLOBAL. The operations in each transaction should
-    /// start from index 0.  To clarify, there may not be any notion of an
-    /// operation index in the blockchain being described.
-    #[serde(rename = "index")]
-    pub index: i64,
-
-    /// Some blockchains specify an operation index that is essential for client
-    /// use. For example, Bitcoin uses a network_index to identify which UTXO
-    /// was used in a transaction.  network_index should not be populated if
-    /// there is no notion of an operation index in a blockchain (typically most
-    /// account-based blockchains).
-    #[serde(rename = "network_index")]
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub network_index: Option<i64>,
-}
-
-impl OperationIdentifier {
-    pub fn new(index: i64) -> OperationIdentifier {
-        OperationIdentifier {
-            index,
-            network_index: None,
-        }
-    }
-}
-
 /// OperationStatus is utilized to indicate which Operation status are
 /// considered successful.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "conversion", derive(LabelledGeneric))]
 pub struct OperationStatus {
     /// The status is the network-specific status of the operation.
@@ -1624,7 +1428,7 @@ impl OperationStatus {
 /// When fetching data by BlockIdentifier, it may be possible to only specify
 /// the index or hash. If neither property is specified, it is assumed that the
 /// client is making a request at the current block.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[cfg_attr(feature = "conversion", derive(LabelledGeneric))]
 pub struct PartialBlockIdentifier {
     #[serde(rename = "index")]
@@ -1646,7 +1450,7 @@ impl PartialBlockIdentifier {
 }
 
 /// A Peer is a representation of a node's peer.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "conversion", derive(LabelledGeneric))]
 pub struct Peer {
     #[serde(rename = "peer_id")]
@@ -1693,7 +1497,7 @@ impl PublicKey {
 /// keypairs used to produce the signature, the signature (encoded in hex), and
 /// the SignatureType.  PublicKey is often times not known during construction
 /// of the signing payloads but may be needed to combine signatures properly.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "conversion", derive(LabelledGeneric))]
 pub struct Signature {
     #[serde(rename = "signing_payload")]
@@ -1776,7 +1580,7 @@ impl ::std::str::FromStr for SignatureType {
 /// AccountIdentifier using the specified SignatureType.  SignatureType can be
 /// optionally populated if there is a restriction on the signature scheme that
 /// can be used to sign the payload.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "conversion", derive(LabelledGeneric))]
 pub struct SigningPayload {
     /// [DEPRECATED by `account_identifier` in `v1.4.4`] The network-specific
@@ -1811,7 +1615,7 @@ impl SigningPayload {
 /// An account may have state specific to a contract address (ERC-20 token)
 /// and/or a stake (delegated balance). The sub_account_identifier should
 /// specify which state (if applicable) an account instantiation refers to.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "conversion", derive(LabelledGeneric))]
 pub struct SubAccountIdentifier {
     /// The SubAccount address may be a cryptographic value or some other
@@ -1840,7 +1644,7 @@ impl SubAccountIdentifier {
 /// In blockchains with sharded state, the SubNetworkIdentifier is required to
 /// query some object on a specific shard. This identifier is optional for all
 /// non-sharded blockchains.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "conversion", derive(LabelledGeneric))]
 pub struct SubNetworkIdentifier {
     #[serde(rename = "network")]
@@ -1864,7 +1668,7 @@ impl SubNetworkIdentifier {
 /// sync status. It is often used to indicate that an implementation is healthy
 /// when it cannot be queried  until some sync phase occurs.  If an
 /// implementation is immediately queryable, this model is often not populated.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "conversion", derive(LabelledGeneric))]
 pub struct SyncStatus {
     /// CurrentIndex is the index of the last synced block in the current stage.
@@ -1899,41 +1703,9 @@ impl SyncStatus {
     }
 }
 
-/// The timestamp of the block in milliseconds since the Unix Epoch. The
-/// timestamp is stored in milliseconds because some blockchains produce blocks
-/// more often than once a second.
-#[derive(Debug, Clone, PartialEq, PartialOrd, Serialize, Deserialize)]
-#[cfg_attr(feature = "conversion", derive(LabelledGeneric))]
-pub struct Timestamp(i64);
-
-impl ::std::convert::From<i64> for Timestamp {
-    fn from(x: i64) -> Self {
-        Timestamp(x)
-    }
-}
-
-impl ::std::convert::From<Timestamp> for i64 {
-    fn from(x: Timestamp) -> Self {
-        x.0
-    }
-}
-
-impl ::std::ops::Deref for Timestamp {
-    type Target = i64;
-    fn deref(&self) -> &i64 {
-        &self.0
-    }
-}
-
-impl ::std::ops::DerefMut for Timestamp {
-    fn deref_mut(&mut self) -> &mut i64 {
-        &mut self.0
-    }
-}
-
 /// Transactions contain an array of Operations that are attributable to the
 /// same TransactionIdentifier.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "conversion", derive(LabelledGeneric))]
 pub struct Transaction {
     #[serde(rename = "transaction_identifier")]
@@ -1966,7 +1738,7 @@ impl Transaction {
 /// TransactionIdentifierResponse contains the transaction_identifier of a
 /// transaction that was submitted to either `/construction/hash` or
 /// `/construction/submit`.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "conversion", derive(LabelledGeneric))]
 pub struct TransactionIdentifierResponse {
     #[serde(rename = "transaction_identifier")]
@@ -2012,7 +1784,7 @@ impl ::std::fmt::Display for Operator {
 /// SearchTransactionsRequest models a small subset of the /search/transactions
 /// endpoint. Currently we only support looking up a transaction given its hash;
 /// this functionality is desired by our crypto exchanges partners.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "conversion", derive(LabelledGeneric))]
 pub struct SearchTransactionsRequest {
     #[serde(rename = "network_identifier")]
@@ -2091,7 +1863,7 @@ impl SearchTransactionsRequest {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "conversion", derive(LabelledGeneric))]
 pub struct BlockTransaction {
     #[serde(rename = "block_identifier")]
@@ -2113,7 +1885,7 @@ impl BlockTransaction {
 /// SearchTransactionsResponse contains an ordered collection of
 /// BlockTransactions that match the query in SearchTransactionsRequest. These
 /// BlockTransactions are sorted from most recent block to oldest block.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "conversion", derive(LabelledGeneric))]
 pub struct SearchTransactionsResponse {
     #[serde(rename = "transactions")]
@@ -2143,7 +1915,7 @@ impl SearchTransactionsResponse {
 
 /// The Version object is utilized to inform the client of the versions of
 /// different components of the Rosetta implementation.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "conversion", derive(LabelledGeneric))]
 pub struct Version {
     /// The rosetta_version is the version of the Rosetta interface the
@@ -2187,7 +1959,7 @@ impl Version {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "conversion", derive(LabelledGeneric))]
 pub struct NeuronSubaccountComponents {
     #[serde(rename = "public_key")]
@@ -2200,7 +1972,7 @@ pub struct NeuronSubaccountComponents {
 
 /// We use this type to make query to the governance
 /// canister about the current neuron information.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "conversion", derive(LabelledGeneric))]
 #[serde(tag = "account_type")]
 pub enum BalanceAccountType {
@@ -2232,7 +2004,7 @@ impl Default for BalanceAccountType {
 }
 
 /// The type of metadata for the /account/balance endpoint.
-#[derive(Debug, Default, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Default, Clone, Eq, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "conversion", derive(LabelledGeneric))]
 pub struct AccountBalanceMetadata {
     #[serde(rename = "account_type")]
@@ -2315,22 +2087,23 @@ fn test_neuron_info_request_parsing() {
     );
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "conversion", derive(LabelledGeneric))]
 pub enum NeuronState {
     #[serde(rename = "NOT_DISSOLVING")]
     NotDissolving,
+    #[serde(rename = "SPAWNING")]
+    Spawning,
     #[serde(rename = "DISSOLVING")]
     Dissolving,
     #[serde(rename = "DISSOLVED")]
     Dissolved,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+/// Response for neuron public information.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "conversion", derive(LabelledGeneric))]
 pub struct NeuronInfoResponse {
-    //    #[serde(rename = "neuron_id")]
-    //    pub neuron_id: u64,
     #[serde(rename = "verified_query")]
     pub verified_query: bool,
 
@@ -2357,4 +2130,233 @@ pub struct NeuronInfoResponse {
     /// submitted after its creation date.
     #[serde(rename = "created_timestamp_seconds")]
     pub created_timestamp_seconds: u64,
+
+    /// Current stake of the neuron, in e8s.
+    #[serde(rename = "stake_e8s")]
+    pub stake_e8s: u64,
+}
+
+pub trait RosettaSupportedKeyPair {
+    fn sign(&self, msg: &[u8]) -> Vec<u8>;
+    fn generate_from_u64(seed: u64) -> Self;
+    fn get_pb_key(&self) -> Vec<u8>;
+    fn get_curve_type(&self) -> CurveType;
+    fn generate_principal_id(&self) -> Result<PrincipalId, ApiError>;
+    fn hex_encode_pk(&self) -> String;
+    fn hex_decode_pk(pk_encoded: &str) -> Result<Vec<u8>, ApiError>;
+    fn get_principal_id(pk_encoded: &str) -> Result<PrincipalId, ApiError>;
+    fn der_encode_pk(pk: Vec<u8>) -> Result<Vec<u8>, ApiError>;
+    fn der_decode_pk(pk_encoded: Vec<u8>) -> Result<Vec<u8>, ApiError>;
+}
+
+impl RosettaSupportedKeyPair for EdKeypair {
+    fn sign(&self, msg: &[u8]) -> Vec<u8> {
+        self.sign(msg).to_vec()
+    }
+    fn generate_from_u64(seed: u64) -> EdKeypair {
+        let mut rng = StdRng::seed_from_u64(seed);
+        EdKeypair::generate(&mut rng)
+    }
+    fn get_pb_key(&self) -> Vec<u8> {
+        self.public_key.to_vec()
+    }
+    fn get_curve_type(&self) -> CurveType {
+        CurveType::Edwards25519
+    }
+
+    fn generate_principal_id(&self) -> Result<PrincipalId, ApiError> {
+        let public_key_der =
+            ic_canister_client_sender::ed25519_public_key_to_der(self.public_key.to_vec());
+        let pid = PrincipalId::new_self_authenticating(&public_key_der);
+        Ok(pid)
+    }
+    fn hex_encode_pk(&self) -> String {
+        hex::encode(self.public_key)
+    }
+    fn hex_decode_pk(pk_encoded: &str) -> Result<Vec<u8>, ApiError> {
+        hex::decode(pk_encoded)
+            .map_err(|e| ApiError::invalid_request(format!("Hex could not be decoded {}", e)))
+    }
+
+    fn get_principal_id(pk_encoded: &str) -> Result<PrincipalId, ApiError> {
+        match EdKeypair::hex_decode_pk(pk_encoded) {
+            Ok(pk_decoded) => {
+                let pub_der = ic_canister_client_sender::ed25519_public_key_to_der(pk_decoded);
+                Ok(PrincipalId::new_self_authenticating(&pub_der))
+            }
+            Err(e) => Err(e),
+        }
+    }
+    fn der_encode_pk(pk: Vec<u8>) -> Result<Vec<u8>, ApiError> {
+        Ok(ic_canister_client_sender::ed25519_public_key_to_der(pk))
+    }
+    fn der_decode_pk(pk_encoded: Vec<u8>) -> Result<Vec<u8>, ApiError> {
+        Ok(ed25519_public_key_from_der(pk_encoded))
+    }
+}
+
+impl RosettaSupportedKeyPair for Secp256k1KeyPair {
+    fn sign(&self, msg: &[u8]) -> Vec<u8> {
+        Secp256k1KeyPair::sign(self, msg)
+    }
+    fn generate_from_u64(seed: u64) -> Secp256k1KeyPair {
+        let mut rng = StdRng::seed_from_u64(seed);
+        Secp256k1KeyPair::generate(&mut rng)
+    }
+    //The default serialization version for the Public Key is sec1
+    fn get_pb_key(&self) -> Vec<u8> {
+        self.get_public_key().serialize_sec1(false)
+    }
+    fn get_curve_type(&self) -> CurveType {
+        CurveType::Secp256K1
+    }
+    fn generate_principal_id(&self) -> Result<PrincipalId, ApiError> {
+        let public_key_der = self.get_public_key().serialize_der();
+        let pid = PrincipalId::new_self_authenticating(&public_key_der);
+        Ok(pid)
+    }
+    fn hex_encode_pk(&self) -> String {
+        hex::encode(self.get_public_key().serialize_sec1(false))
+    }
+    fn hex_decode_pk(pk_hex_encoded: &str) -> Result<Vec<u8>, ApiError> {
+        hex::decode(pk_hex_encoded)
+            .map_err(|e| ApiError::invalid_request(format!("Hex could not be decoded {}", e)))
+    }
+    fn get_principal_id(pk_hex_encoded: &str) -> Result<PrincipalId, ApiError> {
+        match Secp256k1KeyPair::hex_decode_pk(pk_hex_encoded) {
+            Ok(pk_decoded) => {
+                let public_key_der =
+                    ic_crypto_ecdsa_secp256k1::PublicKey::deserialize_sec1(&pk_decoded)
+                        .map_err(|e| {
+                            ApiError::invalid_request(format!("Hex could not be decoded {:?}", e))
+                        })?
+                        .serialize_der();
+                Ok(PrincipalId::new_self_authenticating(&public_key_der))
+            }
+            Err(e) => Err(e),
+        }
+    }
+    fn der_encode_pk(pk_sec1: Vec<u8>) -> Result<Vec<u8>, ApiError> {
+        Ok(
+            ic_crypto_ecdsa_secp256k1::PublicKey::deserialize_sec1(&pk_sec1)
+                .map_err(|e| {
+                    ApiError::invalid_request(format!("Hex could not be decoded {:?}", e))
+                })?
+                .serialize_der(),
+        )
+    }
+    fn der_decode_pk(pk_der: Vec<u8>) -> Result<Vec<u8>, ApiError> {
+        Ok(
+            ic_crypto_ecdsa_secp256k1::PublicKey::deserialize_der(&pk_der)
+                .map_err(|e| {
+                    ApiError::invalid_request(format!("Hex could not be decoded {:?}", e))
+                })?
+                .serialize_sec1(false),
+        )
+    }
+}
+
+impl RosettaSupportedKeyPair for Arc<EdKeypair> {
+    fn sign(&self, msg: &[u8]) -> Vec<u8> {
+        EdKeypair::sign(self, msg).to_vec()
+    }
+    fn generate_from_u64(seed: u64) -> Arc<EdKeypair> {
+        let mut rng = StdRng::seed_from_u64(seed);
+        Arc::new(EdKeypair::generate(&mut rng))
+    }
+    fn get_pb_key(&self) -> Vec<u8> {
+        self.public_key.to_vec()
+    }
+    fn get_curve_type(&self) -> CurveType {
+        CurveType::Edwards25519
+    }
+    fn generate_principal_id(&self) -> Result<PrincipalId, ApiError> {
+        let public_key_der =
+            ic_canister_client_sender::ed25519_public_key_to_der(self.public_key.to_vec());
+        let pid = PrincipalId::new_self_authenticating(&public_key_der);
+        Ok(pid)
+    }
+    fn hex_encode_pk(&self) -> String {
+        hex::encode(self.public_key)
+    }
+    fn hex_decode_pk(pk_encoded: &str) -> Result<Vec<u8>, ApiError> {
+        hex::decode(pk_encoded)
+            .map_err(|e| ApiError::invalid_request(format!("Hex could not be decoded {}", e)))
+    }
+    fn der_encode_pk(pk: Vec<u8>) -> Result<Vec<u8>, ApiError> {
+        Ok(ic_canister_client_sender::ed25519_public_key_to_der(pk))
+    }
+    fn der_decode_pk(pk_encoded: Vec<u8>) -> Result<Vec<u8>, ApiError> {
+        Ok(ed25519_public_key_from_der(pk_encoded))
+    }
+    fn get_principal_id(pk_encoded: &str) -> Result<PrincipalId, ApiError> {
+        match EdKeypair::hex_decode_pk(pk_encoded) {
+            Ok(pk_decoded) => {
+                let pub_der = ic_canister_client_sender::ed25519_public_key_to_der(pk_decoded);
+                Ok(PrincipalId::new_self_authenticating(&pub_der))
+            }
+            Err(e) => Err(e),
+        }
+    }
+}
+
+impl RosettaSupportedKeyPair for Arc<Secp256k1KeyPair> {
+    fn sign(&self, msg: &[u8]) -> Vec<u8> {
+        Secp256k1KeyPair::sign(self, msg)
+    }
+    fn generate_from_u64(seed: u64) -> Arc<Secp256k1KeyPair> {
+        let mut rng = StdRng::seed_from_u64(seed);
+        Arc::new(Secp256k1KeyPair::generate(&mut rng))
+    }
+    //The default serialization version for the Public Key is sec1
+    fn get_pb_key(&self) -> Vec<u8> {
+        self.get_public_key().serialize_sec1(false)
+    }
+    fn get_curve_type(&self) -> CurveType {
+        CurveType::Secp256K1
+    }
+    fn generate_principal_id(&self) -> Result<PrincipalId, ApiError> {
+        let public_key_der = self.get_public_key().serialize_der();
+        let pid = PrincipalId::new_self_authenticating(&public_key_der);
+        Ok(pid)
+    }
+    fn hex_encode_pk(&self) -> String {
+        hex::encode(self.get_public_key().serialize_sec1(false))
+    }
+    fn hex_decode_pk(pk_hex_encoded: &str) -> Result<Vec<u8>, ApiError> {
+        hex::decode(pk_hex_encoded)
+            .map_err(|e| ApiError::invalid_request(format!("Hex could not be decoded {}", e)))
+    }
+    fn get_principal_id(pk_hex_encoded: &str) -> Result<PrincipalId, ApiError> {
+        match Secp256k1KeyPair::hex_decode_pk(pk_hex_encoded) {
+            Ok(pk_decoded) => {
+                let public_key_der =
+                    ic_crypto_ecdsa_secp256k1::PublicKey::deserialize_sec1(&pk_decoded)
+                        .map_err(|e| {
+                            ApiError::invalid_request(format!("Hex could not be decoded {:?}", e))
+                        })?
+                        .serialize_der();
+                Ok(PrincipalId::new_self_authenticating(&public_key_der))
+            }
+            Err(e) => Err(e),
+        }
+    }
+    fn der_encode_pk(pk_sec1: Vec<u8>) -> Result<Vec<u8>, ApiError> {
+        Ok(
+            ic_crypto_ecdsa_secp256k1::PublicKey::deserialize_sec1(&pk_sec1)
+                .map_err(|e| {
+                    ApiError::invalid_request(format!("Hex could not be decoded {:?}", e))
+                })?
+                .serialize_der(),
+        )
+    }
+    fn der_decode_pk(pk_der: Vec<u8>) -> Result<Vec<u8>, ApiError> {
+        Ok(
+            ic_crypto_ecdsa_secp256k1::PublicKey::deserialize_der(&pk_der)
+                .map_err(|e| {
+                    ApiError::invalid_request(format!("Hex could not be decoded {:?}", e))
+                })?
+                .serialize_sec1(false),
+        )
+    }
 }

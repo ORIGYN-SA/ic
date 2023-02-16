@@ -59,6 +59,7 @@ in
       nativeBuildInputs = [
         # same tools for linux and darwin
         pkgs.coreutils
+        pkgs.curl
         pkgs.nc
 
         # for vulnerability audit
@@ -84,9 +85,6 @@ in
 
         # For building Motoko canisters like nns/handlers/lifeline/lifeline.mo
         pkgs.moc
-
-        # used by the ic-ref-tests
-        pkgs.ic-ref
 
         # for minimizing wasm
         pkgs.wabt
@@ -121,6 +119,8 @@ in
         # Needed by gitlab-ci/src/test_results/summary.py
         pkgs.python3Packages.termcolor
         pkgs.python3Packages.requests
+        pkgs.python3Packages.paramiko
+        pkgs.python3Packages.tqdm
       ];
 
       RUST_SRC_PATH = pkgs.rustPlatform.rustcSrc;
@@ -138,11 +138,9 @@ in
         pkgs.lib.optionalString pkgs.stdenv.isLinux ''
           taskset -acp 0-255 $$
         '' + ''
-          checkout_root=$(${pkgs.gitMinimal}/bin/git rev-parse --show-toplevel 2>/dev/null)
-          if [ "$?" == 0 ]; then
-            source "$checkout_root/dshell/load"
+          if (( $(ulimit -n) < 8192 )); then
+            ulimit -n 8192
           fi
-          ulimit -n 8192
 
           if ! hash rustup 2>/dev/null; then
             echo >&2 "Warning: The IC nix-shell no longer provides rustc. Please install rustup using the instructions at https://rustup.rs/."

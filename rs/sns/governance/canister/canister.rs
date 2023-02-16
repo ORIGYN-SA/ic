@@ -9,33 +9,47 @@
 // type, annotated with `#[candid_method(query/update)]` to be able to generate
 // the did definition of the method.
 
-use ic_nns_governance::stable_mem_utils::{BufferedStableMemReader, BufferedStableMemWriter};
-use rand::rngs::StdRng;
-use rand_core::{RngCore, SeedableRng};
+use async_trait::async_trait;
+use rand::{RngCore, SeedableRng};
+use rand_chacha::ChaCha20Rng;
 use std::boxed::Box;
+use std::convert::TryFrom;
 use std::time::SystemTime;
 
 use prost::Message;
 
 use candid::candid_method;
 use dfn_candid::{candid, candid_one, CandidOne};
-use dfn_core::api::{call_with_callbacks, reject_message};
+use dfn_core::api::{call_bytes_with_cleanup, Funds};
 use dfn_core::{
     api::{caller, id, now},
-    over, over_async, over_init, println,
+    over, over_async, over_init,
 };
-
 use ic_base_types::CanisterId;
-use ic_nervous_system_common::ledger::LedgerCanister;
-use ic_sns_governance::governance::{log_prefix, Governance, TimeWarp, ValidGovernanceProto};
-use ic_sns_governance::pb::v1::{
-    governance_error::ErrorType, GetNeuron, GetNeuronResponse, GetProposal, GetProposalResponse,
-    Governance as GovernanceProto, GovernanceError, ListNeurons, ListNeuronsResponse,
-    ListProposals, ListProposalsResponse, ManageNeuron, ManageNeuronResponse,
-    NervousSystemParameters, RewardEvent,
+use ic_canister_log::log;
+use ic_canisters_http_types::{HttpRequest, HttpResponse, HttpResponseBuilder};
+use ic_ic00_types::CanisterStatusResultV2;
+use ic_nervous_system_common::ledger::IcpLedgerCanister;
+use ic_nervous_system_common::{
+    get_canister_status, serve_logs, serve_logs_v2, serve_metrics,
+    stable_mem_utils::{BufferedStableMemReader, BufferedStableMemWriter},
 };
-use ic_sns_governance::types::{Environment, HeapGrowthPotential};
-use ledger_canister::metrics_encoder;
+use ic_nns_constants::LEDGER_CANISTER_ID as NNS_LEDGER_CANISTER_ID;
+use ic_sns_governance::logs::{ERROR, INFO};
+use ic_sns_governance::{
+    governance::{log_prefix, Governance, TimeWarp, ValidGovernanceProto},
+    ledger::LedgerCanister,
+    pb::v1::{
+        governance, ClaimSwapNeuronsRequest, ClaimSwapNeuronsResponse, GetMetadataRequest,
+        GetMetadataResponse, GetMode, GetModeResponse, GetNeuron, GetNeuronResponse, GetProposal,
+        GetProposalResponse, GetRunningSnsVersionRequest, GetRunningSnsVersionResponse,
+        GetSnsInitializationParametersRequest, GetSnsInitializationParametersResponse,
+        Governance as GovernanceProto, ListNervousSystemFunctionsResponse, ListNeurons,
+        ListNeuronsResponse, ListProposals, ListProposalsResponse, ManageNeuron,
+        ManageNeuronResponse, NervousSystemParameters, RewardEvent, SetMode, SetModeResponse,
+    },
+    types::{Environment, HeapGrowthPotential},
+};
 
 /// Size of the buffer for stable memory reads and writes.
 ///
@@ -64,7 +78,7 @@ fn governance_mut() -> &'static mut Governance {
 }
 
 struct CanisterEnv {
-    rng: StdRng,
+    rng: ChaCha20Rng,
     time_warp: TimeWarp,
 }
 
@@ -79,7 +93,7 @@ impl CanisterEnv {
             // Why we don't use raw_rand from the ic00 api instead: this is an asynchronous
             // call so can't really be used to generate random numbers for most cases.
             // It could be used to seed the PRNG, but that wouldn't add any security regarding
-            // upredictability since the pseudo-random numbers could still be predicted after
+            // unpredictability since the pseudo-random numbers could still be predicted after
             // inception.
             rng: {
                 let now_nanos = now()
@@ -89,13 +103,14 @@ impl CanisterEnv {
                 let mut seed = [0u8; 32];
                 seed[..16].copy_from_slice(&now_nanos.to_be_bytes());
                 seed[16..32].copy_from_slice(&now_nanos.to_be_bytes());
-                StdRng::from_seed(seed)
+                ChaCha20Rng::from_seed(seed)
             },
             time_warp: TimeWarp { delta_s: 0 },
         }
     }
 }
 
+#[async_trait]
 impl Environment for CanisterEnv {
     fn now(&self) -> u64 {
         self.time_warp.apply(
@@ -126,56 +141,19 @@ impl Environment for CanisterEnv {
     // proposal as a result of the proposal being adopted.
     //
     // The method returns either a success or error.
-    fn call_canister(
+    async fn call_canister(
         &self,
-        proposal_id: u64,
         canister_id: CanisterId,
         method_name: &str,
         arg: Vec<u8>,
-    ) -> Result<(), GovernanceError> {
-        // If there is a reply, set the proposal's execution status accordingly.
-        let on_reply = move || governance_mut().set_proposal_execution_status(proposal_id, Ok(()));
-
-        // If the message was rejected, set the proposal's execution status to failed with the
-        // error using the reject_message on a best-effort basis (see below).
-        let on_reject = move || {
-            // There's no guarantee that the reject response is a string of characters and it can
-            // potentially be large. Propagating error information is thus done on a best-effort
-            // basis.
-            let mut msg = reject_message();
-            const MAX_REJECT_MSG_SIZE: usize = 10000;
-            if msg.len() > MAX_REJECT_MSG_SIZE {
-                msg = "(truncated error message) "
-                    .to_string()
-                    .chars()
-                    .chain(
-                        msg.char_indices()
-                            .take_while(|(pos, _)| *pos < MAX_REJECT_MSG_SIZE)
-                            .map(|(_, char)| char),
-                    )
-                    .collect();
-            }
-            governance_mut().set_proposal_execution_status(
-                proposal_id,
-                Err(GovernanceError::new_with_message(
-                    ErrorType::External,
-                    format!(
-                        "Error executing ExecuteNervousSystemFunction proposal. Rejection message: {}",
-                        msg
-                    ),
-                )),
-            );
-        };
-
-        let err = call_with_callbacks(canister_id, method_name, &arg, on_reply, on_reject);
-        if err != 0 {
-            Err(GovernanceError::new_with_message(
-                ErrorType::External,
-                format!("call_with_callbacks failed: {:?}", err),
-            ))
-        } else {
-            Ok(())
-        }
+    ) -> Result<
+        /* reply: */ Vec<u8>,
+        (
+            /* error_code: */ Option<i32>,
+            /* message: */ String,
+        ),
+    > {
+        call_bytes_with_cleanup(canister_id, method_name, &arg, Funds::zero()).await
     }
 
     #[cfg(target_arch = "wasm32")]
@@ -199,6 +177,11 @@ impl Environment for CanisterEnv {
     fn canister_id(&self) -> CanisterId {
         id()
     }
+
+    /// Return the canister version.
+    fn canister_version(&self) -> Option<u64> {
+        Some(dfn_core::api::canister_version())
+    }
 }
 
 #[export_name = "canister_init"]
@@ -210,14 +193,14 @@ fn canister_init() {
 /// In addition to canister_init, this method is called by canister_post_upgrade.
 #[candid_method(init)]
 fn canister_init_(init_payload: GovernanceProto) {
-    let init_payload = ValidGovernanceProto::new(init_payload).expect(
+    let init_payload = ValidGovernanceProto::try_from(init_payload).expect(
         "Cannot start canister, because the deserialized \
          GovernanceProto is invalid in some way",
     );
 
-    println!(
-        "{}canister_init_: Initializing with: {}",
-        log_prefix(),
+    log!(
+        INFO,
+        "canister_init_: Initializing with: {}",
         init_payload.summary(),
     );
 
@@ -233,17 +216,18 @@ fn canister_init_(init_payload: GovernanceProto) {
             init_payload,
             Box::new(CanisterEnv::new()),
             Box::new(LedgerCanister::new(ledger_canister_id)),
+            Box::new(IcpLedgerCanister::new(NNS_LEDGER_CANISTER_ID)),
         ));
     }
 }
 
 /// Executes some logic before executing an upgrade, including serializing and writing the
 /// governance's state to stable memory so that it is preserved during the upgrade and can
-/// be deserialised again in canister_post_upgrade. That is, the stable memory allows
+/// be deserialized again in canister_post_upgrade. That is, the stable memory allows
 /// saving the state and restoring it after the upgrade.
 #[export_name = "canister_pre_upgrade"]
 fn canister_pre_upgrade() {
-    println!("{}Executing pre upgrade", log_prefix());
+    log!(INFO, "Executing pre upgrade");
 
     let mut writer = BufferedStableMemWriter::new(STABLE_MEM_BUFFER_SIZE);
 
@@ -253,32 +237,48 @@ fn canister_pre_upgrade() {
         .expect("Error. Couldn't serialize canister pre-upgrade.");
 
     writer.flush(); // or `drop(writer)`
+    log!(INFO, "Completed pre upgrade");
 }
 
-/// Executes some logic after executing an upgrade, including deserialising what has been written
+/// Executes some logic after executing an upgrade, including deserializing what has been written
 /// to stable memory in canister_pre_upgrade and initialising the governance's state with it.
 #[export_name = "canister_post_upgrade"]
 fn canister_post_upgrade() {
     dfn_core::printer::hook();
-    println!("{}Executing post upgrade", log_prefix());
+    log!(INFO, "Executing post upgrade");
 
     let reader = BufferedStableMemReader::new(STABLE_MEM_BUFFER_SIZE);
 
     match GovernanceProto::decode(reader) {
         Err(err) => {
-            println!(
+            log!(
+                ERROR,
                 "Error deserializing canister state post-upgrade. \
-             CANISTER MIGHT HAVE BROKEN STATE!!!!. Error: {:?}",
+                 CANISTER MIGHT HAVE BROKEN STATE!!!!. Error: {:?}",
                 err
             );
             Err(err)
         }
-        Ok(proto) => {
+        Ok(mut proto) => {
+            set_mode_to_normal_if_unspecified(&mut proto);
             canister_init_(proto);
             Ok(())
         }
     }
     .expect("Couldn't upgrade canister.");
+    log!(INFO, "Completed post upgrade");
+}
+
+/// Sets the GovernanceProto's mode to Normal if it is Unspecified.
+///
+/// This is NOT used during installation, because the installer needs to make an
+/// explicit choice about what mode to use. Wheres, this IS INDEED used during
+/// upgrades, because mode did not used to exist, but is now required (because
+/// Unspecified is not allowed); this is called in post_upgrade).
+fn set_mode_to_normal_if_unspecified(g: &mut GovernanceProto) {
+    if g.mode == governance::Mode::Unspecified as i32 {
+        g.mode = governance::Mode::Normal as i32;
+    }
 }
 
 #[cfg(feature = "test")]
@@ -297,7 +297,7 @@ fn set_time_warp_(new_time_warp: TimeWarp) {
 /// Returns the governance's NervousSystemParameters
 #[export_name = "canister_query get_nervous_system_parameters"]
 fn get_nervous_system_parameters() {
-    println!("{}get_nervous_system_parameters", log_prefix());
+    log!(INFO, "get_nervous_system_parameters");
     over(candid_one, get_nervous_system_parameters_)
 }
 
@@ -309,6 +309,34 @@ fn get_nervous_system_parameters_(_: ()) -> NervousSystemParameters {
         .parameters
         .clone()
         .expect("NervousSystemParameters are not set")
+}
+
+/// Returns metadata describing the SNS.
+#[export_name = "canister_query get_metadata"]
+fn get_metadata() {
+    log!(INFO, "get_metadata");
+    over(candid_one, get_metadata_)
+}
+
+/// Internal method for calling get_metadata.
+#[candid_method(query, rename = "get_metadata")]
+fn get_metadata_(request: GetMetadataRequest) -> GetMetadataResponse {
+    governance().get_metadata(&request)
+}
+
+/// Returns the initialization parameters used to spawn an SNS
+#[export_name = "canister_query get_sns_initialization_parameters"]
+fn get_sns_initialization_parameters() {
+    log!(INFO, "get_sns_initialization_parameters");
+    over(candid_one, get_sns_initialization_parameters_)
+}
+
+/// Internal method for calling get_sns_initialization_parameters.
+#[candid_method(query, rename = "get_sns_initialization_parameters")]
+fn get_sns_initialization_parameters_(
+    request: GetSnsInitializationParametersRequest,
+) -> GetSnsInitializationParametersResponse {
+    governance().get_sns_initialization_parameters(&request)
 }
 
 /// Performs a command on a neuron if the caller is authorised to do so.
@@ -324,7 +352,7 @@ fn get_nervous_system_parameters_(_: ()) -> NervousSystemParameters {
 /// - merge the neuron's maturity into the neuron's stake
 #[export_name = "canister_update manage_neuron"]
 fn manage_neuron() {
-    println!("{}manage_neuron", log_prefix());
+    log!(INFO, "manage_neuron");
     over_async(candid_one, manage_neuron_)
 }
 
@@ -339,14 +367,14 @@ async fn manage_neuron_(manage_neuron: ManageNeuron) -> ManageNeuronResponse {
 /// Returns the full neuron corresponding to the neuron with ID `neuron_id`.
 #[export_name = "canister_query get_neuron"]
 fn get_neuron() {
-    println!("{}get_neuron", log_prefix());
+    log!(INFO, "get_neuron");
     over(candid_one, get_neuron_)
 }
 
 /// Internal method for calling get_neuron.
 #[candid_method(query, rename = "get_neuron")]
 fn get_neuron_(get_neuron: GetNeuron) -> GetNeuronResponse {
-    governance().get_neuron(&get_neuron)
+    governance().get_neuron(get_neuron)
 }
 
 /// Returns a list of neurons of size `limit` using `start_page_at` to
@@ -364,7 +392,7 @@ fn get_neuron_(get_neuron: GetNeuron) -> GetNeuronResponse {
 /// If this method is called as a query call, the returned list is not certified.
 #[export_name = "canister_query list_neurons"]
 fn list_neurons() {
-    println!("{}list_neurons", log_prefix());
+    log!(INFO, "list_neurons");
     over(candid_one, list_neurons_)
 }
 
@@ -377,7 +405,6 @@ fn list_neurons_(list_neurons: ListNeurons) -> ListNeuronsResponse {
 /// Returns the full proposal corresponding to the `proposal_id`.
 #[export_name = "canister_query get_proposal"]
 fn get_proposal() {
-    println!("{}get_proposal", log_prefix());
     over(candid_one, get_proposal_)
 }
 
@@ -401,7 +428,7 @@ fn get_proposal_(get_proposal: GetProposal) -> GetProposalResponse {
 /// If this method is called as a query call, the returned list is not certified.
 #[export_name = "canister_query list_proposals"]
 fn list_proposals() {
-    println!("{}list_proposals", log_prefix());
+    log!(INFO, "list_proposals");
     over(candid_one, list_proposals_)
 }
 
@@ -411,18 +438,131 @@ fn list_proposals_(list_proposals: ListProposals) -> ListProposalsResponse {
     governance().list_proposals(&list_proposals)
 }
 
+/// Returns the current list of available NervousSystemFunctions.
+#[export_name = "canister_query list_nervous_system_functions"]
+fn list_nervous_system_functions() {
+    log!(INFO, "list_nervous_system_functions");
+    over(candid, |()| list_nervous_system_functions_())
+}
+
+/// Internal method for calling list_nervous_system_functions.
+#[candid_method(query, rename = "list_nervous_system_functions")]
+fn list_nervous_system_functions_() -> ListNervousSystemFunctionsResponse {
+    governance().list_nervous_system_functions()
+}
+
 /// Returns the latest reward event.
 #[export_name = "canister_query get_latest_reward_event"]
 fn get_latest_reward_event() {
     over(candid, |()| -> RewardEvent {
         let event = governance().latest_reward_event();
-        println!(
-            "{}get_latest_reward_event returns {}; ",
-            log_prefix(),
-            event
-        );
+        log!(INFO, "get_latest_reward_event returns {}; ", event);
         event
     });
+}
+
+/// Returns the root canister's status.
+///
+/// This is a specialized version of the root canister's `canister_status`
+/// method. Getting the root canister's status is special, because root is the
+/// canister that gets the status of all other canisters in the SNS.
+///
+/// The way the underlying system call works is that a principal can only
+/// request the status of canisters that it controls. In theory, this interface
+/// could be generalized to target any canister, but in practice, only the root
+/// canister would ever be targeted, because that is the only canister that
+/// governance controls.
+#[export_name = "canister_update get_root_canister_status"]
+fn get_root_canister_status() {
+    over_async(candid_one, get_root_canister_status_)
+}
+
+/// Internal method for calling get_root_canister_status.
+#[candid_method(update, rename = "get_root_canister_status")]
+async fn get_root_canister_status_(_: ()) -> CanisterStatusResultV2 {
+    get_canister_status(
+        governance()
+            .proto
+            .root_canister_id
+            .expect("Root canister ID not set"),
+    )
+    .await
+    .expect("Unable to get the status of the SNS root canister.")
+}
+
+/// Gets the current SNS version, as understood by Governance.  This is useful
+/// for diagnosing upgrade problems, such as if multiple ledger archives are not
+/// running the same version.
+#[export_name = "canister_query get_running_sns_version"]
+fn get_running_sns_version() {
+    log!(INFO, "get_running_sns_version");
+    over(candid_one, get_running_sns_version_)
+}
+
+/// Internal method for calling get_sns_version.
+#[candid_method(query, rename = "get_running_sns_version")]
+fn get_running_sns_version_(_: GetRunningSnsVersionRequest) -> GetRunningSnsVersionResponse {
+    GetRunningSnsVersionResponse {
+        deployed_version: governance().proto.deployed_version.clone(),
+        pending_version: governance().proto.pending_version.clone(),
+    }
+}
+
+/// Sets the mode. Only the swap canister is allowed to call this.
+///
+/// In practice, the only mode that the swap canister would ever choose is
+/// Normal. Also, in practice, the current value of mode should be
+/// PreInitializationSwap.  whenever the swap canister calls this.
+#[export_name = "canister_update set_mode"]
+fn set_mode() {
+    log!(INFO, "set_mode");
+    over(candid_one, set_mode_);
+}
+
+/// Internal method for calling set_mode.
+#[candid_method(update, rename = "set_mode")]
+fn set_mode_(request: SetMode) -> SetModeResponse {
+    governance_mut().set_mode(request.mode, caller());
+    SetModeResponse {}
+}
+
+#[export_name = "canister_query get_mode"]
+fn get_mode() {
+    log!(INFO, "get_mode");
+    over(candid_one, get_mode_);
+}
+
+#[candid_method(query, rename = "get_mode")]
+fn get_mode_(request: GetMode) -> GetModeResponse {
+    governance().get_mode(request)
+}
+
+/// Claims a batch of neurons requested by the SNS Swap canister. This method is
+/// only callable by the Swap canister that was deployed along with this
+/// SNS Governance canister.
+///
+/// This API takes a request of multiple `NeuronParameters` that provide
+/// the configurable parameters of the to-be-created neurons. Since these neurons
+/// are responsible for the decentralization of an SNS during the Swap, there are
+/// a few differences in neuron creation that occur in comparison to the normal
+/// `ManageNeuron::ClaimOrRefresh` API. See `Governance::claim_swap_neurons` for
+/// more details.
+///
+/// This method is idempotent. If called with a `NeuronParameters` of an already
+/// created Neuron, the `ClaimSwapNeuronsResponse.skipped_claims` field will be
+/// incremented and execution will continue.
+#[export_name = "canister_update claim_swap_neurons"]
+fn claim_swap_neurons() {
+    log!(INFO, "claim_swap_neurons");
+    over(candid_one, claim_swap_neurons_)
+}
+
+/// Internal method for calling claim_swap_neurons.
+#[candid_method(update, rename = "claim_swap_neurons")]
+fn claim_swap_neurons_(
+    claim_swap_neurons_request: ClaimSwapNeuronsRequest,
+) -> ClaimSwapNeuronsResponse {
+    governance_mut().claim_swap_neurons(claim_swap_neurons_request, caller())
 }
 
 /// The canister's heartbeat.
@@ -434,15 +574,39 @@ fn canister_heartbeat() {
     dfn_core::api::futures::spawn(future);
 }
 
-/// Encode the metrics in a format that can be understood by Prometheus.
-fn encode_metrics(_w: &mut metrics_encoder::MetricsEncoder<Vec<u8>>) -> std::io::Result<()> {
-    Ok(())
-}
+ic_nervous_system_common_build_metadata::define_get_build_metadata_candid_method! {}
 
 /// Resources to serve for a given http_request
 #[export_name = "canister_query http_request"]
 fn http_request() {
-    ledger_canister::http_request::serve_metrics(encode_metrics);
+    over(candid_one, serve_http)
+}
+
+/// Serve an HttpRequest made to this canister
+pub fn serve_http(request: HttpRequest) -> HttpResponse {
+    match request.path() {
+        "/metrics" => serve_metrics(encode_metrics),
+        "/logs" => serve_logs_v2(request, &INFO, &ERROR),
+
+        // These are obsolete.
+        "/log/info" => serve_logs(&INFO),
+        "/log/error" => serve_logs(&ERROR),
+
+        _ => HttpResponseBuilder::not_found().build(),
+    }
+}
+
+/// Encode the metrics in a format that can be understood by Prometheus.
+fn encode_metrics(w: &mut ic_metrics_encoder::MetricsEncoder<Vec<u8>>) -> std::io::Result<()> {
+    let governance = governance();
+
+    w.encode_gauge(
+        "sns_governance_neurons_total",
+        governance.proto.neurons.len() as f64,
+        "Total number of neurons.",
+    )?;
+
+    Ok(())
 }
 
 /// This makes this Candid service self-describing, so that for example Candid
@@ -456,13 +620,6 @@ fn http_request() {
 #[export_name = "canister_query __get_candid_interface_tmp_hack"]
 fn expose_candid() {
     over(candid, |_: ()| include_str!("governance.did").to_string())
-}
-
-// Only for integration test(s).
-#[cfg(feature = "do-nothing")]
-#[export_name = "canister_query do_nothing"]
-fn do_nothing() {
-    over(candid_one, |()| ());
 }
 
 /// When run on native, this prints the candid service definition of this
@@ -487,31 +644,78 @@ fn main() {}
 /// A test that fails if the API was updated but the candid definition was not.
 #[test]
 fn check_governance_candid_file() {
-    let governance_did =
-        String::from_utf8(std::fs::read("canister/governance.did").unwrap()).unwrap();
+    let did_path = format!(
+        "{}/canister/governance.did",
+        std::env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR not set")
+    );
+    let did_contents = String::from_utf8(std::fs::read(did_path).unwrap()).unwrap();
 
     // See comments in main above
     candid::export_service!();
     let expected = __export_service();
 
-    if governance_did != expected {
+    if did_contents != expected {
         panic!(
             "Generated candid definition does not match canister/governance.did. \
-            Run `cargo run --bin sns-governance-canister > canister/governance.did` in \
+            Run `bazel run :generate_did > canister/governance.did` (no nix and/or direnv) or \
+            `cargo run --bin sns-governance-canister > canister/governance.did` in \
             rs/sns/governance to update canister/governance.did."
         )
     }
 }
 
-/// A test that checks that set_time_warp advances time correctly.
-#[test]
-fn test_set_time_warp() {
-    let mut environment = CanisterEnv::new();
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use strum::IntoEnumIterator;
 
-    let start = environment.now();
-    environment.set_time_warp(TimeWarp { delta_s: 1_000 });
-    let delta_s = environment.now() - start;
+    /// A test that checks that set_time_warp advances time correctly.
+    #[test]
+    fn test_set_time_warp() {
+        let mut environment = CanisterEnv::new();
 
-    assert!(delta_s >= 1000, "delta_s = {}", delta_s);
-    assert!(delta_s < 1005, "delta_s = {}", delta_s);
+        let start = environment.now();
+        environment.set_time_warp(TimeWarp { delta_s: 1_000 });
+        let delta_s = environment.now() - start;
+
+        assert!(delta_s >= 1000, "delta_s = {}", delta_s);
+        assert!(delta_s < 1005, "delta_s = {}", delta_s);
+    }
+
+    #[test]
+    fn test_set_mode_to_normal_if_unspecified_already_specified() {
+        for mode in governance::Mode::iter() {
+            if mode == governance::Mode::Unspecified {
+                continue;
+            }
+
+            let before = GovernanceProto {
+                mode: mode as i32,
+                ..Default::default()
+            };
+
+            let mut after = before.clone();
+            set_mode_to_normal_if_unspecified(&mut after);
+            // No change.
+            assert_eq!(after, before);
+        }
+    }
+
+    #[test]
+    fn test_set_mode_to_normal_if_unspecified_originally_unspecified() {
+        let mut result = GovernanceProto {
+            mode: governance::Mode::Unspecified as i32,
+            ..Default::default()
+        };
+
+        set_mode_to_normal_if_unspecified(&mut result);
+        // Change!
+        assert_eq!(
+            result,
+            GovernanceProto {
+                mode: governance::Mode::Normal as i32,
+                ..Default::default()
+            },
+        );
+    }
 }

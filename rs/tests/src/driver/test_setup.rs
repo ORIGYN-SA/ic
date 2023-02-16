@@ -1,61 +1,52 @@
-use crate::driver::driver_setup::{FARM_BASE_URL, FARM_GROUP_NAME};
-use crate::driver::test_env::{HasIcPrepDir, TestEnv};
-use crate::driver::test_env_api::*;
-use anyhow::{bail, Result};
-use ic_fondue::ic_manager::{FarmInfo, IcEndpoint, IcHandle, IcSubnet, RuntimeDescriptor};
-use std::time::Instant;
-use url::Url;
+use crate::driver::test_env::TestEnvAttribute;
+use serde::{Deserialize, Serialize};
+use std::time::Duration;
 
-pub trait IcHandleConstructor {
-    fn ic_handle(&self) -> Result<IcHandle>;
+use super::ic::VmResources;
+use crate::driver::new::constants::GROUP_TTL;
+
+#[derive(Clone, Deserialize, Serialize, Default, Debug)]
+pub struct GroupSetup {
+    pub farm_group_name: String,
+    /// For now, the group timeout strictly translates to the corresponding group
+    /// TTL.
+    pub group_timeout: Duration,
+    pub default_vm_resources: Option<VmResources>,
 }
 
-impl IcHandleConstructor for TestEnv {
-    fn ic_handle(&self) -> Result<IcHandle> {
-        let group_name: String = self.read_object(FARM_GROUP_NAME)?;
-        let farm_url: Url = self.read_object(FARM_BASE_URL)?;
-        let ts = self.topology_snapshot();
+impl GroupSetup {
+    // CI
+    // old: hourly__node_reassignment_pot-3099270401
+    // new: hourly__node_reassignment-3099270401
 
-        let mut nodes = vec![];
-        for s in ts.subnets() {
-            for n in s.nodes() {
-                nodes.push((n, Some(s.clone())));
-            }
-        }
-        for n in ts.unassigned_nodes() {
-            nodes.push((n, None));
-        }
+    // Local
+    // old: boundary_nodes_pre_master__boundary_nodes_pot-username-zh1-spm99_zh7_dfinity_network-2784039865
+    // new:
+    pub fn from_bazel_env() -> Self {
+        // binary_name-timestamp
+        let mut res = Self::default();
+        let exec_path = std::env::current_exe().expect("could not acquire parent process path");
+        let fname = exec_path
+            .file_name()
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .strip_suffix("_bin")
+            .expect("Expected the binary to have a '_bin' suffix!");
+        let time = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("bad things")
+            .as_millis();
+        res.farm_group_name = format!("{}--{:?}", fname, time);
+        // GROUP_TTL should be enough for the setup task to allocate the group on Farm
+        // Afterwards, the group's TTL should be bumped via a keepalive task
+        res.group_timeout = GROUP_TTL;
+        res
+    }
+}
 
-        let mut public_api_endpoints = vec![];
-        let started_at = Instant::now();
-        let root_subnet_id = ts.root_subnet_id();
-        for (n, s) in nodes {
-            public_api_endpoints.push(IcEndpoint {
-                node_id: n.node_id,
-                url: n.get_public_url(),
-                metrics_url: n.get_metrics_url(),
-                subnet: s.clone().map(|s| IcSubnet {
-                    id: s.subnet_id,
-                    type_of: s.subnet_type(),
-                }),
-                started_at,
-                runtime_descriptor: RuntimeDescriptor::Vm(FarmInfo {
-                    group_name: group_name.clone(),
-                    vm_name: n.node_id.to_string(),
-                    url: farm_url.clone(),
-                }),
-                is_root_subnet: s.map_or(false, |s| Some(s.subnet_id) == root_subnet_id),
-            });
-        }
-
-        let prep_dir = match self.prep_dir("") {
-            Some(p) => p,
-            None => bail!("No prep dir specified for no-name IC"),
-        };
-        Ok(IcHandle {
-            public_api_endpoints,
-            malicious_public_api_endpoints: vec![],
-            ic_prep_working_dir: Some(prep_dir),
-        })
+impl TestEnvAttribute for GroupSetup {
+    fn attribute_name() -> String {
+        "group_setup".to_string()
     }
 }

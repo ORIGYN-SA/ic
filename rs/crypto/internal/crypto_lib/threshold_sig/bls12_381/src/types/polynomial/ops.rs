@@ -1,8 +1,6 @@
 //! Standard arithmetic operations such as addition
 
-use super::common_traits::zeroize_fr;
 use super::*;
-use ff::Field;
 use std::borrow::Borrow;
 use std::iter::Sum;
 use std::ops;
@@ -51,7 +49,7 @@ impl<B: Borrow<Polynomial>> ops::Add<B> for Polynomial {
     }
 }
 
-impl<'a> ops::Add<Scalar> for Polynomial {
+impl ops::Add<Scalar> for Polynomial {
     type Output = Polynomial;
 
     fn add(mut self, rhs: Scalar) -> Self::Output {
@@ -100,7 +98,7 @@ impl<B: Borrow<Polynomial>> ops::Sub<B> for Polynomial {
 
 // Clippy thinks using `+` in a `Sub` implementation is suspicious.
 #[allow(clippy::suspicious_arithmetic_impl)]
-impl<'a> ops::Sub<Scalar> for Polynomial {
+impl ops::Sub<Scalar> for Polynomial {
     type Output = Polynomial;
 
     fn sub(self, rhs: Scalar) -> Self::Output {
@@ -120,15 +118,12 @@ impl<'a, B: Borrow<Polynomial>> ops::Mul<B> for &'a Polynomial {
         }
         let n_coeffs = self.coefficients.len() + rhs.coefficients.len() - 1;
         let mut coeffs = vec![Scalar::zero(); n_coeffs];
-        let mut tmp = Scalar::zero();
         for (i, ca) in self.coefficients.iter().enumerate() {
             for (j, cb) in rhs.coefficients.iter().enumerate() {
-                tmp = *ca;
-                tmp.mul_assign(cb);
+                let tmp = ca * cb;
                 coeffs[i + j].add_assign(&tmp);
             }
         }
-        zeroize_fr(&mut tmp);
         Polynomial::from(coeffs)
     }
 }
@@ -154,7 +149,7 @@ impl ops::MulAssign<Scalar> for Polynomial {
             self.coefficients.clear();
         } else {
             for c in &mut self.coefficients {
-                *c *= rhs;
+                *c *= &rhs;
             }
         }
     }

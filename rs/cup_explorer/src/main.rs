@@ -1,10 +1,9 @@
-use ic_canister_client::{Agent, Sender};
-use ic_protobuf::{
-    registry::{node::v1::connection_endpoint, node::v1::NodeRecord, subnet::v1::SubnetRecord},
-    types::v1::CatchUpContent,
+use ic_cup_explorer::get_catchup_content;
+use ic_protobuf::registry::{
+    node::v1::connection_endpoint, node::v1::NodeRecord, subnet::v1::SubnetRecord,
 };
-use ic_registry_common::registry::RegistryCanister;
 use ic_registry_keys::{make_node_record_key, make_subnet_record_key};
+use ic_registry_nns_data_provider::registry::RegistryCanister;
 use ic_types::{NodeId, PrincipalId, SubnetId};
 use prost::Message;
 use reqwest::Url;
@@ -77,23 +76,6 @@ fn http_url(n: &NodeRecord) -> Url {
     .unwrap()
 }
 
-/// Fetches the contents of a CatchUp package, if it's present.
-async fn get_catchup_content(agent: &Agent) -> Result<Option<CatchUpContent>, String> {
-    let maybe_cup = agent
-        .query_cup_endpoint(None)
-        .await
-        .map_err(|e| format!("failed to get catch up package: {}", e))?;
-    match maybe_cup {
-        Some(cup) => {
-            // TODO(roman): verify signatures?
-            let content = CatchUpContent::decode(&cup.content[..])
-                .map_err(|e| format!("failed to deserialize cup: {}", e))?;
-            Ok(Some(content))
-        }
-        None => Ok(None),
-    }
-}
-
 #[tokio::main]
 async fn main() {
     let args: Vec<_> = std::env::args().collect();
@@ -122,12 +104,9 @@ async fn main() {
 
     println!("\nDetecting the latest CUP...");
 
-    let tasks = node_records
-        .into_iter()
-        .map(|(node_id, node)| (node_id, Agent::new(http_url(&node), Sender::Anonymous)))
-        .map(|(node_id, agent)| {
-            task::spawn(async move { (node_id, get_catchup_content(&agent).await) })
-        });
+    let tasks = node_records.into_iter().map(|(node_id, node)| {
+        task::spawn(async move { (node_id, get_catchup_content(&http_url(&node)).await) })
+    });
 
     let mut latest_height = 0;
     let mut latest = None;

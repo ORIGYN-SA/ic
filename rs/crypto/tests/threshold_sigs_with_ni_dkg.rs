@@ -1,18 +1,20 @@
 #![allow(clippy::unwrap_used)]
-use ic_crypto::utils::TempCryptoComponent;
+use assert_matches::assert_matches;
+use ic_crypto_temp_crypto::TempCryptoComponent;
+use ic_crypto_test_utils::crypto_for;
 use ic_crypto_test_utils_threshold_sigs::non_interactive::{
     create_dealings, run_ni_dkg_and_create_single_transcript, NiDkgTestEnvironment,
     RandomNiDkgConfig,
 };
 use ic_interfaces::crypto::{
-    LoadTranscriptResult, NiDkgAlgorithm, Signable, SignableMock, ThresholdSigVerifier,
-    ThresholdSigner,
+    LoadTranscriptResult, NiDkgAlgorithm, ThresholdSigVerifier, ThresholdSigner,
 };
-use ic_test_utilities::crypto::crypto_for;
 use ic_types::crypto::threshold_sig::ni_dkg::config::NiDkgConfig;
 use ic_types::crypto::threshold_sig::ni_dkg::errors::create_dealing_error::DkgCreateDealingError;
 use ic_types::crypto::threshold_sig::ni_dkg::{DkgId, NiDkgTag, NiDkgTranscript};
-use ic_types::crypto::{CombinedThresholdSigOf, CryptoError, ThresholdSigShareOf};
+use ic_types::crypto::{
+    CombinedThresholdSigOf, CryptoError, Signable, SignableMock, ThresholdSigShareOf,
+};
 use ic_types::{NodeId, NumberOfNodes, RegistryVersion};
 use rand::prelude::*;
 use std::collections::{BTreeMap, BTreeSet, HashSet};
@@ -25,7 +27,7 @@ const ONE_NODE: NumberOfNodes = NumberOfNodes::new(1);
 // Test uses a random NI-DKG config.
 // A random receiver is chosen to be both combiner and verifier.
 fn should_threshold_sign_if_sufficient_shares() {
-    let subnet_size = thread_rng().gen_range(1, 7);
+    let subnet_size = thread_rng().gen_range(1..7);
     let (config, dkg_id, crypto_components) = setup_with_random_ni_dkg_config(subnet_size);
 
     run_ni_dkg_and_load_transcript_for_receivers(&config, &crypto_components);
@@ -51,7 +53,7 @@ fn should_threshold_sign_if_sufficient_shares() {
 #[test]
 // Test uses a random NI-DKG config. A random receiver is chosen as verifier.
 fn should_produce_valid_signature_shares() {
-    let subnet_size = thread_rng().gen_range(1, 7);
+    let subnet_size = thread_rng().gen_range(1..7);
     let (config, dkg_id, crypto_components) = setup_with_random_ni_dkg_config(subnet_size);
 
     run_ni_dkg_and_load_transcript_for_receivers(&config, &crypto_components);
@@ -81,7 +83,7 @@ fn should_produce_valid_signature_shares() {
 // Test uses a random NI-DKG config. A random receiver is chosen as combiner.
 fn should_fail_to_combine_insufficient_shares() {
     // Need >=4 nodes to have >=2 shares to combine in a low-threshold config
-    let subnet_size = thread_rng().gen_range(4, 7);
+    let subnet_size = thread_rng().gen_range(4..7);
     let (config, dkg_id, crypto_components) = setup_with_random_ni_dkg_config(subnet_size);
     let num_of_shares_to_combine = config.threshold().get() - ONE_NODE;
 
@@ -226,11 +228,13 @@ fn message() -> SignableMock {
 
 mod non_interactive_distributed_key_generation {
     use super::*;
+    use ic_crypto_internal_types::sign::threshold_sig::ni_dkg::CspNiDkgTranscript;
+    use ic_crypto_internal_types::NodeIndex;
     use ic_types::crypto::threshold_sig::ni_dkg::NiDkgDealing;
 
     #[test]
     fn should_produce_valid_dealings_for_all_dealers() {
-        let subnet_size = thread_rng().gen_range(1, 7);
+        let subnet_size = thread_rng().gen_range(1..7);
         let (config, _dkg_id, crypto_components) = setup_with_random_ni_dkg_config(subnet_size);
 
         let dealings = create_dealings(&config, &crypto_components);
@@ -250,15 +254,12 @@ mod non_interactive_distributed_key_generation {
 
     #[test]
     fn should_produce_same_transcript_for_all_receivers() {
-        let subnet_size = thread_rng().gen_range(1, 7);
+        let subnet_size = thread_rng().gen_range(1..7);
         let (config, _dkg_id, crypto_components) = setup_with_random_ni_dkg_config(subnet_size);
 
         let transcripts = run_ni_dkg_and_create_receiver_transcripts(&config, &crypto_components);
 
-        let transcripts_set: HashSet<_> = transcripts
-            .iter()
-            .map(|(_node_id, transcript)| transcript)
-            .collect();
+        let transcripts_set: HashSet<_> = transcripts.values().collect();
         assert_eq!(transcripts_set.len(), 1);
     }
 
@@ -284,10 +285,10 @@ mod non_interactive_distributed_key_generation {
                 .create_dealing(reshare_config.get())
                 .unwrap_err();
 
-            assert!(matches!(
+            assert_matches!(
                 result,
                 DkgCreateDealingError::ThresholdSigningKeyNotInSecretKeyStore(_)
-            ));
+            );
         }
     }
 
@@ -313,6 +314,72 @@ mod non_interactive_distributed_key_generation {
         }
     }
 
+    // Test that transcripts have the correct/minimal size, i.e., that they
+    // contain exactly the minimal number of required dealings (i.e., the
+    // collection threshold) and exactly as many ciphertexts as receivers.
+    // This is tested for (1) a (non-reshared) high-threshold transcript, (2) a
+    // reshared high-threshold transcript, and (3) a (non-reshared)
+    // low-threshold transcript, because these are the cases relevant in
+    // practice.
+    #[test]
+    fn should_produce_transcripts_with_correct_size() {
+        let (initial_subnet_size, max_subnet_size, epochs) = (3, 5, 1);
+
+        // Test for high-threshold NI-DKG including resharing
+        let mut config = RandomNiDkgConfig::builder()
+            .subnet_size(initial_subnet_size)
+            .dkg_tag(NiDkgTag::HighThreshold)
+            .registry_version(REG_V1)
+            .build();
+        let mut env = NiDkgTestEnvironment::new_for_config(config.get());
+        let mut transcript =
+            run_ni_dkg_and_create_single_transcript(config.get(), &env.crypto_components);
+
+        assert_eq!(
+            number_of_dealings_in_transcript(&transcript) as NodeIndex,
+            config.get().collection_threshold().get()
+        );
+        assert_transcript_ciphertexts_have_length(
+            &transcript,
+            config.get().receivers().get().len(),
+        );
+
+        for _i in 0..epochs {
+            config = RandomNiDkgConfig::reshare(transcript, -2..=2, max_subnet_size);
+            env.update_for_config(config.get());
+            transcript =
+                run_ni_dkg_and_create_single_transcript(config.get(), &env.crypto_components);
+
+            assert_eq!(
+                number_of_dealings_in_transcript(&transcript) as NodeIndex,
+                config.get().collection_threshold().get()
+            );
+            assert_transcript_ciphertexts_have_length(
+                &transcript,
+                config.get().receivers().get().len(),
+            );
+        }
+
+        // Test for low-threshold NI-DKG without resharing
+        let config = RandomNiDkgConfig::builder()
+            .subnet_size(initial_subnet_size)
+            .dkg_tag(NiDkgTag::LowThreshold)
+            .registry_version(REG_V1)
+            .build();
+        let env = NiDkgTestEnvironment::new_for_config(config.get());
+        let transcript =
+            run_ni_dkg_and_create_single_transcript(config.get(), &env.crypto_components);
+
+        assert_eq!(
+            number_of_dealings_in_transcript(&transcript) as NodeIndex,
+            config.get().collection_threshold().get()
+        );
+        assert_transcript_ciphertexts_have_length(
+            &transcript,
+            config.get().receivers().get().len(),
+        );
+    }
+
     // Test different scenarios for FS key deletion
     //
     // First create 3 high threshold epochs, followed by a single low threshold
@@ -330,7 +397,7 @@ mod non_interactive_distributed_key_generation {
         let max_subnet_size = 10;
         let mut env = NiDkgTestEnvironment::new();
         let rng = &mut thread_rng();
-        let registry_version = RegistryVersion::from(rng.gen_range(1, u32::MAX - 10_000) as u64);
+        let registry_version = RegistryVersion::from(rng.gen_range(1..u32::MAX - 10_000) as u64);
 
         // epoch 0
         let config0 = RandomNiDkgConfig::builder()
@@ -435,7 +502,7 @@ mod non_interactive_distributed_key_generation {
     fn should_not_reshare_old_transcript_after_pruning_old_keys() {
         let rng = &mut thread_rng();
 
-        let registry_version = RegistryVersion::from(rng.gen_range(1, u32::MAX - 10_000) as u64);
+        let registry_version = RegistryVersion::from(rng.gen_range(1..u32::MAX - 10_000) as u64);
 
         let mut env = NiDkgTestEnvironment::new();
 
@@ -469,10 +536,10 @@ mod non_interactive_distributed_key_generation {
             let result =
                 crypto_for(*dealer, &env.crypto_components).create_dealing(reshare_config.get());
 
-            assert!(matches!(
+            assert_matches!(
                 result,
                 Err(DkgCreateDealingError::FsEncryptionPublicKeyNotInRegistry(_))
-            ));
+            );
         }
     }
 
@@ -598,5 +665,21 @@ mod non_interactive_distributed_key_generation {
                 (*node, transcript)
             })
             .collect()
+    }
+
+    fn number_of_dealings_in_transcript(transcript: &NiDkgTranscript) -> usize {
+        match &transcript.internal_csp_transcript {
+            CspNiDkgTranscript::Groth20_Bls12_381(t) => t.receiver_data.len(),
+        }
+    }
+
+    fn assert_transcript_ciphertexts_have_length(transcript: &NiDkgTranscript, length: usize) {
+        match &transcript.internal_csp_transcript {
+            CspNiDkgTranscript::Groth20_Bls12_381(transcript) => {
+                for ciphertext in transcript.receiver_data.values() {
+                    assert_eq!(ciphertext.len(), length);
+                }
+            }
+        }
     }
 }

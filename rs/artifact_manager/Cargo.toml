@@ -1,20 +1,17 @@
 [package]
 name = "ic-artifact-manager"
 version = "0.8.0"
-edition = "2018"
+edition = "2021"
 
 [dependencies]
 bincode = "1.2.1"
-ic-consensus-message = { path = "../consensus/message" }
 ic-constants = { path = "../constants" }
-ic-crypto-hash = { path = "../crypto/hash" }
-ic-ecdsa-object = { path = "../consensus/ecdsa_object" }
 ic-interfaces = { path = "../interfaces" }
 ic-logger = { path = "../monitoring/logger" }
 ic-metrics = { path = "../monitoring/metrics" }
 ic-types = { path = "../types/types" }
-crossbeam-channel = "0.5.0"
-slog = { version = "2.5.2", features = ["nested-values", "max_level_trace", "release_max_level_debug"] }
+crossbeam-channel = "0.5.5"
+slog = { version = "2.5.2", features = ["nested-values", "release_max_level_debug"] }
 prometheus = { version = "0.12.0", features = [ "process" ] }
 serde = { version = "1.0.99", features = ["derive"] }
 serde_json = "1.0.54"

@@ -1,29 +1,32 @@
 //! Payload creation/validation subcomponent
 
-use crate::consensus::metrics::PayloadBuilderMetrics;
+use crate::consensus::{
+    block_maker::SubnetRecords,
+    metrics::{PayloadBuilderMetrics, CRITICAL_ERROR_SUBNET_RECORD_ISSUE},
+    payload::BatchPayloadSectionBuilder,
+    utils::get_subnet_record,
+};
 use ic_interfaces::{
-    consensus::{PayloadPermanentError, PayloadTransientError, PayloadValidationError},
+    canister_http::CanisterHttpPayloadBuilder,
+    consensus::{PayloadPermanentError, PayloadValidationError},
     ingress_manager::IngressSelector,
     messaging::XNetPayloadBuilder,
-    registry::RegistryClient,
     self_validating_payload::SelfValidatingPayloadBuilder,
     validation::{ValidationError, ValidationResult},
 };
+use ic_interfaces_registry::RegistryClient;
 use ic_logger::{warn, ReplicaLogger};
 use ic_metrics::MetricsRegistry;
 use ic_protobuf::registry::subnet::v1::SubnetRecord;
-use ic_registry_client_helpers::subnet::SubnetRegistry;
 use ic_types::{
-    batch::{BatchPayload, ValidationContext},
+    batch::{BatchPayload, ValidationContext, MAX_BITCOIN_PAYLOAD_IN_BYTES},
     consensus::Payload,
     messages::MAX_XNET_PAYLOAD_IN_BYTES,
-    CountBytes, Height, NumBytes, SubnetId, Time,
+    Height, NumBytes, SubnetId, Time,
 };
 use std::sync::Arc;
 
-use super::block_maker::SubnetRecords;
-
-/// The PayloadBuilder is responsible for creating and validating payload that
+/// The [`PayloadBuilder`] is responsible for creating and validating payload that
 /// is included in consensus blocks.
 pub trait PayloadBuilder: Send + Sync {
     /// Produces a payload that is valid given `past_payloads` and `context`.
@@ -47,6 +50,7 @@ pub trait PayloadBuilder: Send + Sync {
     /// order.
     fn validate_payload(
         &self,
+        height: Height,
         payload: &Payload,
         past_payloads: &[(Height, Time, Payload)],
         context: &ValidationContext,
@@ -57,9 +61,7 @@ pub trait PayloadBuilder: Send + Sync {
 pub struct PayloadBuilderImpl {
     subnet_id: SubnetId,
     registry_client: Arc<dyn RegistryClient>,
-    ingress_selector: Arc<dyn IngressSelector>,
-    xnet_payload_builder: Arc<dyn XNetPayloadBuilder>,
-    self_validating_payload_builder: Arc<dyn SelfValidatingPayloadBuilder>,
+    section_builder: Vec<BatchPayloadSectionBuilder>,
     metrics: PayloadBuilderMetrics,
     logger: ReplicaLogger,
 }
@@ -72,15 +74,21 @@ impl PayloadBuilderImpl {
         ingress_selector: Arc<dyn IngressSelector>,
         xnet_payload_builder: Arc<dyn XNetPayloadBuilder>,
         self_validating_payload_builder: Arc<dyn SelfValidatingPayloadBuilder>,
+        canister_http_payload_builder: Arc<dyn CanisterHttpPayloadBuilder>,
         metrics: MetricsRegistry,
         logger: ReplicaLogger,
     ) -> Self {
+        let section_builder = vec![
+            BatchPayloadSectionBuilder::Ingress(ingress_selector),
+            BatchPayloadSectionBuilder::SelfValidating(self_validating_payload_builder),
+            BatchPayloadSectionBuilder::XNet(xnet_payload_builder),
+            BatchPayloadSectionBuilder::CanisterHttp(canister_http_payload_builder),
+        ];
+
         Self {
             subnet_id,
             registry_client,
-            ingress_selector,
-            xnet_payload_builder,
-            self_validating_payload_builder,
+            section_builder,
             metrics: PayloadBuilderMetrics::new(metrics),
             logger,
         }
@@ -99,66 +107,47 @@ impl PayloadBuilder for PayloadBuilderImpl {
         self.metrics
             .past_payloads_length
             .observe(past_payloads.len() as f64);
-        let past_ingress = self
-            .ingress_selector
-            .filter_past_payloads(past_payloads, context);
 
-        // We enforce the block_payload limit in the following way:
-        // On a block with even height, we fill up the block with xnet messages.
-        // If there is space left, we fill it is ingress messages.
-        // On odd blocks, we prioritize ingress over xnet.
-        let max_block_payload_size = self.get_max_block_payload_size_bytes(&subnet_records.stable);
-        let get_ingress_payload = |byte_limit| {
-            self.ingress_selector
-                .get_ingress_payload(&past_ingress, context, byte_limit)
-        };
-        let get_xnet_payload = |byte_limit| {
-            self.xnet_payload_builder.get_xnet_payload(
-                context,
-                &self
-                    .xnet_payload_builder
-                    .filter_past_payloads(past_payloads),
-                byte_limit,
-            )
-        };
+        // To call the section builders in a somewhat fair manner,
+        // we call them in a rotation. Note that this is not really fair,
+        // as payload builders that yield a lot always give precendence to the
+        // same next payload builder. This might give an advantage to a particular
+        // payload builder.
+        let num_sections = self.section_builder.len();
+        let mut section_select = (0..num_sections).collect::<Vec<_>>();
+        section_select.rotate_right(height.get() as usize % num_sections);
 
-        let (ingress, xnet) = if height.get() % 2 == 0 {
-            let xnet = get_xnet_payload(max_block_payload_size);
-            let ingress = get_ingress_payload(NumBytes::new(
-                max_block_payload_size
-                    .get()
-                    .saturating_sub(xnet.count_bytes() as u64),
-            ));
-            (ingress, xnet)
-        } else {
-            let ingress = get_ingress_payload(max_block_payload_size);
-            let xnet = get_xnet_payload(NumBytes::new(
-                max_block_payload_size
-                    .get()
-                    .saturating_sub(ingress.count_bytes() as u64),
-            ));
-            (ingress, xnet)
-        };
+        // Fetch Subnet Record for Consensus registry version, return empty batch payload is not available
+        let max_block_payload_size =
+            self.get_max_block_payload_size_bytes(&subnet_records.context_version);
 
-        let self_validating = self
-            .self_validating_payload_builder
-            .get_self_validating_payload(
-                context,
-                &self
-                    .self_validating_payload_builder
-                    .filter_past_payloads(past_payloads),
-                MAX_XNET_PAYLOAD_IN_BYTES,
-            );
+        let mut batch_payload = BatchPayload::default();
+        let mut accumulated_size = 0;
 
-        BatchPayload {
-            ingress,
-            xnet,
-            self_validating,
+        for section_id in section_select {
+            accumulated_size += self.section_builder[section_id]
+                .build_payload(
+                    &mut batch_payload,
+                    height,
+                    context,
+                    NumBytes::new(
+                        max_block_payload_size
+                            .get()
+                            .saturating_sub(accumulated_size),
+                    ),
+                    past_payloads,
+                    &self.metrics,
+                    &self.logger,
+                )
+                .get();
         }
+
+        batch_payload
     }
 
     fn validate_payload(
         &self,
+        height: Height,
         payload: &Payload,
         past_payloads: &[(Height, Time, Payload)],
         context: &ValidationContext,
@@ -168,82 +157,49 @@ impl PayloadBuilder for PayloadBuilderImpl {
             return Ok(());
         }
         let batch_payload = &payload.as_ref().as_data().batch;
-        let past_ingress = self
-            .ingress_selector
-            .filter_past_payloads(past_payloads, context);
+        let subnet_record = self.get_subnet_record(context)?;
 
         // Retrieve max_block_payload_size from subnet
-        let max_block_payload_size = match self
-            .registry_client
-            .get_subnet_record(self.subnet_id, context.registry_version)
-        {
-            Err(err) => {
-                warn!(self.logger, "Failed to get subnet record in block_maker");
-                return Err(ValidationError::Transient(
-                    PayloadTransientError::RegistryUnavailable(err),
+        let max_block_payload_size = self.get_max_block_payload_size_bytes(&subnet_record);
+
+        let mut accumulated_size = NumBytes::new(0);
+        for builder in &self.section_builder {
+            accumulated_size +=
+                builder.validate_payload(height, batch_payload, context, past_payloads)?;
+            if accumulated_size > max_block_payload_size {
+                return Err(ValidationError::Permanent(
+                    PayloadPermanentError::PayloadTooBig {
+                        expected: max_block_payload_size,
+                        received: accumulated_size,
+                    },
                 ));
             }
-            Ok(None) => {
-                warn!(
-                    self.logger,
-                    "Subnet id {:?} not found in registry", self.subnet_id
-                );
-                return Err(ValidationError::Transient(
-                    PayloadTransientError::SubnetNotFound(self.subnet_id),
-                ));
-            }
-            Ok(Some(subnet_record)) => self.get_max_block_payload_size_bytes(&subnet_record),
-        };
-
-        // If ingress valiation is not valid, return it early.
-        self.ingress_selector.validate_ingress_payload(
-            &batch_payload.ingress,
-            &past_ingress,
-            context,
-        )?;
-
-        let xnet_size = self.xnet_payload_builder.validate_xnet_payload(
-            &batch_payload.xnet,
-            context,
-            &self
-                .xnet_payload_builder
-                .filter_past_payloads(past_payloads),
-        )?;
-
-        // The size of both payloads together must not exceed the block payload size.
-        // NOTE: We MUST NOT use xnet.count_bytes() here, as it may not be
-        // deterministic and could lead to divergence.
-        if xnet_size + NumBytes::from(batch_payload.ingress.count_bytes() as u64)
-            > max_block_payload_size
-        {
-            return Err(ValidationError::Permanent(
-                PayloadPermanentError::PayloadTooBig {
-                    expected: max_block_payload_size,
-                    received: xnet_size
-                        + NumBytes::from(batch_payload.ingress.count_bytes() as u64),
-                },
-            ));
         }
-        self.self_validating_payload_builder
-            .validate_self_validating_payload(
-                &batch_payload.self_validating,
-                context,
-                &self
-                    .self_validating_payload_builder
-                    .filter_past_payloads(past_payloads),
-            )?;
-
         Ok(())
     }
 }
 
 impl PayloadBuilderImpl {
+    /// Fetches the [`SubnetRecord`] corresponding to the registry version provided
+    /// by the [`ValidationContext`]
+    fn get_subnet_record(
+        &self,
+        context: &ValidationContext,
+    ) -> Result<SubnetRecord, PayloadValidationError> {
+        get_subnet_record(
+            self.registry_client.as_ref(),
+            self.subnet_id,
+            context.registry_version,
+            &self.logger,
+        )
+    }
+
     /// Returns the valid maximum block payload length from the registry and
     /// checks the invariants. Emits a warning in case the invariants are not
     /// met.
     fn get_max_block_payload_size_bytes(&self, subnet_record: &SubnetRecord) -> NumBytes {
-        let required_min_size = MAX_XNET_PAYLOAD_IN_BYTES
-            .get()
+        let required_min_size = MAX_BITCOIN_PAYLOAD_IN_BYTES
+            .max(MAX_XNET_PAYLOAD_IN_BYTES.get())
             .max(subnet_record.max_ingress_bytes_per_message);
 
         let mut max_block_payload_size = subnet_record.max_block_payload_size;
@@ -253,8 +209,9 @@ impl PayloadBuilderImpl {
             warn!(every_n_seconds => 300, self.logger,
                 "max_block_payload_size too small. current value: {}, required minimum: {}! \
                 max_block_payload_size must be larger than max_ingress_bytes_per_message \
-                and MAX_XNET_PAYLOAD_IN_BYTES. Update registry!",
-                max_block_payload_size, required_min_size);
+                and MAX_XNET_PAYLOAD_IN_BYTES. Update registry! @{}",
+                max_block_payload_size, required_min_size, CRITICAL_ERROR_SUBNET_RECORD_ISSUE);
+            self.metrics.critical_error_subnet_record_data_issue.inc();
             max_block_payload_size = required_min_size;
         }
 
@@ -262,14 +219,15 @@ impl PayloadBuilderImpl {
     }
 }
 #[cfg(test)]
-mod test {
+pub(crate) mod test {
     use super::*;
-    use crate::consensus::mocks::{dependencies, dependencies_with_subnet_params, Dependencies};
+    use crate::consensus::mocks::{dependencies, Dependencies};
     use ic_btc_types_internal::{
         BitcoinAdapterResponse, BitcoinAdapterResponseWrapper, GetSuccessorsResponse,
     };
     use ic_logger::replica_logger::no_op_logger;
     use ic_test_utilities::{
+        canister_http::FakeCanisterHttpPayloadBuilder,
         consensus::fake::Fake,
         ingress_selector::FakeIngressSelector,
         mock_time,
@@ -280,11 +238,8 @@ mod test {
     };
     use ic_test_utilities_registry::SubnetRecordBuilder;
     use ic_types::{
-        consensus::{
-            certification::{Certification, CertificationContent},
-            dkg::Dealings,
-            BlockPayload, DataPayload, Payload,
-        },
+        canister_http::CanisterHttpResponseWithConsensus,
+        consensus::certification::{Certification, CertificationContent},
         crypto::{CryptoHash, Signed},
         messages::SignedIngress,
         signature::ThresholdSignature,
@@ -292,13 +247,27 @@ mod test {
         CryptoHashOfPartialState, RegistryVersion,
     };
     use std::collections::BTreeMap;
-    /// Builds a `PayloadBuilderImpl` wrapping fake ingress and XNet payload
+
+    #[cfg(feature = "proptest")]
+    impl PayloadBuilderImpl {
+        /// Return the number of critical errors that have occured.
+        ///
+        /// This is useful for proptests.
+        pub(crate) fn count_critical_errors(&self) -> u64 {
+            self.metrics.critical_error_payload_too_large.get()
+                + self.metrics.critical_error_subnet_record_data_issue.get()
+                + self.metrics.critical_error_validation_not_passed.get()
+        }
+    }
+
+    /// Builds a `PayloadBuilderImpl` wrapping fake payload
     /// builders that return the supplied ingress and XNet data.
-    fn make_test_payload_impl(
+    pub(crate) fn make_test_payload_impl(
         registry: Arc<dyn RegistryClient>,
         mut ingress_messages: Vec<Vec<SignedIngress>>,
         mut certified_streams: Vec<BTreeMap<SubnetId, CertifiedStreamSlice>>,
         responses_from_adapter: Vec<BitcoinAdapterResponse>,
+        canister_http_responses: Vec<CanisterHttpResponseWithConsensus>,
     ) -> PayloadBuilderImpl {
         let ingress_selector = FakeIngressSelector::new();
         ingress_messages
@@ -308,6 +277,8 @@ mod test {
             FakeXNetPayloadBuilder::make(certified_streams.drain(..).collect());
         let self_validating_payload_builder =
             FakeSelfValidatingPayloadBuilder::new().with_responses(responses_from_adapter);
+        let canister_http_payload_builder =
+            FakeCanisterHttpPayloadBuilder::new().with_responses(canister_http_responses);
 
         PayloadBuilderImpl::new(
             subnet_test_id(0),
@@ -315,6 +286,7 @@ mod test {
             Arc::new(ingress_selector),
             Arc::new(xnet_payload_builder),
             Arc::new(self_validating_payload_builder),
+            Arc::new(canister_http_payload_builder),
             MetricsRegistry::new(),
             no_op_logger(),
         )
@@ -342,24 +314,13 @@ mod test {
         }
     }
 
-    /// Wraps a `BatchPayload` into the full `Payload` structure.
-    fn batch_payload_to_payload(height: u64, payload: BatchPayload) -> Payload {
-        Payload::new(
-            ic_crypto::crypto_hash,
-            BlockPayload::Data(DataPayload {
-                batch: payload,
-                dealings: Dealings::new_empty(Height::from(height)),
-                ecdsa: None,
-            }),
-        )
-    }
-
     // Test that confirms that the output of messaging.get_messages aligns with the
     // messages acquired from the application layer.
     fn test_get_messages(
         provided_ingress_messages: Vec<SignedIngress>,
         provided_certified_streams: BTreeMap<SubnetId, CertifiedStreamSlice>,
         provided_responses_from_adapter: Vec<BitcoinAdapterResponse>,
+        provided_canister_http_responses: Vec<CanisterHttpResponseWithConsensus>,
     ) {
         ic_test_utilities::artifact_pool_config::with_test_pool_config(|pool_config| {
             let Dependencies { registry, .. } = dependencies(pool_config, 1);
@@ -368,6 +329,7 @@ mod test {
                 vec![provided_ingress_messages.clone()],
                 vec![provided_certified_streams.clone()],
                 provided_responses_from_adapter.clone(),
+                provided_canister_http_responses.clone(),
             );
 
             let prev_payloads = Vec::new();
@@ -378,8 +340,8 @@ mod test {
             };
             let subnet_record = SubnetRecordBuilder::from(&[node_test_id(0)]).build();
             let subnet_records = SubnetRecords {
-                latest: subnet_record.clone(),
-                stable: subnet_record,
+                membership_version: subnet_record.clone(),
+                context_version: subnet_record,
             };
 
             let (ingress_msgs, stream_msgs, responses_from_adapter) = payload_builder
@@ -413,7 +375,7 @@ mod test {
             callback_id: 0,
         }];
 
-        test_get_messages(inputs, certified_streams, responses_from_adapter)
+        test_get_messages(inputs, certified_streams, responses_from_adapter, vec![])
     }
 
     #[test]
@@ -423,120 +385,5 @@ mod test {
                 param_msgs_test(i, j);
             }
         }
-    }
-
-    /// This test executes the `get_payload` and `validate_payload` functions
-    /// in `PayloadBuilderImpl`.
-    /// It first builds and validated a `BatchPayload` that consists of 3/4
-    /// `XNetPayload` and 1/4 `IngressPayload`.
-    /// Then, it builds and validates a `BatchPayload` that consists of 3/4
-    /// `XNetPayload` and 1/4 `IngressPayload`.
-    /// In the last step, the mocks are setup to return 3/4 `XNetPayload` and
-    /// 3/4 `IngressPayload`. This is too large and makes the `get_payload`
-    /// function fail.
-    #[test]
-    fn test_payload_size_validation() {
-        const MAX_SIZE: u64 = 2 * 1024 * 1024;
-        // NOTE: Since the messages will also contain headers, the payload needs to be a
-        // little bit smaller than the overall size
-        const ONE_QUARTER: usize = 512 * 1024 - 1000;
-        const THREE_QUARTER: usize = 3 * 512 * 1024 - 1000;
-
-        ic_test_utilities::artifact_pool_config::with_test_pool_config(|pool_config| {
-            let mut subnet_record = SubnetRecordBuilder::from(&[node_test_id(0)]).build();
-            // NOTE: We can't set smaller values
-            subnet_record.max_block_payload_size = MAX_SIZE;
-            subnet_record.max_ingress_bytes_per_message = MAX_SIZE;
-
-            let subnet_records = SubnetRecords {
-                latest: subnet_record.clone(),
-                stable: subnet_record.clone(),
-            };
-
-            let Dependencies { registry, .. } = dependencies_with_subnet_params(
-                pool_config,
-                subnet_test_id(0),
-                vec![(1, subnet_record)],
-            );
-            let context = ValidationContext {
-                certified_height: Height::from(0),
-                registry_version: RegistryVersion::from(1),
-                time: mock_time(),
-            };
-
-            // Prepare the messages in the mock
-            let make_ingress = |nonce, size| {
-                vec![SignedIngressBuilder::new()
-                    .method_payload(vec![0; size])
-                    .nonce(nonce)
-                    .build()]
-            };
-            let make_slice = |height, size| {
-                let mut map = BTreeMap::new();
-                map.insert(
-                    subnet_test_id(1),
-                    make_certified_stream_slice(height, vec![0; size], vec![]),
-                );
-                map
-            };
-            let certified_streams: Vec<BTreeMap<SubnetId, CertifiedStreamSlice>> = vec![
-                make_slice(0, THREE_QUARTER),
-                make_slice(1, ONE_QUARTER),
-                make_slice(2, THREE_QUARTER),
-            ];
-            let ingress = vec![
-                make_ingress(0, ONE_QUARTER),
-                make_ingress(1, THREE_QUARTER),
-                make_ingress(2, THREE_QUARTER),
-            ];
-            let payload_builder =
-                make_test_payload_impl(registry, ingress, certified_streams, vec![]);
-
-            // Build first payload and then validate it
-            let payload0 =
-                payload_builder.get_payload(Height::from(0), &[], &context, &subnet_records);
-            let wrapped_payload0 = batch_payload_to_payload(0, payload0);
-            payload_builder
-                .validate_payload(&wrapped_payload0, &[], &context)
-                .unwrap();
-
-            // Build second payload and validate it
-            let past_payload0 = [(Height::from(0), mock_time(), wrapped_payload0)];
-            let payload1 = payload_builder.get_payload(
-                Height::from(1),
-                &past_payload0,
-                &context,
-                &subnet_records,
-            );
-            let wrapped_payload1 = batch_payload_to_payload(0, payload1);
-            payload_builder
-                .validate_payload(&wrapped_payload1, &past_payload0, &context)
-                .unwrap();
-
-            // Build third payload and validate it
-            // This payload is oversized, therefore we expect the validator to fail
-            let past_payload1 = [(Height::from(1), mock_time(), wrapped_payload1)];
-            let payload2 = payload_builder.get_payload(
-                Height::from(2),
-                &past_payload1,
-                &context,
-                &subnet_records,
-            );
-
-            let pb_result = payload_builder.validate_payload(
-                &batch_payload_to_payload(1, payload2),
-                &past_payload1,
-                &context,
-            );
-
-            match pb_result {
-                Err(
-                    ValidationError::<PayloadPermanentError, PayloadTransientError>::Permanent(
-                        PayloadPermanentError::PayloadTooBig { .. },
-                    ),
-                ) => (),
-                _ => panic!("Expected PayloadTooBig error"),
-            }
-        });
     }
 }

@@ -2,6 +2,8 @@
 
 use std::collections::HashMap;
 
+use ic_config::embedders::Config as EmbeddersConfig;
+use ic_embedders::WasmtimeEmbedder;
 use wasmtime::{Config, Engine, Instance, Module, Store};
 
 use ic_wasm_types::BinaryEncodedWasm;
@@ -13,13 +15,18 @@ pub fn wasmtime_instantiate_and_call_run(wasm: &BinaryEncodedWasm) {
     let mut wasmtime = WasmtimeSimple::new();
 
     let (imports_module_instance, imports_module_exports) = {
-        let imports_wasm = wabt::wat2wasm(
+        let imports_wasm = wat::parse_str(
             r#"
             (module
                 (func (export "out_of_instructions"))
                 (func (export "update_available_memory") (param i32 i32) (result i32)
                     i32.const 42
                 )
+                (func (export "try_grow_stable_memory") (param i64 i64 i32) (result i64)
+                    i64.const 0
+                )
+                (func (export "deallocate_pages") (param i64))
+                (func (export "internal_trap") (param i32))
             )"#,
         )
         .unwrap();
@@ -27,6 +34,9 @@ pub fn wasmtime_instantiate_and_call_run(wasm: &BinaryEncodedWasm) {
         let mut e = HashMap::new();
         e.insert("out_of_instructions".to_string(), 0);
         e.insert("update_available_memory".to_string(), 1);
+        e.insert("try_grow_stable_memory".to_string(), 2);
+        e.insert("deallocate_pages".to_string(), 3);
+        e.insert("internal_trap".to_string(), 4);
         (i, e)
     };
 
@@ -49,7 +59,7 @@ pub struct WasmtimeSimple {
 /// Example:
 ///
 /// ```
-/// let wasm = wabt::wat2wasm(
+/// let wasm = wat::parse_str(
 ///     r#"(module
 ///       (import "__" "magic_number" (func $magic_number (result i32)))
 ///       (func (export "run") (result i32) (call $magic_number))
@@ -59,7 +69,7 @@ pub struct WasmtimeSimple {
 /// let wasmtime = ic_test_utilities::wasmtime_simple::WasmtimeSimple::new();
 ///
 /// let (imports_module_instance, imports_module_exports) = {
-///     let imports_wasm = wabt::wat2wasm(
+///     let imports_wasm = wat::parse_str(
 ///         r#"(module
 ///           (func (export "magic_number") (result i32) (i32.const 42))
 ///         )"#,
@@ -86,8 +96,10 @@ pub type ModuleRegistry = HashMap<String, (Instance, HashMap<String, usize>)>;
 #[allow(clippy::new_without_default)]
 impl WasmtimeSimple {
     pub fn new() -> Self {
-        let config = Config::default();
-        let engine = Engine::new(&config).expect("Failed to initialize Wasmtime engine");
+        let engine = Engine::new(&WasmtimeEmbedder::initial_wasmtime_config(
+            &EmbeddersConfig::default(),
+        ))
+        .expect("Failed to initialize Wasmtime engine");
         let store = Store::new(&engine, ());
         Self { engine, store }
     }
@@ -132,13 +144,13 @@ fn instantiate_module(
     module_registry: &ModuleRegistry,
     wasm_binary: &[u8],
 ) -> Result<Instance, Box<dyn std::error::Error>> {
-    let module = Module::new(engine, &wasm_binary)?;
+    let module = Module::new(engine, wasm_binary)?;
     // Resolve import using module_registry.
     let mut imports = vec![];
     for i in module.imports() {
         let module_name = i.module().to_string();
         if let Some((instance, map)) = module_registry.get(&module_name) {
-            let field_name = i.name().unwrap().to_string();
+            let field_name = i.name().to_string();
             if let Some(export_index) = map.get(&field_name) {
                 imports.push(
                     instance

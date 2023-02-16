@@ -1,4 +1,5 @@
-use crate::ExecutionEnvironmentImpl;
+use crate::query_handler::QueryScheduler;
+use crate::ExecutionEnvironment;
 use ic_error_types::UserError;
 use ic_interfaces::execution_environment::{ExecutionMode, IngressFilterService};
 use ic_interfaces_state_manager::StateReader;
@@ -8,37 +9,32 @@ use ic_types::messages::SignedIngressContent;
 use std::convert::Infallible;
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::task::{Context, Poll};
 use tokio::sync::oneshot;
-use tower::{util::BoxService, Service, ServiceBuilder};
+use tower::{limit::GlobalConcurrencyLimitLayer, util::BoxCloneService, Service, ServiceBuilder};
 
+#[derive(Clone)]
 pub(crate) struct IngressFilter {
-    exec_env: Arc<ExecutionEnvironmentImpl>,
+    exec_env: Arc<ExecutionEnvironment>,
     state_reader: Arc<dyn StateReader<State = ReplicatedState>>,
-    threadpool: Arc<Mutex<threadpool::ThreadPool>>,
+    query_scheduler: QueryScheduler,
 }
 
 impl IngressFilter {
     pub(crate) fn new_service(
-        max_buffered_queries: usize,
-        threads: usize,
-        threadpool: Arc<Mutex<threadpool::ThreadPool>>,
+        concurrency_buffer: GlobalConcurrencyLimitLayer,
+        query_scheduler: QueryScheduler,
         state_reader: Arc<dyn StateReader<State = ReplicatedState>>,
-        exec_env: Arc<ExecutionEnvironmentImpl>,
+        exec_env: Arc<ExecutionEnvironment>,
     ) -> IngressFilterService {
-        let base_service = Self {
+        let base_service = BoxCloneService::new(Self {
             exec_env,
             state_reader,
-            threadpool,
-        };
-        let base_service = BoxService::new(
-            ServiceBuilder::new()
-                .concurrency_limit(threads)
-                .service(base_service),
-        );
+            query_scheduler,
+        });
         ServiceBuilder::new()
-            .buffer(max_buffered_queries)
+            .layer(concurrency_buffer)
             .service(base_service)
     }
 }
@@ -60,8 +56,9 @@ impl Service<(ProvisionalWhitelist, SignedIngressContent)> for IngressFilter {
         let exec_env = Arc::clone(&self.exec_env);
         let state_reader = Arc::clone(&self.state_reader);
         let (tx, rx) = oneshot::channel();
-        let threadpool = self.threadpool.lock().unwrap().clone();
-        threadpool.execute(move || {
+        let canister_id = ingress.canister_id();
+        self.query_scheduler.push(canister_id, move || {
+            let start = std::time::Instant::now();
             if !tx.is_closed() {
                 let state = state_reader.get_latest_state().take();
                 let v = exec_env.should_accept_ingress_message(
@@ -72,6 +69,7 @@ impl Service<(ProvisionalWhitelist, SignedIngressContent)> for IngressFilter {
                 );
                 let _ = tx.send(Ok(v));
             }
+            start.elapsed()
         });
         Box::pin(async move {
             rx.await

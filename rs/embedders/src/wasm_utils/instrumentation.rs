@@ -21,12 +21,16 @@
 //! counter overflows, the value of the counter is the initial value minus the
 //! sum of cost of all executed instructions.
 //!
-//! In more details, first, it inserts two System API functions:
+//! In more details, first, it inserts up to five System API functions:
 //!
 //! ```wasm
 //! (import "__" "out_of_instructions" (func (;0;) (func)))
 //! (import "__" "update_available_memory" (func (;1;) ((param i32 i32) (result i32))))
+//! (import "__" "try_grow_stable_memory" (func (;1;) ((param i64 i64 i32) (result i64))))
+//! (import "__" "deallocate_pages" (func (;1;) ((param i64))))
+//! (import "__" "internal_trap" (func (;1;) ((param i32))))
 //! ```
+//! Where the last three will only be inserted if Wasm-native stable memory is enabled.
 //!
 //! It then inserts (and exports) a global mutable counter:
 //! ```wasm
@@ -41,16 +45,16 @@
 //! ```wasm
 //! (func (;5;) (type 4) (param i32) (result i32)
 //!   global.get 0
+//!   local.get 0
+//!   i64.extend_i32_u
+//!   i64.sub
+//!   global.set 0
+//!   global.get 0
 //!   i64.const 0
 //!   i64.lt_s
 //!   if  ;; label = @1
 //!     call 0           # the `out_of_instructions` function
 //!   end
-//!   global.get 0
-//!   local.get 0
-//!   i64.extend_i32_u
-//!   i64.sub
-//!   global.set 0
 //!   local.get 0)
 //! ```
 //!
@@ -93,92 +97,75 @@
 //! blocks to optimize for performance. The maximal overflow in that case is
 //! bound by the length of the longest execution path consisting of
 //! non-reentrant basic blocks.
+//!
+//! # Wasm-native stable memory
+//!
+//! Two additional memories are inserted for stable memory. One is the actual
+//! stable memory and the other is a bytemap to track dirty pages in the stable
+//! memory.
+//! Index of stable memory bytemap = index of stable memory + 1
+//! ```wasm
+//! (memory (export "stable_memory") i64 (i64.const 0) (i64.const MAX_STABLE_MEMORY_SIZE))
+//! (memory (export "stable_memory_bytemap") i32 (i64.const STABLE_BYTEMAP_SIZE) (i64.const STABLE_BYTEMAP_SIZE))
+//! ```
+//!
 
-use super::{errors::into_parity_wasm_error, wasm_module_builder::WasmModuleBuilder};
-use ic_replicated_state::canister_state::WASM_PAGE_SIZE_IN_BYTES;
+use super::system_api_replacements::replacement_functions;
+use super::validation::API_VERSION_IC0;
+use super::{InstrumentationOutput, Segments, SystemApiFunc};
+use ic_config::flag_status::FlagStatus;
+use ic_registry_subnet_type::SubnetType;
 use ic_replicated_state::NumWasmPages;
-use ic_sys::{PageBytes, PageIndex, PAGE_SIZE};
-use ic_types::methods::WasmMethod;
-use ic_wasm_types::{BinaryEncodedWasm, WasmInstrumentationError};
+use ic_sys::PAGE_SIZE;
+use ic_types::{methods::WasmMethod, MAX_WASM_MEMORY_IN_BYTES};
+use ic_types::{NumInstructions, MAX_STABLE_MEMORY_IN_BYTES};
+use ic_wasm_types::{BinaryEncodedWasm, WasmError, WasmInstrumentationError};
+use wasmtime_environ::WASM_PAGE_SIZE;
 
-use parity_wasm::builder;
-use parity_wasm::elements::{
-    BlockType, BulkInstruction, ExportEntry, FuncBody, FunctionType, GlobalEntry, GlobalType,
-    InitExpr, Instruction, Instructions, Internal, Local, Module, Section, Type, ValueType,
+use crate::wasm_utils::wasm_transform::{self, Module};
+use crate::wasmtime_embedder::{
+    STABLE_BYTEMAP_MEMORY_NAME, STABLE_MEMORY_NAME, WASM_HEAP_BYTEMAP_MEMORY_NAME,
+    WASM_HEAP_MEMORY_NAME,
 };
-use std::collections::{BTreeSet, HashMap};
+use wasmparser::{
+    BlockType, ConstExpr, Export, ExternalKind, FuncType, Global, GlobalType, Import, MemoryType,
+    Operator, Type, TypeRef, ValType,
+};
+
+use std::collections::BTreeMap;
 use std::convert::TryFrom;
 
-const UPDATE_AVAILABLE_MEMORY_FN: u32 = 1; // because it's the second import
-
-// Converts a Wasm instruction to a string mnemonic.
-// TODO(EXC-221): Consider optimizing this to "cache" results, so we don't have
-// to extract the mnemomic each time this function is called.
-fn instruction_to_mnemonic(i: &Instruction) -> String {
-    let out = i.to_string();
-    let mut iter = out.split_whitespace();
-    iter.next()
-        .expect("The string representation of a Wasm instruction is never empty.")
-        .to_string()
+// The indicies of injected function imports.
+pub(crate) enum InjectedImports {
+    OutOfInstructions = 0,
+    UpdateAvailableMemory = 1,
+    TryGrowStableMemory = 2,
+    DeallocatePages = 3,
+    InternalTrap = 4,
 }
 
-/// The metering can be configured by providing a cost-per-instruction table and
-/// the default cost for an instruction in case it's not present in the cost
-/// table.
-pub struct InstructionCostTable {
-    // mapping of instruction mnemonic to its cost
-    instruction_cost: HashMap<String, u64>,
-    // default cost of an instruction (if not present in the cost table)
-    default_cost: u64,
-}
-
-impl InstructionCostTable {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    pub fn with_default_cost(mut self, cost: u64) -> Self {
-        self.default_cost = cost;
-        self
-    }
-
-    pub fn with_instruction_cost(mut self, id: String, cost: u64) -> Self {
-        self.instruction_cost.insert(id, cost);
-        self
-    }
-
-    // Returns the cost of a Wasm instruction from the cost table or the default
-    // cost if the instruction is not in the cost table.
-    fn cost(&self, i: &Instruction) -> u64 {
-        let mnemonic = instruction_to_mnemonic(i);
-        *self
-            .instruction_cost
-            .get(&mnemonic)
-            .unwrap_or(&self.default_cost)
+impl InjectedImports {
+    fn count(wasm_native_stable_memory: FlagStatus) -> usize {
+        if wasm_native_stable_memory == FlagStatus::Enabled {
+            5
+        } else {
+            2
+        }
     }
 }
 
-impl Default for InstructionCostTable {
-    fn default() -> Self {
-        let mut instruction_cost = HashMap::new();
-
+// Gets the cost of an instruction.
+fn instruction_to_cost(i: &Operator) -> u64 {
+    match i {
         // The following instructions are mostly signaling the start/end of code blocks,
         // so we assign 0 cost to them.
-        instruction_cost.insert(
-            instruction_to_mnemonic(&Instruction::Block(BlockType::NoResult)),
-            0,
-        );
-        instruction_cost.insert(instruction_to_mnemonic(&Instruction::Else), 0);
-        instruction_cost.insert(instruction_to_mnemonic(&Instruction::End), 0);
-        instruction_cost.insert(
-            instruction_to_mnemonic(&Instruction::Loop(BlockType::NoResult)),
-            0,
-        );
+        Operator::Block { .. } => 0,
+        Operator::Else => 0,
+        Operator::End => 0,
+        Operator::Loop { .. } => 0,
 
-        Self {
-            default_cost: 1,
-            instruction_cost,
-        }
+        // Default cost of an instruction is 1.
+        _ => 1,
     }
 }
 
@@ -194,189 +181,164 @@ impl Default for InstructionCostTable {
 // added as the last two imports, we'd need to increment only non imported
 // functions, since imported functions precede all others in the function index
 // space, but this would be error-prone).
-fn inject_helper_functions(module: Module) -> Module {
-    let mut builder = builder::from_module(module);
-    let import_sig = builder.push_signature(builder::signature().build_sig());
 
-    builder.push_import(
-        builder::import()
-            .module("__")
-            .field("out_of_instructions")
-            .external()
-            .func(import_sig)
-            .build(),
-    );
+const INSTRUMENTED_FUN_MODULE: &str = "__";
+const OUT_OF_INSTRUCTIONS_FUN_NAME: &str = "out_of_instructions";
+const UPDATE_MEMORY_FUN_NAME: &str = "update_available_memory";
+const TRY_GROW_STABLE_MEMORY_FUN_NAME: &str = "try_grow_stable_memory";
+const DEALLOCATE_PAGES_NAME: &str = "deallocate_pages";
+const INTERNAL_TRAP_FUN_NAME: &str = "internal_trap";
+const TABLE_STR: &str = "table";
+pub(crate) const INSTRUCTIONS_COUNTER_GLOBAL_NAME: &str = "canister counter_instructions";
+pub(crate) const DIRTY_PAGES_COUNTER_GLOBAL_NAME: &str = "canister counter_dirty_pages";
+const CANISTER_START_STR: &str = "canister_start";
 
-    let import_sig = builder.push_signature(
-        builder::signature()
-            .with_param(ValueType::I32)
-            .with_param(ValueType::I32)
-            .with_result(ValueType::I32)
-            .build_sig(),
-    );
-    builder.push_import(
-        builder::import()
-            .module("__")
-            .field("update_available_memory")
-            .external()
-            .func(import_sig)
-            .build(),
-    );
-    let mut module = builder.build();
-    // We know, we have at least two imports, because we pushed them above, now
-    // let's move them to the first two positions respectively, so that we can
-    // increase all other function indices unconditionally.
-    let entries = module.import_section_mut().unwrap().entries_mut();
-    let last = entries.pop().unwrap();
-    debug_assert!(last.module() == "__" && last.field() == "update_available_memory");
-    entries.insert(0, last);
-    let last = entries.pop().unwrap();
-    debug_assert!(last.module() == "__" && last.field() == "out_of_instructions");
-    entries.insert(0, last);
+/// There is one byte for each OS page in the wasm heap.
+const BYTEMAP_SIZE_IN_WASM_PAGES: u64 =
+    MAX_WASM_MEMORY_IN_BYTES / (PAGE_SIZE as u64) / (WASM_PAGE_SIZE as u64);
 
-    // We lift all call references by 2
-    for section in module.sections_mut() {
-        match section {
-            Section::Code(ref mut code_section) => {
-                for func_body in code_section.bodies_mut() {
-                    let code = func_body.code_mut();
-                    code.elements_mut().iter_mut().for_each(|instr| {
-                        if let Instruction::Call(ref mut call_index) = instr {
-                            *call_index += 2
-                        }
-                    });
-                }
-            }
-            Section::Export(ref mut export_section) => {
-                for export in export_section.entries_mut() {
-                    if let Internal::Function(ref mut func_index) = export.internal_mut() {
-                        *func_index += 2
-                    }
-                }
-            }
-            Section::Element(ref mut elements_section) => {
-                for segment in elements_section.entries_mut() {
-                    for func_index in segment.members_mut() {
-                        *func_index += 2
-                    }
-                }
-            }
-            Section::Start(ref mut func_index) => *func_index += 2,
-            _ => {}
+const MAX_STABLE_MEMORY_IN_WASM_PAGES: u64 = MAX_STABLE_MEMORY_IN_BYTES / (WASM_PAGE_SIZE as u64);
+/// There is one byte for each OS page in the stable memory.
+const STABLE_BYTEMAP_SIZE_IN_WASM_PAGES: u64 = MAX_STABLE_MEMORY_IN_WASM_PAGES / (PAGE_SIZE as u64);
+
+fn add_type(module: &mut Module, ty: Type) -> u32 {
+    let Type::Func(sig) = &ty;
+    for (idx, Type::Func(msig)) in module.types.iter().enumerate() {
+        if *msig == *sig {
+            return idx as u32;
         }
     }
+    module.types.push(ty);
+    (module.types.len() - 1) as u32
+}
+
+fn mutate_function_indices(module: &mut Module, f: impl Fn(u32) -> u32) {
+    for func_body in &mut module.code_sections {
+        for instr in &mut func_body.instructions {
+            match instr {
+                Operator::Call { function_index }
+                | Operator::ReturnCall { function_index }
+                | Operator::RefFunc { function_index } => {
+                    *function_index = f(*function_index);
+                }
+                _ => {}
+            }
+        }
+    }
+    for exp in &mut module.exports {
+        if let ExternalKind::Func = exp.kind {
+            exp.index = f(exp.index);
+        }
+    }
+    for (_, elem_items) in &mut module.elements {
+        if let wasm_transform::ElementItems::Functions(fun_items) = elem_items {
+            for idx in fun_items {
+                *idx = f(*idx);
+            }
+        }
+    }
+    if let Some(start_idx) = module.start.as_mut() {
+        *start_idx = f(*start_idx);
+    }
+}
+
+fn inject_helper_functions(mut module: Module, wasm_native_stable_memory: FlagStatus) -> Module {
+    // insert types
+    let ooi_type = Type::Func(FuncType::new([], []));
+    let uam_type = Type::Func(FuncType::new([ValType::I32, ValType::I32], [ValType::I32]));
+
+    let ooi_type_idx = add_type(&mut module, ooi_type);
+    let uam_type_idx = add_type(&mut module, uam_type);
+
+    // push_front imports
+    let ooi_imp = Import {
+        module: INSTRUMENTED_FUN_MODULE,
+        name: OUT_OF_INSTRUCTIONS_FUN_NAME,
+        ty: TypeRef::Func(ooi_type_idx),
+    };
+
+    let uam_imp = Import {
+        module: INSTRUMENTED_FUN_MODULE,
+        name: UPDATE_MEMORY_FUN_NAME,
+        ty: TypeRef::Func(uam_type_idx),
+    };
+
+    let mut old_imports = module.imports;
+    module.imports =
+        Vec::with_capacity(old_imports.len() + InjectedImports::count(wasm_native_stable_memory));
+    module.imports.push(ooi_imp);
+    module.imports.push(uam_imp);
+
+    if wasm_native_stable_memory == FlagStatus::Enabled {
+        let tgsm_type = Type::Func(FuncType::new(
+            [ValType::I64, ValType::I64, ValType::I32],
+            [ValType::I64],
+        ));
+        let dp_type = Type::Func(FuncType::new([ValType::I64], []));
+        let tgsm_type_idx = add_type(&mut module, tgsm_type);
+        let dp_type_idx = add_type(&mut module, dp_type);
+        let tgsm_imp = Import {
+            module: INSTRUMENTED_FUN_MODULE,
+            name: TRY_GROW_STABLE_MEMORY_FUN_NAME,
+            ty: TypeRef::Func(tgsm_type_idx),
+        };
+        let dp_imp = Import {
+            module: INSTRUMENTED_FUN_MODULE,
+            name: DEALLOCATE_PAGES_NAME,
+            ty: TypeRef::Func(dp_type_idx),
+        };
+        module.imports.push(tgsm_imp);
+        module.imports.push(dp_imp);
+
+        let it_type = Type::Func(FuncType::new([ValType::I32], []));
+        let it_type_idx = add_type(&mut module, it_type);
+        let it_imp = Import {
+            module: INSTRUMENTED_FUN_MODULE,
+            name: INTERNAL_TRAP_FUN_NAME,
+            ty: TypeRef::Func(it_type_idx),
+        };
+        module.imports.push(it_imp);
+    }
+
+    module.imports.append(&mut old_imports);
+
+    // now increment all function references by InjectedImports::Count
+    let cnt = InjectedImports::count(wasm_native_stable_memory) as u32;
+    mutate_function_indices(&mut module, |i| i + cnt);
+
+    debug_assert!(
+        module.imports[InjectedImports::OutOfInstructions as usize].name == "out_of_instructions"
+    );
+    debug_assert!(
+        module.imports[InjectedImports::UpdateAvailableMemory as usize].name
+            == "update_available_memory"
+    );
+    if wasm_native_stable_memory == FlagStatus::Enabled {
+        debug_assert!(
+            module.imports[InjectedImports::TryGrowStableMemory as usize].name
+                == "try_grow_stable_memory"
+        );
+        debug_assert!(
+            module.imports[InjectedImports::DeallocatePages as usize].name == "deallocate_pages"
+        );
+        debug_assert!(
+            module.imports[InjectedImports::InternalTrap as usize].name == "internal_trap"
+        );
+    }
+
     module
 }
 
-/// Vector of heap data chunks with their offsets.
-pub struct Segments(Vec<(usize, Vec<u8>)>);
-
-impl From<Vec<(usize, Vec<u8>)>> for Segments {
-    fn from(vec: Vec<(usize, Vec<u8>)>) -> Self {
-        Self(vec)
-    }
-}
-
-impl Segments {
-    // Returns the slice of the internal data. For testing purposes only.
-    #[allow(dead_code)]
-    pub fn as_slice(&self) -> &[(usize, Vec<u8>)] {
-        &self.0
-    }
-
-    pub fn validate(
-        &self,
-        initial_wasm_pages: NumWasmPages,
-    ) -> Result<(), WasmInstrumentationError> {
-        let initial_memory_size =
-            (initial_wasm_pages.get() as usize) * WASM_PAGE_SIZE_IN_BYTES as usize;
-        for (offset, bytes) in self.0.iter() {
-            let out_of_bounds = match offset.checked_add(bytes.len()) {
-                None => true,
-                Some(end) => end > initial_memory_size,
-            };
-            if out_of_bounds {
-                return Err(WasmInstrumentationError::InvalidDataSegment {
-                    offset: *offset,
-                    len: bytes.len(),
-                });
-            }
-        }
-        Ok(())
-    }
-
-    // Takes chunks extracted from data, and creates pages out of them, by mapping
-    // them to the corresponding page, leaving uninitialized parts filled with
-    // zeros.
-    pub fn as_pages(self) -> Vec<(PageIndex, PageBytes)> {
-        self.0
-            .iter()
-            // We go over all chunks and split them into multiple chunks if they cross page
-            // boundaries.
-            .flat_map(|(offset, bytes)| {
-                // First, we determine the size of the first chunk, which is equal to the chunk
-                // itself, if it does not cross the page boundary.
-                let first_chunk_size = std::cmp::min(bytes.len(), PAGE_SIZE - (offset % PAGE_SIZE));
-                let mut split_chunks = vec![(*offset, bytes[..first_chunk_size].to_vec())];
-                // If the chunk crosses the page boundary, split the rest of it into
-                // page-sized chunks and compute the correct offset for them.
-                split_chunks.extend_from_slice(
-                    bytes[first_chunk_size..]
-                        .chunks(PAGE_SIZE)
-                        .enumerate()
-                        .map(move |(chunk_num, chunk)| {
-                            (
-                                offset + first_chunk_size + PAGE_SIZE * chunk_num,
-                                chunk.to_vec(),
-                            )
-                        })
-                        .collect::<Vec<(usize, Vec<u8>)>>()
-                        .as_slice(),
-                );
-                split_chunks
-            })
-            // Second, after we know, that no chunk crosses the page boundary, simply fold all of
-            // them into a map page_num -> page. Whenever we map a chunk into its page,
-            // we simply copy its bytes to the right place inside the page.
-            .fold(HashMap::new(), |mut acc, (offset, bytes)| {
-                let page_num = offset / PAGE_SIZE;
-                let list = acc
-                    .entry(PageIndex::new(page_num as u64))
-                    .or_insert_with(|| [0; PAGE_SIZE]);
-                let local_offset = offset % PAGE_SIZE;
-                list[local_offset..local_offset + (bytes.len() as usize)].copy_from_slice(&bytes);
-                acc
-            })
-            .into_iter()
-            .collect()
-    }
-}
-
-pub struct InstrumentationOutput {
-    /// All exported methods that are relevant to the IC.
-    /// Methods relevant to the IC are:
-    ///     - Queries (e.g. canister_query ___)
-    ///     - Updates (e.g. canister_update ___)
-    ///     - System methods (e.g. canister_init)
-    /// Other methods are assumed to be private to the module and are ignored.
-    pub exported_functions: BTreeSet<WasmMethod>,
-
-    /// Memory limits (min, max).
-    pub limits: (u32, Option<u32>),
-
-    /// Data segements.
-    pub data: Segments,
-
-    /// Instrumented Wasm binary.
-    pub binary: BinaryEncodedWasm,
-}
-
+/// Indices of functions, globals, etc that will be need in the later parts of
+/// instrumentation.
 #[derive(Default)]
-pub struct ExportModuleData {
-    pub out_of_instructions_fn: u32,
+pub(super) struct SpecialIndices {
     pub instructions_counter_ix: u32,
+    pub dirty_pages_counter_ix: Option<u32>,
     pub decr_instruction_counter_fn: u32,
+    pub count_clean_pages_fn: Option<u32>,
     pub start_fn_ix: Option<u32>,
+    pub stable_memory_index: u32,
 }
 
 /// Takes a Wasm binary and inserts the instructions metering and memory grow
@@ -384,170 +346,394 @@ pub struct ExportModuleData {
 ///
 /// Returns an [`InstrumentationOutput`] or an error if the input binary could
 /// not be instrumented.
-pub fn instrument(
-    wasm: &BinaryEncodedWasm,
-    instruction_cost_table: &InstructionCostTable,
+pub(super) fn instrument(
+    module: Module<'_>,
+    cost_to_compile_wasm_instruction: NumInstructions,
+    write_barrier: FlagStatus,
+    wasm_native_stable_memory: FlagStatus,
+    subnet_type: SubnetType,
+    dirty_page_overhead: NumInstructions,
 ) -> Result<InstrumentationOutput, WasmInstrumentationError> {
-    let module = parity_wasm::deserialize_buffer::<Module>(wasm.as_slice()).map_err(|err| {
-        WasmInstrumentationError::ParityDeserializeError(into_parity_wasm_error(err))
-    })?;
-    let mut module = inject_helper_functions(module);
+    let stable_memory_index;
+    let mut module = inject_helper_functions(module, wasm_native_stable_memory);
     module = export_table(module);
-    module = export_memory(module);
-    module = export_mutable_globals(module);
-    let num_functions = module.functions_space() as u32;
-    let num_globals = module.globals_space() as u32;
+    (module, stable_memory_index) =
+        update_memories(module, write_barrier, wasm_native_stable_memory);
 
-    let export_module_data = ExportModuleData {
-        out_of_instructions_fn: 0, // because it's the first import
-        instructions_counter_ix: num_globals,
-        decr_instruction_counter_fn: num_functions,
-        start_fn_ix: module.start_section(),
+    let mut extra_strs: Vec<String> = Vec::new();
+    module = export_mutable_globals(module, &mut extra_strs);
+
+    let mut num_imported_functions = 0;
+    let mut num_imported_globals = 0;
+    for imp in &module.imports {
+        match imp.ty {
+            TypeRef::Func(_) => {
+                num_imported_functions += 1;
+            }
+            TypeRef::Global(_) => {
+                num_imported_globals += 1;
+            }
+            _ => (),
+        }
+    }
+
+    let num_functions = (module.functions.len() + num_imported_functions) as u32;
+    let num_globals = (module.globals.len() + num_imported_globals) as u32;
+
+    let dirty_pages_counter_ix;
+    let count_clean_pages_fn;
+    match wasm_native_stable_memory {
+        FlagStatus::Enabled => {
+            dirty_pages_counter_ix = Some(num_globals + 1);
+            count_clean_pages_fn = Some(num_functions + 1);
+        }
+        FlagStatus::Disabled => {
+            dirty_pages_counter_ix = None;
+            count_clean_pages_fn = None;
+        }
     };
 
-    if export_module_data.start_fn_ix.is_some() {
-        module.clear_start_section();
+    let special_indices = SpecialIndices {
+        instructions_counter_ix: num_globals,
+        dirty_pages_counter_ix,
+        decr_instruction_counter_fn: num_functions,
+        count_clean_pages_fn,
+        start_fn_ix: module.start,
+        stable_memory_index,
+    };
+
+    if special_indices.start_fn_ix.is_some() {
+        module.start = None;
     }
 
     // inject instructions counter decrementation
-    {
-        if let Some(code_section) = module.code_section_mut() {
-            for func_body in code_section.bodies_mut().iter_mut() {
-                let code = func_body.code_mut();
-                inject_metering(code, instruction_cost_table, &export_module_data);
+    for func_body in &mut module.code_sections {
+        inject_metering(&mut func_body.instructions, &special_indices);
+    }
+
+    // Collect all the function types of the locally defined functions inside the
+    // module.
+    //
+    // The main reason to create this vector of function types is because we can't
+    // mix a mutable (to inject instructions) and immutable (to look up the function
+    // type) reference to the `code_section`.
+    let mut func_types = Vec::new();
+    for i in 0..module.code_sections.len() {
+        let Type::Func(t) = &module.types[module.functions[i] as usize];
+        func_types.push(t.clone());
+    }
+
+    // Inject `update_available_memory` to functions with `memory.grow`
+    // instructions.
+    if !func_types.is_empty() {
+        let func_bodies = &mut module.code_sections;
+        for (func_ix, func_type) in func_types.into_iter().enumerate() {
+            inject_update_available_memory(&mut func_bodies[func_ix], &func_type);
+            if write_barrier == FlagStatus::Enabled {
+                inject_mem_barrier(&mut func_bodies[func_ix], &func_type);
             }
         }
     }
 
-    {
-        // Collect all the function types of the locally defined functions inside the
-        // module.
-        //
-        // The main reason to create this vector of function types is because we can't
-        // mix a mutable (to inject instructions) and immutable (to look up the function
-        // type) reference to the `code_section`.
-        let mut func_types = Vec::new();
-        if let Some(code_section) = module.code_section() {
-            let functions = module.function_section().unwrap().entries();
-            let types = module.type_section().unwrap().types();
-            for i in 0..code_section.bodies().len() {
-                let Type::Function(t) = &types[functions[i].type_ref() as usize];
-                func_types.push(t.clone());
-            }
-        }
-        // Inject `update_available_memory` to functions with `memory.grow`
-        // instructions.
-        if !func_types.is_empty() {
-            let func_bodies = module.code_section_mut().unwrap().bodies_mut();
-            for (func_ix, func_type) in func_types.into_iter().enumerate() {
-                inject_update_available_memory(&mut func_bodies[func_ix], &func_type);
-            }
-        }
+    let mut extra_data: Option<Vec<u8>> = None;
+    module = export_additional_symbols(
+        module,
+        &special_indices,
+        &mut extra_data,
+        wasm_native_stable_memory,
+    );
+
+    if wasm_native_stable_memory == FlagStatus::Enabled {
+        replace_system_api_functions(
+            &mut module,
+            special_indices,
+            subnet_type,
+            dirty_page_overhead,
+        )
     }
 
-    let mut module = export_additional_symbols(module, &export_module_data)?;
     let exported_functions = module
-        .export_section()
-        .unwrap() // because we definitely push exports above
-        .entries()
+        .exports
         .iter()
-        .filter_map(|export| WasmMethod::try_from(export.field().to_string()).ok())
+        .filter_map(|export| WasmMethod::try_from(export.name.to_string()).ok())
         .collect();
 
-    let limits = match module.memory_section() {
+    let expected_memories =
+        1 + match write_barrier {
+            FlagStatus::Enabled => 1,
+            FlagStatus::Disabled => 0,
+        } + match wasm_native_stable_memory {
+            FlagStatus::Enabled => 2,
+            FlagStatus::Disabled => 0,
+        };
+    if module.memories.len() > expected_memories {
+        return Err(WasmInstrumentationError::IncorrectNumberMemorySections {
+            expected: expected_memories,
+            got: module.memories.len(),
+        });
+    }
+
+    let initial_limit = if module.memories.is_empty() {
         // if Wasm does not declare any memory section (mostly tests), use this default
-        None => (0, None),
-        Some(section) => {
-            let entries = section.entries();
-            if entries.len() != 1 {
-                return Err(WasmInstrumentationError::IncorrectNumberMemorySections {
-                    expected: 1,
-                    got: entries.len(),
-                });
-            }
-            let limits = entries[0].limits();
-            (limits.initial(), limits.maximum())
-        }
+        0
+    } else {
+        module.memories[0].initial
     };
 
     // pull out the data from the data section
-    let data = Segments::from(get_data(module.sections_mut()));
-    data.validate(NumWasmPages::from(limits.0 as usize))?;
+    let data = get_data(&mut module.data)?;
+    data.validate(NumWasmPages::from(initial_limit as usize))?;
 
-    let result = parity_wasm::serialize(module).map_err(|err| {
-        WasmInstrumentationError::ParitySerializeError(into_parity_wasm_error(err))
+    let mut wasm_instruction_count: u64 = 0;
+    for body in &module.code_sections {
+        wasm_instruction_count += body.instructions.len() as u64;
+    }
+    for glob in &module.globals {
+        wasm_instruction_count += glob.init_expr.get_operators_reader().into_iter().count() as u64;
+    }
+
+    let result = module.encode().map_err(|err| {
+        WasmInstrumentationError::WasmSerializeError(WasmError::new(err.to_string()))
     })?;
+
     Ok(InstrumentationOutput {
         exported_functions,
-        limits,
         data,
         binary: BinaryEncodedWasm::new(result),
+        compilation_cost: cost_to_compile_wasm_instruction * wasm_instruction_count,
     })
+}
+
+fn calculate_api_indexes(module: &Module<'_>) -> BTreeMap<SystemApiFunc, u32> {
+    module
+        .imports
+        .iter()
+        .filter(|imp| matches!(imp.ty, TypeRef::Func(_)))
+        .enumerate()
+        .filter_map(|(func_index, import)| {
+            if import.module == API_VERSION_IC0 {
+                // The imports get function indexes before defined functions (so
+                // starting at zero) and these are required to fit in 32-bits.
+                SystemApiFunc::from_import_name(import.name).map(|api| (api, func_index as u32))
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
+fn replace_system_api_functions(
+    module: &mut Module<'_>,
+    special_indices: SpecialIndices,
+    subnet_type: SubnetType,
+    dirty_page_overhead: NumInstructions,
+) {
+    let api_indexes = calculate_api_indexes(module);
+    let number_of_func_imports = module
+        .imports
+        .iter()
+        .filter(|i| matches!(i.ty, TypeRef::Func(_)))
+        .count();
+
+    // Collect a single map of all the function indexes that need to be
+    // replaced.
+    let mut func_index_replacements = BTreeMap::new();
+    for (api, (ty, body)) in
+        replacement_functions(special_indices, subnet_type, dirty_page_overhead)
+    {
+        if let Some(old_index) = api_indexes.get(&api) {
+            let type_idx = add_type(module, ty);
+            let new_index = (number_of_func_imports + module.functions.len()) as u32;
+            module.functions.push(type_idx);
+            module.code_sections.push(body);
+            func_index_replacements.insert(*old_index, new_index);
+        }
+    }
+
+    // Perform all the replacements in a single pass.
+    mutate_function_indices(module, |idx| {
+        *func_index_replacements.get(&idx).unwrap_or(&idx)
+    });
 }
 
 // Helper function used by instrumentation to export additional symbols.
 //
-// Returns the new module or an error if a symbol is not reserved.
-#[doc(hidden)] // pub for usage in tests
-pub fn export_additional_symbols(
-    module: Module,
-    export_module_data: &ExportModuleData,
-) -> Result<Module, WasmInstrumentationError> {
-    let mut mbuilder = WasmModuleBuilder::new(builder::from_module(module));
-
+// Returns the new module or panics in debug mode if a symbol is not reserved.
+fn export_additional_symbols<'a>(
+    mut module: Module<'a>,
+    special_indices: &SpecialIndices,
+    extra_data: &'a mut Option<Vec<u8>>,
+    wasm_native_stable_memory: FlagStatus,
+) -> Module<'a> {
     // push function to decrement the instruction counter
-    mbuilder.push_function(
-        builder::function()
-            .with_signature(
-                builder::signature()
-                    .with_param(ValueType::I32) // amount to decrement by
-                    .with_result(ValueType::I32) // argument is returned so stack remains unchanged
-                    .build_sig(),
-            )
-            .body()
-            .with_instructions(Instructions::new(vec![
-                // Call out_of_instructions if count is already negative.
-                Instruction::GetGlobal(export_module_data.instructions_counter_ix),
-                Instruction::GetLocal(0),
-                Instruction::I64ExtendUI32,
-                Instruction::I64LtS,
-                Instruction::If(BlockType::NoResult),
-                Instruction::Call(export_module_data.out_of_instructions_fn),
-                Instruction::End,
-                // Subtract the parameter amount from the instruction counter
-                Instruction::GetGlobal(export_module_data.instructions_counter_ix),
-                Instruction::GetLocal(0),
-                Instruction::I64ExtendUI32,
-                Instruction::I64Sub,
-                Instruction::SetGlobal(export_module_data.instructions_counter_ix),
-                // Return the original param so this function doesn't alter the stack
-                Instruction::GetLocal(0),
-                Instruction::End,
-            ]))
-            .build()
-            .build(),
-    );
 
-    // globals must be exported to be accessible to hypervisor or persisted
-    mbuilder.push_export(
-        "canister counter_instructions",
-        Internal::Global(export_module_data.instructions_counter_ix),
-    )?;
+    let func_type = Type::Func(FuncType::new([ValType::I64], [ValType::I64]));
 
-    if let Some(ix) = export_module_data.start_fn_ix {
-        // push canister_start
-        mbuilder.push_export("canister_start", Internal::Function(ix))?;
+    use Operator::*;
+
+    let instructions = vec![
+        // Subtract the parameter amount from the instruction counter
+        GlobalGet {
+            global_index: special_indices.instructions_counter_ix,
+        },
+        LocalGet { local_index: 0 },
+        I64Sub,
+        // Store the new counter value in the local
+        LocalTee { local_index: 1 },
+        // If `new_counter > old_counter` there was underflow, so set counter to
+        // minimum value. Otherwise set it to the new counter value.
+        GlobalGet {
+            global_index: special_indices.instructions_counter_ix,
+        },
+        I64GtS,
+        If {
+            blockty: BlockType::Type(ValType::I64),
+        },
+        I64Const { value: i64::MIN },
+        Else,
+        LocalGet { local_index: 1 },
+        End,
+        GlobalSet {
+            global_index: special_indices.instructions_counter_ix,
+        },
+        // Call out_of_instructions() if `new_counter < 0`.
+        GlobalGet {
+            global_index: special_indices.instructions_counter_ix,
+        },
+        I64Const { value: 0 },
+        I64LtS,
+        If {
+            blockty: BlockType::Empty,
+        },
+        Call {
+            function_index: InjectedImports::OutOfInstructions as u32,
+        },
+        End,
+        // Return the original param so this function doesn't alter the stack
+        LocalGet { local_index: 0 },
+        End,
+    ];
+
+    let func_body = wasm_transform::Body {
+        locals: vec![(1, ValType::I64)],
+        instructions,
+    };
+
+    let type_idx = add_type(&mut module, func_type);
+    module.functions.push(type_idx);
+    module.code_sections.push(func_body);
+
+    if wasm_native_stable_memory == FlagStatus::Enabled {
+        // function to count dirty pages in a given range
+        let func_type = Type::Func(FuncType::new([ValType::I32, ValType::I32], [ValType::I32]));
+        let it = 2; // iterator index
+        let acc = 3; // accumulator index
+        let instructions = vec![
+            I32Const { value: 0 },
+            LocalSet { local_index: acc },
+            LocalGet { local_index: 0 },
+            LocalSet { local_index: it },
+            Loop {
+                blockty: BlockType::Empty,
+            },
+            LocalGet { local_index: it },
+            // TODO read in bigger chunks (i64Load)
+            I32Load8U {
+                memarg: wasmparser::MemArg {
+                    align: 0,
+                    max_align: 0,
+                    offset: 0,
+                    // We assume the bytemap for stable memory is always
+                    // inserted directly after the stable memory.
+                    memory: special_indices.stable_memory_index + 1,
+                },
+            },
+            LocalGet { local_index: acc },
+            I32Add,
+            LocalSet { local_index: acc },
+            LocalGet { local_index: it },
+            I32Const { value: 1 },
+            I32Add,
+            LocalTee { local_index: it },
+            LocalGet { local_index: 1 },
+            I32LtU,
+            BrIf { relative_depth: 0 },
+            End,
+            // clean pages = len - dirty_count
+            LocalGet { local_index: 1 },
+            LocalGet { local_index: 0 },
+            I32Sub,
+            LocalGet { local_index: acc },
+            I32Sub,
+            End,
+        ];
+        let func_body = wasm_transform::Body {
+            locals: vec![(2, ValType::I32)],
+            instructions,
+        };
+        let type_idx = add_type(&mut module, func_type);
+        module.functions.push(type_idx);
+        module.code_sections.push(func_body);
     }
 
-    // push the instructions counter
-    let module = mbuilder
-        .with_global(GlobalEntry::new(
-            GlobalType::new(ValueType::I64, true),
-            InitExpr::new(vec![Instruction::I64Const(0), Instruction::End]),
-        ))
-        .build();
+    // globals must be exported to be accessible to hypervisor or persisted
+    let counter_export = Export {
+        name: INSTRUCTIONS_COUNTER_GLOBAL_NAME,
+        kind: ExternalKind::Global,
+        index: special_indices.instructions_counter_ix,
+    };
+    debug_assert!(super::validation::RESERVED_SYMBOLS.contains(&counter_export.name));
+    module.exports.push(counter_export);
 
-    Ok(module)
+    if let Some(index) = special_indices.dirty_pages_counter_ix {
+        let export = Export {
+            name: DIRTY_PAGES_COUNTER_GLOBAL_NAME,
+            kind: ExternalKind::Global,
+            index,
+        };
+        debug_assert!(super::validation::RESERVED_SYMBOLS.contains(&export.name));
+        module.exports.push(export);
+    }
+
+    if let Some(index) = special_indices.start_fn_ix {
+        // push canister_start
+        let start_export = Export {
+            name: CANISTER_START_STR,
+            kind: ExternalKind::Func,
+            index,
+        };
+        debug_assert!(super::validation::RESERVED_SYMBOLS.contains(&start_export.name));
+        module.exports.push(start_export);
+    }
+
+    let mut zero_init_data: Vec<u8> = Vec::new();
+    use wasm_encoder::Encode;
+    //encode() automatically adds an End instructions
+    wasm_encoder::ConstExpr::i64_const(0).encode(&mut zero_init_data);
+    debug_assert!(extra_data.is_none());
+    *extra_data = Some(zero_init_data);
+
+    // push the instructions counter
+    module.globals.push(Global {
+        ty: GlobalType {
+            content_type: ValType::I64,
+            mutable: true,
+        },
+        init_expr: ConstExpr::new(extra_data.as_ref().unwrap(), 0),
+    });
+
+    if wasm_native_stable_memory == FlagStatus::Enabled {
+        // push the dirty page counter
+        module.globals.push(Global {
+            ty: GlobalType {
+                content_type: ValType::I64,
+                mutable: true,
+            },
+            init_expr: ConstExpr::new(extra_data.as_ref().unwrap(), 0),
+        });
+    }
+
+    module
 }
 
 // Represents a hint about the context of each static cost injection point in
@@ -612,12 +798,8 @@ impl InjectionPoint {
 // - we insert a function call before each dynamic cost instruction which
 //   performs an overflow check and then decrements the counter by the value at
 //   the top of the stack.
-fn inject_metering(
-    code: &mut Instructions,
-    instruction_cost_table: &InstructionCostTable,
-    export_data_module: &ExportModuleData,
-) {
-    let points = injections(code.elements(), instruction_cost_table);
+fn inject_metering(code: &mut Vec<Operator>, export_data_module: &SpecialIndices) {
+    let points = injections(code);
     let points = points.iter().filter(|point| match point.cost_detail {
         InjectionPointCostDetail::StaticCost {
             scope: Scope::ReentrantBlockStart,
@@ -626,54 +808,281 @@ fn inject_metering(
         InjectionPointCostDetail::StaticCost { scope: _, cost } => cost > 0,
         InjectionPointCostDetail::DynamicCost => true,
     });
-    let orig_elems = code.elements();
-    let mut elems: Vec<Instruction> = Vec::new();
+    let orig_elems = code;
+    let mut elems: Vec<Operator> = Vec::new();
     let mut last_injection_position = 0;
+
+    use Operator::*;
+
     for point in points {
         elems.extend_from_slice(&orig_elems[last_injection_position..point.position]);
         match point.cost_detail {
             InjectionPointCostDetail::StaticCost { scope, cost } => {
                 elems.extend_from_slice(&[
-                    Instruction::GetGlobal(export_data_module.instructions_counter_ix),
-                    Instruction::I64Const(cost as i64),
-                    Instruction::I64Sub,
-                    Instruction::SetGlobal(export_data_module.instructions_counter_ix),
+                    GlobalGet {
+                        global_index: export_data_module.instructions_counter_ix,
+                    },
+                    I64Const { value: cost as i64 },
+                    I64Sub,
+                    GlobalSet {
+                        global_index: export_data_module.instructions_counter_ix,
+                    },
                 ]);
                 if scope == Scope::ReentrantBlockStart {
                     elems.extend_from_slice(&[
-                        Instruction::GetGlobal(export_data_module.instructions_counter_ix),
-                        Instruction::I64Const(0),
-                        Instruction::I64LtS,
-                        Instruction::If(BlockType::NoResult),
-                        Instruction::Call(export_data_module.out_of_instructions_fn),
-                        Instruction::End,
+                        GlobalGet {
+                            global_index: export_data_module.instructions_counter_ix,
+                        },
+                        I64Const { value: 0 },
+                        I64LtS,
+                        If {
+                            blockty: BlockType::Empty,
+                        },
+                        Call {
+                            function_index: InjectedImports::OutOfInstructions as u32,
+                        },
+                        End,
                     ]);
                 }
             }
             InjectionPointCostDetail::DynamicCost => {
-                elems.extend_from_slice(&[Instruction::Call(
-                    export_data_module.decr_instruction_counter_fn,
-                )]);
+                elems.extend_from_slice(&[
+                    I64ExtendI32U,
+                    Call {
+                        function_index: export_data_module.decr_instruction_counter_fn,
+                    },
+                    // decr_instruction_counter returns it's argument unchanged,
+                    // so we can convert back to I32 without worrying about
+                    // overflows.
+                    I32WrapI64,
+                ]);
             }
         }
         last_injection_position = point.position;
     }
     elems.extend_from_slice(&orig_elems[last_injection_position..]);
-    *code.elements_mut() = elems;
+    *orig_elems = elems;
+}
+
+// This function adds mem barrier writes, assuming that arguments
+// of the original store operation are on the stack
+fn write_barrier_instructions<'a>(
+    offset: u64,
+    val_arg_idx: u32,
+    addr_arg_idx: u32,
+) -> Vec<Operator<'a>> {
+    use Operator::*;
+    let page_size_shift = PAGE_SIZE.trailing_zeros() as i32;
+    let tracking_mem_idx = 1;
+    if offset % PAGE_SIZE as u64 == 0 {
+        vec![
+            LocalSet {
+                local_index: val_arg_idx,
+            }, // value
+            LocalTee {
+                local_index: addr_arg_idx,
+            }, // address
+            I32Const {
+                value: page_size_shift,
+            },
+            I32ShrU,
+            I32Const { value: 1 },
+            I32Store8 {
+                memarg: wasmparser::MemArg {
+                    align: 0,
+                    max_align: 0,
+                    offset: offset >> page_size_shift,
+                    memory: tracking_mem_idx,
+                },
+            },
+            // Put original params on the stack
+            LocalGet {
+                local_index: addr_arg_idx,
+            },
+            LocalGet {
+                local_index: val_arg_idx,
+            },
+        ]
+    } else {
+        vec![
+            LocalSet {
+                local_index: val_arg_idx,
+            }, // value
+            LocalTee {
+                local_index: addr_arg_idx,
+            }, // address
+            I32Const {
+                value: offset as i32,
+            },
+            I32Add,
+            I32Const {
+                value: page_size_shift,
+            },
+            I32ShrU,
+            I32Const { value: 1 },
+            I32Store8 {
+                memarg: wasmparser::MemArg {
+                    align: 0,
+                    max_align: 0,
+                    offset: 0,
+                    memory: tracking_mem_idx,
+                },
+            },
+            // Put original params on the stack
+            LocalGet {
+                local_index: addr_arg_idx,
+            },
+            LocalGet {
+                local_index: val_arg_idx,
+            },
+        ]
+    }
+}
+
+fn inject_mem_barrier(func_body: &mut wasm_transform::Body, func_type: &FuncType) {
+    use Operator::*;
+    let mut val_i32_needed = false;
+    let mut val_i64_needed = false;
+    let mut val_f32_needed = false;
+    let mut val_f64_needed = false;
+
+    let mut injection_points: Vec<usize> = Vec::new();
+    {
+        for (idx, instr) in func_body.instructions.iter().enumerate() {
+            match instr {
+                I32Store { .. } | I32Store8 { .. } | I32Store16 { .. } => {
+                    val_i32_needed = true;
+                    injection_points.push(idx)
+                }
+                I64Store { .. } | I64Store8 { .. } | I64Store16 { .. } | I64Store32 { .. } => {
+                    val_i64_needed = true;
+                    injection_points.push(idx)
+                }
+                F32Store { .. } => {
+                    val_f32_needed = true;
+                    injection_points.push(idx)
+                }
+                F64Store { .. } => {
+                    val_f64_needed = true;
+                    injection_points.push(idx)
+                }
+                _ => (),
+            }
+        }
+    }
+
+    // If we found some injection points, we need to instrument the code.
+    if !injection_points.is_empty() {
+        // We inject some locals to cache the arguments to `memory.store`.
+        // The locals are stored as a vector of (count, ValType), so summing over the first field gives
+        // the total number of locals.
+        let n_locals: u32 = func_body.locals.iter().map(|x| x.0).sum();
+        let mut next_local = func_type.params().len() as u32 + n_locals;
+        let arg_i32_addr_idx = next_local;
+        next_local += 1;
+
+        // conditionally add following locals
+        let arg_i32_val_idx;
+        let arg_i64_val_idx;
+        let arg_f32_val_idx;
+        let arg_f64_val_idx;
+
+        if val_i32_needed {
+            arg_i32_val_idx = next_local;
+            next_local += 1;
+            func_body.locals.push((2, ValType::I32)); // addr and val locals
+        } else {
+            arg_i32_val_idx = u32::MAX; // not used
+            func_body.locals.push((1, ValType::I32)); // only addr local
+        }
+
+        if val_i64_needed {
+            arg_i64_val_idx = next_local;
+            next_local += 1;
+            func_body.locals.push((1, ValType::I64));
+        } else {
+            arg_i64_val_idx = u32::MAX;
+        }
+
+        if val_f32_needed {
+            arg_f32_val_idx = next_local;
+            next_local += 1;
+            func_body.locals.push((1, ValType::F32));
+        } else {
+            arg_f32_val_idx = u32::MAX;
+        }
+
+        if val_f64_needed {
+            arg_f64_val_idx = next_local;
+            // next_local += 1;
+            func_body.locals.push((1, ValType::F64));
+        } else {
+            arg_f64_val_idx = u32::MAX;
+        }
+
+        let orig_elems = &func_body.instructions;
+        let mut elems: Vec<Operator> = Vec::new();
+        let mut last_injection_position = 0;
+        for point in injection_points {
+            let mem_instr = orig_elems[point].clone();
+            elems.extend_from_slice(&orig_elems[last_injection_position..point]);
+
+            match mem_instr {
+                I32Store { memarg } | I32Store8 { memarg } | I32Store16 { memarg } => {
+                    elems.extend_from_slice(&write_barrier_instructions(
+                        memarg.offset,
+                        arg_i32_val_idx,
+                        arg_i32_addr_idx,
+                    ));
+                }
+                I64Store { memarg }
+                | I64Store8 { memarg }
+                | I64Store16 { memarg }
+                | I64Store32 { memarg } => {
+                    elems.extend_from_slice(&write_barrier_instructions(
+                        memarg.offset,
+                        arg_i64_val_idx,
+                        arg_i32_addr_idx,
+                    ));
+                }
+                F32Store { memarg } => {
+                    elems.extend_from_slice(&write_barrier_instructions(
+                        memarg.offset,
+                        arg_f32_val_idx,
+                        arg_i32_addr_idx,
+                    ));
+                }
+                F64Store { memarg } => {
+                    elems.extend_from_slice(&write_barrier_instructions(
+                        memarg.offset,
+                        arg_f64_val_idx,
+                        arg_i32_addr_idx,
+                    ));
+                }
+                _ => {}
+            }
+            // add the original store instruction itself
+            elems.push(mem_instr);
+
+            last_injection_position = point + 1;
+        }
+        elems.extend_from_slice(&orig_elems[last_injection_position..]);
+        func_body.instructions = elems;
+    }
 }
 
 // Scans through a function and adds instrumentation after each `memory.grow`
 // instruction to make sure that there's enough available memory left to support
 // the requested extra memory. If no `memory.grow` instructions are present then
 // the function's code remains unchanged.
-fn inject_update_available_memory(func_body: &mut FuncBody, func_type: &FunctionType) {
+fn inject_update_available_memory(func_body: &mut wasm_transform::Body, func_type: &FuncType) {
+    use Operator::*;
     let mut injection_points: Vec<usize> = Vec::new();
     {
-        let code = func_body.code();
-        for (idx, instr) in code.elements().iter().enumerate() {
+        for (idx, instr) in func_body.instructions.iter().enumerate() {
             // TODO(EXC-222): Once `table.grow` is supported we should extend the list of
             // injections here.
-            if let Instruction::GrowMemory(_) = instr {
+            if let MemoryGrow { .. } = instr {
                 injection_points.push(idx);
             }
         }
@@ -682,12 +1091,14 @@ fn inject_update_available_memory(func_body: &mut FuncBody, func_type: &Function
     // If we found any injection points, we need to instrument the code.
     if !injection_points.is_empty() {
         // We inject a local to cache the argument to `memory.grow`.
-        let n_locals: u32 = func_body.locals().iter().map(Local::count).sum();
+        // The locals are stored as a vector of (count, ValType), so summing over the first field gives
+        // the total number of locals.
+        let n_locals: u32 = func_body.locals.iter().map(|x| x.0).sum();
         let memory_local_ix = func_type.params().len() as u32 + n_locals;
-        func_body.locals_mut().push(Local::new(1, ValueType::I32));
-        let code = func_body.code_mut();
-        let orig_elems = code.elements_mut();
-        let mut elems: Vec<Instruction> = Vec::new();
+        func_body.locals.push((1, ValType::I32));
+
+        let orig_elems = &func_body.instructions;
+        let mut elems: Vec<Operator> = Vec::new();
         let mut last_injection_position = 0;
         for point in injection_points {
             let update_available_memory_instr = orig_elems[point].clone();
@@ -696,15 +1107,21 @@ fn inject_update_available_memory(func_body: &mut FuncBody, func_type: &Function
             // the stack, which we just assign to `memory_local_ix` with a local.tee
             // instruction.
             elems.extend_from_slice(&[
-                Instruction::TeeLocal(memory_local_ix),
+                LocalTee {
+                    local_index: memory_local_ix,
+                },
                 update_available_memory_instr,
-                Instruction::GetLocal(memory_local_ix),
-                Instruction::Call(UPDATE_AVAILABLE_MEMORY_FN),
+                LocalGet {
+                    local_index: memory_local_ix,
+                },
+                Call {
+                    function_index: InjectedImports::UpdateAvailableMemory as u32,
+                },
             ]);
             last_injection_position = point + 1;
         }
         elems.extend_from_slice(&orig_elems[last_injection_position..]);
-        *orig_elems = elems;
+        func_body.instructions = elems;
     }
 }
 
@@ -713,31 +1130,27 @@ fn inject_update_available_memory(func_body: &mut FuncBody, func_type: &Function
 // with no branches) and before each bulk memory instruction. An injection point
 // contains a "hint" about the context of every basic block, specifically if
 // it's re-entrant or not.
-fn injections(
-    code: &[Instruction],
-    instruction_cost_table: &InstructionCostTable,
-) -> Vec<InjectionPoint> {
+fn injections(code: &[Operator]) -> Vec<InjectionPoint> {
     let mut res = Vec::new();
     let mut stack = Vec::new();
-    use Instruction::*;
+    use Operator::*;
     // The function itself is a re-entrant code block.
     let mut curr = InjectionPoint::new_static_cost(0, Scope::ReentrantBlockStart);
     for (position, i) in code.iter().enumerate() {
-        curr.cost_detail
-            .increment_cost(instruction_cost_table.cost(i));
+        curr.cost_detail.increment_cost(instruction_to_cost(i));
         match i {
             // Start of a re-entrant code block.
-            Loop(_) => {
+            Loop { .. } => {
                 stack.push(curr);
                 curr = InjectionPoint::new_static_cost(position + 1, Scope::ReentrantBlockStart);
             }
             // Start of a non re-entrant code block.
-            If(_) | Block(_) => {
+            If { .. } | Block { .. } => {
                 stack.push(curr);
                 curr = InjectionPoint::new_static_cost(position + 1, Scope::NonReentrantBlockStart);
             }
             // End of a code block but still more code left.
-            Else | Br(_) | BrIf(_) | BrTable(_) => {
+            Else | Br { .. } | BrIf { .. } | BrTable { .. } => {
                 res.push(curr);
                 curr = InjectionPoint::new_static_cost(position + 1, Scope::BlockEnd);
             }
@@ -752,131 +1165,185 @@ fn injections(
             }
             // Bulk memory instructions require injected metering __before__ the instruction
             // executes so that size arguments can be read from the stack at runtime.
-            Bulk(BulkInstruction::MemoryFill)
-            | Bulk(BulkInstruction::MemoryCopy)
-            | Bulk(BulkInstruction::MemoryInit(_))
-            | Bulk(BulkInstruction::TableCopy)
-            | Bulk(BulkInstruction::TableInit(_)) => {
+            MemoryFill { .. }
+            | MemoryCopy { .. }
+            | MemoryInit { .. }
+            | TableCopy { .. }
+            | TableInit { .. } => {
                 res.push(InjectionPoint::new_dynamic_cost(position));
             }
             // Nothing special to be done for other instructions.
             _ => (),
         }
     }
+
     res.sort_by_key(|k| k.position);
     res
 }
 
 // Looks for the data section and if it is present, converts it to a vector of
 // tuples (heap offset, bytes) and then deletes the section.
-fn get_data(sections: &mut Vec<Section>) -> Vec<(usize, Vec<u8>)> {
-    let mut res = Vec::new();
-    let mut data_section_idx = sections.len();
-    for (i, section) in sections.iter_mut().enumerate() {
-        if let Section::Data(section) = section {
-            data_section_idx = i;
-            res = section
-                .entries_mut()
-                .iter_mut()
-                .map(|segment| {
-                    let offset = match segment.offset() {
-                        None => panic!("no offset found for the data segment"),
-                        Some(exp) => {
-                            match exp.code() {
-                                [
-                                    Instruction::I32Const(val),
-                                    Instruction::End
-                               ] => ((*val) as u32) as usize, // Convert via `u32` to avoid 64-bit sign-extension.
-                                _ => panic!(
-                                    "complex initialization expressions for data segments are not supported!"
-                                    ),
-                            }
-                        }
-                    };
-                    (offset, std::mem::take(segment.value_mut()))
-                })
-                .collect();
-        }
-    }
-    if data_section_idx < sections.len() {
-        sections.remove(data_section_idx);
-    }
-    res
-}
+fn get_data(
+    data_section: &mut Vec<wasm_transform::DataSegment>,
+) -> Result<Segments, WasmInstrumentationError> {
+    let res = data_section
+        .iter()
+        .map(|segment| {
+            let offset = match &segment.kind {
+                wasm_transform::DataSegmentKind::Active {
+                    memory_index: _,
+                    offset_expr,
+                } => match offset_expr {
+                    Operator::I32Const { value } => *value as usize,
+                    _ => return Err(WasmInstrumentationError::WasmDeserializeError(WasmError::new(
+                        "complex initialization expressions for data segments are not supported!".into()
+                    ))),
+                },
 
-fn rename_export(export_entry: &mut ExportEntry, name: &str) {
-    *export_entry.field_mut() = name.to_string();
+                _ => return Err(WasmInstrumentationError::WasmDeserializeError(
+                    WasmError::new("no offset found for the data segment".into())
+                )),
+            };
+
+            Ok((offset, segment.data.to_vec()))
+        })
+        .collect::<Result<_,_>>()?;
+
+    data_section.clear();
+    Ok(res)
 }
 
 fn export_table(mut module: Module) -> Module {
     let mut table_already_exported = false;
-    if let Some(export_section) = module.export_section_mut() {
-        for e in export_section.entries_mut() {
-            if let Internal::Table(_) = e.internal() {
-                table_already_exported = true;
-                rename_export(e, "table");
-            }
+    for export in &mut module.exports {
+        if let ExternalKind::Table = export.kind {
+            table_already_exported = true;
+            export.name = TABLE_STR;
         }
     }
 
-    if table_already_exported || module.table_section().is_none() {
-        module
-    } else {
-        let mut mbuilder = builder::from_module(module);
-        mbuilder.push_export(ExportEntry::new("table".to_string(), Internal::Table(0)));
-        mbuilder.build()
+    if !table_already_exported && !module.tables.is_empty() {
+        let table_export = Export {
+            name: TABLE_STR,
+            kind: ExternalKind::Table,
+            index: 0,
+        };
+        module.exports.push(table_export);
     }
+
+    module
 }
 
-fn export_memory(mut module: Module) -> Module {
+/// Exports existing memories and injects new memories. Returns the index of an
+/// injected stable memory when using wasm-native stable memory. The bytemap for
+/// the stable memory will always be inserted directly after the stable memory.
+fn update_memories(
+    mut module: Module,
+    write_barrier: FlagStatus,
+    wasm_native_stable_memory: FlagStatus,
+) -> (Module, u32) {
+    let mut stable_index = 0;
+
     let mut memory_already_exported = false;
-    if let Some(export_section) = module.export_section_mut() {
-        for e in export_section.entries_mut() {
-            if let Internal::Memory(_) = e.internal() {
-                memory_already_exported = true;
-                rename_export(e, "memory");
-            }
+    for export in &mut module.exports {
+        if let ExternalKind::Memory = export.kind {
+            memory_already_exported = true;
+            export.name = WASM_HEAP_MEMORY_NAME;
         }
     }
 
-    if memory_already_exported || module.memory_section().is_none() {
-        module
-    } else {
-        let mut mbuilder = builder::from_module(module);
-        mbuilder.push_export(ExportEntry::new("memory".to_string(), Internal::Memory(0)));
-        mbuilder.build()
+    if !memory_already_exported && !module.memories.is_empty() {
+        let memory_export = Export {
+            name: WASM_HEAP_MEMORY_NAME,
+            kind: ExternalKind::Memory,
+            index: 0,
+        };
+        module.exports.push(memory_export);
     }
+
+    if write_barrier == FlagStatus::Enabled && !module.memories.is_empty() {
+        module.memories.push(MemoryType {
+            memory64: false,
+            shared: false,
+            initial: BYTEMAP_SIZE_IN_WASM_PAGES,
+            maximum: Some(BYTEMAP_SIZE_IN_WASM_PAGES),
+        });
+
+        module.exports.push(Export {
+            name: WASM_HEAP_BYTEMAP_MEMORY_NAME,
+            kind: ExternalKind::Memory,
+            index: 1,
+        });
+    }
+
+    if wasm_native_stable_memory == FlagStatus::Enabled {
+        stable_index = module.memories.len() as u32;
+        module.memories.push(MemoryType {
+            memory64: true,
+            shared: false,
+            initial: 0,
+            maximum: Some(MAX_STABLE_MEMORY_IN_WASM_PAGES),
+        });
+
+        module.exports.push(Export {
+            name: STABLE_MEMORY_NAME,
+            kind: ExternalKind::Memory,
+            index: stable_index,
+        });
+
+        module.memories.push(MemoryType {
+            memory64: false,
+            shared: false,
+            initial: STABLE_BYTEMAP_SIZE_IN_WASM_PAGES,
+            maximum: Some(STABLE_BYTEMAP_SIZE_IN_WASM_PAGES),
+        });
+
+        module.exports.push(Export {
+            name: STABLE_BYTEMAP_MEMORY_NAME,
+            kind: ExternalKind::Memory,
+            // Bytemap for a memory needs to be placed at the next index after the memory
+            index: stable_index + 1,
+        })
+    }
+
+    (module, stable_index)
 }
 
 // Mutable globals must be exported to be persisted.
-fn export_mutable_globals(module: Module) -> Module {
-    if let Some(global_section) = module.global_section() {
-        let mut mutable_exported: Vec<(bool, bool)> = global_section
-            .entries()
-            .iter()
-            .map(|g| g.global_type().is_mutable())
-            .zip(std::iter::repeat(false))
-            .collect();
+fn export_mutable_globals<'a>(
+    mut module: Module<'a>,
+    extra_data: &'a mut Vec<String>,
+) -> Module<'a> {
+    let mut mutable_exported: Vec<(bool, bool)> = module
+        .globals
+        .iter()
+        .map(|g| g.ty.mutable)
+        .zip(std::iter::repeat(false))
+        .collect();
 
-        if let Some(export_section) = module.export_section() {
-            for e in export_section.entries() {
-                if let Internal::Global(ix) = e.internal() {
-                    mutable_exported[*ix as usize].1 = true;
-                }
-            }
+    for export in &module.exports {
+        if let ExternalKind::Global = export.kind {
+            mutable_exported[export.index as usize].1 = true;
         }
-
-        let mut mbuilder = builder::from_module(module);
-        for (ix, (mutable, exported)) in mutable_exported.into_iter().enumerate() {
-            if mutable && !exported {
-                mbuilder.push_export(ExportEntry::new(
-                    format!("__persistent_mutable_global_{}", ix),
-                    Internal::Global(ix as u32),
-                ));
-            }
-        }
-        mbuilder.build()
-    } else {
-        module
     }
+
+    for (ix, (mutable, exported)) in mutable_exported.iter().enumerate() {
+        if *mutable && !exported {
+            extra_data.push(format!("__persistent_mutable_global_{}", ix));
+        }
+    }
+    let mut iy = 0;
+    for (ix, (mutable, exported)) in mutable_exported.into_iter().enumerate() {
+        if mutable && !exported {
+            let global_export = Export {
+                name: extra_data[iy].as_str(),
+                kind: ExternalKind::Global,
+                index: ix as u32,
+            };
+            module.exports.push(global_export);
+            iy += 1;
+        }
+    }
+
+    module
 }

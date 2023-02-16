@@ -1,13 +1,14 @@
-use ic_config::registry_client::DataProviderConfig;
-use ic_crypto_utils_threshold_sig::parse_threshold_sig_key;
+use ic_crypto_utils_threshold_sig_der::parse_threshold_sig_key;
 use ic_metrics::MetricsRegistry;
 use ic_protobuf::registry::subnet::v1::SubnetType;
-use ic_registry_client::client::{create_data_provider, RegistryClient, RegistryClientImpl};
+use ic_registry_client::client::{RegistryClient, RegistryClientImpl};
 use ic_registry_client_helpers::{
     node::NodeRegistry,
     routing_table::RoutingTableRegistry,
     subnet::{SubnetListRegistry, SubnetRegistry},
 };
+use ic_registry_nns_data_provider::create_nns_data_provider;
+use ic_registry_routing_table::CanisterIdRange;
 use ic_registry_routing_table::RoutingTable;
 use ic_types::{registry::connection_endpoint::ConnectionEndpoint, NodeId, PrincipalId, SubnetId};
 use std::{
@@ -29,6 +30,9 @@ pub trait TestnetT {
 
     /// Returns the subnet hosting the given `PrincipalId`, if any.
     fn route(&self, principal_id: PrincipalId) -> Option<SubnetId>;
+
+    /// Returns a canister id in the canister ranges of the subnet to which the node belongs.
+    fn effective_canister_id(&self, node_id: NodeId) -> PrincipalId;
 }
 
 #[derive(Debug)]
@@ -57,8 +61,9 @@ pub fn registry_client(
     let nns_public_key = nns_public_key_path.map(|path| {
         parse_threshold_sig_key(&PathBuf::from(&path)).expect("Unable to parse public key file")
     });
-    let data_provider = create_data_provider(
-        &DataProviderConfig::RegistryCanisterUrl(vec![nns_url]),
+    let data_provider = create_nns_data_provider(
+        tokio::runtime::Handle::current(),
+        vec![nns_url],
         nns_public_key,
     );
     let metrics_registry = MetricsRegistry::new();
@@ -67,9 +72,6 @@ pub fn registry_client(
         Some(&metrics_registry),
     ));
     registry_client.try_polling_latest_version(100).unwrap();
-    if let Err(e) = registry_client.fetch_and_start_polling() {
-        panic!("fetch_and_start_polling failed: {}", e);
-    }
 
     registry_client
 }
@@ -194,5 +196,29 @@ impl TestnetT for Testnet {
 
     fn route(&self, principal_id: PrincipalId) -> Option<SubnetId> {
         self.routing_table.route(principal_id)
+    }
+
+    fn effective_canister_id(&self, node_id: NodeId) -> PrincipalId {
+        let subnet_id: Option<SubnetId> = self
+            .subnet_ids
+            .clone()
+            .iter()
+            .find(|s| self.node_ids(**s).contains(&node_id))
+            .copied();
+        match subnet_id {
+            Some(sub) => {
+                let canister_ranges: Vec<CanisterIdRange> = self
+                    .routing_table
+                    .iter()
+                    .filter(|(_, sub_id)| sub_id.get() == sub.get())
+                    .map(|(ran, _)| *ran)
+                    .collect();
+                match canister_ranges.get(0) {
+                    Some(range) => range.start.get(),
+                    None => PrincipalId::default(),
+                }
+            }
+            None => PrincipalId::default(),
+        }
     }
 }

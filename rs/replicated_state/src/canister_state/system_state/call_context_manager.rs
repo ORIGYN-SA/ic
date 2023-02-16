@@ -2,7 +2,8 @@
 mod tests;
 
 use crate::StateError;
-use ic_interfaces::{execution_environment::HypervisorError, messages::RequestOrIngress};
+use ic_interfaces::messages::CanisterCallOrTask;
+use ic_interfaces::{execution_environment::HypervisorError, messages::CanisterCall};
 use ic_protobuf::proxy::{try_from_option_field, ProxyDecodeError};
 use ic_protobuf::state::canister_state_bits::v1 as pb;
 use ic_protobuf::types::v1 as pb_types;
@@ -100,6 +101,7 @@ impl CallContext {
 
     /// Mark the call context as responded.
     pub fn mark_responded(&mut self) {
+        self.available_cycles = Cycles::new(0);
         self.responded = true;
     }
 
@@ -217,7 +219,8 @@ pub enum CallOrigin {
     CanisterUpdate(CanisterId, CallbackId),
     Query(UserId),
     CanisterQuery(CanisterId, CallbackId),
-    Heartbeat,
+    /// System task is either a Heartbeat or a GlobalTimer.
+    SystemTask,
 }
 
 impl From<&CallOrigin> for pb::call_context::CallOrigin {
@@ -240,7 +243,7 @@ impl From<&CallOrigin> for pb::call_context::CallOrigin {
                     callback_id: callback_id.get(),
                 })
             }
-            CallOrigin::Heartbeat => Self::Heartbeat(pb::call_context::Heartbeat {}),
+            CallOrigin::SystemTask => Self::SystemTask(pb::call_context::SystemTask {}),
         }
     }
 }
@@ -280,7 +283,7 @@ impl TryFrom<pb::call_context::CallOrigin> for CallOrigin {
                 try_from_option_field(canister_id, "CallOrigin::CanisterQuery::canister_id")?,
                 callback_id.into(),
             ),
-            pb::call_context::CallOrigin::Heartbeat { .. } => Self::Heartbeat,
+            pb::call_context::CallOrigin::SystemTask { .. } => Self::SystemTask,
         };
         Ok(call_origin)
     }
@@ -357,7 +360,7 @@ impl CallContextManager {
                         if response.respondent != respondent
                             || response.originator != originator =>
                     {
-                        return Err(StateError::NonMatchingResponse {
+                        Err(StateError::NonMatchingResponse {
                                 err_str: format!(
                                     "invalid details, expected => [originator => {}, respondent => {}], but got response with",
                                     originator, respondent,
@@ -365,7 +368,7 @@ impl CallContextManager {
                                 originator: response.originator,
                                 callback_id: response.originator_reply_callback,
                                 respondent: response.respondent,
-                            });
+                            })
                     }
                     _ => Ok(()),
                 }
@@ -387,6 +390,7 @@ impl CallContextManager {
     pub fn on_canister_result(
         &mut self,
         call_context_id: CallContextId,
+        callback_id: Option<CallbackId>,
         result: Result<Option<WasmResult>, HypervisorError>,
     ) -> CallContextAction {
         enum OutstandingCalls {
@@ -396,6 +400,10 @@ impl CallContextManager {
         enum Responded {
             Yes,
             No,
+        }
+
+        if let Some(callback_id) = callback_id {
+            self.unregister_callback(callback_id);
         }
 
         let outstanding_calls = if self.outstanding_calls(call_context_id) > 0 {
@@ -442,11 +450,9 @@ impl CallContextManager {
                 CallContextAction::Reply { payload, refund }
             }
             (Ok(Some(WasmResult::Reply(payload))), Responded::No, OutstandingCalls::Yes) => {
-                context.responded = true;
-                CallContextAction::Reply {
-                    payload,
-                    refund: context.available_cycles,
-                }
+                let refund = context.available_cycles;
+                context.mark_responded();
+                CallContextAction::Reply { payload, refund }
             }
 
             (Ok(Some(WasmResult::Reject(payload))), Responded::No, OutstandingCalls::No) => {
@@ -455,11 +461,9 @@ impl CallContextManager {
                 CallContextAction::Reject { payload, refund }
             }
             (Ok(Some(WasmResult::Reject(payload))), Responded::No, OutstandingCalls::Yes) => {
-                context.responded = true;
-                CallContextAction::Reject {
-                    payload,
-                    refund: context.available_cycles,
-                }
+                let refund = context.available_cycles;
+                context.mark_responded();
+                CallContextAction::Reject { payload, refund }
             }
 
             (Err(error), Responded::No, OutstandingCalls::No) => {
@@ -500,13 +504,6 @@ impl CallContextManager {
         self.callbacks.remove(&callback_id)
     }
 
-    pub fn unregister_call_context(
-        &mut self,
-        call_context_id: CallContextId,
-    ) -> Option<CallContext> {
-        self.call_contexts.remove(&call_context_id)
-    }
-
     /// Returns the call origin, which is either the message id of the ingress
     /// message or the canister id of the canister that sent the initial
     /// request.
@@ -530,17 +527,30 @@ impl CallContextManager {
             .count()
     }
 
+    /// Returns true iff all open call contexts are marked as deleted
+    /// and all outstanding callbacks refer to open call contexts.
+    pub fn canister_ready_to_stop(&self) -> bool {
+        self.call_contexts()
+            .iter()
+            .all(|(_, ctxt)| ctxt.is_deleted())
+            && self
+                .callbacks
+                .iter()
+                .all(|(_, callback)| self.call_contexts.contains_key(&callback.call_context_id))
+    }
+
     /// Expose the `next_callback_id` field so that the canister sandbox can
     /// predict what the new ids will be.
     pub fn next_callback_id(&self) -> u64 {
         self.next_callback_id
     }
 
+    /// Returns a collection of all call contexts older than the provided age.
     pub fn call_contexts_older_than(
         &self,
         current_time: Time,
-        duration: Duration,
-    ) -> Vec<(CallOrigin, Time)> {
+        age: Duration,
+    ) -> Vec<(&CallOrigin, Time)> {
         // Call contexts are stored in order of increasing CallContextId, and
         // the IDs are generated sequentially, so we are iterating in order of
         // creation time. This means we can stop as soon as we encounter a call
@@ -548,13 +558,13 @@ impl CallContextManager {
         self.call_contexts
             .iter()
             .take_while(|(_, call_context)| match call_context.time() {
-                Some(context_time) => context_time + duration <= current_time,
+                Some(context_time) => context_time + age <= current_time,
                 None => true,
             })
             .filter_map(|(_, call_context)| {
                 if let Some(time) = call_context.time() {
                     if !call_context.is_deleted() {
-                        return Some((call_context.call_origin().clone(), time));
+                        return Some((call_context.call_origin(), time));
                     }
                 }
                 None
@@ -563,15 +573,24 @@ impl CallContextManager {
     }
 }
 
-impl From<&RequestOrIngress> for CallOrigin {
-    fn from(msg: &RequestOrIngress) -> Self {
+impl From<&CanisterCall> for CallOrigin {
+    fn from(msg: &CanisterCall) -> Self {
         match msg {
-            RequestOrIngress::Request(request) => {
+            CanisterCall::Request(request) => {
                 CallOrigin::CanisterUpdate(request.sender, request.sender_reply_callback)
             }
-            RequestOrIngress::Ingress(ingress) => {
+            CanisterCall::Ingress(ingress) => {
                 CallOrigin::Ingress(ingress.source, ingress.message_id.clone())
             }
+        }
+    }
+}
+
+impl From<&CanisterCallOrTask> for CallOrigin {
+    fn from(call_or_task: &CanisterCallOrTask) -> Self {
+        match call_or_task {
+            CanisterCallOrTask::Call(call) => CallOrigin::from(call),
+            CanisterCallOrTask::Task(_) => CallOrigin::SystemTask,
         }
     }
 }

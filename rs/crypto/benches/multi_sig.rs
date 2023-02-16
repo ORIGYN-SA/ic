@@ -3,7 +3,8 @@ use criterion::BatchSize::SmallInput;
 use criterion::{criterion_group, criterion_main, BenchmarkGroup, Criterion, Throughput};
 
 use ic_crypto_test_utils_multi_sigs::MultiSigTestEnvironment;
-use ic_interfaces::crypto::{MultiSigVerifier, MultiSigner, SignableMock};
+use ic_interfaces::crypto::{MultiSigVerifier, MultiSigner};
+use ic_types::crypto::SignableMock;
 use rand::prelude::*;
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -187,7 +188,5 @@ fn signable_with_random_32_bytes() -> SignableMock {
 }
 
 fn as_u64(usize: usize) -> u64 {
-    use std::convert::TryFrom;
-
     u64::try_from(usize).expect("failed to convert usize to u64")
 }

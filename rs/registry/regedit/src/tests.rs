@@ -133,11 +133,8 @@ pub fn run_ic_prep() -> (TempDir, IcPrepStateDir) {
             p2p_addr: "org.internetcomputer.p2p1://0.0.0.0:0"
                 .parse()
                 .expect("can't fail"),
-            p2p_num_flows: 1,
-            p2p_start_flow_tag: 0,
             prometheus_metrics: vec![],
             node_operator_principal_id: None,
-            no_idkg_key: false,
             secret_key_store: None,
         },
     );
@@ -163,6 +160,7 @@ pub fn run_ic_prep() -> (TempDir, IcPrepStateDir) {
             None,
             None,
             None,
+            None,
             vec![],
             vec![],
         ),
@@ -181,8 +179,9 @@ pub fn run_ic_prep() -> (TempDir, IcPrepStateDir) {
         None,
         None,
         /* ssh_readonly_access_to_unassigned_nodes */ vec![],
+        /* guest_launch_measurement_sha256_hex */ None,
     );
     ic_config.initialize().unwrap();
     let path: PathBuf = temp_dir.path().into();
-    (temp_dir, IcPrepStateDir::new(&path))
+    (temp_dir, IcPrepStateDir::new(path))
 }

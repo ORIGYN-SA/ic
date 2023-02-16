@@ -1,0 +1,46 @@
+load("@rules_rust//rust:defs.bzl", "rust_doc_test", "rust_library", "rust_test")
+
+package(default_visibility = ["//visibility:public"])
+
+rust_library(
+    name = "utils",
+    srcs = glob(["src/**"]),
+    crate_name = "ic_utils",
+    version = "0.8.0",
+    deps = [
+        "@crate_index//:bitflags",
+        "@crate_index//:features",
+        "@crate_index//:hex",
+        "@crate_index//:prost",
+        "@crate_index//:scoped_threadpool",
+        "@crate_index//:serde",
+    ] + select({
+        "@rules_rust//rust/platform:unix": [
+            "@crate_index//:rand_0_8_4",
+        ],
+        "//conditions:default": [],
+    }) + select({
+        "@rules_rust//rust/platform:linux": [
+            "@crate_index//:cvt",
+            "@crate_index//:libc",
+            "@crate_index//:nix",
+            "@crate_index//:thiserror",
+            "//rs/sys",
+        ],
+        "//conditions:default": [],
+    }),
+)
+
+rust_test(
+    name = "utils_test",
+    crate = ":utils",
+    deps = [
+        "@crate_index//:serde",
+        "@crate_index//:tempfile",
+    ],
+)
+
+rust_doc_test(
+    name = "utils_doc_test",
+    crate = ":utils",
+)

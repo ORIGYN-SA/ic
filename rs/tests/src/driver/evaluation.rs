@@ -1,251 +1,311 @@
-use std::time::Duration;
-use std::{panic::catch_unwind, time::Instant};
+use std::{panic::catch_unwind, thread::JoinHandle, time::Duration};
 
-use super::driver_setup::{DriverContext, FARM_BASE_URL};
-use super::farm::{Farm, GroupSpec};
-use super::pot_dsl::{ExecutionMode, Pot, Suite, Test, TestPath, TestSet};
-use crate::driver::driver_setup::{FARM_GROUP_NAME, POT_TIMEOUT};
-use crate::driver::test_env::{HasTestPath, TestEnv};
+use crate::driver::{
+    config,
+    driver_setup::DriverContext,
+    farm::{Farm, GroupSpec},
+    pot_dsl::{
+        ExecutionMode, Pot, Suite, Test, TestPath, TestResult, TestResultNode, TestSet,
+        TestSuiteContract,
+    },
+    prometheus_vm::HasPrometheus,
+    test_env::{HasTestPath, TestEnv, TestEnvAttribute},
+    test_env_api::HasIcDependencies,
+    test_setup::GroupSetup,
+};
 use anyhow::{bail, Result};
-use crossbeam_channel::{bounded, Receiver, Sender};
-use ic_fondue::result::*;
+use crossbeam_channel::{bounded, Receiver, RecvTimeoutError, Sender};
+use crossbeam_utils::sync::WaitGroup;
+use rayon::{ScopeFifo, ThreadPoolBuilder};
 use slog::{error, info, warn, Logger};
 
-pub const N_THREADS_PER_SUITE: usize = 8;
-pub const N_THREADS_PER_POT: usize = 8;
-
-pub fn evaluate(ctx: &DriverContext, ts: Suite) -> TestResultNode {
-    let started_at = Instant::now();
-    let pots: Vec<Pot> = ts
+// This function has a `dry-run` execution concept for the test suite.
+// Namely, it generates a test suite contract, where all tests, pots, and the suite itself are labeled
+pub fn generate_suite_execution_contract(suite: &Suite) -> TestSuiteContract {
+    let mut pot_results: Vec<TestSuiteContract> = Vec::new();
+    for pot in suite
         .pots
-        .into_iter()
+        .iter()
         .filter(|p| p.execution_mode != ExecutionMode::Ignore)
-        .collect();
-    let pots_num = pots.len();
-
-    let path = TestPath::new_with_root(ts.name.clone());
-    let (sender, receiver) = bounded(pots.len());
-    let chunks = chunk(pots, N_THREADS_PER_SUITE);
-
-    let mut join_handles = vec![];
-    for chunk in chunks {
-        let s = sender.clone();
-
-        let join_handle = std::thread::spawn({
-            let t_path = path.clone();
-            let t_ctx = ctx.clone();
-            move || {
-                for p in chunk {
-                    evaluate_pot_and_propagate_result(&t_ctx, s.clone(), p, t_path.clone());
-                }
+    {
+        let mut tests_results_for_pot: Vec<TestSuiteContract> = Vec::new();
+        for test in pot.testset.iter() {
+            if test.execution_mode != ExecutionMode::Ignore {
+                tests_results_for_pot.push(TestSuiteContract {
+                    name: test.name.clone(),
+                    is_skipped: test.execution_mode == ExecutionMode::Skip,
+                    alert_channels: vec![],
+                    children: vec![],
+                });
             }
-        });
-        join_handles.push(join_handle);
-    }
-
-    for jh in join_handles {
-        jh.join().expect("waiting for thread failed!");
-    }
-
-    let children = collect_n_children(receiver, pots_num);
-    TestResultNode {
-        name: ts.name,
-        group_name: None,
-        started_at,
-        duration: started_at.elapsed(),
-        result: infer_result(children.as_slice()),
-        children,
-    }
-}
-
-fn evaluate_pot_and_propagate_result(
-    ctx: &DriverContext,
-    parent: Sender<TestResultNode>,
-    pot: Pot,
-    path: TestPath,
-) {
-    let name = pot.name.clone();
-    let result = evaluate_pot(ctx, pot, path).unwrap_or_else(|e| {
-        error!(ctx.logger, "failed to execute pot {}: {}", &name, e);
-        TestResultNode {
-            name,
-            result: TestResult::Failed,
-            ..TestResultNode::default()
         }
-    });
-    parent
-        .send(result)
-        .expect("failed to send result to parent node");
+        pot_results.push(TestSuiteContract {
+            name: pot.name.clone(),
+            is_skipped: false,
+            alert_channels: if pot.alert_channels.is_empty() {
+                suite.alert_channels.clone()
+            } else {
+                pot.alert_channels.clone()
+            },
+            children: tests_results_for_pot,
+        })
+    }
+    TestSuiteContract {
+        name: suite.name.clone(),
+        is_skipped: false,
+        alert_channels: vec![],
+        children: pot_results,
+    }
 }
 
-#[allow(clippy::mutex_atomic)]
-fn evaluate_pot(ctx: &DriverContext, mut pot: Pot, path: TestPath) -> Result<TestResultNode> {
-    if pot.execution_mode == ExecutionMode::Skip {
-        return Ok(TestResultNode {
-            name: pot.name,
-            ..TestResultNode::default()
-        });
-    }
+pub fn evaluate(ctx: &DriverContext, ts: Suite) {
+    let pots = ts.pots;
+    let path = &TestPath::new_with_root(ts.name);
+    let pool = ThreadPoolBuilder::new()
+        .num_threads(config::N_THREADS_PER_SUITE)
+        .build()
+        .expect("Could not create threadpool");
 
+    pool.scope_fifo(move |scope| {
+        let pots = pots
+            .into_iter()
+            .filter(|p| p.execution_mode != ExecutionMode::Ignore);
+
+        for p in pots {
+            scope.spawn_fifo(move |_| {
+                let pot_name = p.name.clone();
+                evaluate_pot(ctx, p, path).unwrap_or_else(|e| {
+                    error!(ctx.logger, "Failed to execute pot {}: {}.", pot_name, e);
+                });
+            })
+        }
+    })
+}
+
+fn evaluate_pot(ctx: &DriverContext, mut pot: Pot, path: &TestPath) -> Result<()> {
     let pot_path = path.join(&pot.name);
     let group_name = format!("{}-{}", pot_path.url_string(), ctx.job_id)
-        .replace(":", "_")
-        .replace(".", "_");
+        .replace(':', "_")
+        .replace('.', "_");
 
-    let pot_working_dir = ctx.working_dir.join(&pot.name);
+    let pot_working_dir = ctx.working_dir.join(&pot.name).join(config::POT_SETUP_DIR);
     let pot_env = ctx.env.fork(ctx.logger.clone(), pot_working_dir)?;
 
     pot_env
         .write_test_path(&pot_path)
         .expect("Could not write the pot test path");
-    pot_env.write_object(FARM_GROUP_NAME, &group_name)?;
-    pot_env.write_object(POT_TIMEOUT, &pot.pot_timeout.unwrap_or(ctx.pot_timeout))?;
 
-    create_group_for_pot(&pot_env, &pot, &ctx.logger)?;
+    GroupSetup {
+        farm_group_name: group_name.clone(),
+        group_timeout: pot.pot_timeout.unwrap_or(ctx.pot_timeout),
+        default_vm_resources: pot.default_vm_resources,
+    }
+    .write_attribute(&pot_env);
 
-    if let Err(e) = pot.setup.evaluate(&pot_env) {
-        if let Some(s) = e.downcast_ref::<String>() {
-            bail!("Could not evaluate pot config: {}", s);
-        } else if let Some(s) = e.downcast_ref::<&str>() {
-            bail!("Could not evaluate pot config: {}", s);
+    // create the group (and start the keep alive thread) and evaluate the pot
+    // setup
+    let (pot_setup_result, keep_alive_handle_and_signal) =
+        match create_group_for_pot_and_spawn_keepalive_thread(&pot_env, &pot, &ctx.logger) {
+            Ok(keep_alive_handle_and_signal) => {
+                let res = if let Err(err) = pot.setup.evaluate(pot_env.clone()) {
+                    if let Some(s) = err.downcast_ref::<String>() {
+                        TestResult::failed_with_message(s.as_str())
+                    } else if let Some(s) = err.downcast_ref::<&str>() {
+                        TestResult::failed_with_message(s)
+                    } else {
+                        TestResult::failed_with_message(format!("{:?}", err).as_str())
+                    }
+                } else {
+                    TestResult::Passed
+                };
+                (res, Some(keep_alive_handle_and_signal))
+            }
+            Err(err) => (
+                TestResult::failed_with_message(format!("{:?}", err).as_str()),
+                None,
+            ),
+        };
+
+    // store away the pot result before the pot's tests are evaluated
+    pot_env
+        .write_json_object(config::POT_SETUP_RESULT_FILE, &pot_setup_result)
+        .unwrap_or_else(|e| {
+            error!(
+                ctx.logger,
+                "Couldn't save pot setup result {} file: {}.",
+                config::POT_SETUP_RESULT_FILE,
+                e
+            );
+        });
+
+    // fail fast in case of a setup failure
+    if let TestResult::Failed(err) = pot_setup_result {
+        bail!("Could not evaluate pot setup: {}", err);
+    }
+
+    evaluate_pot_with_group(ctx, pot, &pot_path, &pot_env);
+
+    // Download prometheus data directory
+    // if the prometheus universal VM exists in the environment.
+    pot_env.download_prometheus_data_dir_if_exists();
+
+    // at this point we should be guaranteed to have a task_handle
+    if let Some((task_handle, stop_sig_s)) = keep_alive_handle_and_signal {
+        info!(ctx.logger, "Stopping keep alive task for pot: {}", pot_path);
+        if let Err(e) = stop_sig_s.try_send(()) {
+            warn!(ctx.logger, "Could not send stop signal: {:?}", e);
         }
-        bail!("Could not evaluate pot config: {:?}", e);
-    };
+        std::mem::drop(stop_sig_s);
+        info!(ctx.logger, "Joining keep alive task for pot: {}", pot_path);
+        task_handle
+            .join()
+            .expect("could not join keep alive handle");
+    }
 
-    let res = evaluate_pot_with_group(ctx, pot, pot_path, &pot_env, &group_name);
     if let Err(e) = ctx.farm.delete_group(&group_name) {
         warn!(ctx.logger, "Could not delete group {}: {:?}", group_name, e);
     }
-    res
+    Ok(())
 }
 
-fn create_group_for_pot(env: &TestEnv, pot: &Pot, logger: &Logger) -> Result<()> {
-    let pot_timeout: Duration = env.read_object(POT_TIMEOUT)?;
-    let group_name: String = env.read_object(FARM_GROUP_NAME)?;
-    let farm = Farm::new(env.read_object(FARM_BASE_URL)?, logger.clone());
-    info!(logger, "creating group '{}'", &group_name);
-    Ok(farm.create_group(
-        &group_name,
-        pot_timeout,
+fn create_group_for_pot_and_spawn_keepalive_thread(
+    env: &TestEnv,
+    pot: &Pot,
+    logger: &Logger,
+) -> Result<(JoinHandle<()>, Sender<()>)> {
+    let pot_setup = GroupSetup::read_attribute(env);
+    let farm_base_url = env.get_farm_url().unwrap();
+    let farm = Farm::new(farm_base_url, logger.clone());
+    info!(logger, "creating group '{}'", &pot_setup.farm_group_name);
+    farm.create_group(
+        &pot_setup.farm_group_name,
+        pot_setup.group_timeout,
         GroupSpec {
             vm_allocation: pot.vm_allocation.clone(),
+            required_host_features: pot.required_host_features.clone(),
+            // TODO: retrieve this value dynamically, based on the runner IPv6.
+            preferred_network: None,
         },
-    )?)
+    )?;
+
+    // keep the group alive using a background thread
+    let (keep_alive_task, stop_sig_s) =
+        keep_group_alive_task(logger.clone(), farm, &pot_setup.farm_group_name);
+    let task_handle = std::thread::spawn(keep_alive_task);
+
+    Ok((task_handle, stop_sig_s))
 }
 
-#[allow(clippy::mutex_atomic)]
-fn evaluate_pot_with_group(
-    ctx: &DriverContext,
-    pot: Pot,
-    pot_path: TestPath,
-    env: &TestEnv,
-    group_name: &str,
-) -> Result<TestResultNode> {
-    let started_at = Instant::now();
-    let (no_threads, all_tests) = match pot.testset {
-        TestSet::Sequence(tests) => (1, tests),
-        TestSet::Parallel(tests) => (N_THREADS_PER_POT, tests),
-    };
-    let tests: Vec<Test> = all_tests
-        .into_iter()
-        .filter(|t| t.execution_mode != ExecutionMode::Ignore)
-        .collect();
-    let tests_num = tests.len();
-
-    let (sender, receiver) = bounded(tests_num);
-    let chunks = chunk(tests, no_threads);
-    let mut join_handles = vec![];
-
-    for chunk in chunks {
-        let s = sender.clone();
-        let join_handle = std::thread::spawn({
-            let t_path = pot_path.clone();
-            let t_test_env = env.clone();
-            let t_ctx = ctx.clone();
-            move || {
-                for t in chunk {
-                    // in the long run, these directories are retained (!). For
-                    // now, we just use the test env as a way to pass
-                    // information
-                    let tempdir = tempfile::tempdir().unwrap();
-                    let test_env = t_test_env
-                        .fork(t_ctx.logger.clone(), tempdir.path())
-                        .expect("Could not create test env.");
-                    let t_path = t_path.clone();
-                    evaluate_test(&t_ctx, test_env, s.clone(), t, t_path.clone());
-                }
-            }
-        });
-        join_handles.push(join_handle);
-    }
-    for jh in join_handles {
-        jh.join().expect("waiting for thread failed!");
-    }
-    let children = collect_n_children(receiver, tests_num);
-
-    Ok(TestResultNode {
-        name: pot.name.clone(),
-        group_name: Some(group_name.to_string()),
-        started_at,
-        duration: started_at.elapsed(),
-        result: infer_result(children.as_slice()),
-        children,
+fn evaluate_pot_with_group(ctx: &DriverContext, pot: Pot, pot_path: &TestPath, pot_env: &TestEnv) {
+    let pool = ThreadPoolBuilder::new()
+        .num_threads(config::N_THREADS_PER_POT)
+        .build()
+        .expect("Could not create threadpool");
+    pool.scope_fifo(move |scope| {
+        scope.spawn_fifo(move |scope| {
+            evaluate_testset_with_group(ctx, scope, pot.testset, pot_path, pot_env)
+        })
     })
 }
 
-fn evaluate_test(
-    ctx: &DriverContext,
-    test_env: TestEnv,
-    parent: Sender<TestResultNode>,
-    t: Test,
-    path: TestPath,
+fn evaluate_testset_with_group<'scope>(
+    ctx: &'scope DriverContext,
+    scope: &ScopeFifo<'scope>,
+    testset: TestSet,
+    pot_path: &'scope TestPath,
+    pot_env: &'scope TestEnv,
 ) {
+    match testset {
+        TestSet::Single(test) => {
+            if test.execution_mode != ExecutionMode::Ignore {
+                evaluate_test(ctx, pot_env, test, pot_path)
+            }
+        }
+        TestSet::Sequence(tests) => {
+            for test in tests {
+                evaluate_testset_with_group(ctx, scope, test, pot_path, pot_env)
+            }
+        }
+        TestSet::Parallel(tests) => {
+            let wg = WaitGroup::new();
+            for test in tests {
+                let wg = wg.clone();
+                scope.spawn_fifo(move |scope| {
+                    let _wg = wg;
+                    evaluate_testset_with_group(ctx, scope, test, pot_path, pot_env)
+                });
+            }
+            wg.wait();
+        }
+    }
+}
+
+fn evaluate_test(ctx: &DriverContext, pot_env: &TestEnv, t: Test, pot_path: &TestPath) {
+    use slog::Drain;
+    let discard_drain = slog::Discard;
+    let logger = if ctx.propagate_test_logs {
+        ctx.logger()
+    } else {
+        slog::Logger::root(discard_drain.fuse(), slog::o!())
+    };
+
+    // the pot env is in <pot>/setup. Hence, we take the parent,
+    // to create the path <pot>/tests/<test>
+    let t_env_dir = pot_env
+        .base_path()
+        .parent()
+        .expect("parent not set")
+        .to_owned()
+        .join(config::TESTS_DIR)
+        .join(&t.name);
+    let test_env = pot_env
+        .fork(logger, t_env_dir)
+        .expect("Could not create test env.");
+
     let mut result = TestResultNode {
         name: t.name.clone(),
         ..TestResultNode::default()
     };
+
     if t.execution_mode == ExecutionMode::Skip {
-        parent
-            .send(result)
-            .expect("failed to send result to parent node");
         return;
     }
 
-    let path = path.join(&t.name);
+    let path = pot_path.join(&t.name);
     test_env
         .write_test_path(&path)
         .expect("Could not write test path");
     info!(ctx.logger, "Starting test: {}", path);
-    let logger = ctx.logger();
-    let t_res = catch_unwind(|| (t.f)(test_env, logger));
+    let t_res = catch_unwind(|| (t.f)(test_env.clone()));
+
     if let Err(panic_res) = t_res {
         if let Some(s) = panic_res.downcast_ref::<String>() {
             warn!(ctx.logger, "{} FAILED: {}", path, s);
+            result.result = TestResult::failed_with_message(s);
         } else if let Some(s) = panic_res.downcast_ref::<&str>() {
             warn!(ctx.logger, "{} FAILED: {}", path, s);
+            result.result = TestResult::failed_with_message(s);
         } else {
             warn!(ctx.logger, "{} FAILED (): {:?}", path, panic_res);
+            result.result = TestResult::failed_with_message(format!("{:?}", panic_res).as_str());
         }
-        result.result = TestResult::Failed;
     } else {
         info!(ctx.logger, "{} SUCCESS.", path);
         result.result = TestResult::Passed;
     }
 
     result.duration = result.started_at.elapsed();
-    parent
-        .send(result)
-        .expect("failed to send result to parent node");
-}
-
-fn chunk<T>(items: Vec<T>, no_buckets: usize) -> Vec<Vec<T>> {
-    let mut res: Vec<Vec<T>> = (0..no_buckets).map(|_| Vec::new()).collect();
-    items
-        .into_iter()
-        .enumerate()
-        .for_each(|(i, item)| res[i % no_buckets].push(item));
-    res.retain(|i| !i.is_empty());
-    res
+    // Failure of an individual test should not cause panic of the pot execution.
+    test_env
+        .write_json_object(config::TEST_RESULT_FILE, &result)
+        .unwrap_or_else(|e| {
+            error!(
+                ctx.logger,
+                "Couldn't save test result {} file, err={}.",
+                config::TEST_RESULT_FILE,
+                e
+            );
+        })
 }
 
 pub fn collect_n_children(r: Receiver<TestResultNode>, n: usize) -> Vec<TestResultNode> {
@@ -257,20 +317,24 @@ pub fn collect_n_children(r: Receiver<TestResultNode>, n: usize) -> Vec<TestResu
     ch
 }
 
-#[cfg(test)]
-mod tests {
-    use super::chunk;
-    use std::collections::HashSet;
+/// The goal of this choice of parameters is to
+/// * not overload farm with repeated requests, ...
+/// * while keeping the TTL as short as possible, and
+/// * ensuring that setting the TTL is retried at least once in case of a failure.
+const KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(30);
+const GROUP_TTL: Duration = Duration::from_secs(90);
 
-    #[test]
-    fn chunking_retains_all_elements() {
-        for c in 1..11 {
-            for n in 1..63 {
-                let set: HashSet<_> = (0..n).collect();
-                let chunks = chunk(set.iter().cloned().collect::<Vec<_>>(), c);
-                assert_eq!(chunks.len().min(n), c.min(n));
-                assert_eq!(chunks.concat().iter().cloned().collect::<HashSet<_>>(), set);
+fn keep_group_alive_task(log: Logger, farm: Farm, group_name: &str) -> (impl FnMut(), Sender<()>) {
+    // A non-empty channel guarantees that a signal can be sent at least once
+    // without the sender being blocked.
+    let (stop_sig_s, stop_sig_r) = bounded::<()>(1);
+    let group_name = group_name.to_string();
+    let task = move || {
+        while let Err(RecvTimeoutError::Timeout) = stop_sig_r.recv_timeout(KEEP_ALIVE_INTERVAL) {
+            if let Err(e) = farm.set_group_ttl(&group_name, GROUP_TTL) {
+                warn!(log, "Failed to set group ttl of {:?}: {:?}", group_name, e);
             }
         }
-    }
+    };
+    (task, stop_sig_s)
 }

@@ -1,6 +1,6 @@
 use crate::*;
 use core::fmt::{self, Debug};
-use ic_types::crypto::canister_threshold_sig::idkg::IDkgMultiSignedDealing;
+use ic_types::crypto::canister_threshold_sig::idkg::BatchSignedIDkgDealing;
 use ic_types::NumberOfNodes;
 use serde::{Deserialize, Serialize};
 use std::convert::TryFrom;
@@ -205,8 +205,8 @@ impl IDkgDealingInternal {
 
         let (commitment, ciphertext, proof) = match shares {
             SecretShares::Random => {
-                let values = Polynomial::random(curve, num_coefficients, &mut poly_rng)?; // omega in paper
-                let mask = Polynomial::random(curve, num_coefficients, &mut poly_rng)?; // omega' in paper
+                let values = Polynomial::random(curve, num_coefficients, &mut poly_rng); // omega in paper
+                let mask = Polynomial::random(curve, num_coefficients, &mut poly_rng); // omega' in paper
 
                 let (ciphertext, commitment) = encrypt_and_commit_pair_of_polynomials(
                     &values,
@@ -226,7 +226,7 @@ impl IDkgDealingInternal {
                 }
 
                 let values =
-                    Polynomial::random_with_constant(*secret, num_coefficients, &mut poly_rng)?;
+                    Polynomial::random_with_constant(secret, num_coefficients, &mut poly_rng)?;
 
                 let (ciphertext, commitment) = encrypt_and_commit_single_polynomial(
                     &values,
@@ -246,7 +246,7 @@ impl IDkgDealingInternal {
                 }
 
                 let values =
-                    Polynomial::random_with_constant(*secret, num_coefficients, &mut poly_rng)?;
+                    Polynomial::random_with_constant(secret, num_coefficients, &mut poly_rng)?;
 
                 let (ciphertext, commitment) = encrypt_and_commit_single_polynomial(
                     &values,
@@ -277,12 +277,12 @@ impl IDkgDealingInternal {
                 // Generate secret polynomials
                 let product = left_value.mul(right_value)?;
 
-                let product_masking = EccScalar::random(curve, &mut poly_rng)?;
+                let product_masking = EccScalar::random(curve, &mut poly_rng);
 
                 let values =
-                    Polynomial::random_with_constant(product, num_coefficients, &mut poly_rng)?;
+                    Polynomial::random_with_constant(&product, num_coefficients, &mut poly_rng)?;
                 let mask = Polynomial::random_with_constant(
-                    product_masking,
+                    &product_masking,
                     num_coefficients,
                     &mut poly_rng,
                 )?;
@@ -328,7 +328,7 @@ impl IDkgDealingInternal {
         associated_data: &[u8],
     ) -> ThresholdEcdsaResult<()> {
         if self.commitment.len() != reconstruction_threshold.get() as usize {
-            return Err(ThresholdEcdsaError::InconsistentCommitments);
+            return Err(ThresholdEcdsaError::InvalidCommitment);
         }
 
         if self.commitment.curve_type() != curve_type {
@@ -381,13 +381,13 @@ impl IDkgDealingInternal {
 
                 match previous_commitment {
                     PolynomialCommitment::Pedersen(_) => {
-                        return Err(ThresholdEcdsaError::InconsistentCommitments)
+                        return Err(ThresholdEcdsaError::UnexpectedCommitmentType)
                     }
                     PolynomialCommitment::Simple(c) => {
                         let constant_term = self.commitment.constant_term();
 
                         if c.evaluate_at(dealer_index)? != constant_term {
-                            return Err(ThresholdEcdsaError::InconsistentCommitments);
+                            return Err(ThresholdEcdsaError::InvalidCommitment);
                         }
                     }
                 }
@@ -457,10 +457,10 @@ impl IDkgDealingInternal {
     }
 }
 
-impl TryFrom<&IDkgMultiSignedDealing> for IDkgDealingInternal {
+impl TryFrom<&BatchSignedIDkgDealing> for IDkgDealingInternal {
     type Error = ThresholdEcdsaError;
 
-    fn try_from(signed_dealing: &IDkgMultiSignedDealing) -> ThresholdEcdsaResult<Self> {
-        Self::deserialize(&signed_dealing.dealing.idkg_dealing.internal_dealing_raw)
+    fn try_from(signed_dealing: &BatchSignedIDkgDealing) -> ThresholdEcdsaResult<Self> {
+        Self::deserialize(&signed_dealing.idkg_dealing().internal_dealing_raw)
     }
 }

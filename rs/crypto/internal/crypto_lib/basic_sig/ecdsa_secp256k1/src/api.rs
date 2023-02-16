@@ -39,31 +39,25 @@ pub fn algorithm_identifier() -> PkixAlgorithmIdentifier {
 /// # Returns
 /// A tuple of the secret key bytes and public key bytes
 #[cfg(test)]
-pub fn new_keypair() -> CryptoResult<(types::SecretKeyBytes, types::PublicKeyBytes)> {
-    let group = EcGroup::from_curve_name(CURVE_NAME)
-        .map_err(|e| wrap_openssl_err(e, "unable to create EC group"))?;
-    let ec_key =
-        EcKey::generate(&group).map_err(|e| wrap_openssl_err(e, "unable to generate EC key"))?;
-    let mut ctx =
-        BigNumContext::new().map_err(|e| wrap_openssl_err(e, "unable to create BigNumContext"))?;
-    let mut sk_der =
-        ec_key
-            .private_key_to_der()
-            .map_err(|e| CryptoError::AlgorithmNotSupported {
-                algorithm: AlgorithmId::EcdsaSecp256k1,
-                reason: format!("OpenSSL failed with error {}", e),
-            })?;
-    let sk = types::SecretKeyBytes(SecretVec::new_and_zeroize_argument(&mut sk_der));
-    let pk_bytes = ec_key
-        .public_key()
-        .to_bytes(
-            &group,
-            openssl::ec::PointConversionForm::UNCOMPRESSED,
-            &mut ctx,
-        )
-        .map_err(|e| wrap_openssl_err(e, "unable to serialize EC public key"))?;
-    let pk = types::PublicKeyBytes::from(pk_bytes);
-    Ok((sk, pk))
+pub fn new_keypair(
+    rng: &mut (impl rand::RngCore + rand::CryptoRng),
+) -> CryptoResult<(types::SecretKeyBytes, types::PublicKeyBytes)> {
+    use k256::elliptic_curve::sec1::ToEncodedPoint;
+
+    let (sk, pk) = {
+        let sk = k256::ecdsa::SigningKey::random(rng);
+        let encoded_pk = k256::PublicKey::from(&sk.verifying_key()).to_encoded_point(false);
+        let serialized_pk: [u8; 65] = encoded_pk
+            .as_bytes()
+            .try_into()
+            .expect("public key with incorrect length");
+        (sk.to_bytes(), serialized_pk)
+    };
+
+    let pk_bytes = crate::types::PublicKeyBytes::from(pk.to_vec());
+    let sk_bytes = secret_key_from_components(&sk, &pk_bytes)?;
+
+    Ok((sk_bytes, pk_bytes))
 }
 
 /// Create a secp256k1 secret key from raw bytes
@@ -72,7 +66,7 @@ pub fn new_keypair() -> CryptoResult<(types::SecretKeyBytes, types::PublicKeyByt
 /// * `sk_raw_bytes` is the big-endian encoding of unsigned integer
 /// * `pk` is the public key associated with this secret key
 /// # Errors
-/// * `AlgorithmNotSupported` if an error occured while invoking OpenSSL
+/// * `AlgorithmNotSupported` if an error occurred while invoking OpenSSL
 /// * `MalformedPublicKey` if the public key could not be parsed
 /// * `MalformedSecretKey` if the secret key does not coorespond with the public
 ///   key
@@ -117,7 +111,7 @@ pub fn secret_key_from_components(
 /// # Arguments
 /// * `pk_der` is the binary DER encoding of the public key
 /// # Errors
-/// * `AlgorithmNotSupported` if an error occured while invoking OpenSSL
+/// * `AlgorithmNotSupported` if an error occurred while invoking OpenSSL
 /// * `MalformedPublicKey` if the public key could not be parsed
 /// # Returns
 /// The decoded public key
@@ -172,7 +166,7 @@ pub fn public_key_from_der(pk_der: &[u8]) -> CryptoResult<types::PublicKeyBytes>
 /// # Arguments
 /// * `pk` is the public key
 /// # Errors
-/// * `AlgorithmNotSupported` if an error occured while invoking OpenSSL
+/// * `AlgorithmNotSupported` if an error occurred while invoking OpenSSL
 /// * `MalformedPublicKey` if the public key seems to be invalid
 /// # Returns
 /// The encoded public key

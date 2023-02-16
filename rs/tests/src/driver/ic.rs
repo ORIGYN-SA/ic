@@ -1,44 +1,52 @@
-use super::bootstrap::{init_ic, setup_and_start_vms};
-use super::resource::{allocate_resources, get_resource_request, ResourceGroup};
-use super::test_env::TestEnv;
-use crate::driver::driver_setup::mk_logger;
-use crate::driver::driver_setup::{FARM_BASE_URL, FARM_GROUP_NAME};
-use crate::driver::farm::Farm;
+use crate::driver::{
+    bootstrap::{init_ic, setup_and_start_vms},
+    farm::{Farm, HostFeature},
+    node_software_version::NodeSoftwareVersion,
+    resource::{allocate_resources, get_resource_request, ResourceGroup},
+    test_env::{TestEnv, TestEnvAttribute},
+    test_env_api::{HasIcDependencies, HasRegistryLocalStore},
+    test_setup::GroupSetup,
+};
 use anyhow::Result;
-use ic_fondue::ic_instance::node_software_version::NodeSoftwareVersion;
 use ic_prep_lib::node::NodeSecretKeyStore;
+use ic_prep_lib::prep_state_directory::IcPrepStateDir;
 use ic_protobuf::registry::subnet::v1::GossipConfig;
+use ic_regedit;
 use ic_registry_subnet_features::SubnetFeatures;
 use ic_registry_subnet_type::SubnetType;
+use ic_types::malicious_behaviour::MaliciousBehaviour;
 use ic_types::p2p::build_default_gossip_config;
 use ic_types::{Height, NodeId, PrincipalId};
 use phantom_newtype::AmountOf;
 use serde::{Deserialize, Serialize};
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
-use std::net::{IpAddr, Ipv6Addr};
+use std::net::{Ipv6Addr, SocketAddr};
 use std::path::Path;
 use std::time::Duration;
 
-/// Builder object to declare a topology of an InternetComputer. Used as input
-/// to the IC Manager.
+/// Builder object to declare a topology of an InternetComputer.
+/// Used as input to the IC Manager.
 #[derive(Clone, Debug, Default)]
 pub struct InternetComputer {
     pub initial_version: Option<NodeSoftwareVersion>,
-    pub vm_allocation: Option<VmAllocationStrategy>,
     pub default_vm_resources: VmResources,
+    pub vm_allocation: Option<VmAllocationStrategy>,
+    pub required_host_features: Vec<HostFeature>,
     pub subnets: Vec<Subnet>,
     pub node_operator: Option<PrincipalId>,
     pub node_provider: Option<PrincipalId>,
     pub unassigned_nodes: Vec<Node>,
     pub ssh_readonly_access_to_unassigned_nodes: Vec<String>,
     name: String,
-    pub no_idkg_key: bool,
-    pub bitcoind_addr: Option<IpAddr>,
+    pub bitcoind_addr: Option<SocketAddr>,
+    pub socks_proxy: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
 pub enum VmAllocationStrategy {
+    #[serde(rename = "distributeToArbitraryHost")]
+    DistributeToArbitraryHost,
     #[serde(rename = "distributeWithinSingleHost")]
     DistributeWithinSingleHost,
     #[serde(rename = "distributeAcrossDcs")]
@@ -61,6 +69,16 @@ impl InternetComputer {
         self
     }
 
+    pub fn with_vm_allocation(mut self, vm_allocation: VmAllocationStrategy) -> Self {
+        self.vm_allocation = Some(vm_allocation);
+        self
+    }
+
+    pub fn with_required_host_features(mut self, required_host_features: Vec<HostFeature>) -> Self {
+        self.required_host_features = required_host_features;
+        self
+    }
+
     pub fn add_subnet(mut self, subnet: Subnet) -> Self {
         self.subnets.push(subnet);
         self
@@ -75,17 +93,14 @@ impl InternetComputer {
     pub fn add_fast_single_node_subnet(mut self, subnet_type: SubnetType) -> Self {
         let mut subnet = Subnet::fast_single_node(subnet_type);
         subnet.default_vm_resources = self.default_vm_resources;
+        subnet.vm_allocation = self.vm_allocation.clone();
+        subnet.required_host_features = self.required_host_features.clone();
         self.subnets.push(subnet);
         self
     }
 
     pub fn with_initial_replica(mut self, initial_replica: NodeSoftwareVersion) -> Self {
         self.initial_version = Some(initial_replica);
-        self
-    }
-
-    pub fn without_idkg_key(mut self) -> Self {
-        self.no_idkg_key = true;
         self
     }
 
@@ -104,14 +119,12 @@ impl InternetComputer {
     /// The nodes inherit the VM resources of the IC.
     pub fn with_unassigned_nodes(mut self, no_of_nodes: i32) -> Self {
         for _ in 0..no_of_nodes {
-            self.unassigned_nodes
-                .push(Node::new_with_vm_resources(self.default_vm_resources));
+            self.unassigned_nodes.push(Node::new_with_settings(
+                self.default_vm_resources,
+                self.vm_allocation.clone(),
+                self.required_host_features.clone(),
+            ));
         }
-        self
-    }
-
-    pub fn with_allocation_strategy(mut self, strategy: VmAllocationStrategy) -> Self {
-        self.vm_allocation = Some(strategy);
         self
     }
 
@@ -130,23 +143,75 @@ impl InternetComputer {
         self.name.clone()
     }
 
-    pub fn with_bitcoind_addr(mut self, bitcoind_addr: IpAddr) -> Self {
+    pub fn with_bitcoind_addr(mut self, bitcoind_addr: SocketAddr) -> Self {
         self.bitcoind_addr = Some(bitcoind_addr);
+        self
+    }
+
+    pub fn with_socks_proxy(mut self, socks_proxy: String) -> Self {
+        self.socks_proxy = Some(socks_proxy);
         self
     }
 
     pub fn setup_and_start(&mut self, env: &TestEnv) -> Result<()> {
         let tempdir = tempfile::tempdir()?;
         self.create_secret_key_stores(tempdir.path())?;
-
-        let logger = mk_logger();
-        let farm = Farm::new(env.read_object(FARM_BASE_URL)?, logger.clone());
-        let group_name: String = env.read_object(FARM_GROUP_NAME)?;
+        let logger = env.logger();
+        let group_setup = GroupSetup::read_attribute(env);
+        let farm_base_url = env.get_farm_url()?;
+        let farm = Farm::new(farm_base_url, logger.clone());
+        let group_name: String = group_setup.farm_group_name;
         let res_request = get_resource_request(self, env, &group_name)?;
         let res_group = allocate_resources(&farm, &res_request)?;
         self.propagate_ip_addrs(&res_group);
-        let init_ic = init_ic(self, env, &logger)?;
-        setup_and_start_vms(&init_ic, &self.name, env, &farm, &group_name)?;
+        let init_ic = init_ic(self, env, &logger, false)?;
+
+        // save initial registry snapshot for this pot
+        let local_store_path = env
+            .registry_local_store_path(&self.name)
+            .expect("corrupted ic-prep directory structure");
+        let reg_snapshot = ic_regedit::load_registry_local_store(local_store_path)?;
+        let reg_snapshot_serialized =
+            serde_json::to_string_pretty(&reg_snapshot).expect("Could not pretty print value.");
+        IcPrepStateDir::new(init_ic.target_dir.to_str().expect("invalid target dir"));
+        std::fs::write(
+            init_ic.target_dir.join("initial_registry_snapshot.json"),
+            reg_snapshot_serialized,
+        )
+        .unwrap();
+
+        setup_and_start_vms(&init_ic, self, env, &farm, &group_name)?;
+        Ok(())
+    }
+
+    pub fn setup_and_start_with_ids(&mut self, env: &TestEnv) -> Result<()> {
+        let tempdir = tempfile::tempdir()?;
+        self.create_secret_key_stores(tempdir.path())?;
+        let logger = env.logger();
+        let pot_setup = GroupSetup::read_attribute(env);
+        let farm_base_url = env.get_farm_url()?;
+        let farm = Farm::new(farm_base_url, logger.clone());
+        let group_name: String = pot_setup.farm_group_name;
+        let res_request = get_resource_request(self, env, &group_name)?;
+        let res_group = allocate_resources(&farm, &res_request)?;
+        self.propagate_ip_addrs(&res_group);
+        let init_ic = init_ic(self, env, &logger, true)?;
+
+        // save initial registry snapshot for this group
+        let local_store_path = env
+            .registry_local_store_path(&self.name)
+            .expect("corrupted ic-prep directory structure");
+        let reg_snapshot = ic_regedit::load_registry_local_store(local_store_path)?;
+        let reg_snapshot_serialized =
+            serde_json::to_string_pretty(&reg_snapshot).expect("Could not pretty print value.");
+        IcPrepStateDir::new(init_ic.target_dir.to_str().expect("invalid target dir"));
+        std::fs::write(
+            init_ic.target_dir.join("initial_registry_snapshot.json"),
+            reg_snapshot_serialized,
+        )
+        .unwrap();
+
+        setup_and_start_vms(&init_ic, self, env, &farm, &group_name)?;
         Ok(())
     }
 
@@ -186,12 +251,49 @@ impl InternetComputer {
             }
         }
     }
+
+    pub fn has_malicious_behaviours(&self) -> bool {
+        let has_malicious_nodes: bool = self
+            .subnets
+            .iter()
+            .any(|s| s.nodes.iter().any(|n| n.malicious_behaviour.is_some()));
+        let has_malicious_unassigned_nodes = self
+            .unassigned_nodes
+            .iter()
+            .any(|n| n.malicious_behaviour.is_some());
+        has_malicious_nodes || has_malicious_unassigned_nodes
+    }
+
+    pub fn get_malicious_behavior_of_node(&self, node_id: NodeId) -> Option<MaliciousBehaviour> {
+        let node_filter_map = |n: &Node| {
+            if n.secret_key_store.as_ref().unwrap().node_id == node_id {
+                Some(n.malicious_behaviour.clone())
+            } else {
+                None
+            }
+        };
+        // extract malicious nodes all subnet nodes
+        let mut malicious_nodes: Vec<Option<MaliciousBehaviour>> = self
+            .subnets
+            .iter()
+            .flat_map(|s| s.nodes.iter().filter_map(node_filter_map))
+            .collect();
+        // extract malicious nodes from all unassigned nodes
+        malicious_nodes.extend(self.unassigned_nodes.iter().filter_map(node_filter_map));
+        match malicious_nodes.len() {
+            0 => None,
+            1 => malicious_nodes.first().unwrap().clone(),
+            _ => panic!("more than one node has id={node_id}"),
+        }
+    }
 }
 
 /// A builder for the initial configuration of a subnetwork.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Subnet {
     pub default_vm_resources: VmResources,
+    pub vm_allocation: Option<VmAllocationStrategy>,
+    pub required_host_features: Vec<HostFeature>,
     pub nodes: Vec<Node>,
     pub max_ingress_bytes_per_message: Option<u64>,
     pub ingress_bytes_per_block_soft_cap: Option<u64>,
@@ -218,6 +320,8 @@ impl Subnet {
     pub fn new(subnet_type: SubnetType) -> Self {
         Self {
             default_vm_resources: Default::default(),
+            vm_allocation: Default::default(),
+            required_host_features: vec![],
             nodes: vec![],
             max_ingress_bytes_per_message: None,
             ingress_bytes_per_block_soft_cap: None,
@@ -246,6 +350,16 @@ impl Subnet {
     /// has to be via `Node::new_with_vm_resources`.
     pub fn with_default_vm_resources(mut self, default_vm_resources: VmResources) -> Self {
         self.default_vm_resources = default_vm_resources;
+        self
+    }
+
+    pub fn with_vm_allocation(mut self, vm_allocation: VmAllocationStrategy) -> Self {
+        self.vm_allocation = Some(vm_allocation);
+        self
+    }
+
+    pub fn with_required_host_features(mut self, required_host_features: Vec<HostFeature>) -> Self {
+        self.required_host_features = required_host_features;
         self
     }
 
@@ -306,7 +420,13 @@ impl Subnet {
     pub fn add_nodes(self, no_of_nodes: usize) -> Self {
         (0..no_of_nodes).fold(self, |subnet, _| {
             let default_vm_resources = subnet.default_vm_resources;
-            subnet.add_node(Node::new_with_vm_resources(default_vm_resources))
+            let vm_allocation = subnet.vm_allocation.clone();
+            let required_host_features = subnet.required_host_features.clone();
+            subnet.add_node(Node::new_with_settings(
+                default_vm_resources,
+                vm_allocation,
+                required_host_features,
+            ))
         })
     }
 
@@ -355,6 +475,18 @@ impl Subnet {
         self
     }
 
+    pub fn add_malicious_nodes(
+        mut self,
+        no_of_nodes: usize,
+        malicious_behaviour: MaliciousBehaviour,
+    ) -> Self {
+        for _ in 0..no_of_nodes {
+            let node = Node::new().with_malicious_behaviour(malicious_behaviour.clone());
+            self.nodes.push(node);
+        }
+        self
+    }
+
     /// provides a small summary of this subnet topology and config to be used
     /// as a part of a test environment identifier.
     pub fn summary(&self) -> String {
@@ -370,6 +502,8 @@ impl Default for Subnet {
     fn default() -> Self {
         Self {
             default_vm_resources: Default::default(),
+            vm_allocation: Default::default(),
+            required_host_features: vec![],
             nodes: vec![],
             max_ingress_bytes_per_message: None,
             ingress_bytes_per_block_soft_cap: None,
@@ -394,23 +528,29 @@ impl Default for Subnet {
 
 pub type NrOfVCPUs = AmountOf<VCPUs, u64>;
 pub type AmountOfMemoryKiB = AmountOf<MemoryKiB, u64>;
+pub type ImageSizeGiB = AmountOf<SizeGiB, u64>;
 
 pub enum VCPUs {}
 pub enum MemoryKiB {}
+pub enum SizeGiB {}
 
 /// Resources that the VM will use like number of virtual CPUs and memory.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Deserialize, Serialize)]
 pub struct VmResources {
     pub vcpus: Option<NrOfVCPUs>,
     pub memory_kibibytes: Option<AmountOfMemoryKiB>,
+    pub boot_image_minimal_size_gibibytes: Option<ImageSizeGiB>,
 }
 
 /// A builder for the initial configuration of a node.
 #[derive(Clone, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Node {
     pub vm_resources: VmResources,
+    pub vm_allocation: Option<VmAllocationStrategy>,
+    pub required_host_features: Vec<HostFeature>,
     pub secret_key_store: Option<NodeSecretKeyStore>,
     pub ipv6: Option<Ipv6Addr>,
+    pub malicious_behaviour: Option<MaliciousBehaviour>,
 }
 
 impl Node {
@@ -418,9 +558,15 @@ impl Node {
         Default::default()
     }
 
-    pub fn new_with_vm_resources(vm_resources: VmResources) -> Self {
+    pub fn new_with_settings(
+        vm_resources: VmResources,
+        vm_allocation: Option<VmAllocationStrategy>,
+        required_host_features: Vec<HostFeature>,
+    ) -> Self {
         let mut node = Node::new();
         node.vm_resources = vm_resources;
+        node.vm_allocation = vm_allocation;
+        node.required_host_features = required_host_features;
         node
     }
 
@@ -429,5 +575,10 @@ impl Node {
             .clone()
             .expect("no secret key store")
             .node_id
+    }
+
+    pub fn with_malicious_behaviour(mut self, malicious_behaviour: MaliciousBehaviour) -> Self {
+        self.malicious_behaviour = Some(malicious_behaviour);
+        self
     }
 }

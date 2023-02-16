@@ -89,7 +89,7 @@ pub const CERT_ANY: CertificationMask = CertificationMask::new(1 | 2);
 
 /// A node state with a `height` attached to it, indicating that the state was
 /// obtained by executing a block with the given `height`.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Labeled<State> {
     height: Height,
     state: State,
@@ -133,7 +133,7 @@ pub trait StateManager: StateReader {
     /// * A call to `deliver_state_certification` with a certification of some
     ///   height removes the corresponding entry from the list.
     ///
-    /// * A call to one of the `remove_state*` methods removes the corresponding
+    /// * A call to one of the `remove_*_below` methods removes the corresponding
     ///   entry from the list.
     ///
     /// Since the hash computation can be asynchronous, the order in
@@ -188,8 +188,8 @@ pub trait StateManager: StateReader {
     /// # Errors
     ///
     /// * If the state at `height` was already removed with a call to
-    ///   `remove_states_below()`, the `Permanent(StateRemoved)` error is
-    ///   returned.
+    ///   `remove_states_below()` the `Permanent(StateRemoved)` error
+    ///   is returned.
     ///
     /// * If the state at `height` was not committed with
     ///   `CertificationScope::Full`, the `Permanent(StateNotFullyCertified)`
@@ -261,6 +261,17 @@ pub trait StateManager: StateReader {
     ///    optimize future operations.
     fn remove_states_below(&self, height: Height);
 
+    /// Notify the state manager that states committed with partial certification
+    /// state and heights strictly less than specified `height` can be removed.
+    ///
+    /// Note that:
+    ///  * The initial state (height = 0) cannot be removed.
+    ///  * Some states matching the removal criteria might be kept alive.  For
+    ///    example, the last fully persisted state might be preserved to
+    ///    optimize future operations.
+    ///  * No checkpoints are removed, see also `remove_states_below()`
+    fn remove_inmemory_states_below(&self, height: Height);
+
     /// Commits the `state` at given `height`, limits the certification to
     /// `scope`. The `state` must be the mutable state obtained via a call to
     /// `take_tip`.
@@ -314,7 +325,10 @@ pub trait StateManager: StateReader {
     /// This function always panics because there is no point in continuing the
     /// normal operation.  We rely on orchestrator restarting the replica, which
     /// in turn will initiate the normal recovery procedure.
-    fn report_diverged_state(&self, height: Height);
+    /// Backs up the diverged checkpoint for troubleshooting.
+    /// Requires: height is a height of a checkpoint. Otherwise nothing is saved
+    /// for troubleshooting.
+    fn report_diverged_checkpoint(&self, height: Height);
 }
 // end::state-manager-interface[]
 

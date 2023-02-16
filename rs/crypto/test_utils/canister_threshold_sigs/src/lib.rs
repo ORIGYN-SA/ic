@@ -1,22 +1,29 @@
 //! Utilities for testing IDkg and canister threshold signature operations.
 
-use ic_crypto::utils::TempCryptoComponent;
 use ic_crypto_internal_threshold_sig_ecdsa::test_utils::corrupt_dealing;
-use ic_crypto_internal_threshold_sig_ecdsa::IDkgDealingInternal;
-use ic_interfaces::crypto::{IDkgProtocol, MultiSigVerifier, MultiSigner};
+use ic_crypto_internal_threshold_sig_ecdsa::{IDkgDealingInternal, NodeIndex, Seed};
+use ic_crypto_temp_crypto::TempCryptoComponent;
+use ic_interfaces::crypto::{
+    BasicSigner, IDkgProtocol, KeyManager, ThresholdEcdsaSigVerifier, ThresholdEcdsaSigner,
+};
 use ic_registry_client_fake::FakeRegistryClient;
 use ic_registry_keys::make_crypto_node_key;
 use ic_registry_proto_data_provider::ProtoRegistryDataProvider;
-use ic_types::consensus::ecdsa::EcdsaDealing;
 use ic_types::crypto::canister_threshold_sig::idkg::{
-    IDkgDealing, IDkgMaskedTranscriptOrigin, IDkgMultiSignedDealing, IDkgReceivers, IDkgTranscript,
-    IDkgTranscriptId, IDkgTranscriptOperation, IDkgTranscriptParams, IDkgTranscriptType,
-    IDkgUnmaskedTranscriptOrigin,
+    BatchSignedIDkgDealing, IDkgComplaint, IDkgDealing, IDkgMaskedTranscriptOrigin, IDkgReceivers,
+    IDkgTranscript, IDkgTranscriptId, IDkgTranscriptOperation, IDkgTranscriptParams,
+    IDkgTranscriptType, IDkgUnmaskedTranscriptOrigin, SignedIDkgDealing,
 };
-use ic_types::crypto::canister_threshold_sig::PreSignatureQuadruple;
-use ic_types::crypto::canister_threshold_sig::ThresholdEcdsaSigInputs;
-use ic_types::crypto::{AlgorithmId, KeyPurpose};
-use ic_types::{Height, NodeId, PrincipalId, RegistryVersion, SubnetId};
+use ic_types::crypto::canister_threshold_sig::{
+    ExtendedDerivationPath, PreSignatureQuadruple, ThresholdEcdsaSigShare,
+};
+use ic_types::crypto::canister_threshold_sig::{
+    ThresholdEcdsaCombinedSignature, ThresholdEcdsaSigInputs,
+};
+use ic_types::crypto::{AlgorithmId, KeyPurpose, Signed};
+use ic_types::crypto::{BasicSig, BasicSigOf};
+use ic_types::signature::{BasicSignature, BasicSignatureBatch};
+use ic_types::{Height, NodeId, PrincipalId, Randomness, RegistryVersion, SubnetId};
 use rand::prelude::*;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
@@ -26,7 +33,7 @@ pub fn create_params_for_dealers(
     operation: IDkgTranscriptOperation,
 ) -> IDkgTranscriptParams {
     IDkgTranscriptParams::new(
-        transcript_id_generator(),
+        random_transcript_id(),
         dealer_set.clone(),
         dealer_set.clone(),
         RegistryVersion::from(0),
@@ -36,20 +43,9 @@ pub fn create_params_for_dealers(
     .expect("Should be able to create IDKG params")
 }
 
-// A randomized way to get non-repeating IDs.
-pub fn transcript_id_generator() -> IDkgTranscriptId {
-    const SUBNET_ID: u64 = 314159;
-
-    let rng = &mut rand::thread_rng();
-    let id = rng.gen();
-    let subnet = SubnetId::from(PrincipalId::new_subnet_test_id(SUBNET_ID));
-
-    IDkgTranscriptId::new(subnet, id)
-}
-
 pub fn mock_unmasked_transcript_type() -> IDkgTranscriptType {
     IDkgTranscriptType::Unmasked(IDkgUnmaskedTranscriptOrigin::ReshareMasked(
-        transcript_id_generator(),
+        random_transcript_id(),
     ))
 }
 
@@ -73,7 +69,7 @@ pub fn mock_transcript(
     };
 
     IDkgTranscript {
-        transcript_id: transcript_id_generator(),
+        transcript_id: random_transcript_id(),
         receivers: IDkgReceivers::new(receivers).unwrap(),
         registry_version: RegistryVersion::from(314),
         verified_dealings: BTreeMap::new(),
@@ -83,98 +79,108 @@ pub fn mock_transcript(
     }
 }
 
-pub fn create_and_verify_dealing(
+pub fn create_signed_dealing(
     params: &IDkgTranscriptParams,
     crypto_components: &BTreeMap<NodeId, TempCryptoComponent>,
     dealer_id: NodeId,
-) -> IDkgDealing {
-    let dealing = crypto_for(dealer_id, crypto_components)
-        .create_dealing(params)
-        .unwrap_or_else(|error| {
-            panic!(
-                "failed to create IDkg dealing for {:?}: {:?}",
-                dealer_id, error
-            )
-        });
+) -> SignedIDkgDealing {
+    let dealer = crypto_for(dealer_id, crypto_components);
 
+    dealer.create_dealing(params).unwrap_or_else(|error| {
+        panic!(
+            "failed to create IDkg dealing for {:?}: {:?}",
+            dealer_id, error
+        )
+    })
+}
+
+pub fn create_and_verify_signed_dealing(
+    params: &IDkgTranscriptParams,
+    crypto_components: &BTreeMap<NodeId, TempCryptoComponent>,
+    dealer_id: NodeId,
+) -> SignedIDkgDealing {
+    let signed_dealing = create_signed_dealing(params, crypto_components, dealer_id);
+
+    let dealer = crypto_for(dealer_id, crypto_components);
     // Verify the dealing is publicly valid
-    let csp = crypto_for(dealer_id, crypto_components);
-    csp.verify_dealing_public(params, dealer_id, &dealing)
+    dealer
+        .verify_dealing_public(params, &signed_dealing)
         .expect("unexpectedly invalid dealing");
 
     // Verify the dealing is privately valid for all receivers
     for receiver in params.receivers().get() {
         crypto_for(*receiver, crypto_components)
-            .verify_dealing_private(params, dealer_id, &dealing)
+            .verify_dealing_private(params, &signed_dealing)
             .expect("unexpectedly invalid dealing (private verification)");
     }
 
-    dealing
+    signed_dealing
 }
 
-pub fn create_dealings(
+pub fn create_and_verify_signed_dealings(
     params: &IDkgTranscriptParams,
     crypto_components: &BTreeMap<NodeId, TempCryptoComponent>,
-) -> BTreeMap<NodeId, IDkgDealing> {
+) -> BTreeMap<NodeId, SignedIDkgDealing> {
     params
         .dealers()
         .get()
         .iter()
         .map(|node| {
-            let dealing = create_and_verify_dealing(params, crypto_components, *node);
+            let dealing = create_and_verify_signed_dealing(params, crypto_components, *node);
             (*node, dealing)
         })
         .collect()
 }
 
-pub fn multisign_dealing(
+pub fn batch_sign_signed_dealing(
     params: &IDkgTranscriptParams,
     crypto_components: &BTreeMap<NodeId, TempCryptoComponent>,
-    dealing: &IDkgDealing,
-) -> IDkgMultiSignedDealing {
-    let ecdsa_dealing = EcdsaDealing {
-        requested_height: Height::from(1),
-        idkg_dealing: dealing.clone(),
-    };
+    signed_dealing: SignedIDkgDealing,
+) -> BatchSignedIDkgDealing {
+    let signers = params.receivers().get();
+    batch_signature_from_signers(
+        params.registry_version(),
+        crypto_components,
+        signed_dealing,
+        signers,
+    )
+}
 
+pub fn batch_signature_from_signers(
+    registry_version: RegistryVersion,
+    crypto_components: &BTreeMap<NodeId, TempCryptoComponent>,
+    signed_dealing: SignedIDkgDealing,
+    signers: &BTreeSet<NodeId>,
+) -> BatchSignedIDkgDealing {
     let signature = {
-        let signatures: BTreeMap<_, _> = params
-            .receivers()
-            .get()
-            .iter()
-            .map(|signer_id| {
-                let signature = crypto_for(*signer_id, crypto_components)
-                    .sign_multi(&ecdsa_dealing, *signer_id, params.registry_version())
-                    .expect("failed to generate multi-signature share");
+        let mut signatures_map = BTreeMap::new();
+        for signer in signers {
+            let signature = crypto_for(*signer, crypto_components)
+                .sign_basic(&signed_dealing, *signer, registry_version)
+                .expect("failed to generate basic-signature");
+            signatures_map.insert(*signer, signature);
+        }
 
-                (*signer_id, signature)
-            })
-            .collect();
-
-        let combiner_id = random_receiver_id(params);
-        crypto_for(combiner_id, crypto_components)
-            .combine_multi_sig_individuals(signatures, params.registry_version())
-            .expect("failed to combine individual signatures")
+        BasicSignatureBatch { signatures_map }
     };
-
-    IDkgMultiSignedDealing {
+    BatchSignedIDkgDealing {
+        content: signed_dealing,
         signature,
-        signers: params.receivers().get().clone(),
-        dealing: ecdsa_dealing,
     }
 }
 
-pub fn multisign_dealings(
+pub fn batch_sign_signed_dealings(
     params: &IDkgTranscriptParams,
     crypto_components: &BTreeMap<NodeId, TempCryptoComponent>,
-    dealings: &BTreeMap<NodeId, IDkgDealing>,
-) -> BTreeMap<NodeId, IDkgMultiSignedDealing> {
-    dealings
-        .iter()
-        .map(|(dealer_id, dealing)| {
-            let multisigned_dealing = multisign_dealing(params, crypto_components, dealing);
+    signed_dealings: BTreeMap<NodeId, SignedIDkgDealing>,
+) -> BTreeMap<NodeId, BatchSignedIDkgDealing> {
+    signed_dealings
+        .into_iter()
+        .map(|(dealer_id, signed_dealing)| {
+            let multisigned_dealing =
+                batch_sign_signed_dealing(params, crypto_components, signed_dealing);
 
-            (*dealer_id, multisigned_dealing)
+            (dealer_id, multisigned_dealing)
         })
         .collect()
 }
@@ -182,7 +188,7 @@ pub fn multisign_dealings(
 pub fn create_transcript(
     params: &IDkgTranscriptParams,
     crypto_components: &BTreeMap<NodeId, TempCryptoComponent>,
-    dealings: &BTreeMap<NodeId, IDkgMultiSignedDealing>,
+    dealings: &BTreeMap<NodeId, BatchSignedIDkgDealing>,
     creator_id: NodeId,
 ) -> IDkgTranscript {
     crypto_for(creator_id, crypto_components)
@@ -235,11 +241,11 @@ pub fn load_input_transcripts(
     load_transcript(inputs.key_transcript(), crypto_components, loader_id);
 }
 
-pub fn load_previous_transcripts_and_create_dealing(
+pub fn load_previous_transcripts_and_create_signed_dealing(
     params: &IDkgTranscriptParams,
     crypto_components: &BTreeMap<NodeId, TempCryptoComponent>,
     loader_id: NodeId,
-) -> IDkgDealing {
+) -> SignedIDkgDealing {
     match params.operation_type() {
         IDkgTranscriptOperation::Random => (),
         IDkgTranscriptOperation::ReshareOfMasked(transcript)
@@ -252,21 +258,24 @@ pub fn load_previous_transcripts_and_create_dealing(
         }
     }
 
-    create_and_verify_dealing(params, crypto_components, loader_id)
+    create_and_verify_signed_dealing(params, crypto_components, loader_id)
 }
 
-pub fn load_previous_transcripts_and_create_dealings(
+pub fn load_previous_transcripts_and_create_signed_dealings(
     params: &IDkgTranscriptParams,
     crypto_components: &BTreeMap<NodeId, TempCryptoComponent>,
-) -> BTreeMap<NodeId, IDkgDealing> {
+) -> BTreeMap<NodeId, SignedIDkgDealing> {
     params
         .dealers()
         .get()
         .iter()
         .map(|node| {
-            let dealing =
-                load_previous_transcripts_and_create_dealing(params, crypto_components, *node);
-            (*node, dealing)
+            let signed_dealing = load_previous_transcripts_and_create_signed_dealing(
+                params,
+                crypto_components,
+                *node,
+            );
+            (*node, signed_dealing)
         })
         .collect()
 }
@@ -278,8 +287,8 @@ pub fn run_idkg_and_create_and_verify_transcript(
     params: &IDkgTranscriptParams,
     crypto_components: &BTreeMap<NodeId, TempCryptoComponent>,
 ) -> IDkgTranscript {
-    let dealings = load_previous_transcripts_and_create_dealings(params, crypto_components);
-    let multisigned_dealings = multisign_dealings(params, crypto_components, &dealings);
+    let dealings = load_previous_transcripts_and_create_signed_dealings(params, crypto_components);
+    let multisigned_dealings = batch_sign_signed_dealings(params, crypto_components, dealings);
     let transcript_creator = params.dealers().get().iter().next().unwrap();
     let transcript = create_transcript(
         params,
@@ -409,7 +418,7 @@ impl CanisterThresholdSigTestEnvironment {
         };
 
         for node_id in n_random_node_ids(num_of_nodes) {
-            env.create_crypto_component_with_mega_and_multisign_keys_in_registry(
+            env.create_crypto_component_with_sign_mega_and_multisign_keys_in_registry(
                 node_id,
                 registry_version,
             );
@@ -439,7 +448,7 @@ impl CanisterThresholdSigTestEnvironment {
         self.crypto_components.keys().cloned().collect()
     }
 
-    fn create_crypto_component_with_mega_and_multisign_keys_in_registry(
+    fn create_crypto_component_with_sign_mega_and_multisign_keys_in_registry(
         &mut self,
         node_id: NodeId,
         registry_version: RegistryVersion,
@@ -448,18 +457,34 @@ impl CanisterThresholdSigTestEnvironment {
             return;
         }
 
-        let registry = Arc::clone(&self.registry) as Arc<_>;
-        let (temp_crypto, node_keys) =
-            TempCryptoComponent::new_with_idkg_dealing_encryption_and_multisigning_keys_generation(
-                registry, node_id,
-            );
+        let temp_crypto = TempCryptoComponent::builder()
+            .with_registry(Arc::clone(&self.registry) as Arc<_>)
+            .with_node_id(node_id)
+            .with_keys(ic_crypto_temp_crypto::NodeKeysToGenerate {
+                generate_node_signing_keys: true,
+                generate_committee_signing_keys: true,
+                generate_dkg_dealing_encryption_keys: false,
+                generate_idkg_dealing_encryption_keys: true,
+                generate_tls_keys_and_certificate: false,
+            })
+            .build();
+        let node_keys = temp_crypto
+            .current_node_public_keys()
+            .expect("Failed to retrieve node public keys");
         self.crypto_components.insert(node_id, temp_crypto);
 
         self.registry_data
             .add(
+                &make_crypto_node_key(node_id, KeyPurpose::NodeSigning),
+                registry_version,
+                node_keys.node_signing_public_key,
+            )
+            .expect("failed to add committee public key to registry");
+        self.registry_data
+            .add(
                 &make_crypto_node_key(node_id, KeyPurpose::CommitteeSigning),
                 registry_version,
-                Some(node_keys.multisign_pubkey),
+                node_keys.committee_signing_public_key,
             )
             .expect("failed to add committee public key to registry");
 
@@ -467,7 +492,7 @@ impl CanisterThresholdSigTestEnvironment {
             .add(
                 &make_crypto_node_key(node_id, KeyPurpose::IDkgMEGaEncryption),
                 registry_version,
-                Some(node_keys.mega_pubkey),
+                node_keys.idkg_dealing_encryption_public_key,
             )
             .expect("Could not add MEGa public key to registry");
     }
@@ -517,16 +542,17 @@ pub fn set_of_nodes(ids: &[u64]) -> BTreeSet<NodeId> {
 }
 
 fn random_registry_version() -> RegistryVersion {
-    RegistryVersion::new(thread_rng().gen_range(1, u32::MAX) as u64)
+    RegistryVersion::new(thread_rng().gen_range(1..u32::MAX) as u64)
 }
 
 fn random_transcript_id() -> IDkgTranscriptId {
     let mut rng = thread_rng();
 
-    let id = rng.gen::<usize>();
+    let id = rng.gen::<u64>();
     let subnet = SubnetId::from(PrincipalId::new_subnet_test_id(rng.gen::<u64>()));
+    let height = Height::from(rng.gen::<u64>());
 
-    IDkgTranscriptId::new(subnet, id)
+    IDkgTranscriptId::new(subnet, id, height)
 }
 
 fn n_random_node_ids(n: usize) -> BTreeSet<NodeId> {
@@ -545,28 +571,27 @@ fn crypto_for<T>(node_id: NodeId, crypto_components: &BTreeMap<NodeId, T>) -> &T
 }
 
 pub fn random_receiver_id(params: &IDkgTranscriptParams) -> NodeId {
-    *params
-        .receivers()
-        .get()
-        .iter()
-        .choose(&mut thread_rng())
+    *random_receiver_id_excluding_set(params.receivers(), &BTreeSet::new(), &mut thread_rng())
         .expect("receivers is empty")
 }
 
 pub fn random_receiver_id_excluding(receivers: &IDkgReceivers, exclusion: NodeId) -> NodeId {
-    if receivers.get().len() == 1 {
-        let (_receiver_idx, receiver_id) = receivers.iter().next().unwrap();
-        if receiver_id == exclusion {
-            panic!("the only possible receiver is excluded")
-        }
+    let mut excluded_receivers = BTreeSet::new();
+    excluded_receivers.insert(exclusion);
+    *random_receiver_id_excluding_set(receivers, &excluded_receivers, &mut thread_rng())
+        .expect("the only possible receiver is excluded")
+}
+
+pub fn random_receiver_id_excluding_set<'a, R: CryptoRng + RngCore>(
+    receivers: &'a IDkgReceivers,
+    excluded_receivers: &'a BTreeSet<NodeId>,
+    rng: &mut R,
+) -> Option<&'a NodeId> {
+    let acceptable_receivers: Vec<_> = receivers.get().difference(excluded_receivers).collect();
+    if acceptable_receivers.is_empty() {
+        return None;
     }
-    let rng = &mut thread_rng();
-    loop {
-        let random_receiver_id = *receivers.get().iter().choose(rng).expect("receivers empty");
-        if random_receiver_id != exclusion {
-            return random_receiver_id;
-        }
-    }
+    Some(acceptable_receivers[rng.gen_range(0..acceptable_receivers.len())])
 }
 
 pub fn random_dealer_id(params: &IDkgTranscriptParams) -> NodeId {
@@ -578,45 +603,502 @@ pub fn random_dealer_id(params: &IDkgTranscriptParams) -> NodeId {
         .expect("dealers is empty")
 }
 
+pub fn random_dealer_id_excluding(transcript: &IDkgTranscript, exclusion: NodeId) -> NodeId {
+    let mut rng = thread_rng();
+    let excluded_index = transcript
+        .index_for_dealer_id(exclusion)
+        .expect("excluded node not a dealer");
+    let dealer_indexes = transcript
+        .verified_dealings
+        .keys()
+        .cloned()
+        .filter(|x| x != &excluded_index)
+        .collect::<Vec<u32>>();
+
+    let node_index = dealer_indexes.choose(&mut rng).expect("dealing is empty");
+    transcript
+        .dealer_id_for_index(*node_index)
+        .expect("dealer index not in transcript")
+}
+
 /// Corrupts the dealing for a single randomly picked receiver.
 /// node_id is the self Node Id. The shares for the receivers specified
-/// in exclude_receivers won't be corrupted.
+/// in excluded_receivers won't be corrupted.
 /// The transcript params used to create the dealing is passed in with the
 /// dealing to be corrupted.
-pub fn corrupt_idkg_dealing<R: CryptoRng + RngCore>(
-    idkg_dealing: &IDkgDealing,
+pub fn corrupt_signed_idkg_dealing<R: CryptoRng + RngCore, T: BasicSigner<IDkgDealing>>(
+    idkg_dealing: SignedIDkgDealing,
     transcript_params: &IDkgTranscriptParams,
-    exclude_receivers: &BTreeSet<NodeId>,
+    basic_signer: &T,
+    signer_id: NodeId,
+    excluded_receivers: &BTreeSet<NodeId>,
     rng: &mut R,
-) -> Result<IDkgDealing, CorruptIDkgDealingError> {
-    let internal_dealing = IDkgDealingInternal::deserialize(&idkg_dealing.internal_dealing_raw)
-        .map_err(|e| CorruptIDkgDealingError::SerializationError(format!("{:?}", e)))?;
-
-    let receivers: Vec<_> = transcript_params
-        .receivers()
-        .get()
-        .difference(exclude_receivers)
-        .collect();
-    if receivers.is_empty() {
-        return Err(CorruptIDkgDealingError::NoReceivers);
-    }
-    let receiver = receivers[rng.gen_range(0, receivers.len())];
+) -> Result<SignedIDkgDealing, CorruptSignedIDkgDealingError> {
+    let receiver =
+        random_receiver_id_excluding_set(transcript_params.receivers(), excluded_receivers, rng)
+            .ok_or(CorruptSignedIDkgDealingError::NoReceivers)?;
     let node_index = transcript_params.receivers().position(*receiver).unwrap();
+    let seed = Seed::from_rng(rng);
 
-    let corrupted_dealing = corrupt_dealing(&internal_dealing, &[node_index], rng)
-        .map_err(|e| CorruptIDkgDealingError::FailedToCorruptDealing(format!("{:?}", e)))?;
-    let internal_dealing_raw = corrupted_dealing
-        .serialize()
-        .map_err(|e| CorruptIDkgDealingError::SerializationError(format!("{:?}", e)))?;
-    Ok(IDkgDealing {
-        transcript_id: idkg_dealing.transcript_id,
-        dealer_id: idkg_dealing.dealer_id,
-        internal_dealing_raw,
-    })
+    Ok(idkg_dealing
+        .into_builder()
+        .corrupt_internal_dealing_raw_by_changing_ciphertexts(&[node_index], seed)
+        .build_with_signature(transcript_params, basic_signer, signer_id))
 }
+
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub enum CorruptIDkgDealingError {
+pub enum CorruptSignedIDkgDealingError {
     SerializationError(String),
     FailedToCorruptDealing(String),
     NoReceivers,
+}
+
+pub fn generate_tecdsa_protocol_inputs(
+    env: &CanisterThresholdSigTestEnvironment,
+    key_transcript: &IDkgTranscript,
+    message_hash: &[u8],
+    nonce: Randomness,
+    derivation_path: ExtendedDerivationPath,
+    algorithm_id: AlgorithmId,
+) -> ThresholdEcdsaSigInputs {
+    let quadruple = generate_presig_quadruple(env, algorithm_id, key_transcript);
+
+    ThresholdEcdsaSigInputs::new(
+        &derivation_path,
+        message_hash,
+        nonce,
+        quadruple,
+        key_transcript.clone(),
+    )
+    .expect("failed to create signature inputs")
+}
+
+pub fn run_tecdsa_protocol(
+    env: &CanisterThresholdSigTestEnvironment,
+    sig_inputs: &ThresholdEcdsaSigInputs,
+) -> ThresholdEcdsaCombinedSignature {
+    let sig_shares: BTreeMap<_, _> = sig_inputs
+        .receivers()
+        .get()
+        .iter()
+        .map(|&signer_id| {
+            load_input_transcripts(&env.crypto_components, signer_id, sig_inputs);
+
+            let sig_share = crypto_for(signer_id, &env.crypto_components)
+                .sign_share(sig_inputs)
+                .expect("failed to create sig share");
+            (signer_id, sig_share)
+        })
+        .collect();
+
+    // Verify that each signature share can be verified
+    let verifier_id = random_node_id_excluding(sig_inputs.receivers().get());
+    let verifier_crypto_component = TempCryptoComponent::builder()
+        .with_registry(Arc::clone(&env.registry) as Arc<_>)
+        .with_node_id(verifier_id)
+        .build();
+    for (signer_id, sig_share) in sig_shares.iter() {
+        assert!(verifier_crypto_component
+            .verify_sig_share(*signer_id, sig_inputs, sig_share)
+            .is_ok());
+    }
+
+    let combiner_crypto_component = TempCryptoComponent::builder()
+        .with_registry(Arc::clone(&env.registry) as Arc<_>)
+        .with_node_id(verifier_id)
+        .build();
+    combiner_crypto_component
+        .combine_sig_shares(sig_inputs, &sig_shares)
+        .expect("Failed to generate signature")
+}
+
+/// Corrupts valid instances of a given type containing some binary data
+/// (e.g., signatures) for testing purposes.
+///
+/// Some types that we want to corrupt are immutable and that's the reason why this trait does
+/// not mutate its parameter but rather produces a new instance of the given type.
+pub trait CorruptBytes {
+    /// The type to corrupt.
+    type Type;
+
+    /// Produces a new instance where a bit was flipped.
+    /// Which bit was flipped is an implementation's detail.
+    /// The produced instance is *guaranteed* to be different from the original one.
+    ///
+    /// # Panics
+    /// If a bit cannot be flipped (e.g., when the binary data contained by the instance is empty)
+    /// ```should_panic
+    /// # use ic_crypto_test_utils_canister_threshold_sigs::CorruptBytes;
+    /// # use ic_types::crypto::BasicSig;
+    /// BasicSig(vec![]).clone_with_bit_flipped();
+    /// ```
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use ic_crypto_test_utils_canister_threshold_sigs::CorruptBytes;
+    /// # use ic_types::crypto::BasicSig;
+    /// let original_signature=BasicSig(vec![0b00000000]);
+    /// let corrupted_signature=original_signature.clone_with_bit_flipped();
+    ///
+    /// assert_ne!(original_signature, corrupted_signature);
+    /// assert_eq!(corrupted_signature, BasicSig(vec![0b00000001]))
+    /// ```
+    ///
+    fn clone_with_bit_flipped(&self) -> Self::Type;
+}
+
+impl<T> CorruptBytes for BasicSignature<T> {
+    type Type = Self;
+
+    fn clone_with_bit_flipped(&self) -> Self {
+        let corrupted_signature = self.signature.clone_with_bit_flipped();
+        BasicSignature {
+            signature: corrupted_signature,
+            signer: self.signer,
+        }
+    }
+}
+
+impl<T> CorruptBytes for BasicSigOf<T> {
+    type Type = Self;
+
+    fn clone_with_bit_flipped(&self) -> Self {
+        let corrupted_signature = self.get_ref().clone_with_bit_flipped();
+        BasicSigOf::new(corrupted_signature)
+    }
+}
+
+impl CorruptBytes for BasicSig {
+    type Type = Self;
+
+    fn clone_with_bit_flipped(&self) -> Self {
+        BasicSig(self.0.clone_with_bit_flipped())
+    }
+}
+
+impl CorruptBytes for Vec<u8> {
+    type Type = Self;
+
+    fn clone_with_bit_flipped(&self) -> Self {
+        assert!(!self.is_empty(), "cannot flip bit in empty vector");
+        let mut bytes = self.clone();
+        *bytes.last_mut().expect("cannot be empty") ^= 1;
+        bytes
+    }
+}
+
+impl<const N: usize> CorruptBytes for [u8; N] {
+    type Type = Self;
+
+    fn clone_with_bit_flipped(&self) -> Self::Type {
+        let mut bytes = *self;
+        bytes[N - 1] ^= 1;
+        bytes
+    }
+}
+
+impl CorruptBytes for ThresholdEcdsaSigShare {
+    type Type = Self;
+
+    fn clone_with_bit_flipped(&self) -> Self::Type {
+        ThresholdEcdsaSigShare {
+            sig_share_raw: self.sig_share_raw.clone_with_bit_flipped(),
+        }
+    }
+}
+
+impl CorruptBytes for Randomness {
+    type Type = Self;
+
+    fn clone_with_bit_flipped(&self) -> Self::Type {
+        Randomness::from(self.get().clone_with_bit_flipped())
+    }
+}
+
+/// Corrupts a collection of elements containing each some binary data.
+///
+/// A single element in the collection can be corrupted or all of them.
+pub trait CorruptBytesCollection {
+    /// Mutates a collection of elements, each containing some binary data,
+    /// by flipping a bit in the data held by a *single* element.
+    /// Which element in the collection was modified or which bit in the modified element
+    /// was flipped is an implementation's detail.
+    ///
+    /// # Panics
+    /// If the collection is empty
+    /// ```should_panic
+    /// # use std::collections::BTreeMap;
+    /// # use ic_crypto_test_utils_canister_threshold_sigs::CorruptBytesCollection;
+    /// # use ic_types::signature::BasicSignatureBatch;
+    /// let mut signatures: BasicSignatureBatch<String> = BasicSignatureBatch {signatures_map: BTreeMap::new()};
+    /// signatures.flip_a_bit_in_one();
+    /// ```
+    ///
+    /// # Examples
+    /// ```
+    /// # use ic_crypto_test_utils_canister_threshold_sigs::CorruptBytesCollection;
+    /// # use ic_types::{NodeId, PrincipalId};
+    /// # use ic_types::crypto::{BasicSig, BasicSigOf};
+    /// # use ic_types::signature::BasicSignatureBatch;
+    /// let  node_id1 = NodeId::from(PrincipalId::new_node_test_id(1));
+    /// let  node_id2 = NodeId::from(PrincipalId::new_node_test_id(2));
+    /// let mut signatures: BasicSignatureBatch<String> = BasicSignatureBatch {
+    ///     signatures_map: vec![
+    ///         (node_id1, BasicSigOf::new(BasicSig(vec![0b00000000]))),
+    ///         (node_id2, BasicSigOf::new(BasicSig(vec![0b11111111]))),
+    ///     ]
+    ///     .drain(..)
+    ///     .collect(),
+    /// };
+    ///
+    /// signatures.flip_a_bit_in_one();
+    ///
+    /// assert_eq!(signatures.signatures_map[&node_id1].get_ref(), &BasicSig(vec![0b00000001]));
+    /// assert_eq!(signatures.signatures_map[&node_id2].get_ref(), &BasicSig(vec![0b11111111]));
+    /// ```
+    fn flip_a_bit_in_one(&mut self);
+
+    /// Mutates a collection of elements, each containing some binary data,
+    /// by flipping a bit in the data held by *every* element.
+    /// Which bit was flipped is an implementation's detail.
+    ///
+    /// # Panics
+    /// If the collection is empty
+    /// ```should_panic
+    /// # use std::collections::BTreeMap;
+    /// # use ic_crypto_test_utils_canister_threshold_sigs::CorruptBytesCollection;
+    /// # use ic_types::signature::BasicSignatureBatch;
+    /// let mut signatures: BasicSignatureBatch<String> = BasicSignatureBatch {signatures_map: BTreeMap::new()};
+    /// signatures.flip_a_bit_in_all();
+    /// ```
+    ///
+    /// # Examples
+    /// ```
+    /// # use ic_crypto_test_utils_canister_threshold_sigs::CorruptBytesCollection;
+    /// # use ic_types::{NodeId, PrincipalId};
+    /// # use ic_types::crypto::{BasicSig, BasicSigOf};
+    /// # use ic_types::signature::BasicSignatureBatch;
+    /// let  node_id1 = NodeId::from(PrincipalId::new_node_test_id(1));
+    /// let  node_id2 = NodeId::from(PrincipalId::new_node_test_id(2));
+    /// let mut signatures: BasicSignatureBatch<String> = BasicSignatureBatch {
+    ///     signatures_map: vec![
+    ///         (node_id1, BasicSigOf::new(BasicSig(vec![0b00000000]))),
+    ///         (node_id2, BasicSigOf::new(BasicSig(vec![0b11111111]))),
+    ///     ]
+    ///     .drain(..)
+    ///     .collect(),
+    /// };
+    ///
+    /// signatures.flip_a_bit_in_all();
+    ///
+    /// assert_eq!(signatures.signatures_map[&node_id1].get_ref(), &BasicSig(vec![0b00000001]));
+    /// assert_eq!(signatures.signatures_map[&node_id2].get_ref(), &BasicSig(vec![0b11111110]));
+    /// ```
+    fn flip_a_bit_in_all(&mut self);
+}
+
+impl<T> CorruptBytesCollection for BasicSignatureBatch<T> {
+    fn flip_a_bit_in_one(&mut self) {
+        let signature = self
+            .signatures_map
+            .values_mut()
+            .next()
+            .expect("cannot flip a bit of a signature in an empty collection");
+        *signature = signature.clone_with_bit_flipped();
+    }
+
+    fn flip_a_bit_in_all(&mut self) {
+        assert!(
+            !self.signatures_map.is_empty(),
+            "cannot flip a bit of a signature in an empty collection"
+        );
+        self.signatures_map
+            .values_mut()
+            .for_each(|signature| *signature = signature.clone_with_bit_flipped());
+    }
+}
+
+impl<T> CorruptBytesCollection for Signed<T, BasicSignatureBatch<T>> {
+    fn flip_a_bit_in_one(&mut self) {
+        self.signature.flip_a_bit_in_one();
+    }
+
+    fn flip_a_bit_in_all(&mut self) {
+        self.signature.flip_a_bit_in_all();
+    }
+}
+
+pub trait IntoBuilder {
+    type BuilderType;
+    fn into_builder(self) -> Self::BuilderType;
+}
+
+pub struct IDkgComplaintBuilder {
+    transcript_id: IDkgTranscriptId,
+    dealer_id: NodeId,
+    internal_complaint_raw: Vec<u8>,
+}
+
+impl IDkgComplaintBuilder {
+    pub fn build(self) -> IDkgComplaint {
+        IDkgComplaint {
+            transcript_id: self.transcript_id,
+            dealer_id: self.dealer_id,
+            internal_complaint_raw: self.internal_complaint_raw,
+        }
+    }
+
+    pub fn with_transcript_id(mut self, new_transcript_id: IDkgTranscriptId) -> Self {
+        self.transcript_id = new_transcript_id;
+        self
+    }
+
+    pub fn with_dealer_id(mut self, new_dealer_id: NodeId) -> Self {
+        self.dealer_id = new_dealer_id;
+        self
+    }
+}
+
+impl IntoBuilder for IDkgComplaint {
+    type BuilderType = IDkgComplaintBuilder;
+
+    fn into_builder(self) -> Self::BuilderType {
+        IDkgComplaintBuilder {
+            transcript_id: self.transcript_id,
+            dealer_id: self.dealer_id,
+            internal_complaint_raw: self.internal_complaint_raw,
+        }
+    }
+}
+
+pub struct SignedIDkgDealingBuilder {
+    content: IDkgDealing,
+    signature: BasicSignature<IDkgDealing>,
+}
+
+impl SignedIDkgDealingBuilder {
+    pub fn build(self) -> SignedIDkgDealing {
+        Signed {
+            content: self.content,
+            signature: self.signature,
+        }
+    }
+    pub fn corrupt_transcript_id(mut self) -> Self {
+        self.content = IDkgDealing {
+            transcript_id: self.content.transcript_id.increment(),
+            ..self.content
+        };
+        self
+    }
+
+    pub fn build_with_signature<T: BasicSigner<IDkgDealing>>(
+        mut self,
+        params: &IDkgTranscriptParams,
+        basic_signer: &T,
+        signer_id: NodeId,
+    ) -> SignedIDkgDealing {
+        self.signature = BasicSignature {
+            signature: basic_signer
+                .sign_basic(&self.content, signer_id, params.registry_version())
+                .expect("Failed to sign a dealing"),
+            signer: signer_id,
+        };
+        self.build()
+    }
+
+    pub fn corrupt_signature(mut self) -> Self {
+        self.signature = self.signature.clone_with_bit_flipped();
+        self
+    }
+
+    pub fn with_dealer_id(mut self, dealer_id: NodeId) -> Self {
+        self.signature = BasicSignature {
+            signer: dealer_id,
+            ..self.signature
+        };
+        self
+    }
+
+    pub fn corrupt_internal_dealing_raw_by_flipping_bit(mut self) -> Self {
+        self.content = IDkgDealing {
+            internal_dealing_raw: self.content.internal_dealing_raw.clone_with_bit_flipped(),
+            ..self.content
+        };
+        self
+    }
+
+    pub fn corrupt_internal_dealing_raw_by_changing_ciphertexts(
+        mut self,
+        corruption_targets: &[NodeIndex],
+        seed: Seed,
+    ) -> Self {
+        let internal_dealing = IDkgDealingInternal::deserialize(&self.content.internal_dealing_raw)
+            .expect("error deserializing iDKG dealing internal");
+        let corrupted_dealing = corrupt_dealing(&internal_dealing, corruption_targets, seed)
+            .expect("error corrupting dealing");
+        self.content = IDkgDealing {
+            internal_dealing_raw: corrupted_dealing
+                .serialize()
+                .expect("error serializing corrupted dealing"),
+            ..self.content
+        };
+        self
+    }
+}
+
+impl IntoBuilder for SignedIDkgDealing {
+    type BuilderType = SignedIDkgDealingBuilder;
+
+    fn into_builder(self) -> Self::BuilderType {
+        SignedIDkgDealingBuilder {
+            content: self.content,
+            signature: self.signature,
+        }
+    }
+}
+
+pub struct ThresholdEcdsaSigInputsBuilder {
+    derivation_path: ExtendedDerivationPath,
+    hashed_message: Vec<u8>,
+    nonce: Randomness,
+    presig_quadruple: PreSignatureQuadruple,
+    key_transcript: IDkgTranscript,
+}
+
+impl ThresholdEcdsaSigInputsBuilder {
+    pub fn build(self) -> ThresholdEcdsaSigInputs {
+        ThresholdEcdsaSigInputs::new(
+            &self.derivation_path,
+            &self.hashed_message,
+            self.nonce,
+            self.presig_quadruple,
+            self.key_transcript,
+        )
+        .expect("invalid threshold ECDSA sig inputs")
+    }
+
+    pub fn corrupt_hashed_message(mut self) -> Self {
+        self.hashed_message = self.hashed_message.clone_with_bit_flipped();
+        self
+    }
+
+    pub fn corrupt_nonce(mut self) -> Self {
+        self.nonce = self.nonce.clone_with_bit_flipped();
+        self
+    }
+}
+
+impl IntoBuilder for ThresholdEcdsaSigInputs {
+    type BuilderType = ThresholdEcdsaSigInputsBuilder;
+
+    fn into_builder(self) -> Self::BuilderType {
+        ThresholdEcdsaSigInputsBuilder {
+            derivation_path: self.derivation_path().clone(),
+            hashed_message: Vec::from(self.hashed_message()),
+            nonce: *self.nonce(),
+            presig_quadruple: self.presig_quadruple().clone(),
+            key_transcript: self.key_transcript().clone(),
+        }
+    }
 }

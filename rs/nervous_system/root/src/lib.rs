@@ -1,4 +1,4 @@
-use candid::{CandidType, Deserialize};
+use candid::{CandidType, Deserialize, Encode};
 use dfn_core::api::{call, CanisterId};
 use ic_base_types::PrincipalId;
 use ic_crypto_sha::Sha256;
@@ -164,7 +164,7 @@ impl ChangeCanisterProposal {
             mode,
             canister_id,
             wasm_module: Vec::new(),
-            arg: Vec::new(),
+            arg: Encode!().unwrap(),
             compute_allocation: None,
             memory_allocation: Some(candid::Nat::from(default_memory_allocation)),
             query_allocation: None,
@@ -306,6 +306,7 @@ pub async fn install_code(proposal: ChangeCanisterProposal) -> ic_cdk::api::call
         compute_allocation: proposal.compute_allocation,
         memory_allocation: proposal.memory_allocation,
         query_allocation: proposal.query_allocation,
+        sender_canister_version: None,
     };
     // Warning: despite dfn_core::call returning a Result, it actually traps when
     // the callee traps! Use the public cdk instead, which does not have this
@@ -384,7 +385,7 @@ where
     }
 }
 
-pub async fn canister_status((canister_id_record,): (CanisterIdRecord,)) -> CanisterStatusResult {
+pub async fn canister_status(canister_id_record: CanisterIdRecord) -> CanisterStatusResult {
     call(
         IC_00,
         "canister_status",

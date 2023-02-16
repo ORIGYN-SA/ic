@@ -12,6 +12,7 @@ use std::collections::HashMap;
 use strum::IntoEnumIterator;
 
 use ic_base_types::PrincipalId;
+use ic_nervous_system_common::stable_mem_utils::BufferedStableMemWriter;
 use ic_nns_common::pb::v1::{NeuronId as NeuronIdProto, ProposalId as ProposalIdProto};
 use ic_nns_governance::governance::{
     HEAP_SIZE_SOFT_LIMIT_IN_WASM32_PAGES, MAX_NUMBER_OF_NEURONS,
@@ -19,7 +20,6 @@ use ic_nns_governance::governance::{
 };
 use ic_nns_governance::pb::v1::proposal::Action;
 use ic_nns_governance::pb::v1::*;
-use ic_nns_governance::stable_mem_utils::BufferedStableMemWriter;
 use ic_nns_governance::{
     governance::{MAX_FOLLOWEES_PER_TOPIC, MAX_NEURON_RECENT_BALLOTS},
     pb::v1::{
@@ -27,7 +27,7 @@ use ic_nns_governance::{
         NetworkEconomics as NetworkEconomicsProto, Neuron, Proposal, ProposalData, Topic,
     },
 };
-use ledger_canister::Subaccount;
+use icp_ledger::Subaccount;
 
 const LOG_PREFIX: &str = "[Governance mem test] ";
 
@@ -36,8 +36,9 @@ const LOG_PREFIX: &str = "[Governance mem test] ";
 /// much less memory than what is actually left when the soft limit is reached.
 /// We choose test with having 1/3 of the free memory.
 const MAX_POSSIBLE_HEAP_SIZE_IN_PAGES: usize = 4 * 1024 * 1024 / 64;
-const TEST_TARGET_HEAP_SIZE_IN_NUM_PAGES: usize = MAX_POSSIBLE_HEAP_SIZE_IN_PAGES
-    - ((MAX_POSSIBLE_HEAP_SIZE_IN_PAGES - HEAP_SIZE_SOFT_LIMIT_IN_WASM32_PAGES) / 3);
+const TEST_TARGET_HEAP_SIZE_IN_NUM_PAGES: usize = (MAX_POSSIBLE_HEAP_SIZE_IN_PAGES
+    - (MAX_POSSIBLE_HEAP_SIZE_IN_PAGES - HEAP_SIZE_SOFT_LIMIT_IN_WASM32_PAGES))
+    / 3;
 
 /// Total number of neurons the governance will have.
 const TEST_NUM_NEURONS: u64 = MAX_NUMBER_OF_NEURONS as u64;
@@ -164,12 +165,14 @@ fn populate_canister_state() {
         )
     );
 
-    for i in 0..TEST_NUM_SETTLED_PROPOSALS_PER_TOPIC {
+    let mut proposal_id = 0_u64;
+    for _ in 0..TEST_NUM_SETTLED_PROPOSALS_PER_TOPIC {
         for topic in topic_iterator() {
             // Closed proposals don't have ballots
             proto
                 .proposals
-                .insert(i as u64, allocate_proposal_data(false, topic));
+                .insert(proposal_id, allocate_proposal_data(false, topic));
+            proposal_id += 1;
         }
     }
     let num_settled_proposals = proto.proposals.len();
@@ -190,16 +193,17 @@ fn populate_canister_state() {
     // through them
     let topics: Vec<Topic> = topic_iterator().collect();
     let mut topic_iter = topics.iter().cycle();
-    for i in num_settled_proposals..num_settled_proposals + TEST_NUM_NOT_YET_SETTLED_PROPOSALS {
+    for _ in num_settled_proposals..num_settled_proposals + TEST_NUM_NOT_YET_SETTLED_PROPOSALS {
         if heap_size_num_pages() > TEST_TARGET_HEAP_SIZE_IN_NUM_PAGES {
             break;
         }
         // Open proposals have ballots, for the worst case we assume every neuron votes
         // on every open proposal
         proto.proposals.insert(
-            i as u64,
+            proposal_id,
             allocate_proposal_data(true, *topic_iter.next().unwrap()),
         );
+        proposal_id += 1;
     }
 
     let num_unsettled_proposals = proto.proposals.len() - num_settled_proposals;
@@ -261,10 +265,13 @@ fn allocate_neuron(id: u64) -> Neuron {
         kyc_verified: false,
         transfer: None,
         maturity_e8s_equivalent: 0,
+        staked_maturity_e8s_equivalent: None,
+        auto_stake_maturity: None,
         dissolve_state: Some(neuron::DissolveState::WhenDissolvedTimestampSeconds(0)),
         not_for_profit: true,
         joined_community_fund_timestamp_seconds: None,
         known_neuron_data: None,
+        spawn_at_timestamp_seconds: None,
     }
 }
 

@@ -3,226 +3,235 @@
 Note: For an overview over the testing terminology, please visit [this
 notion-page](https://www.notion.so/Testing-Terminology-8cc0735dfcd945959f8d47caedf058b5).
 
+**Note**: If you want to add a system test, please jump right to the section
+about [bazelified system tests](How-can-I-run-system-tests-in-Bazel?).
+
 ## System tests
 
-System Tests (declared in `rs/tests/bin/prod_test_driver.rs`) drive all
-components in combination in the form of a functioning IC. The test API is
-implemented in Rust.
+System tests can involve all components in combination in the form of a
+functioning IC. The test API is implemented in Rust.
 
-In System Tests, every node is instantiated as a virtual machine running the
-[ic-os](https://sourcegraph.com/github.com/dfinity/ic/-/tree/ic-os/guestos). The
-test driver allocates virtual machines using a backend service called
-[Farm](https://github.com/dfinity-lab/infra/tree/master/farm/). Resources
-allocated with farm are collected after a maximum time-to-live.
+The system test driver allows for the execution of arbitrary setup and test
+functions written in Rust. However, the accompanying APIs are geared towards
+instantiating and managing virtual machines on a backend service called
+[Farm](https://github.com/dfinity-lab/infra/tree/master/farm/). Farm actively
+manages all allocated resources; e.g., all virtual machines allocated
+by the test driver are collected after the test driver finishes. When deploying
+an Internet Computer instance, every node is instantiated as a virtual machine
+running the
+[ic-os](https://sourcegraph.com/github.com/dfinity/ic/-/tree/ic-os/guestos).
 
-System Tests are organized in a hierarchy: every test belongs to a _pot_. A pot
-declares the test system (Internet Computer under test). Multiple tests can run
-using the same test instance (of a pot) either in parallel or in sequence. Pots
-in turn are grouped into _test suites_.
+### How can I write system tests in Bazel?
+T&V team is working actively on the
+[bazelification](https://docs.google.com/document/d/1RGyvOkRluFsqroDmyM9hfr37VG-nCrTOrutQnStJsco/edit#heading=h.fcajjuvgc2dn)
+of all system tests. When you want to write a new test or when you own system
+tests declared in `rs/tests/bin/prod_test_driver.rs`, take a look at the linked
+document.
 
-### How can I run system tests?
-
-When running system tests, the base ic-os version has to be set manually.
-Currently, only images built by CI can be used. Thus, you first need to find out
-the `IC_VERSION_ID` that belongs to the image that you want to use. Note that
-alongside the image itself, also all other build artifacts that belong to that
-version are downloaded from CI/CD (NNS canisters, auxiliary binaries, etc.).
-When run locally, only the test driver (including tests) is re-compiled and
-includes local changes.
-
-You have two options to find the desired `IC_VERSION_ID`:
-
-1. To obtain a GuestOS image version for your commit, please push your branch
-to origin and create an MR. See http://go/guestos-image-version
-1. To obtain the latest GuestOS image version for `origin/master` (e.g., if your
-changes are withing `ic/rs/tests`), use the following command (Note: this
-command is not guaranteed to be deterministic):
-
-```bash
-ic/gitlab-ci/src/artifacts/newest_sha_with_disk_image.sh origin/master
+### How can I run system tests in Bazel?
+In order to run system tests, enter the build docker container:
+```
+/ic$ ./gitlab-ci/container/container-run.sh
+```
+To launch a test target (`my_test_target` in this case) within the docker run:
+```
+devenv-container$ bazel test --config=systest //rs/tests:my_test_target
 ```
 
-For example, running all tests in a test suite `hourly` can be achieved as
-follows:
+In the docker container, you can also use `ict` to start tests.
 
-```bash
-IC_VERSION_ID=<version> ./run-system-tests.py --suite hourly
+```
+ict test //rs/tests:my_test_target
 ```
 
-The command line options `include-pattern` and `exclude-pattern` allow the
-inclusion and exclusion of tests based on regular expressions. See also the
-`--help` message for more information.
+At some point in the future, ict should be the only thing a user needs to know.
+I.e., she can explore all options by interacting with ict and there is no need
+for a README here no more. ;-)
 
-For example, running the basic health test can be achieved using the following
-command:
+# How to write a system test
 
-```bash
-IC_VERSION_ID=<version> ./run-system-tests.py --suite hourly --include-pattern basic_health_test
+Before progressing, it is worth understanding how system tests work
+conceptually and what makes them different from unit tests.
+
+System tests are a form of end-to-end tests. Currently, they integrate all
+layers of the Internet Computer software stack with the exception of the Host
+OS. E.g., it is not possible at the moment to test host os upgrades.
+
+Technically, the testing infrastructure can be used to deploy any kind of
+virtual machine (e.g. auxiliary services like rosetta node), provided the images
+are available in the correct format. Typically, however, a setup function of a
+pot is used to instantiate one Internet Computer instance and possibly some
+auxiliary virtual machines.
+
+When instantiating an IC, the IC is «bootstrapped». For all intends and
+purposes, this is the same procedure as was used when mainnet was launched:
+`ic-prep` is used to generate the initial registry reflecting the initial
+topology of the network.
+
+## Test Environment
+
+A *test environment* is essentially a directory structure that contains
+information about the environment in which the test is executed. For example, it
+contains infrastructure configuration, such as the URL where Farm is located.
+Or, when a Internet Computer is deployed in the setup of a pot, the
+corresponding topology data is stored in the test env—which can then be picked
+up by the tests.
+
+From the point of view of the test driver, both a test and a setup function are
+just procedures that operate on the test environment. They both have the
+same signature:
+
+```rust
+fn setup(test_env: TestEnv) { /* ... */ }
+fn test(test_env: TestEnv) { /* ... */ }
 ```
 
-If you have further questions, please contact the testing team on #eng-testing.
+For example, when an Internet Computer is instantiated, information about the
+internet computer is stored in the test environment which can then be picked up
+in the test:
 
-## Legacy System Tests
+```rust
+fn setup(test_env: TestEnv) {
+	InternetComputer::new()
+	    .with_subnet(/* ... */)
+		.setup_and_start(&test_env); // (1)
+}
 
-The `rs/tests`-crate is also host to so-called legacy system tests declared in
-`rs/tests/src/main.rs`. The tests use largely the same API, however, the nodes
-are instantiated as processes that are launched on the same operating system as
-the test driver.
+fn test(test_env: TestEnv) {
+	use crate::test_env_api::*;
+	let root_subnet = test_env
+		.topology_snapshot()         // (2)
+		.root_subnet();              // (3)
+}
+```
 
-**Note**: Legacy system tests are **not** supported on Darwin!
-### My test is failing/flaky, what do I do?
+The module
+[`test_env_api`](https://sourcegraph.com/github.com/dfinity/ic/-/blob/rs/tests/src/driver/test_env_api.rs)
+contains traits and functions to access the information contained in the test
+environment in a structured way. For example,
+the above call (1), initializes the IC and stores the initial registry (and
+further config data) under `<test_env>/ic_prep`.
 
-Please, check the [FAQ](doc/FAQ.md) or [TROUBLESHOOTING](doc/TROUBLESHOOTING.md) before submitting
-a bug report
+The call in (2), in turn, reads this information to construct a data structure
+that reflects the initial topology. So, e.g., the call (3) returns a data
+structure that represents to root_subnet.
 
-### Running the tests
-To run the tests locally, run the `setup-and-cargo-test.sh` script. Go to the end of the page for info on the CLI arguments.
-If you are running the script within nix-shell on Linux and run out of disk space, `export TMPDIR=` might solve this issue for you.
-On Ubuntu 20.04, nix-shell sets the initially unset TMPDIR to /run/user/1000, which might be too small for the tests. Unsetting this variable enables the tests to use /tmp instead.
+For more information about the test environment API, check out the module
+`test_env_api.rs` and its module documentation!
 
-### High Level Overview
+## Working Directory
 
-The `rs/tests` crate builds our `system-tests` binary, whose sole responsibility is to run our system tests 
-Underneath `system-tests` we have two auxiliary libraries: `ic_fondue` and `fondue`.
+As stated in the previous section, any test works within a test environment.
+Before a test starts, the test driver «forks» the test environment of the
+corresponding pot setup; that is, the directory is copied as is. Thus, every
+test *inherits* the environment of the pot's setup, but no two tests share the
+same test environment.
 
-1. `fondue` is a general-purpose abstraction for running distributed system
-	 tests. It enables us to specify a initial configuration describing the
-	 initial state of the system, an active test that interacts with the
-	 configured system and a passive pipeline that monitors the signals from the
-	 different system components. Fondue is paramount to our tests by abstracting
-	 away the meta environment setup: which thread processes what? Where do the
-	 log messages go? How do we access the passive pipeline from within a test?
-	 How do we pass a PRNG through ensuring they are reproducible? etc...
-	 Moreover, having a general purpose library ensures we can test that these
-	 features are all working properly with toy systems, increasing the
-	 confidence in `fondue`'s reliability.
-1. `ic_fondue` is an instantiation of `fondue` for the IC: the initial
-	 configuration corresponds with a topology, each `fondue` process is a
-	 `orchestrator` and we look at the logs produced by each replica as the source
-	 of passive information. This minimizes the chance of a test writer wiring
-	 everything in the wrong way.
+All tests environment are placed in the working directory of the test driver
+(see CLI options for more information). The working directory's structure
+follows the hierarchical structure of the tests. For example:
 
-### So You Want to Write a Test?
+```
+── working_dir
+   └── 20220428_224049         <<== timestamp of test run
+       ├── api_test            <<== POT name
+       │   ├── setup           <<== data related to the setup of this pot
+       │   │   ├── ic_prep
+       │   │   │   ├── blessed_replica_versions.pb
+       │   │   │   <... etc. etc. ...>
+       │   │   └── test.log    <<== logs produced during the setup
+       │   └── tests
+       │       ├── ics_have_correct_subnet_count  <<== test name
+       │       │   <... more files ...>
+       │       │   ├── test.log                   <<== test (driver) log
+       │       |   ├── test_execution_result.json <<== test result
+	   <... etc. ...>
+       ├── system_env           <<== global system env that all pots inherit
+       │   ├──suite_execution_contract.json
+<... etc. ...>
+```
 
-You've got the urge to write a test? Need a little guidance? you can start
-looking at `src/basic_health_test`. It is a small, documented and rich example.
-Please, ask your questions away on #eng-testing! We're happy to answer them.
+
+## Example Test
+
+The `basic_health_test` is an example test that should act as guidance on how to
+use the test API. **Note**: As every test environment is a copy of another test
+environment with the exception of the system environment, a test environment
+includes all the logs of the parent environment. As a consequence, a test
+environment contains all the logs of the system environment, up to the point
+where the test environment was created.
+
+## Guiding principles when writing tests
 
 When writing your test, please keep in mind a few important things:
 
-1. Make sure to add a ASCIIDOC description to the beginning of your file, just
-	 like `basic_health_test`.
-1. Don't forget to make use of the `ekg` module, which provides combinators to
-	 passively monitor the behavior of the replicas that are running. Most of the
-	 times you'll want `ekg::basic_monitoring`, just like `basic_health_test`.
-1. Make sure to mark your test as "stating", this means it wont be blocking PRs
-	 until you're confident it is stable enough to block PRs.
-1. Keep reproducibility at mind. All the tests receive a PRNG to be used to do
-	 any sort of random operation, please use it as much as reasonably possible.
-1. Refrain from `println!` and use the logging primitives and `ctx.logger`
-	 instead.
-1. Do not make too many environment assumptions: `fondue` enables us to easily
-	 re-use a setup, providing a simple way to decrease runtime of our tests. In
-	 fact, `fondue` divides tests in two categories: (A) isolated tests and (B)
-	 composable tests. Isolated tests have full freedom to change their
-	 environment by starting, stopping and restarting nodes.  Composable tests,
-	 on the other hand, can only _read_ from their environment. Hence, if you
-	 write your test as a composable test, chances are we can group it with some
-	 other composable tests and share the same IC instance to run them.
-1. Go ahead and write a test that we can run!
-
+* Make sure to add a ASCIIDOC description to the beginning of your file, just
+like `basic_health_test`.
+* Keep reproducibility in mind. For example, if you use a RNG in the test, make
+  sure the seed is fixed (or at least logged).
+* Refrain from `println!` and use the logging primitives of the test environment instead.
+* In general, do not make too many environment assumptions. For example, never access
+  the file system directory or only through information available through the test environment.
+* Put your test in a suitable folder in the src directory or create a new
+  sub-directory. Don't forget to modify CODEOWNERS accordingly.
+* Add your test to a suitable suite in `rs/tests/bin/prod-test-driver.rs`.
+  If your test takes more than 50min, it must only run nightly and the pipeline
+  might need to be adjusted in `testnet/tests/pipeline/pipeline.yml`.
 
 ### A note on the CLI
 
-The System Tests are defined in `rs/tests/bin/prod-test-driver.rs`. The API of the tests themselves remains unchanged.
+The system tests are defined in `rs/tests/bin/prod-test-driver.rs`. The API of the tests themselves remains unchanged.
 
-For example, to run all the `pre-master` System Tests use:
+For example, to run all the `pre-master` system tests use:
 
 ```bash
-./run-system-tests.py --suite pre_master --log-base-dir $(date +"%Y%m%d") 2>&1 | tee farm.log
+./run-system-tests.py --suite pre_master 2>&1 | tee system-test-logs.log
 ```
 
 Note: This requires the commit to be built by CI/CD, i.e. it must be pushed to the remote and an MR has to be created. If the script can't find artifacts for the current commit, it will fail.
 
-Below is the usage of the "legacy" System Tests.
 
-To run all tests, but still log debug-level messages to `my-log` we run:
+### My test is failing/flaky, what do I do?
 
-```
-$ ./setup-and-cargo-test.sh -- -v --log-to-file my-log
-```
+Please, check the [FAQ](doc/FAQ.md) or [TROUBLESHOOTING](doc/TROUBLESHOOTING.md) before submitting
+a bug report.
 
-The `--` separates the arguments to `setup-and-cargo-test.sh` from the arguments
-consumed by `rs/tests/src/main.rs`. In general,
+### Running the tests
+Go to the end of the page for info on the CLI arguments.
+If you are running the script within nix-shell on Linux and run out of disk space, `export TMPDIR=` might solve this issue for you.
+In particular, the `nix-shell` command run in Ubuntu 20.04 sets the `TMPDIR` variable to `/run/user/1000`, which might correspond to a disk partition that is be too small for storing all the artifacts produced by the tests. To mitigate the problem, one could run, e.g., `export TMPDIR=/tmp`.
 
-```
-$ ./setup-and-cargo-test.sh [SCRIPT-OPTIONS] [-- SYSTEM-TEST-OPTIONS]
-```
+### Running Docker Containers in system-tests
 
-If you wish to see more info on which options are supported, run:
+Docker containers can be run in Universal VMs. Search for calls of "UniversalVm::new" to see examples on how to set that up.
 
-```
-$ ./setup-and-cargo-test.sh -- --help
-```
+Note that Universal VMs are created afresh for each pot. This means that if it runs a docker container the container's image needs to be fetched from the registry each time.
 
-### Pots and Tests
+Docker Hub has a rate limit which makes it is unsuitable for system-tests. Instead, please use the registry:
 
-In `fondue`, tests are organized in _pots_ of two different kinds:
+https://gitlab.com/dfinity-lab/open/public-docker-registry/container_registry
 
-- *Composable* pots consist of multiple individual tests that run against the
-	same environment configuration. This means we pay the price of setting up a
-	bunch of nodes only once. The disadvantage is that these tests receive a
-	read-only `IcHandle` object, which does not enable the test author to change
-	its environment (i.e., start new replicas, stop replicas, etc). Note that
-	altering the state of the nodes is allowed — think of installing a canister,
-	for instance.  You can think of an `IcHandle` as a vector of HTTP endpoints.
-
-- *Isolated* pots consists in a _single_ test that runs against a given
-	environment. This single test, however, receives a `IcManager` instead of a
-	`IcManager::handle()`; hence, it is allowed to perform arbitrary changes in
-	its environment.
-
-### Filtering
-
-Often, we might want to run just one specific test, or we might
-want to skip certain tests. We can do so by passing a filter
-as the last argument to `system-tests` or as an argument to `--skip`.
-
-To run all tests that contain the string "basic" in their name we run:
+In order to fetch images from this registry you first need to ensure your image is pushed there. In order to do that first login using:
 
 ```
-$ ./setup-and-cargo-test.sh -- basic
+docker login registry.gitlab.com
 ```
 
-This will run `basic_health_test` and `canister_lifecycle_basic_test`.
-Now, say that we do not want to run the steps that have `delete` in their
-names:
+Then push your image using the following shell function:
 
 ```
-$ ./setup-and-cargo-test.sh -- --skip delete basic
+push_to_gitlab() {
+  image="$1"
+  docker pull --platform linux/amd64 "$image"
+  docker tag "$image" "registry.gitlab.com/dfinity-lab/open/public-docker-registry/$image"
+  docker image push "registry.gitlab.com/dfinity-lab/open/public-docker-registry/$image"
+}
+```
+
+You can then run this image in your Universal VM activation script as follows:
+
+```
+docker run "registry.gitlab.com/dfinity-lab/open/public-docker-registry/$image"
 ```
 
 ### Known Issues
-
-#### Darwin Support is 'Best Effort'
-
-It might happen that tests break on Darwin because, on CI, they are not tested
-on Darwin.
-
-This is a compromise. As many developers use Darwin, we can save overhead by
-running the tests directly on Darwin for local testing. Hence, they _should_
-run on Darwin. On the other hand, supporting both Linux _and_ Darwin on CI is
-costly.
-
-#### NNS Canister Installation Timeouts when testing locally
-
-Using the `NNSInstaller`-trait, it is possible to install all NNS-canisters on
-the root subnet using functionality by the `nns/test_utils`-crate. The NNS
-canisters are compiled before installation. If your local cargo cache is
-outdated ( e.g., after an explicit cache invalidation or pulling updates),
-canister compilation can take on the order of 10 minutes. As a result, a test
-might hit a global timeout configured in the test runner
-(`rs/tests/src/main.rs`). *It is suggested to adjust such timeouts to mitigate
-this issue.*
-
-On CI, the issue is mitigated as the canisters are built in a separate stage. 

@@ -6,7 +6,7 @@ use bitcoin::{
     blockdata::transaction::Transaction, hash_types::Txid, network::message::NetworkMessage,
     network::message_blockdata::Inventory,
 };
-use ic_logger::{debug, ReplicaLogger};
+use ic_logger::{debug, trace, ReplicaLogger};
 
 use crate::ProcessBitcoinNetworkMessageError;
 use crate::{Channel, Command};
@@ -16,6 +16,10 @@ const TX_ADVERTISE_INTERVAL: u64 = 2 * 60; // 2 minutes
 
 /// How long should the transaction manager hold on to a transaction.
 const TX_CACHE_TIMEOUT_PERIOD_SECS: u64 = 10 * 60; // 10 minutes
+
+/// Maxmimum number of transaction to advertise.
+// https://developer.bitcoin.org/reference/p2p_networking.html#inv
+const MAXIMUM_TRANSACTION_PER_INV: usize = 50_000;
 
 /// This struct represents the current information to track the
 /// broadcasting of a transaction.
@@ -68,29 +72,6 @@ impl TransactionManager {
         }
     }
 
-    /// This function processes a `getdata` message from a BTC node.
-    /// If there are messages for transactions, the transaction queues up outgoing messages
-    /// to be processed later.
-    fn process_getdata_message(
-        &mut self,
-        channel: &mut impl Channel,
-        address: &SocketAddr,
-        inventory: &[Inventory],
-    ) {
-        for inv in inventory {
-            if let Inventory::Transaction(txid) = inv {
-                if let Some(info) = self.transactions.get(txid) {
-                    channel
-                        .send(Command {
-                            address: Some(*address),
-                            message: NetworkMessage::Tx(info.transaction.clone()),
-                        })
-                        .ok();
-                }
-            }
-        }
-    }
-
     /// This heartbeat method is called periodically by the adapter.
     /// This method is used to send messages to Bitcoin peers.
     pub fn tick(&mut self, channel: &mut impl Channel) {
@@ -103,7 +84,7 @@ impl TransactionManager {
     pub fn send_transaction(&mut self, raw_tx: &[u8]) {
         if let Ok(transaction) = deserialize::<Transaction>(raw_tx) {
             let txid = transaction.txid();
-            debug!(self.logger, "Received {} from the system component", txid);
+            trace!(self.logger, "Received {} from the system component", txid);
             self.transactions
                 .entry(txid)
                 .or_insert_with(|| TransactionInfo::new(&transaction));
@@ -118,7 +99,6 @@ impl TransactionManager {
 
     /// Clear out transactions that have been held on to for more than the transaction timeout period.
     fn reap(&mut self) {
-        debug!(self.logger, "Reaping old transactions");
         let now = SystemTime::now();
         self.transactions.retain(|_, info| info.timeout_at > now);
     }
@@ -133,6 +113,20 @@ impl TransactionManager {
             if info.next_advertisement_at() <= now {
                 inventory.push(Inventory::Transaction(*txid));
                 info.last_advertised_at = Some(now);
+            }
+            // If inventory contains maximum allowed amount of transation we will send it
+            // and start building a new one.
+            if inventory.len() == MAXIMUM_TRANSACTION_PER_INV {
+                debug!(self.logger, "Broadcasting Txids ({:?}) to peers", inventory);
+                for address in channel.available_connections() {
+                    channel
+                        .send(Command {
+                            address: Some(address),
+                            message: NetworkMessage::Inv(inventory.clone()),
+                        })
+                        .ok();
+                }
+                inventory = vec![];
             }
         }
 
@@ -153,6 +147,9 @@ impl TransactionManager {
     }
 
     /// This method is used to process an event from the connected BTC nodes.
+    /// This function processes a `getdata` message from a BTC node.
+    /// If there are messages for transactions, the transaction is sent to the
+    /// requesting node. Transactions sent are then removed from the cache.
     pub fn process_bitcoin_network_message(
         &mut self,
         channel: &mut impl Channel,
@@ -160,7 +157,23 @@ impl TransactionManager {
         message: &NetworkMessage,
     ) -> Result<(), ProcessBitcoinNetworkMessageError> {
         if let NetworkMessage::GetData(inventory) = message {
-            self.process_getdata_message(channel, &addr, inventory);
+            if inventory.len() > MAXIMUM_TRANSACTION_PER_INV {
+                return Err(ProcessBitcoinNetworkMessageError::InvalidMessage);
+            }
+
+            for inv in inventory {
+                if let Inventory::Transaction(txid) = inv {
+                    if let Some(TransactionInfo { transaction, .. }) = self.transactions.get(txid) {
+                        let result = channel.send(Command {
+                            address: Some(addr),
+                            message: NetworkMessage::Tx(transaction.clone()),
+                        });
+                        if result.is_ok() {
+                            self.transactions.remove(txid);
+                        }
+                    }
+                }
+            }
         }
         Ok(())
     }
@@ -169,37 +182,12 @@ impl TransactionManager {
 #[cfg(test)]
 mod test {
     use super::*;
-    use crate::{Channel, ChannelError, Command};
+    use crate::common::test_common::TestChannel;
     use bitcoin::{
         blockdata::constants::genesis_block, consensus::serialize, Network, Transaction,
     };
     use ic_logger::replica_logger::no_op_logger;
-    use std::{collections::VecDeque, str::FromStr};
-
-    /// This struct is used to capture Commands generated by the [TransactionManager](TransactionManager).
-    struct TestChannel {
-        /// This field holds Commands that are generated by the [TransactionManager](TransactionManager).
-        received_commands: VecDeque<Command>,
-    }
-
-    impl TestChannel {
-        fn new() -> Self {
-            Self {
-                received_commands: VecDeque::new(),
-            }
-        }
-    }
-
-    impl Channel for TestChannel {
-        fn send(&mut self, command: Command) -> Result<(), ChannelError> {
-            self.received_commands.push_back(command);
-            Ok(())
-        }
-
-        fn available_connections(&self) -> Vec<std::net::SocketAddr> {
-            vec![SocketAddr::from_str("127.0.0.1:8333").expect("invalid address")]
-        }
-    }
+    use std::str::FromStr;
 
     /// This function creates a new transaction manager with a test logger.
     fn make_transaction_manager() -> TransactionManager {
@@ -251,7 +239,9 @@ mod test {
     /// 5. Attempt to re-broadcast.
     #[test]
     fn test_broadcast_txids() {
-        let mut channel = TestChannel::new();
+        let mut channel = TestChannel::new(vec![
+            SocketAddr::from_str("127.0.0.1:8333").expect("invalid address")
+        ]);
         let mut manager = make_transaction_manager();
         let transaction = get_transaction();
         let raw_tx = serialize(&transaction);
@@ -270,11 +260,8 @@ mod test {
             .get_mut(&txid)
             .expect("transaction should be map");
         assert!(info.last_advertised_at.is_some());
-        assert_eq!(channel.received_commands.len(), 1);
-        let command = channel
-            .received_commands
-            .pop_front()
-            .expect("There should be one.");
+        assert_eq!(channel.command_count(), 1);
+        let command = channel.pop_front().expect("There should be one.");
         assert!(command.address.is_some());
         assert!(matches!(command.message, NetworkMessage::Inv(_)));
         let inventory = if let NetworkMessage::Inv(inv) = command.message {
@@ -296,11 +283,58 @@ mod test {
             .get(&txid)
             .expect("transaction should be map");
         assert!(info.last_advertised_at.is_some());
-        assert_eq!(channel.received_commands.len(), 1);
+        assert_eq!(channel.command_count(), 1);
 
         // Attempt re-broadcast, but it should be ignored as the timeout period has not passed.
         manager.advertise_txids(&mut channel);
-        assert_eq!(channel.received_commands.len(), 1);
+        assert_eq!(channel.command_count(), 1);
+    }
+
+    /// This function tests the that `TransactionManager::broadcast_txids(...)` splits
+    /// the invetory messages of `MAXIMUM_TRANSACTION_PER_INV`.
+    /// Test Steps:
+    /// 1. Receive more than `MAXIMUM_TRANSACTION_PER_INV` transactions.
+    /// 2. Perform broadcast.
+    /// 3. Make sure transaction is split up into multiple inventory messages.
+    #[test]
+    fn test_broadcast_txid_with_maximum_limit() {
+        let num_transaction = MAXIMUM_TRANSACTION_PER_INV * 3 + 1;
+        let expected_inv_messages = 4;
+        let mut channel = TestChannel::new(vec![
+            SocketAddr::from_str("127.0.0.1:8333").expect("invalid address")
+        ]);
+        let mut manager = make_transaction_manager();
+
+        for i in 0..num_transaction {
+            // First regtest genesis transaction.
+            let mut transaction = get_transaction();
+            // Alter transaction such that we get a different `txid`
+            transaction.lock_time = i.try_into().unwrap();
+            let raw_tx = serialize(&transaction);
+            manager.send_transaction(&raw_tx);
+        }
+        assert_eq!(manager.transactions.len(), num_transaction);
+
+        // Broadcast. We expect 4 inventory messages.
+        manager.advertise_txids(&mut channel);
+        assert_eq!(channel.command_count(), expected_inv_messages);
+
+        let mut expected_txs_per_inv = num_transaction;
+        for _ in 0..expected_inv_messages {
+            let command = channel.pop_front().expect("There should be one.");
+            assert!(command.address.is_some());
+            assert!(matches!(command.message, NetworkMessage::Inv(_)));
+            let inventory = if let NetworkMessage::Inv(inv) = command.message {
+                inv
+            } else {
+                vec![]
+            };
+            assert_eq!(
+                inventory.len(),
+                expected_txs_per_inv.min(MAXIMUM_TRANSACTION_PER_INV)
+            );
+            expected_txs_per_inv -= inventory.len();
+        }
     }
 
     /// This function tests the `TransactionManager::process_bitcoin_network_message(...)` method.
@@ -311,12 +345,12 @@ mod test {
     /// 4. Check the TestChannel for received outgoing commands.
     #[test]
     fn test_process_bitcoin_network_message() {
-        let mut channel = TestChannel::new();
+        let address = SocketAddr::from_str("127.0.0.1:8333").expect("invalid address");
+        let mut channel = TestChannel::new(vec![address]);
         let mut manager = make_transaction_manager();
         let transaction = get_transaction();
         let raw_tx = serialize(&transaction);
         let txid = transaction.txid();
-        let address = SocketAddr::from_str("127.0.0.1:8333").expect("invalid address");
         manager.send_transaction(&raw_tx);
         assert_eq!(manager.transactions.len(), 1);
         manager
@@ -326,9 +360,38 @@ mod test {
                 &NetworkMessage::GetData(vec![Inventory::Transaction(txid)]),
             )
             .ok();
-        assert_eq!(channel.received_commands.len(), 1);
-        let command = channel.received_commands.pop_front().unwrap();
+        assert_eq!(channel.command_count(), 1);
+        let command = channel.pop_front().unwrap();
         assert!(matches!(command.message, NetworkMessage::Tx(t) if t.txid() == txid));
+    }
+
+    /// This function tests the `TransactionManager::process_bitcoin_network_message(...)` method.
+    /// Test Steps:
+    /// 1. Receive a more than `MAXIMUM_TRANSACTION_PER_INV` transaction.
+    /// 2. Process a [StreamEvent](StreamEvent) containing a `getdata` network message and reject.
+    #[test]
+    fn test_invalid_process_bitcoin_network_message() {
+        let num_transaction = MAXIMUM_TRANSACTION_PER_INV + 1;
+        let address = SocketAddr::from_str("127.0.0.1:8333").expect("invalid address");
+        let mut channel = TestChannel::new(vec![address]);
+        let mut manager = make_transaction_manager();
+
+        let mut inventory = vec![];
+        for i in 0..num_transaction {
+            // First regtest genesis transaction.
+            let mut transaction = get_transaction();
+            // Alter transaction such that we get a different `txid`
+            transaction.lock_time = i.try_into().unwrap();
+            let txid = transaction.txid();
+            inventory.push(Inventory::Transaction(txid));
+        }
+        manager
+            .process_bitcoin_network_message(
+                &mut channel,
+                address,
+                &NetworkMessage::GetData(inventory),
+            )
+            .unwrap_err();
     }
 
     /// This function tests the `TransactionManager::tick(...)` method.
@@ -339,12 +402,12 @@ mod test {
     /// 4. Check the TestChannel for received outgoing commands for an `inv` message and a `tx` message.
     #[test]
     fn test_tick() {
-        let mut channel = TestChannel::new();
+        let address = SocketAddr::from_str("127.0.0.1:8333").expect("invalid address");
+        let mut channel = TestChannel::new(vec![address]);
         let mut manager = make_transaction_manager();
         let transaction = get_transaction();
         let raw_tx = serialize(&transaction);
         let txid = transaction.txid();
-        let address = SocketAddr::from_str("127.0.0.1:8333").expect("invalid address");
         manager.send_transaction(&raw_tx);
         manager.tick(&mut channel);
         manager
@@ -354,10 +417,10 @@ mod test {
                 &NetworkMessage::GetData(vec![Inventory::Transaction(txid)]),
             )
             .ok();
-        assert_eq!(channel.received_commands.len(), 2);
-        assert_eq!(manager.transactions.len(), 1);
+        assert_eq!(channel.command_count(), 2);
+        assert_eq!(manager.transactions.len(), 0);
 
-        let command = channel.received_commands.pop_front().unwrap();
+        let command = channel.pop_front().unwrap();
         assert!(matches!(command.message, NetworkMessage::Inv(_)));
         let inventory = if let NetworkMessage::Inv(inv) = command.message {
             inv
@@ -368,9 +431,10 @@ mod test {
             matches!(inventory.first().expect("should be one entry"), Inventory::Transaction(ctxid) if *ctxid == txid)
         );
 
-        let command = channel.received_commands.pop_front().unwrap();
+        let command = channel.pop_front().unwrap();
         assert!(matches!(command.message, NetworkMessage::Tx(t) if t.txid() == txid));
 
+        manager.send_transaction(&raw_tx);
         let info = manager
             .transactions
             .get_mut(&transaction.txid())
@@ -381,23 +445,18 @@ mod test {
     }
 
     /// Test to ensure that when `TransactionManager.idle(...)` is called that the `transactions`
-    /// and `outgoing_command_queue` fields are cleared.
+    /// field is cleared.
     #[test]
     fn test_make_idle() {
-        let mut channel = TestChannel::new();
         let mut manager = make_transaction_manager();
         let transaction = get_transaction();
         let raw_tx = serialize(&transaction);
         let txid = transaction.txid();
-        let address = SocketAddr::from_str("127.0.0.1:8333").expect("invalid address");
-        let inventory = vec![Inventory::Transaction(txid)];
 
         manager.send_transaction(&raw_tx);
-        manager.process_getdata_message(&mut channel, &address, &inventory);
 
         assert_eq!(manager.transactions.len(), 1);
         assert!(manager.transactions.contains_key(&txid));
-        assert_eq!(channel.received_commands.len(), 1);
 
         manager.make_idle();
         assert_eq!(manager.transactions.len(), 0);

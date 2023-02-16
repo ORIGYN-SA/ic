@@ -1,59 +1,63 @@
-use structopt::StructOpt;
-
+use clap::Parser;
 use ic_crypto_internal_threshold_sig_bls12381 as bls12_381;
-use ic_crypto_utils_threshold_sig::parse_threshold_sig_key;
+use ic_crypto_utils_threshold_sig_der::parse_threshold_sig_key;
+use ic_rosetta_api::request_handler::RosettaRequestHandler;
 use ic_rosetta_api::rosetta_server::{RosettaApiServer, RosettaApiServerOpt};
-use ic_rosetta_api::{ledger_client, RosettaRequestHandler, DEFAULT_TOKEN_SYMBOL};
+use ic_rosetta_api::{ledger_client, DEFAULT_BLOCKCHAIN, DEFAULT_TOKEN_SYMBOL};
 use ic_types::crypto::threshold_sig::ThresholdSigPublicKey;
 use ic_types::{CanisterId, PrincipalId};
 use std::{path::Path, path::PathBuf, str::FromStr, sync::Arc};
 use url::Url;
 
-#[derive(Debug, StructOpt)]
+#[derive(Debug, Parser)]
+#[clap(version)]
 struct Opt {
-    #[structopt(short = "a", long = "address", default_value = "0.0.0.0")]
+    #[clap(short = 'a', long = "address", default_value = "0.0.0.0")]
     listen_address: String,
-    #[structopt(short = "p", long = "port", default_value = "8080")]
+    #[clap(short = 'p', long = "port", default_value = "8081")]
     listen_port: u16,
-    #[structopt(short = "c", long = "canister-id")]
+    #[clap(short = 'c', long = "canister-id")]
     ic_canister_id: Option<String>,
-    #[structopt(short = "t", long = "token-symbol")]
+    #[clap(short = 't', long = "token-sybol")]
     token_symbol: Option<String>,
     /// Id of the governance canister to use for neuron management.
-    #[structopt(short = "g", long = "governance-canister-id")]
+    #[clap(short = 'g', long = "governance-canister-id")]
     governance_canister_id: Option<String>,
-    #[structopt(long = "ic-url")]
+    #[clap(long = "ic-url")]
     ic_url: Option<String>,
-    #[structopt(
-        short = "l",
+    #[clap(
+        short = 'l',
         long = "log-config-file",
         default_value = "log_config.yml"
     )]
     log_config_file: PathBuf,
-    #[structopt(long = "root-key")]
+    #[clap(long = "root-key")]
     root_key: Option<PathBuf>,
     /// Supported options: sqlite, sqlite-in-memory
-    #[structopt(long = "store-type", default_value = "sqlite")]
+    #[clap(long = "store-type", default_value = "sqlite")]
     store_type: String,
-    #[structopt(long = "store-location", default_value = "./data")]
+    #[clap(long = "store-location", default_value = "./data")]
     store_location: PathBuf,
-    #[structopt(long = "store-max-blocks")]
+    #[clap(long = "store-max-blocks")]
     store_max_blocks: Option<u64>,
-    #[structopt(long = "exit-on-sync")]
+    #[clap(long = "exit-on-sync")]
     exit_on_sync: bool,
-    #[structopt(long = "offline")]
+    #[clap(long = "offline")]
     offline: bool,
-    #[structopt(long = "mainnet", about = "Connect to the Internet Computer Mainnet")]
+    #[clap(long = "mainnet", help = "Connect to the Internet Computer Mainnet")]
     mainnet: bool,
-    #[structopt(long = "not-whitelisted")]
+    /// The name of the blockchain reported in the network identifier.
+    #[clap(long = "blockchain", default_value = DEFAULT_BLOCKCHAIN)]
+    blockchain: String,
+    #[clap(long = "not-whitelisted")]
     not_whitelisted: bool,
-    #[structopt(long = "expose-metrics")]
+    #[clap(long = "expose-metrics")]
     expose_metrics: bool,
 }
 
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
-    let opt = Opt::from_args();
+    let opt = Opt::parse();
 
     if let Err(e) = log4rs::init_file(opt.log_config_file.as_path(), Default::default()) {
         panic!(
@@ -126,7 +130,7 @@ async fn main() -> std::io::Result<()> {
         // Not connecting to the mainnet, so default to the exchanges url
         let url = Url::parse(
             &opt.ic_url
-                .unwrap_or_else(|| "https://exchanges.dfinity.network".to_string())[..],
+                .unwrap_or_else(|| "https://exchanges.testnet.dfinity.network".to_string())[..],
         )
         .unwrap();
         (root_key, canister_id, governance_canister_id, url)
@@ -156,6 +160,7 @@ async fn main() -> std::io::Result<()> {
         mainnet,
         not_whitelisted,
         expose_metrics,
+        blockchain,
         ..
     } = opt;
     let client = ledger_client::LedgerClient::new(
@@ -178,7 +183,7 @@ async fn main() -> std::io::Result<()> {
     .unwrap_or_else(|(e, is_403)| panic!("Failed to initialize ledger client{}: {:?}", is_403, e));
 
     let ledger = Arc::new(client);
-    let req_handler = RosettaRequestHandler::new(ledger.clone());
+    let req_handler = RosettaRequestHandler::new(blockchain, ledger.clone());
 
     log::info!("Network id: {:?}", req_handler.network_id());
     let serv = RosettaApiServer::new(ledger, req_handler, addr, expose_metrics)

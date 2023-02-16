@@ -7,7 +7,7 @@ use crate::{
     util::runtime_from_url,
 };
 
-use ic_fondue::ic_manager::IcEndpoint;
+use ic_nns_constants::REGISTRY_CANISTER_ID;
 use ic_nns_governance::pb::v1::NnsFunction;
 use ic_types::{time::current_time, SubnetId};
 use openssh_keys::PublicKey;
@@ -16,8 +16,9 @@ use openssl::rsa::Rsa;
 use pem::{encode, Pem};
 use registry_canister::mutations::do_update_subnet::UpdateSubnetPayload;
 use registry_canister::mutations::do_update_unassigned_nodes_config::UpdateUnassignedNodesConfigPayload;
+use reqwest::Url;
 use ssh2::Session;
-use std::io::Read;
+use std::io::{Read, Write};
 use std::net::{IpAddr, TcpStream};
 use std::path::Path;
 use std::time::Duration;
@@ -162,7 +163,6 @@ pub(crate) fn get_updatesubnetpayload_with_keys(
         pfn_evaluation_period_ms: None,
         registry_poll_period_ms: None,
         retransmission_request_ms: None,
-        advert_best_effort_percentage: None,
         set_gossip_config_to_default: false,
         start_as_nns: None,
         subnet_type: None,
@@ -173,14 +173,15 @@ pub(crate) fn get_updatesubnetpayload_with_keys(
         features: None,
         ecdsa_config: None,
         ecdsa_key_signing_enable: None,
+        ecdsa_key_signing_disable: None,
         max_number_of_canisters: None,
         ssh_readonly_access: readonly_keys,
         ssh_backup_access: backup_keys,
     }
 }
 
-pub(crate) async fn update_subnet_record(nns_endpoint: &IcEndpoint, payload: UpdateSubnetPayload) {
-    let r = runtime_from_url(nns_endpoint.url.clone());
+pub(crate) async fn update_subnet_record(nns_url: Url, payload: UpdateSubnetPayload) {
+    let r = runtime_from_url(nns_url, REGISTRY_CANISTER_ID.into());
     let gov_can = get_governance_canister(&r);
 
     let proposal_id =
@@ -190,11 +191,8 @@ pub(crate) async fn update_subnet_record(nns_endpoint: &IcEndpoint, payload: Upd
     vote_execute_proposal_assert_executed(&gov_can, proposal_id).await;
 }
 
-pub(crate) async fn fail_to_update_subnet_record(
-    nns_endpoint: &IcEndpoint,
-    payload: UpdateSubnetPayload,
-) {
-    let r = runtime_from_url(nns_endpoint.url.clone());
+pub(crate) async fn fail_to_update_subnet_record(nns_url: Url, payload: UpdateSubnetPayload) {
+    let r = runtime_from_url(nns_url, REGISTRY_CANISTER_ID.into());
     let gov_can = get_governance_canister(&r);
 
     let proposal_id =
@@ -214,10 +212,10 @@ pub(crate) fn get_updateunassignednodespayload(
 }
 
 pub(crate) async fn update_ssh_keys_for_all_unassigned_nodes(
-    nns_endpoint: &IcEndpoint,
+    nns_url: Url,
     payload: UpdateUnassignedNodesConfigPayload,
 ) {
-    let r = runtime_from_url(nns_endpoint.url.clone());
+    let r = runtime_from_url(nns_url, REGISTRY_CANISTER_ID.into());
     let gov_can = get_governance_canister(&r);
 
     let proposal_id = submit_external_proposal_with_test_id(
@@ -231,10 +229,10 @@ pub(crate) async fn update_ssh_keys_for_all_unassigned_nodes(
 }
 
 pub(crate) async fn fail_updating_ssh_keys_for_all_unassigned_nodes(
-    nns_endpoint: &IcEndpoint,
+    nns_url: Url,
     payload: UpdateUnassignedNodesConfigPayload,
 ) {
-    let r = runtime_from_url(nns_endpoint.url.clone());
+    let r = runtime_from_url(nns_url, REGISTRY_CANISTER_ID.into());
     let gov_can = get_governance_canister(&r);
 
     let proposal_id = submit_external_proposal_with_test_id(
@@ -245,4 +243,44 @@ pub(crate) async fn fail_updating_ssh_keys_for_all_unassigned_nodes(
     .await;
 
     vote_execute_proposal_assert_failed(&gov_can, proposal_id, "too long").await;
+}
+
+pub(crate) fn execute_bash_command(sess: &Session, command: String) -> Result<String, String> {
+    let mut channel = sess.channel_session().map_err(|e| e.to_string())?;
+    channel.exec("bash").map_err(|e| e.to_string())?;
+    channel
+        .write_all(command.as_bytes())
+        .map_err(|e| e.to_string())?;
+    channel.flush().map_err(|e| e.to_string())?;
+    channel.send_eof().map_err(|e| e.to_string())?;
+    let mut out = String::new();
+    channel
+        .read_to_string(&mut out)
+        .map_err(|e| e.to_string())?;
+    let mut err_str = String::new();
+    match channel.exit_status() {
+        Ok(status) => match status {
+            0 => Ok(out),
+            _ => {
+                channel
+                    .stderr()
+                    .read_to_string(&mut err_str)
+                    .map_err(|e| e.to_string())?;
+                Err(format!(
+                    "Error in: {}\nErr code: {}\nstdout: \n{}\nstderr: \n{}",
+                    command, status, out, err_str
+                ))
+            }
+        },
+        Err(e) => {
+            channel
+                .stderr()
+                .read_to_string(&mut err_str)
+                .map_err(|e| e.to_string())?;
+            Err(format!(
+                "Error in: {}\nError: {}\nstdout: \n{}\nstderr: \n{}",
+                command, e, out, err_str
+            ))
+        }
+    }
 }

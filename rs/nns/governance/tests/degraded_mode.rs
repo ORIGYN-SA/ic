@@ -3,11 +3,11 @@
 use assert_matches::assert_matches;
 use async_trait::async_trait;
 use futures::future::FutureExt;
-use ic_base_types::PrincipalId;
-use ic_nervous_system_common::{ledger::Ledger, NervousSystemError};
+use ic_base_types::{CanisterId, PrincipalId};
+use ic_nervous_system_common::{ledger::IcpLedger, NervousSystemError};
 use ic_nns_common::pb::v1::NeuronId;
 use ic_nns_governance::{
-    governance::{Environment, Governance},
+    governance::{Environment, Governance, CMC},
     pb::v1::{
         governance_error::ErrorType,
         manage_neuron::{
@@ -20,14 +20,15 @@ use ic_nns_governance::{
         Proposal,
     },
 };
-use ledger_canister::{AccountIdentifier, Tokens};
+use icp_ledger::{AccountIdentifier, Tokens};
 use maplit::hashmap;
 use std::convert::TryFrom;
 
 use ic_nns_governance::governance::{HeapGrowthPotential, HEAP_SIZE_SOFT_LIMIT_IN_WASM32_PAGES};
-use ledger_canister::Subaccount;
+use icp_ledger::Subaccount;
 
 struct DegradedEnv {}
+#[async_trait]
 impl Environment for DegradedEnv {
     fn now(&self) -> u64 {
         111000222
@@ -48,10 +49,19 @@ impl Environment for DegradedEnv {
     fn heap_growth_potential(&self) -> HeapGrowthPotential {
         HeapGrowthPotential::LimitedAvailability
     }
+
+    async fn call_canister_method(
+        &mut self,
+        _target: CanisterId,
+        _method_name: &str,
+        _request: Vec<u8>,
+    ) -> Result<Vec<u8>, (Option<i32>, String)> {
+        unimplemented!();
+    }
 }
 
 #[async_trait]
-impl Ledger for DegradedEnv {
+impl IcpLedger for DegradedEnv {
     async fn transfer_funds(
         &self,
         _: u64,
@@ -68,6 +78,17 @@ impl Ledger for DegradedEnv {
     }
 
     async fn account_balance(&self, _: AccountIdentifier) -> Result<Tokens, NervousSystemError> {
+        unimplemented!()
+    }
+
+    fn canister_id(&self) -> CanisterId {
+        unimplemented!()
+    }
+}
+
+#[async_trait]
+impl CMC for DegradedEnv {
+    async fn neuron_maturity_modulation(&mut self) -> Result<i32, String> {
         unimplemented!()
     }
 }
@@ -112,6 +133,7 @@ fn degraded_governance() -> Governance {
         fixture_two_neurons_second_is_bigger(),
         Box::new(DegradedEnv {}),
         Box::new(DegradedEnv {}),
+        Box::new(DegradedEnv {}),
     )
 }
 
@@ -124,8 +146,8 @@ fn test_heap_soft_limit_is_3_and_half_gigibyte() {
     )
 }
 
-#[test]
-fn test_cannot_submit_motion_in_degraded_mode() {
+#[tokio::test]
+async fn test_cannot_submit_motion_in_degraded_mode() {
     let mut gov = degraded_governance();
 
     // Now let's send a proposal
@@ -141,13 +163,13 @@ fn test_cannot_submit_motion_in_degraded_mode() {
             })),
             ..Default::default()
         },
-    ),
+    ).await,
     Err(e) if e.error_type == ErrorType::ResourceExhausted as i32
     );
 }
 
-#[test]
-fn test_can_submit_nns_canister_upgrade_in_degraded_mode() {
+#[tokio::test]
+async fn test_can_submit_nns_canister_upgrade_in_degraded_mode() {
     let mut gov = degraded_governance();
 
     // Now let's send a proposal
@@ -165,7 +187,8 @@ fn test_can_submit_nns_canister_upgrade_in_degraded_mode() {
                 })),
                 ..Default::default()
             },
-        ),
+        )
+        .await,
         Ok(_)
     );
 }

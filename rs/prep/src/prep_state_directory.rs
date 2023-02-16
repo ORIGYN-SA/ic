@@ -126,10 +126,7 @@ mod tests {
                 private_api: vec![],
                 prometheus_metrics: vec!["http://1.2.3.4:3".parse()?],
                 p2p_addr: "org.internetcomputer.p2p1://1.2.3.4:4".parse()?,
-                p2p_num_flows: 1,
-                p2p_start_flow_tag: 0,
                 node_operator_principal_id: None,
-                no_idkg_key: false,
                 secret_key_store: None,
             },
         );
@@ -155,6 +152,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
                 vec![],
                 vec![],
             ),
@@ -172,8 +170,10 @@ mod tests {
             None,
             None,
             /* ssh_readonly_access_to_unassigned_nodes */ vec![],
+            /* guest_launch_measurement_sha256_hex */ None,
         );
         let _init_ic = ic_config.initialize()?;
+
         let prep_state_dir = IcPrepStateDir::new(tmp.path());
         Ok((tmp, prep_state_dir))
     }

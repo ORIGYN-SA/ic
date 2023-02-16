@@ -1,9 +1,10 @@
 use crate::message_routing::MessageRoutingMetrics;
 use crate::routing::{demux::Demux, stream_builder::StreamBuilder};
-use ic_interfaces::execution_environment::Scheduler;
+use ic_interfaces::execution_environment::{
+    ExecutionRoundType, RegistryExecutionSettings, Scheduler,
+};
 use ic_logger::{fatal, ReplicaLogger};
 use ic_metrics::Timer;
-use ic_registry_provisional_whitelist::ProvisionalWhitelist;
 use ic_registry_subnet_features::SubnetFeatures;
 use ic_replicated_state::{NetworkTopology, ReplicatedState};
 use ic_types::{batch::Batch, ExecutionRound};
@@ -15,6 +16,7 @@ mod tests;
 const PHASE_INDUCTION: &str = "induction";
 const PHASE_EXECUTION: &str = "execution";
 const PHASE_MESSAGE_ROUTING: &str = "message_routing";
+const PHASE_TIME_OUT_REQUESTS: &str = "time_out_requests";
 
 pub(crate) trait StateMachine: Send {
     fn execute_round(
@@ -22,9 +24,8 @@ pub(crate) trait StateMachine: Send {
         state: ReplicatedState,
         network_topology: NetworkTopology,
         batch: Batch,
-        provisional_whitelist: ProvisionalWhitelist,
         subnet_features: SubnetFeatures,
-        max_number_of_canisters: u64,
+        registry_settings: &RegistryExecutionSettings,
     ) -> ReplicatedState;
 }
 pub(crate) struct StateMachineImpl {
@@ -53,7 +54,7 @@ impl StateMachineImpl {
     }
 
     /// Adds an observation to the `METRIC_PROCESS_BATCH_PHASE_DURATION`
-    /// histgram for the given phase.
+    /// histogram for the given phase.
     fn observe_phase_duration(&self, phase: &str, timer: &Timer) {
         self.metrics
             .process_batch_phase_duration
@@ -67,40 +68,61 @@ impl StateMachine for StateMachineImpl {
         &self,
         mut state: ReplicatedState,
         network_topology: NetworkTopology,
-        batch: Batch,
-        provisional_whitelist: ProvisionalWhitelist,
+        mut batch: Batch,
         subnet_features: SubnetFeatures,
-        max_number_of_canisters: u64,
+        registry_settings: &RegistryExecutionSettings,
     ) -> ReplicatedState {
         let phase_timer = Timer::start();
 
-        let mut metadata = state.system_metadata().clone();
-        metadata.batch_time = batch.time;
-        metadata.network_topology = network_topology;
-        metadata.own_subnet_features = subnet_features;
-        state.set_system_metadata(metadata);
+        state.metadata.batch_time = batch.time;
+        state.metadata.network_topology = network_topology;
+        state.metadata.own_subnet_features = subnet_features;
+        if let Err(message) = state.metadata.init_allocation_ranges_if_empty() {
+            self.metrics
+                .observe_no_canister_allocation_range(&self.log, message);
+        }
 
-        // Preprocess messages and add messages to the induction pool through the Demux.
-        let mut state_with_messages = self.demux.process_payload(state, batch.payload);
-        if !state_with_messages.consensus_queue.is_empty() {
+        if !state.consensus_queue.is_empty() {
             fatal!(
                 self.log,
                 "Consensus queue not empty at the beginning of round {:?}.",
                 batch.batch_number
             )
         }
-        state_with_messages.consensus_queue = batch.consensus_responses;
+
+        // Time out requests.
+        let timed_out_requests = state.time_out_requests(batch.time);
+        self.metrics
+            .timed_out_requests_total
+            .inc_by(timed_out_requests);
+        self.observe_phase_duration(PHASE_TIME_OUT_REQUESTS, &phase_timer);
+
+        // Preprocess messages and add messages to the induction pool through the Demux.
+        let phase_timer = Timer::start();
+        let mut state_with_messages = self.demux.process_payload(state, batch.payload);
+
+        // Append additional responses to the consensus queue.
+        state_with_messages
+            .consensus_queue
+            .append(&mut batch.consensus_responses);
+
         self.observe_phase_duration(PHASE_INDUCTION, &phase_timer);
+
+        let execution_round_type = if batch.requires_full_state_hash {
+            ExecutionRoundType::CheckpointRound
+        } else {
+            ExecutionRoundType::OrdinaryRound
+        };
 
         let phase_timer = Timer::start();
         // Process messages from the induction pool through the Scheduler.
         let state_after_execution = self.scheduler.execute_round(
             state_with_messages,
             batch.randomness,
-            batch.ecdsa_subnet_public_key,
+            batch.ecdsa_subnet_public_keys,
             ExecutionRound::from(batch.batch_number.get()),
-            provisional_whitelist,
-            max_number_of_canisters,
+            execution_round_type,
+            registry_settings,
         );
         self.observe_phase_duration(PHASE_EXECUTION, &phase_timer);
 

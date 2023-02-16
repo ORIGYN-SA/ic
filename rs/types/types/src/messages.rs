@@ -12,22 +12,23 @@ pub use self::http::{
     Authentication, Certificate, CertificateDelegation, Delegation, HasCanisterId, HttpCallContent,
     HttpCanisterUpdate, HttpQueryContent, HttpQueryResponse, HttpQueryResponseReply, HttpReadState,
     HttpReadStateContent, HttpReadStateResponse, HttpReply, HttpRequest, HttpRequestContent,
-    HttpRequestEnvelope, HttpRequestError, HttpResponseStatus, HttpStatusResponse, HttpUserQuery,
-    RawHttpRequestVal, ReplicaHealthStatus, SignedDelegation,
+    HttpRequestEnvelope, HttpRequestError, HttpStatusResponse, HttpUserQuery, RawHttpRequestVal,
+    ReplicaHealthStatus, SignedDelegation,
 };
 use crate::{user_id_into_protobuf, user_id_try_from_protobuf, Cycles, Funds, NumBytes, UserId};
 pub use blob::Blob;
 use ic_base_types::{CanisterId, PrincipalId};
-pub use ic_ic00_types::CanisterInstallMode;
 use ic_protobuf::proxy::{try_from_option_field, ProxyDecodeError};
 use ic_protobuf::state::canister_state_bits::v1 as pb;
 use ic_protobuf::types::v1 as pb_types;
-pub use ingress_messages::{is_subnet_message, Ingress, SignedIngress, SignedIngressContent};
+pub use ingress_messages::{
+    extract_effective_canister_id, Ingress, ParseIngressError, SignedIngress, SignedIngressContent,
+};
 pub use inter_canister::{
     CallContextId, CallbackId, Payload, RejectContext, Request, RequestOrResponse, Response,
 };
 pub use message_id::{MessageId, MessageIdError, EXPECTED_MESSAGE_ID_LENGTH};
-pub use query::{InternalQuery, InternalQueryResponse, InternalQueryResponseReply, UserQuery};
+pub use query::{AnonymousQuery, AnonymousQueryResponse, AnonymousQueryResponseReply, UserQuery};
 pub use read_state::ReadState;
 use serde::{Deserialize, Serialize};
 use std::convert::TryFrom;
@@ -38,8 +39,10 @@ pub use webauthn::{WebAuthnEnvelope, WebAuthnSignature};
 /// that can be used for computation in const context.
 pub const MAX_INTER_CANISTER_PAYLOAD_IN_BYTES_U64: u64 = 2 * 1024 * 1024; // 2 MiB
 
-/// This sets the upper bound on how big a single inter-canister request or
-/// response can be.  We know that allowing messages larger than around 2MB has
+/// This sets the upper bound on how large a single inter-canister request or
+/// response (as returned by `RequestOrResponse::payload_size_bytes()`) can be.
+///
+/// We know that allowing messages larger than around 2MB has
 /// various security and performance impacts on the network.  More specifically,
 /// large messages can allow dishonest block makers to always manage to get
 /// their blocks notarized; and when the consensus protocol is configured for
@@ -79,7 +82,7 @@ pub struct UserSignature {
 
 /// Stores info needed for processing and tracking requests to
 /// stop canisters.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum StopCanisterContext {
     Ingress {
         sender: UserId,
@@ -256,7 +259,6 @@ mod tests {
     use super::*;
     use crate::time::current_time_and_expiry_time;
     use maplit::btreemap;
-    use proptest::prelude::*;
     use serde_cbor::Value;
     use std::{convert::TryFrom, io::Cursor};
 
@@ -332,19 +334,6 @@ mod tests {
 
     fn integer(val: u64) -> Value {
         Value::Integer(val as i128)
-    }
-
-    proptest! {
-        #[ignore]
-        #[test]
-        // The conversion from Submit to HttpRequest is not total so we proptest
-        // the hell out of it to make sure no enum constructors are added which are
-        // not handled by the conversion.
-        fn request_id_conversion_does_not_panic(
-            submit: HttpRequestEnvelope::<HttpCallContent>)
-        {
-            let _ = HttpRequest::try_from(submit).unwrap();
-        }
     }
 
     #[test]
@@ -475,6 +464,10 @@ mod tests {
     }
 
     #[test]
+    /// Allowing bincode::deserialize_from here since
+    /// 1. It's only being used in a test
+    /// 2. The deserialized_from is used on data that has just been serialized before the method.
+    #[allow(clippy::disallowed_methods)]
     fn serialize_via_bincode_without_signature() {
         let expiry_time = current_time_and_expiry_time().1;
         let update = HttpRequestEnvelope::<HttpCallContent> {

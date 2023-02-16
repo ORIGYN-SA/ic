@@ -123,9 +123,7 @@ pub enum RegistryDataProviderError {
     /// canister.
     Timeout,
     /// Error when using registry transfer
-    Transfer {
-        source: ic_registry_transport::Error,
-    },
+    Transfer { source: String },
 }
 
 impl std::error::Error for RegistryDataProviderError {}
@@ -163,4 +161,7 @@ pub enum RegistryClientError {
 
     #[error("failed to report the same version twice after {retries} times")]
     PollingLatestVersionFailed { retries: usize },
+
+    #[error("failed to decode registry contents: {error}")]
+    DecodeError { error: String },
 }

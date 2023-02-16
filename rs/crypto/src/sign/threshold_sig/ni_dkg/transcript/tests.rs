@@ -14,14 +14,13 @@ use ic_crypto_internal_types::sign::threshold_sig::ni_dkg::{
     ni_dkg_groth20_bls12_381, CspNiDkgDealing, CspNiDkgTranscript, Epoch,
 };
 use ic_crypto_internal_types::sign::threshold_sig::public_key::bls12_381::PublicKeyBytes;
-use ic_test_utilities::crypto::basic_utilities::set_of;
-use ic_test_utilities::crypto::empty_ni_csp_dkg_transcript;
-use ic_test_utilities::types::ids::{NODE_1, NODE_2, NODE_3, NODE_4, NODE_5, NODE_6};
+use ic_crypto_test_utils::set_of;
 use ic_types::crypto::threshold_sig::ni_dkg::config::receivers::NiDkgReceivers;
 use ic_types::crypto::threshold_sig::ni_dkg::config::{NiDkgConfigData, NiDkgThreshold};
 use ic_types::crypto::threshold_sig::ni_dkg::errors::create_transcript_error::DkgCreateTranscriptError;
 use ic_types::crypto::threshold_sig::ni_dkg::NiDkgDealing;
 use ic_types::{NodeId, NumberOfNodes};
+use ic_types_test_utils::ids::{NODE_1, NODE_2, NODE_3, NODE_4, NODE_5, NODE_6};
 use std::collections::BTreeMap;
 
 const PK_BYTES_1: PublicKeyBytes = PublicKeyBytes([42; PublicKeyBytes::SIZE]);
@@ -60,7 +59,12 @@ mod create_transcript {
 
         let result = create_transcript(&csp, &config, &verified_dealings);
 
-        assert_eq!(result, Err(insufficient_dealings_error("Too few dealings: got 2, need more than 3 (the maximum number of corrupt dealers).")));
+        assert_eq!(
+            result,
+            Err(insufficient_dealings_error(
+                "Too few dealings: got 2, need at least 4 (=collection threshold)."
+            ))
+        );
     }
 
     #[test]
@@ -104,7 +108,12 @@ mod create_transcript {
 
         let result = create_transcript(&csp, &config, &verified_dealings);
 
-        assert_eq!(result.unwrap_err(), insufficient_dealings_error("Too few dealings: got 2, need more than 2 (the maximum number of corrupt dealers)."));
+        assert_eq!(
+            result.unwrap_err(),
+            insufficient_dealings_error(
+                "Too few dealings: got 2, need at least 3 (=collection threshold)."
+            )
+        );
     }
 
     #[test]
@@ -136,14 +145,20 @@ mod create_transcript {
             threshold: THRESHOLD,
             ..minimal_dkg_config_data_without_resharing()
         });
+        let collection_threshold_ = config.collection_threshold();
         let mut csp = MockAllCryptoServiceProvider::new();
         csp.expect_create_transcript()
             .withf(
-                move |algorithm_id, threshold, number_of_receivers, csp_dealings| {
+                move |algorithm_id,
+                      threshold,
+                      number_of_receivers,
+                      csp_dealings,
+                      collection_threshold| {
                     *algorithm_id == AlgorithmId::NiDkg_Groth20_Bls12_381
                         && *threshold == THRESHOLD
                         && *number_of_receivers == NumberOfNodes::new(4)
                         && *csp_dealings == map_of(vec![(0, csp_dealing_1()), (2, csp_dealing_3())])
+                        && *collection_threshold == collection_threshold_
                 },
             )
             .times(1)
@@ -294,7 +309,9 @@ mod create_transcript_with_resharing {
 
         assert_eq!(
             error,
-            insufficient_dealings_error("Too few dealings for resharing: got 2, need at least 3 (threshold in re-sharing transcript).")
+            insufficient_dealings_error(
+                "Too few dealings: got 2, need at least 3 (=collection threshold)."
+            )
         )
     }
 
@@ -405,7 +422,6 @@ mod load_transcript {
     use ic_logger::replica_logger::no_op_logger;
     use ic_types::crypto::error::{InvalidArgumentError, KeyNotFoundError};
     use ic_types::crypto::threshold_sig::ni_dkg::NiDkgId;
-    use ic_types::crypto::KeyId;
 
     const PK_BYTES_1: PublicKeyBytes = PublicKeyBytes([42; PublicKeyBytes::SIZE]);
     const PK_BYTES_2: PublicKeyBytes = PublicKeyBytes([43; PublicKeyBytes::SIZE]);
@@ -701,7 +717,8 @@ mod load_transcript {
     fn key_not_found_error() -> CspDkgLoadPrivateKeyError {
         CspDkgLoadPrivateKeyError::KeyNotFoundError(KeyNotFoundError {
             internal_error: "some error".to_string(),
-            key_id: KeyId::from([1u8; 32]),
+            key_id: "KeyId(0x0101010101010101010101010101010101010101010101010101010101010101)"
+                .to_string(),
         })
     }
 
@@ -738,5 +755,14 @@ fn receivers(nodes: &[NodeId]) -> NiDkgReceivers {
 fn insufficient_dealings_error(message: &str) -> DkgCreateTranscriptError {
     DkgCreateTranscriptError::InsufficientDealings(InvalidArgumentError {
         message: message.to_string(),
+    })
+}
+
+fn empty_ni_csp_dkg_transcript() -> CspNiDkgTranscript {
+    CspNiDkgTranscript::Groth20_Bls12_381(ni_dkg_groth20_bls12_381::Transcript {
+        public_coefficients: PublicCoefficientsBytes {
+            coefficients: vec![],
+        },
+        receiver_data: Default::default(),
     })
 }

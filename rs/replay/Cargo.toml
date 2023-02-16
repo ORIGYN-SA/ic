@@ -1,11 +1,11 @@
 [package]
 name = "ic-replay"
 version = "0.8.0"
-edition = "2018"
+edition = "2021"
 
 [dependencies]
-candid = "0.7.4"
-clap = "3.0.0-beta.2"
+candid = "0.8.1"
+clap = { version = "3.1.6", features = ["derive"] }
 hex = "0.4.2"
 ic-artifact-pool = { path = "../artifact_pool" }
 ic-canister-client = { path = "../canister_client" }
@@ -13,28 +13,30 @@ ic-canister-sandbox-backend-lib = { path = "../canister_sandbox/backend_lib" }
 ic-canister-sandbox-launcher = { path = "../canister_sandbox/sandbox_launcher" }
 ic-config = { path = "../config" }
 ic-consensus = { path = "../consensus" }
-ic-consensus-message = { path = "../consensus/message" }
-ic-crypto = { path = "../crypto" }
+ic-crypto-for-verification-only = { path = "../crypto/for_verification_only" }
+ic-crypto-utils-threshold-sig = { path = "../crypto/utils/threshold_sig" }
+ic-crypto-utils-threshold-sig-der = { path = "../crypto/utils/threshold_sig_der" }
 ic-crypto-internal-types = { path = "../crypto/internal/crypto_lib/types" }
 ic-crypto-sha = {path = "../crypto/sha/"}
 ic-cycles-account-manager = { path = "../cycles_account_manager" }
 ic-execution-environment = { path = "../execution_environment" }
-ic-http-handler = { path = "../http_handler" }
 ic-interfaces = { path = "../interfaces" }
+ic-interfaces-registry = { path = "../interfaces/registry" }
 ic-interfaces-state-manager = { path = "../interfaces/state_manager" }
 ic-logger = { path = "../monitoring/logger" }
 ic-messaging = { path = "../messaging" }
 ic-metrics = { path = "../monitoring/metrics" }
 ic-nervous-system-common = { path = "../nervous_system/common" }
-ic-nns-constants = { path = "../nns/constants" }
 ic-nns-common = { path = "../nns/common" }
-ic-nns-init = { path = "../nns/init" }
+ic-nns-constants = { path = "../nns/constants" }
 ic-nns-governance = { path = "../nns/governance" }
+ic-nns-init = { path = "../nns/init" }
 ic-protobuf = { path = "../protobuf" }
 ic-registry-client = { path = "../registry/client" }
 ic-registry-client-helpers = { path = "../registry/helpers" }
-ic-registry-common = { path = "../registry/common" }
+ic-registry-nns-data-provider = { path = "../registry/nns_data_provider" }
 ic-registry-keys = { path = "../registry/keys" }
+ic-registry-local-store = { path = "../registry/local_store" }
 ic-registry-subnet-type = { path = "../registry/subnet_type" }
 ic-registry-transport = { path = "../registry/transport" }
 ic-replica = { path = "../replica" }
@@ -42,14 +44,19 @@ ic-replicated-state = { path = "../replicated_state" }
 ic-state-manager = { path = "../state_manager" }
 ic-types = { path = "../types/types" }
 ic-utils = { path = "../utils" }
-ledger-canister = { path = "../rosetta-api/ledger_canister" }
-prost = "0.9.0"
+icp-ledger = { path = "../rosetta-api/icp_ledger" }
+prost = "0.11.0"
+rand = "0.8"
+serde = { version = "1.0.115", features = ["derive"] }
 serde_json = "1.0.40"
 slog = "2.5.2"
-rand = "0.7"
+slog-async = { version = "2.5", features = ["nested-values"] }
 tempfile = "3.1.0"
 tokio = { version = "1.15.0", features = ["full"] }
 url = { version = "2.1.1", features = ["serde"] }
+
+[dev-dependencies]
+ic-test-utilities = { path = "../test_utilities" }
 
 [[bin]]
 name = "ic-replay"

@@ -3,9 +3,9 @@
 use crate::types::ids::node_test_id;
 use ic_config::{
     logger::{default_logtarget, Config as LoggerConfig, LogFormat},
-    transport::{TransportConfig, TransportFlowConfig},
+    transport::TransportConfig,
 };
-use ic_interfaces::registry::RegistryClient;
+use ic_interfaces_registry::RegistryClient;
 use ic_logger::*;
 use ic_metrics::MetricsRegistry;
 use ic_p2p::P2PThreadJoiner;
@@ -252,7 +252,6 @@ pub fn test_group_set_registry(
             protocol: Protocol::P2p1Tls13 as i32,
         });
         let flow_end_point = FlowEndpoint {
-            flow_tag: 0,
             endpoint: connection_endpoint,
         };
         let flow_end_points = vec![flow_end_point];
@@ -319,16 +318,13 @@ pub fn get_replica_transport_config(
         .as_ref()
         .expect("p2p flow endpoint not present in node record.")
         .port;
-    use std::convert::TryFrom;
     let port = u16::try_from(port).expect("Could not convert u32 to u16");
 
     TransportConfig {
         node_ip: "127.0.0.1".to_string(),
-        p2p_flows: vec![TransportFlowConfig {
-            flow_tag: 0,
-            server_port: port,
-            queue_size: 8,
-        }],
+        listening_port: port,
+        send_queue_size: 8,
+        ..Default::default()
     }
 }
 

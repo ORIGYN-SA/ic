@@ -8,7 +8,6 @@
 //! the tests in this module can be used to test the Pool implementation.
 
 use crate::consensus_pool::{MutablePoolSection, PoolSectionOp, PoolSectionOps};
-use ic_consensus_message::ConsensusMessageHashable;
 use ic_interfaces::consensus_pool::{
     HeightIndexedPool, HeightRange, PoolSection, ValidatedConsensusArtifact,
 };
@@ -21,9 +20,10 @@ use ic_test_utilities::{
 use ic_types::{
     artifact::{ConsensusMessage, ConsensusMessageId},
     consensus::{
-        dkg::Summary, Block, BlockPayload, BlockProposal, Finalization, FinalizationContent,
-        FinalizationShare, Notarization, NotarizationContent, NotarizationShare, RandomBeacon,
-        RandomBeaconContent, RandomBeaconShare, RandomTape, RandomTapeContent, RandomTapeShare,
+        dkg::Summary, Block, BlockPayload, BlockProposal, ConsensusMessageHashable, Finalization,
+        FinalizationContent, FinalizationShare, Notarization, NotarizationContent,
+        NotarizationShare, RandomBeacon, RandomBeaconContent, RandomBeaconShare, RandomTape,
+        RandomTapeContent, RandomTapeShare,
     },
     crypto::{ThresholdSigShare, ThresholdSigShareOf},
     signature::*,
@@ -459,7 +459,7 @@ fn random_beacon_share_ops() -> PoolSectionOps<ValidatedConsensusArtifact> {
         let height = Height::from(i);
         for j in 0..3 {
             let random_beacon = fake_random_beacon(Height::from(i));
-            let parent = ic_crypto::crypto_hash(&random_beacon);
+            let parent = ic_types::crypto::crypto_hash(&random_beacon);
             let content = RandomBeaconContent::new(height, parent);
             let signature = ThresholdSigShareOf::new(ThresholdSigShare(vec![]));
             let signer = node_test_id(j);
