@@ -34,11 +34,13 @@ make_group_owned_and_sticky /var/lib/ic/crypto ic-replica confidential
 make_group_owned_and_sticky /var/lib/ic/data/ic_consensus_pool ic-replica nonconfidential
 make_group_owned_and_sticky /var/lib/ic/data/ic_state ic-replica nonconfidential
 make_group_owned_and_sticky /var/lib/ic/data/cups ic-replica nonconfidential
+make_group_owned_and_sticky /var/lib/ic/data/orchestrator ic-replica nonconfidential
 make_group_owned_and_sticky /var/lib/ic/data/ic_registry_local_store ic-replica ic-registry-local-store
+make_group_owned_and_sticky /var/lib/ic/data/ic_state/page_deltas ic-replica nonconfidential
 
 # Fix up security labels for everything.
 echo "Restoring SELinux security contexts in /var/lib/ic"
-restorecon -p -r /var/lib/ic/data /var/lib/ic/crypto
+/opt/ic/bin/prestorecon -j 0 /var/lib/ic/data /var/lib/ic/crypto
 
 # Note: we are not setting up contexts individually for /var/lib/ic/backup.
 # This is handled instead by mount option for the filesystem in its entirety.

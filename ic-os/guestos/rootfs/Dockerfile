@@ -2,43 +2,22 @@
 #
 # Build steps:
 # - `docker build --pull -t dfinity/guestos-main -f Dockerfile .`
-#
-# First build stage:
-# - Download 3rd party tools
-#
 
 # The base images are defined in docker-base.prod and docker-base.dev. Update
 # the references there when a new base image has been built. Note that this
 # argument MUST be given by the build script, otherwise build will fail.
 ARG BASE_IMAGE=
 
-FROM ubuntu:20.04 as download
-
-ENV TZ=UTC
-RUN ln -snf /usr/share/zoneinfo/$TZ /etc/localtime && echo $TZ > /etc/timezone
-RUN apt-get -y update && apt-get -y upgrade && apt-get -y --no-install-recommends install \
-    ca-certificates \
-    curl \
-    perl
-
-# Download and verify journalbeat
-RUN cd /tmp/ && \
-    curl -L -O https://artifacts.elastic.co/downloads/beats/journalbeat/journalbeat-oss-7.5.1-linux-x86_64.tar.gz && \
-    echo "b1c4c12a5ea8b0e95ed78243ad08dc6e82dc414186da8324d86833c5114846c6edf06590b45cf6c0f29f57e4631c4bf4163e0020d466cf3a2cb65910540f39c5  journalbeat-oss-7.5.1-linux-x86_64.tar.gz" > journalbeat.sha512 && \
-    shasum -c journalbeat.sha512
-
-# Download and verify node_exporter
-RUN cd /tmp/ && \
-    curl -L -O https://github.com/prometheus/node_exporter/releases/download/v1.3.1/node_exporter-1.3.1.linux-amd64.tar.gz && \
-    echo "68f3802c2dd3980667e4ba65ea2e1fb03f4a4ba026cca375f15a0390ff850949  node_exporter-1.3.1.linux-amd64.tar.gz" > node_exporter.sha256 && \
-    shasum -c node_exporter.sha256
+# We support prod and dev images
+ARG BUILD_TYPE=
 
 #
-# Second build stage:
+# First build stage:
 # - Construct the actual target image (IC-OS root filesystem)
-# - Copy downloaded archives from first build stage into the target image
 #
-FROM $BASE_IMAGE
+FROM $BASE_IMAGE as output_prod
+
+USER root:root
 
 RUN mkdir -p /boot/config \
              /boot/efi \
@@ -48,9 +27,11 @@ COPY etc /etc
 # Update POSIX permissions in /etc/
 RUN find /etc -type d -exec chmod 0755 {} \+ && \
     find /etc -type f -not -path "/etc/hostname" -not -path "/etc/hosts" -not -path "/etc/resolv.conf" -exec chmod 0644 {} \+ && \
-    chmod 0755 /etc/systemd/system-generators/mount-generator && \
+    chmod 0755 /etc/systemd/system-generators/* && \
     chmod 0440 /etc/sudoers && \
-    chmod 755 /etc/initramfs-tools/scripts/init-bottom/set-machine-id
+    chmod 755 /etc/initramfs-tools/scripts/init-bottom/set-machine-id && \
+    chmod 755 /etc/initramfs-tools/scripts/init-premount/verity-root && \
+    chmod 755 /etc/initramfs-tools/hooks/veritysetup
 
 # Deactivate motd, it tries creating $HOME/.cache/motd.legal-displayed,
 # but we want to prohibit it from writing to user home dirs
@@ -72,12 +53,6 @@ RUN ln -sf /run/ic-node/nftables-ruleset/nftables.conf /etc/nftables.conf
 
 # Regenerate initramfs (config changed after copying in /etc)
 RUN RESUME=none update-initramfs -c -k all
-
-ARG ROOT_PASSWORD=
-RUN \
-    if [ "${ROOT_PASSWORD}" != "" ]; then \
-        echo "root:$(openssl passwd -6 -salt jE8zzDEHeRg/DuGq ${ROOT_PASSWORD})" | chpasswd -e ; \
-    fi
 
 # Prepare for bind mount of authorized_keys
 RUN mkdir -p /root/.ssh && chmod 0700 /root/.ssh
@@ -101,6 +76,9 @@ RUN sed -e "s/.*PermitRootLogin.*/PermitRootLogin prohibit-password/" -i /etc/ss
 RUN mkdir -p /var/lib/ic/backup \
              /var/lib/ic/crypto \
              /var/lib/ic/data
+
+# Create two mount points for temporary use during setup of "var" partition
+RUN mkdir -p /mnt/var_old /mnt/var_new
 
 RUN \
     for SERVICE in /etc/systemd/system/*; do \
@@ -130,14 +108,20 @@ RUN addgroup --system nonconfidential && \
     addgroup --system vsock && \
     addgroup --system ic-registry-local-store
 
+# The "ic-http-adapter" account. Used to run `ic-https-outcalls-adapter` binary
+# to allow nodes to make HTTP calls.
+RUN addgroup ic-http-adapter && \
+    adduser --system --disabled-password --shell /usr/sbin/nologin -c "IC Canister HTTP Adapter" ic-http-adapter && \
+    adduser ic-http-adapter ic-http-adapter
+
 # User which will run the replica service.
 RUN adduser --system --disabled-password --home /var/lib/ic --group --no-create-home ic-replica && \
     adduser ic-replica backup && \
     adduser ic-replica nonconfidential && \
     adduser ic-replica confidential && \
     adduser ic-replica ic-registry-local-store && \
-    adduser ic-replica vsock && \
-    adduser ic-replica sudo
+    adduser ic-replica ic-http-adapter && \
+    adduser ic-replica vsock
 
 # Accounts to allow remote access to state bits
 
@@ -173,23 +157,7 @@ RUN adduser --system --disabled-password --home /var/lib/admin --shell /bin/bash
 RUN addgroup journalbeat && \
     adduser --system --disabled-password --shell /usr/sbin/nologin -c "Journalbeat" journalbeat && \
     adduser journalbeat journalbeat && \
-    adduser journalbeat systemd-journal
-
-# The "node_exporter" account. Used to run node_exporter binary to export
-# telemetry metrics of the GuestOS.
-RUN addgroup node_exporter && \
-    adduser --system --disabled-password --shell /usr/sbin/nologin -c "Node Exporter" node_exporter && \
-    adduser node_exporter node_exporter
-
-# Install journalbeat
-COPY --from=download /tmp/journalbeat-oss-7.5.1-linux-x86_64.tar.gz /tmp/journalbeat-oss-7.5.1-linux-x86_64.tar.gz
-RUN cd /tmp/ && \
-    mkdir -p /etc/journalbeat \
-             /var/lib/journalbeat \
-             /var/log/journalbeat && \
-    tar --strip-components=1 -C /etc/journalbeat/ -zvxf journalbeat-oss-7.5.1-linux-x86_64.tar.gz journalbeat-7.5.1-linux-x86_64/fields.yml && \
-    tar --strip-components=1 -C /etc/journalbeat/ -zvxf journalbeat-oss-7.5.1-linux-x86_64.tar.gz journalbeat-7.5.1-linux-x86_64/journalbeat.reference.yml && \
-    tar --strip-components=1 -C /usr/local/bin/ -zvxf journalbeat-oss-7.5.1-linux-x86_64.tar.gz journalbeat-7.5.1-linux-x86_64/journalbeat && \
+    adduser journalbeat systemd-journal && \
     chown root:root /etc/journalbeat/*.yml \
                     /usr/local/bin/journalbeat && \
     chown journalbeat:journalbeat /var/lib/journalbeat \
@@ -197,21 +165,19 @@ RUN cd /tmp/ && \
     chmod 0755 /etc/journalbeat && \
     chmod 0750 /var/lib/journalbeat \
                /var/log/journalbeat && \
-    chmod 0644 /etc/journalbeat/*.yml && \
-    rm /tmp/journalbeat-oss-7.5.1-linux-x86_64.tar.gz
+    chmod 0644 /etc/journalbeat/*.yml
 
-# Install node_exporter
-COPY --from=download /tmp/node_exporter-1.3.1.linux-amd64.tar.gz /tmp/node_exporter-1.3.1.linux-amd64.tar.gz
-RUN cd /tmp/ && \
-    mkdir -p /etc/node_exporter && \
-    tar --strip-components=1 -C /usr/local/bin/ -zvxf node_exporter-1.3.1.linux-amd64.tar.gz node_exporter-1.3.1.linux-amd64/node_exporter && \
+# The "node_exporter" account. Used to run node_exporter binary to export
+# telemetry metrics of the GuestOS.
+RUN addgroup node_exporter && \
+    adduser --system --disabled-password --shell /usr/sbin/nologin -c "Node Exporter" node_exporter && \
+    adduser node_exporter node_exporter && \
     chown root:root /etc/node_exporter \
                     /usr/local/bin/node_exporter && \
     chmod 0755 /etc/node_exporter \
                /usr/local/bin/node_exporter && \
     chmod 0644 /etc/default/node_exporter \
-               /etc/node_exporter/web.yml && \
-    rm /tmp/node_exporter-1.3.1.linux-amd64.tar.gz
+               /etc/node_exporter/web.yml
 
 # Clear all files that may lead to indeterministic build.
 RUN apt-get clean && \
@@ -219,7 +185,7 @@ RUN apt-get clean && \
         /var/cache/fontconfig/* /var/cache/ldconfig/aux-cache \
         /var/log/alternatives.log /var/log/apt/history.log /var/log/apt/term.log /var/log/dpkg.log \
         /var/lib/apt/lists/* /var/lib/dbus/machine-id \
-        /var/lib/initramfs-tools/5.8.0-50-generic && \
+        /var/lib/initramfs-tools/* && \
     find /usr/local/share/fonts -name .uuid | xargs rm && \
     find /usr/share/fonts -name .uuid | xargs rm && \
     find /usr/lib/python3.8 -name "*.pyc" | xargs rm && \
@@ -237,6 +203,23 @@ RUN find /opt -type d -exec chmod 0755 {} \+ && \
     chmod 0755 /opt/ic/bin/* && \
     chmod 0644 /opt/ic/share/*
 
-COPY boot /boot
-# Update POSIX permissions in /boot/
-RUN chmod 0644 /boot/extra_boot_args /boot/version.txt
+# The following steps apply conditionally to the dev image ONLY
+# https://www.docker.com/blog/advanced-dockerfiles-faster-builds-and-smaller-images-using-buildkit-and-multistage-builds/#4374
+FROM output_prod as output_dev
+
+USER root:root
+
+# Set a root password if specified
+ARG ROOT_PASSWORD=
+RUN \
+    if [ "${ROOT_PASSWORD}" != "" ]; then \
+        echo "root:$(openssl passwd -6 -salt jE8zzDEHeRg/DuGq ${ROOT_PASSWORD})" | chpasswd -e ; \
+    fi
+
+# Include the dev root CA cert
+COPY dev-certs/canister_http_test_ca.cert /usr/local/share/ca-certificates/dev-root-ca.crt
+RUN update-ca-certificates
+
+FROM output_${BUILD_TYPE}
+
+USER root:root

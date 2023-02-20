@@ -8,6 +8,9 @@ import gflags
 
 FLAGS = gflags.FLAGS
 gflags.DEFINE_bool("use_updates", False, "Issue update calls instead of query calls")
+gflags.DEFINE_string("mainnet_target_subnet_id", None, "")
+gflags.MarkFlagAsRequired("mainnet_target_subnet_id")
+gflags.DEFINE_string("testnet", "mercury", "")
 
 
 class Mainnet:
@@ -15,11 +18,12 @@ class Mainnet:
 
     def __init__(self):
         """Initialize."""
-        if FLAGS.testnet == "mercury" and FLAGS.target_subnet_id is None:
-            raise Exception("--target_subnet_id has to be set when running against mainnet")
+        if FLAGS.testnet == "mercury" and FLAGS.mainnet_target_subnet_id is None:
+            raise Exception("--mainnet_target_subnet_id has to be set when running against mainnet")
 
         # Testnets you have booked and the number of subnetworks each (including NNS)
         self.testnets = {
+            "benchmarklarge": 2,
             "large01": 5,
             # "large02": 5,
             "large03": 5,
@@ -87,12 +91,12 @@ class Mainnet:
     def get_query_command(self, canister, subnet, wg_testnet, wg_subnet, subnet_prefix):
         """Return query command."""
         return [
-            "./max_capacity_system_baseline.py",
+            "experiments/max_capacity_system_baseline.py",
             "--testnet",
             "mercury",
-            "--canister",
+            "--canister_id",
             canister,
-            "--target_subnet_id",
+            "--mainnet_target_subnet_id",
             subnet,
             "--wg_testnet",
             wg_testnet,
@@ -105,50 +109,47 @@ class Mainnet:
             subnet_prefix,
             "--num_workload_generators",
             str(4),
-            "--query_initial_rps",
+            "--initial_rps",
             str(500),
-            "--max_query_load",
+            "--max_rps",
             str(500),
-            "--skip_generate_report=True",
-            "--target_query_load",
+            "--target_rps",
             str(440),
-            "--query_rps_increment",
+            "--increment_rps",
             str(40),
             "--target_all=True",
         ]
 
     def get_update_command(self, canister, subnet, wg_testnet, wg_subnet, subnet_prefix):
         """Retrun update command."""
+        LOAD = 600
         return [
-            "./max_capacity_system_baseline.py",
+            "experiments/max_capacity_system_baseline.py",
             "--testnet",
             "mercury",
-            "--canister",
+            "--canister_id",
             canister,
-            "--target_subnet_id",
+            "--mainnet_target_subnet_id",
             subnet,
             "--wg_testnet",
             wg_testnet,
             "--wg_subnet",
             str(wg_subnet),
             "--no_instrument=True",
-            "--max_update_load",
-            str(600),
+            "--max_rps",
+            str(LOAD),
             "--top_level_out_dir",
             "mainnet-{}".format(self.start_time),
             "--second_level_out_dir",
             subnet_prefix,
             "--num_workload_generators",
             str(4),
-            "--target_update_load",
-            str(600),
-            "--update_rps_increment",
+            "--target_rps",
+            str(LOAD),
+            "--increment_rps",
             str(4),
-            "--update_initial_rps",
-            str(600),
-            "--skip_generate_report=True",
-            "--target_update_load",
-            str(600),
+            "--initial_rps",
+            str(LOAD),
             "--use_updates=True",
             "--iter_duration={}".format(300),
         ]

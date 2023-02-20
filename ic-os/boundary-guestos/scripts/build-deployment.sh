@@ -3,20 +3,31 @@
 # Build subnet based on subnet.json and transform it into removable media.
 
 # Build Requirements:
+# - Bash 4+
+#
 # - Operating System: Ubuntu 20.04
-# - Packages: coreutils, jq, mtools, tar, util-linux, wget, rclone
+# - >sudo apt install coreutils jq mtools tar util-linux wget rclone
+#
+# - Operating System: MacOS 12.5
+# - >brew install coreutil bash jq rclone dosfstools wget mtools gnu-tar
+# - /usr/local/sbin/ must be in your path (for dosfstools)
 
-set -o errexit
-set -o pipefail
+set -euo pipefail
+
+function err() {
+    echo "[$(date +'%Y-%m-%dT%H:%M:%S%z')]: $*" >&2
+}
+
+if [[ "${BASH_VERSINFO:-0}" -lt 4 ]]; then
+    err "Bash 4+ is required"
+    exit 1
+fi
 
 BASE_DIR="$(dirname "${BASH_SOURCE[0]}")/.."
-REPO_ROOT=$(git rev-parse --show-toplevel)
+GIT_REVISION=$(git rev-parse --verify HEAD)
 
-# Get keyword arguments
-for argument in "${@}"; do
-    case ${argument} in
-        -h | --help)
-            echo 'Usage:
+function exit_usage() {
+    echo 'Usage:
 
 Removable Media Builder for Boundary Node VMs
 
@@ -25,13 +36,28 @@ Arguments:
   -h,  --help                           show this help message and exit
   -i=, --input=                         JSON formatted input file (Default: ./subnet.json)
   -o=, --output=                        removable media output directory (Default: ./build-out/)
-  -s=, --ssh=                           specify directory holding SSH authorized_key files (Default: ../../testnet/config/ssh_authorized_keys)
-  -c=, --certdir=                       specify directory holding TLS certificates for hosted domain (Default: None i.e. snakeoil/self certified certificate will be used)
-  -n=, --nns_urls=                      specify a file that lists on each line a nns url of the form http://[ip]:port this file will override nns urls derived from input json file
-       --git-revision=                  git revision for which to prepare the media
-  -x,  --debug                enable verbose console output
+       --ssh=                           specify directory holding SSH authorized_key files (Default: ../../testnet/config/ssh_authorized_keys)
+       --certdir=                       specify directory holding TLS certificates for hosted domain (Default: None i.e. snakeoil/self certified certificate will be used)
+       --nns_public_key=                specify NNS public key pem file
+       --nns_urls=                      specify a file that lists on each line a nns url of the form `http://[ip]:port` this file will override nns urls derived from input json file
+       --replicas-ipv6=                 specify a file that lists on each line an ipv6 firewall rule to allow replicas of the form `ipv6-addr/prefix-length` (# comments and trailing whitespace will be stripped)
+       --denylist=                      a deny list of canisters
+       --prober-identity=               specify an identity file for the prober
+       --geolite2-country-db=           specify path to GeoLite2 Country Database
+       --geolite2-city-db=              specify path to GeoLite2 City Database
+       --cert-issuer-creds              specify a credentials file for certificate-issuer
+       --cert-issuer-identity           specify an identity file for certificate-issuer
+       --cert-issuer-enc-key            specify an encryption key for certificate-issuer
+  -x,  --debug                          enable verbose console output
 '
-            exit 1
+    exit 1
+}
+
+# Get keyword arguments
+for argument in "${@}"; do
+    case ${argument} in
+        -h | --help)
+            exit_usage
             ;;
         -i=* | --input=*)
             INPUT="${argument#*=}"
@@ -41,24 +67,49 @@ Arguments:
             OUTPUT="${argument#*=}"
             shift
             ;;
-        -s=* | --ssh=*)
+        --ssh=*)
             SSH="${argument#*=}"
             shift
             ;;
-        -c=* | --certdir=*)
+        --certdir=*)
             CERT_DIR="${argument#*=}"
             shift
             ;;
-        -n=* | --nns_url=*)
+        --nns_url=*)
             NNS_URL_OVERRIDE="${argument#*=}"
             shift
             ;;
-        --git-revision=*)
-            GIT_REVISION="${argument#*=}"
+        --nns_public_key=*)
+            NNS_PUBLIC_KEY="${argument#*=}"
             shift
             ;;
+        --replicas-ipv6=*)
+            REPLICA_IPV6_OVERRIDE="${argument#*=}"
+            shift
+            ;;
+        --denylist=*)
+            DENY_LIST="${argument#*=}"
+            ;;
+        --prober-identity=*)
+            PROBER_IDENTITY="${argument#*=}"
+            ;;
+        --geolite2-country-db=*)
+            GEOLITE2_COUNTRY_DB="${argument#*=}"
+            ;;
+        --geolite2-city-db=*)
+            GEOLITE2_CITY_DB="${argument#*=}"
+            ;;
+        --cert-issuer-creds=*)
+            CERTIFICATE_ISSUER_CREDENTIALS="${argument#*=}"
+            ;;
+        --cert-issuer-identity=*)
+            CERTIFICATE_ISSUER_IDENTITY="${argument#*=}"
+            ;;
+        --cert-issuer-enc-key=*)
+            CERTIFICATE_ISSUER_ENCRYPTION_KEY="${argument#*=}"
+            ;;
         *)
-            echo 'Error: Argument is not supported.'
+            echo "Error: Argument \"${argument#}\" is not supported for $0"
             exit 1
             ;;
     esac
@@ -68,57 +119,67 @@ done
 INPUT="${INPUT:=${BASE_DIR}/subnet.json}"
 OUTPUT="${OUTPUT:=${BASE_DIR}/build-out}"
 SSH="${SSH:=${BASE_DIR}/../../testnet/config/ssh_authorized_keys}"
-CERT_DIR="${CERT_DIR:=""}"
-GIT_REVISION="${GIT_REVISION:=}"
-
-if [[ -z "$GIT_REVISION" ]]; then
-    echo "Please provide the GIT_REVISION as env. variable or the command line with --git-revision=<value>"
+CERT_DIR="${CERT_DIR:-}"
+CERTIFICATE_ISSUER_CREDENTIALS="${CERTIFICATE_ISSUER_CREDENTIALS:-}"
+if [ -z ${NNS_PUBLIC_KEY+x} ]; then
+    err "--nns_public_key not set"
+    exit 1
+elif [ ! -f "${NNS_PUBLIC_KEY}" ]; then
+    err "nns_public_key '${NNS_PUBLIC_KEY}' not found"
     exit 1
 fi
 
 # Load INPUT
 CONFIG="$(cat ${INPUT})"
 
+# Read all the BN vars
+BN_VARS=$(
+    echo ${CONFIG} | jq -r '.bn_vars | to_entries | map(
+        .key as $key | (                   # Save the key
+            [.value] |                     # Force value to be an array
+            flatten |                      # Flatten so we can create pairs
+            map( [$key, (. | tostring)] )  # Create pairs
+        )
+    )[][] | join("=")'
+)
+
 # Read all the top-level values out in one swoop
 VALUES=$(echo ${CONFIG} | jq -r -c '[
     .deployment,
     (.name_servers | join(" ")),
     (.name_servers_fallback | join(" ")),
-    (.journalbeat_hosts | join(" ")),
-    (.journalbeat_tags | join(" "))
+    (.ipv4_name_servers | join(" "))
 ] | join("\u0001")')
-IFS=$'\1' read -r DEPLOYMENT NAME_SERVERS NAME_SERVERS_FALLBACK JOURNALBEAT_HOSTS JOURNALBEAT_TAGS < <(echo $VALUES)
+IFS=$'\1' read -r DEPLOYMENT IPV6_NAME_SERVERS IPV6_NAME_SERVERS_FALLBACK IPV4_NAME_SERVERS < <(echo $VALUES)
 
 # Read all the node info out in one swoop
 NODES=0
 VALUES=$(echo ${CONFIG} \
     | jq -r -c '.datacenters[]
 | .aux_nodes[] += { "type": "aux" } | .boundary_nodes[] += {"type": "boundary"} | .nodes[] += { "type": "replica" }
-| [.aux_nodes[], .boundary_nodes[], .nodes[]][] + { "ipv6_prefix": .ipv6_prefix, "ipv6_subnet": .ipv6_subnet } | [
-    .ipv6_prefix,
-    .ipv6_subnet,
+| [.aux_nodes[], .boundary_nodes[], .nodes[]][] | [
     .ipv6_address,
+    .ipv6_gateway,
     .ipv4_gateway,
     .ipv4_address,
+    .prober,
     .hostname,
     .subnet_type,
     .subnet_idx,
     .node_idx,
-    .use_hsm,
     .type
 ] | join("\u0001")')
-while IFS=$'\1' read -r ipv6_prefix ipv6_subnet ipv6_address ipv4_gateway ipv4_address hostname subnet_type subnet_idx node_idx use_hsm type; do
+while IFS=$'\1' read -r ipv6_address ipv6_gateway ipv4_gateway ipv4_address prober hostname subnet_type subnet_idx node_idx type; do
     eval "declare -A __RAW_NODE_$NODES=(
-        ['ipv6_prefix']=$ipv6_prefix
-        ['ipv6_subnet']=$ipv6_subnet
         ['ipv6_address']=$ipv6_address
+        ['ipv6_gateway']=$ipv6_gateway
 	['ipv4_gateway']=$ipv4_gateway
         ['ipv4_address']=$ipv4_address
-        ['subnet_type']=$subnet_type
+        ['prober']=$prober
         ['hostname']=$hostname
+        ['subnet_type']=$subnet_type
         ['subnet_idx']=$subnet_idx
         ['node_idx']=$node_idx
-        ['use_hsm']=$use_hsm
         ['type']=$type
     )"
     NODES=$((NODES + 1))
@@ -141,23 +202,6 @@ function prepare_build_directories() {
     fi
 }
 
-function download_binaries() {
-    for filename in "boundary-node-control-plane.gz" "boundary-node-prober.gz"; do
-        "${REPO_ROOT}"/gitlab-ci/src/artifacts/rclone_download.py \
-            --git-rev "$GIT_REVISION" --remote-path=release --include ${filename} --out="${IC_PREP_DIR}/bin/"
-    done
-
-    find "${IC_PREP_DIR}/bin/" -name "*.gz" -print0 | xargs -P100 -0I{} bash -c "gunzip -f {} && basename {} .gz | xargs -I[] chmod +x ${IC_PREP_DIR}/bin/[]"
-
-    mkdir -p "$OUTPUT/bin"
-    rsync -a --delete "${IC_PREP_DIR}/bin/" "$OUTPUT/bin/"
-}
-
-function place_control_plane() {
-    cp -a "${IC_PREP_DIR}/bin/boundary-node-control-plane" "$REPO_ROOT/ic-os/boundary-guestos/rootfs/opt/ic/bin/boundary-node-control-plane"
-    cp -a "${IC_PREP_DIR}/bin/boundary-node-prober" "$REPO_ROOT/ic-os/boundary-guestos/rootfs/opt/ic/bin/boundary-node-prober"
-}
-
 function create_tarball_structure() {
     for n in $NODES; do
         declare -n NODE=$n
@@ -165,100 +209,143 @@ function create_tarball_structure() {
             local subnet_idx=${NODE["subnet_idx"]}
             local node_idx=${NODE["node_idx"]}
             NODE_PREFIX=${DEPLOYMENT}.$subnet_idx.$node_idx
-            mkdir -p "${CONFIG_DIR}/$NODE_PREFIX/node/replica_config"
-        fi
-    done
-}
-
-function generate_journalbeat_config() {
-    for n in $NODES; do
-        declare -n NODE=$n
-        if [[ "${NODE["type"]}" == "boundary" ]]; then
-            local subnet_idx=${NODE["subnet_idx"]}
-            local node_idx=${NODE["node_idx"]}
-
-            # Define hostname
-            NODE_PREFIX=${DEPLOYMENT}.$subnet_idx.$node_idx
-
-            if [ "${JOURNALBEAT_HOSTS}" != "" ]; then
-                echo "journalbeat_hosts=${JOURNALBEAT_HOSTS}" >"${CONFIG_DIR}/$NODE_PREFIX/journalbeat.conf"
-            fi
-            if [ "${JOURNALBEAT_TAGS}" != "" ]; then
-                echo "journalbeat_tags=${JOURNALBEAT_TAGS}" >>"${CONFIG_DIR}/$NODE_PREFIX/journalbeat.conf"
-            fi
+            mkdir -p "${CONFIG_DIR}/${NODE_PREFIX}/node/replica_config"
         fi
     done
 }
 
 function generate_boundary_node_config() {
-    rm -rf ${IC_PREP_DIR}/NNS_URL
+    local NNS_URL=
     if [ -z ${NNS_URL_OVERRIDE+x} ]; then
         # Query and list all NNS nodes in subnet
-        echo ${CONFIG} | jq -c '.datacenters[]' | while read datacenters; do
-            local ipv6_prefix=$(echo ${datacenters} | jq -r '.ipv6_prefix')
-            echo ${datacenters} | jq -c '.nodes[]' | while read nodes; do
-                NNS_DC_URL=$(echo ${nodes} | jq -c 'select(.subnet_type|test("root_subnet"))' | while read nns_node; do
-                    local ipv6_address=$(echo "${nns_node}" | jq -r '.ipv6_address')
-                    echo -n "http://[${ipv6_address}]:8080"
-                done)
-                echo ${NNS_DC_URL} >>"${IC_PREP_DIR}/NNS_URL"
-            done
+        for n in $NODES; do
+            declare -n NODE=$n
+
+            local ipv6_address=${NODE["ipv6_address"]}
+
+            if [[ "${NODE["type"]}" != "replica" || "${NODE["subnet_type"]}" != "root_subnet" ]]; then
+                continue
+            fi
+
+            NNS_URL+="http://[${ipv6_address}]:8080,"
         done
-        NNS_URL_FILE=${IC_PREP_DIR}/NNS_URL
     else
-        NNS_URL_FILE=${NNS_URL_OVERRIDE}
+        NNS_URL=$(cat ${NNS_URL_OVERRIDE} | awk '$1=$1' ORS=',')
     fi
-    NNS_URL="$(cat ${NNS_URL_FILE} | awk '$1=$1' ORS=',' | sed 's@,$@@g')"
-    #echo ${NNS_URL}
+    NNS_URL=$(echo ${NNS_URL} | sed 's/,$//g')
+    #echo "nns_url=${NNS_URL}"
 
     # nns config for boundary nodes
-    echo ${CONFIG} | jq -c '.datacenters[]' | while read datacenters; do
-        echo ${datacenters} | jq -c '[.boundary_nodes[]][]' | while read nodes; do
-            local subnet_idx=$(echo ${nodes} | jq -r '.subnet_idx')
-            local node_idx=$(echo ${nodes} | jq -r '.node_idx')
-            NODE_PREFIX=${DEPLOYMENT}.$subnet_idx.$node_idx
-            if [ -f "${IC_PREP_DIR}/nns_public_key.pem" ]; then
-                cp "${IC_PREP_DIR}/nns_public_key.pem" "${CONFIG_DIR}/$NODE_PREFIX/nns_public_key.pem"
-            fi
-            echo "nns_url=${NNS_URL}" >"${CONFIG_DIR}/$NODE_PREFIX/nns.conf"
-        done
+    for n in $NODES; do
+        declare -n NODE=$n
+
+        local subnet_idx=${NODE["subnet_idx"]}
+        local node_idx=${NODE["node_idx"]}
+
+        NODE_PREFIX=${DEPLOYMENT}.$subnet_idx.$node_idx
+
+        if [[ "${NODE["type"]}" != "boundary" ]]; then
+            continue
+        fi
+
+        cp "${NNS_PUBLIC_KEY}" "${CONFIG_DIR}/${NODE_PREFIX}/nns_public_key.pem"
+
+        echo "nns_url=${NNS_URL}" >"${CONFIG_DIR}/${NODE_PREFIX}/nns.conf"
+        mkdir -p "${CONFIG_DIR}/${NODE_PREFIX}/buildinfo"
+        cat >"${CONFIG_DIR}/${NODE_PREFIX}/buildinfo/version.prom" <<EOF
+# HELP bn_version_info version information for the boundary node
+# TYPE bn_version_info counter
+bn_version_info{git_revision="${GIT_REVISION}"} 1
+EOF
+
+        echo "$BN_VARS" >"${CONFIG_DIR}/${NODE_PREFIX}/bn_vars.conf"
     done
 }
 
 function generate_network_config() {
+    local REPLICAS_IPV6=
+    if [ -z ${REPLICA_IPS_OVERRIDE+x} ]; then
+        # Query and list all NNS nodes in subnet
+        for n in $NODES; do
+            declare -n NODE=$n
+
+            local ipv6_address=${NODE["ipv6_address"]}
+
+            if [[ "${NODE["type"]}" != "replica" ]]; then
+                continue
+            fi
+
+            REPLICAS_IPV6+="${ipv6_address}/64,"
+        done
+    else
+        # Remove comments and comma separate
+        REPLICAS_IPV6=$(cat ${REPLICA_IPV6_OVERRIDE} | sed 's/[[:blank:]]*#.*//' | awk '$1=$1' ORS=',')
+    fi
+    REPLICAS_IPV6=$(echo ${REPLICAS_IPV6} | sed 's/,$//g')
+
     for n in $NODES; do
         declare -n NODE=$n
         if [[ "${NODE["type"]}" == "boundary" ]]; then
             local hostname=${NODE["hostname"]}
             local subnet_idx=${NODE["subnet_idx"]}
             local node_idx=${NODE["node_idx"]}
+            local ipv6_address=${NODE["ipv6_address"]}
+            local ipv6_gateway=${NODE["ipv6_gateway"]}
             local ipv4_address=${NODE["ipv4_address"]}
             local ipv4_gateway=${NODE["ipv4_gateway"]}
 
             # Define hostname
             NODE_PREFIX=${DEPLOYMENT}.$subnet_idx.$node_idx
-            echo "hostname=${hostname}" >"${CONFIG_DIR}/$NODE_PREFIX/network.conf"
+            echo "hostname=${hostname}" >"${CONFIG_DIR}/${NODE_PREFIX}/network.conf"
 
             # Set name servers
-            echo "name_servers=${NAME_SERVERS}" >>"${CONFIG_DIR}/$NODE_PREFIX/network.conf"
-            echo "name_servers_fallback=${NAME_SERVERS_FALLBACK}" >>"${CONFIG_DIR}/$NODE_PREFIX/network.conf"
+            echo "ipv6_name_servers=${IPV6_NAME_SERVERS}" >>"${CONFIG_DIR}/${NODE_PREFIX}/network.conf"
+            echo "ipv6_name_servers_fallback=${IPV6_NAME_SERVERS_FALLBACK}" >>"${CONFIG_DIR}/${NODE_PREFIX}/network.conf"
+            echo "ipv4_name_servers=${IPV4_NAME_SERVERS}" >>"${CONFIG_DIR}/${NODE_PREFIX}/network.conf"
 
-            # Set ipv4 address
-            if [ -z ${ipv4_address:-} ]; then
-                echo "ipv4_address is unset"
-            else
-                echo "ipv4_address=${ipv4_address}" >>"${CONFIG_DIR}/$NODE_PREFIX/network.conf"
+            # ipv6
+            if [ -z ${ipv6_address:-} ]; then echo "ipv6_address is unset"; else
+                echo "ipv6_address=${ipv6_address}" >>"${CONFIG_DIR}/${NODE_PREFIX}/network.conf"
+            fi
+            if [ -z ${ipv6_gateway:-} ]; then echo "ipv6_gateway is unset"; else
+                echo "ipv6_gateway=${ipv6_gateway}" >>"${CONFIG_DIR}/${NODE_PREFIX}/network.conf"
             fi
 
-            # Set ipv4 gateway
-            if [ -z ${ipv4_gateway:-} ]; then
-                echo "ipv4_gateway is unset"
-            else
-                echo "ipv4_gateway=${ipv4_gateway}" >>"${CONFIG_DIR}/$NODE_PREFIX/network.conf"
+            # ipv4
+            if [ -z ${ipv4_address:-} ]; then echo "ipv4_address is unset"; else
+                echo "ipv4_address=${ipv4_address}" >>"${CONFIG_DIR}/${NODE_PREFIX}/network.conf"
+            fi
+            if [ -z ${ipv4_gateway:-} ]; then echo "ipv4_gateway is unset"; else
+                echo "ipv4_gateway=${ipv4_gateway}" >>"${CONFIG_DIR}/${NODE_PREFIX}/network.conf"
             fi
 
-            cat "${CONFIG_DIR}/$NODE_PREFIX/network.conf"
+            # Set ipv6 replicas
+            echo "ipv6_replica_ips=${REPLICAS_IPV6}" >>"${CONFIG_DIR}/${NODE_PREFIX}/network.conf"
+
+            cat "${CONFIG_DIR}/${NODE_PREFIX}/network.conf"
             # IPv6 network configuration is obtained from the Router Advertisement.
+        fi
+    done
+}
+
+function generate_prober_config() {
+    for n in $NODES; do
+        declare -n NODE=$n
+        if [[ "${NODE["type"]}" == "boundary" ]]; then
+            local hostname=${NODE["hostname"]}
+            local subnet_idx=${NODE["subnet_idx"]}
+            local node_idx=${NODE["node_idx"]}
+            local prober=${NODE["prober"]}
+
+            NODE_PREFIX=${DEPLOYMENT}.$subnet_idx.$node_idx
+
+            mkdir -p "${CONFIG_DIR}/${NODE_PREFIX}"
+
+            # copy prober identity if enabled
+            if [[ -f "${PROBER_IDENTITY:-}" && "${prober:-}" == "true" ]]; then
+                echo "Using prober identity ${PROBER_IDENTITY}"
+                cp "${PROBER_IDENTITY}" "${CONFIG_DIR}/${NODE_PREFIX}/prober_identity.pem"
+            fi
         fi
     done
 }
@@ -277,21 +364,131 @@ function copy_ssh_keys() {
             # Symlinks must be refused by the config injection script (they
             # can lead to confusion and side effects when overwriting one
             # file changes another).
-            cp -Lr "${SSH}" "${CONFIG_DIR}/$NODE_PREFIX/accounts_ssh_authorized_keys"
+            cp -Lr "${SSH}" "${CONFIG_DIR}/${NODE_PREFIX}/accounts_ssh_authorized_keys"
+        fi
+    done
+}
+
+function copy_deny_list() {
+    for n in $NODES; do
+        declare -n NODE=$n
+        if [[ "${NODE["type"]}" == "boundary" ]]; then
+            local subnet_idx=${NODE["subnet_idx"]}
+            local node_idx=${NODE["node_idx"]}
+
+            NODE_PREFIX=${DEPLOYMENT}.$subnet_idx.$node_idx
+            if [[ -f "${DENY_LIST:-}" ]]; then
+                echo "Using deny list ${DENY_LIST}"
+                cp "${DENY_LIST}" "${CONFIG_DIR}/${NODE_PREFIX}/denylist.map"
+            else
+                echo "Using empty denylist"
+                touch "${CONFIG_DIR}/${NODE_PREFIX}/denylist.map"
+            fi
         fi
     done
 }
 
 function copy_certs() {
-    if [[ -f ${CERT_DIR}/fullchain.pem ]] && [[ -f ${CERT_DIR}/privkey.pem ]] && [[ -f ${CERT_DIR}/chain.pem ]]; then
+    if [[ -f "${CERT_DIR}/fullchain.pem" && -f "${CERT_DIR}/privkey.pem" && -f "${CERT_DIR}/chain.pem" ]]; then
         echo "Using certificates ${CERT_DIR}/fullchain.pem ${CERT_DIR}/privkey.pem ${CERT_DIR}/chain.pem"
-        mkdir -p ${CONFIG_DIR}/$NODE_PREFIX/certs
-        cp ${CERT_DIR}/fullchain.pem ${CONFIG_DIR}/$NODE_PREFIX/certs
-        cp ${CERT_DIR}/privkey.pem ${CONFIG_DIR}/$NODE_PREFIX/certs
-        cp ${CERT_DIR}/chain.pem ${CONFIG_DIR}/$NODE_PREFIX/certs
+        for n in $NODES; do
+            declare -n NODE=$n
+            if [[ "${NODE["type"]}" == "boundary" ]]; then
+                local subnet_idx=${NODE["subnet_idx"]}
+                local node_idx=${NODE["node_idx"]}
+
+                NODE_PREFIX=${DEPLOYMENT}.$subnet_idx.$node_idx
+                mkdir -p "${CONFIG_DIR}/${NODE_PREFIX}/certs"
+                cp "${CERT_DIR}/fullchain.pem" "${CONFIG_DIR}/${NODE_PREFIX}/certs"
+                cp "${CERT_DIR}/privkey.pem" "${CONFIG_DIR}/${NODE_PREFIX}/certs"
+                cp "${CERT_DIR}/chain.pem" "${CONFIG_DIR}/${NODE_PREFIX}/certs"
+            fi
+        done
     else
         echo "Not copying certificates"
     fi
+}
+
+function copy_geolite2_dbs() {
+    if [[ -z "${GEOLITE2_COUNTRY_DB:-}" || -z "${GEOLITE2_CITY_DB:-}" ]]; then
+        err "geolite2 dbs have not been provided, therefore geolocation capabilities will be disabled"
+        return
+    fi
+
+    for n in $NODES; do
+        declare -n NODE=$n
+        if [[ "${NODE["type"]}" != "boundary" ]]; then
+            continue
+        fi
+
+        local SUBNET_IDX="${NODE["subnet_idx"]}"
+        local NODE_IDX="${NODE["node_idx"]}"
+        local NODE_PREFIX="${DEPLOYMENT}.${SUBNET_IDX}.${NODE_IDX}"
+
+        mkdir -p "${CONFIG_DIR}/${NODE_PREFIX}/geolite2_dbs"
+        cp "${GEOLITE2_COUNTRY_DB}" "${CONFIG_DIR}/${NODE_PREFIX}/geolite2_dbs/"
+        cp "${GEOLITE2_CITY_DB}" "${CONFIG_DIR}/${NODE_PREFIX}/geolite2_dbs/"
+    done
+}
+
+function generate_certificate_issuer_config() {
+    if [[ -z "${CERTIFICATE_ISSUER_CREDENTIALS}" ]]; then
+        err "WARNING: Missing certificate-issuer credentials."
+        err "WARNING: Skipping certificate-issuer configuration."
+        return
+    fi
+
+    while IFS="=" read -r key value; do
+        case "${key}" in
+            "certificate_orchestrator_uri") readonly CERTIFICATE_ORCHESTRATOR_URI="${value:-}" ;;
+            "certificate_orchestrator_canister_id") readonly CERTIFICATE_ORCHESTRATOR_CANISTER_ID="${value:-}" ;;
+            "certificate_issuer_delegation_domain") readonly CERTIFICATE_ISSUER_DELEGATION_DOMAIN="${value:-}" ;;
+            "certificate_issuer_application_domain") readonly CERTIFICATE_ISSUER_APPLICATION_DOMAIN="${value:-}" ;;
+            "certificate_issuer_acme_id") readonly CERTIFICATE_ISSUER_ACME_ID="${value:-}" ;;
+            "certificate_issuer_acme_key") readonly CERTIFICATE_ISSUER_ACME_KEY="${value:-}" ;;
+            "certificate_issuer_cloudflare_api_key") readonly CERTIFICATE_ISSUER_CLOUDFLARE_API_KEY="${value:-}" ;;
+        esac
+    done <"${CERTIFICATE_ISSUER_CREDENTIALS}"
+
+    if [[ -z \
+        "${CERTIFICATE_ORCHESTRATOR_URI}" || -z \
+        "${CERTIFICATE_ORCHESTRATOR_CANISTER_ID}" || -z \
+        "${CERTIFICATE_ISSUER_DELEGATION_DOMAIN}" || -z \
+        "${CERTIFICATE_ISSUER_APPLICATION_DOMAIN}" || -z \
+        "${CERTIFICATE_ISSUER_IDENTITY}" || -z \
+        "${CERTIFICATE_ISSUER_ENCRYPTION_KEY}" || -z \
+        "${CERTIFICATE_ISSUER_ACME_ID}" || -z \
+        "${CERTIFICATE_ISSUER_ACME_KEY}" || -z \
+        "${CERTIFICATE_ISSUER_CLOUDFLARE_API_KEY}" ]] \
+            ; then
+        err "ERROR: Missing certificate-issuer configuration."
+        exit_usage
+    fi
+
+    for n in $NODES; do
+        declare -n NODE=$n
+        if [[ "${NODE["type"]}" == "boundary" ]]; then
+            local hostname=${NODE["hostname"]}
+            local subnet_idx=${NODE["subnet_idx"]}
+            local node_idx=${NODE["node_idx"]}
+
+            NODE_PREFIX=${DEPLOYMENT}.$subnet_idx.$node_idx
+
+            mkdir -p "${CONFIG_DIR}/${NODE_PREFIX}"
+            cp "${CERTIFICATE_ISSUER_IDENTITY}" "${CONFIG_DIR}/${NODE_PREFIX}/certificate_issuer_identity.pem"
+            cp "${CERTIFICATE_ISSUER_ENCRYPTION_KEY}" "${CONFIG_DIR}/${NODE_PREFIX}/certificate_issuer_enc_key.pem"
+
+            cat >"${CONFIG_DIR}/${NODE_PREFIX}/certificate_issuer.conf" <<EOF
+certificate_orchestrator_uri=${CERTIFICATE_ORCHESTRATOR_URI}
+certificate_orchestrator_canister_id=${CERTIFICATE_ORCHESTRATOR_CANISTER_ID}
+certificate_issuer_delegation_domain=${CERTIFICATE_ISSUER_DELEGATION_DOMAIN}
+certificate_issuer_application_domain=${CERTIFICATE_ISSUER_APPLICATION_DOMAIN}
+certificate_issuer_acme_id=${CERTIFICATE_ISSUER_ACME_ID}
+certificate_issuer_acme_key=${CERTIFICATE_ISSUER_ACME_KEY}
+certificate_issuer_cloudflare_api_key=${CERTIFICATE_ISSUER_CLOUDFLARE_API_KEY}
+EOF
+        fi
+    done
 }
 
 function build_tarball() {
@@ -303,11 +500,11 @@ function build_tarball() {
 
             # Create temporary tarball directory per node
             NODE_PREFIX=${DEPLOYMENT}.$subnet_idx.$node_idx
-            mkdir -p "${TARBALL_DIR}/$NODE_PREFIX"
+            mkdir -p "${TARBALL_DIR}/${NODE_PREFIX}"
             (
-                cd "${CONFIG_DIR}/$NODE_PREFIX"
+                cd "${CONFIG_DIR}/${NODE_PREFIX}"
                 tar c .
-            ) >${TARBALL_DIR}/$NODE_PREFIX/ic-bootstrap.tar
+            ) >"${TARBALL_DIR}/${NODE_PREFIX}/ic-bootstrap.tar"
         fi
     done
     tar czf "${OUTPUT}/config.tgz" -C "${CONFIG_DIR}" .
@@ -322,9 +519,9 @@ function build_removable_media() {
 
             #echo "${DEPLOYMENT}.$subnet_idx.$node_idx"
             NODE_PREFIX=${DEPLOYMENT}.$subnet_idx.$node_idx
-            truncate --size 4M "${OUTPUT}/$NODE_PREFIX.img"
-            mkfs.vfat "${OUTPUT}/$NODE_PREFIX.img"
-            mcopy -i "${OUTPUT}/$NODE_PREFIX.img" -o -s ${TARBALL_DIR}/$NODE_PREFIX/ic-bootstrap.tar ::
+            truncate --size 100M "${OUTPUT}/${NODE_PREFIX}.img"
+            mkfs.vfat "${OUTPUT}/${NODE_PREFIX}.img"
+            mcopy -i "${OUTPUT}/${NODE_PREFIX}.img" -o -s ${TARBALL_DIR}/${NODE_PREFIX}/ic-bootstrap.tar ::
         fi
     done
 }
@@ -336,17 +533,18 @@ function remove_temporary_directories() {
 function main() {
     # Establish run order
     prepare_build_directories
-    download_binaries
-    place_control_plane
     create_tarball_structure
     generate_boundary_node_config
-    generate_journalbeat_config
     generate_network_config
+    generate_prober_config
     copy_ssh_keys
     copy_certs
+    copy_deny_list
+    copy_geolite2_dbs
+    generate_certificate_issuer_config
     build_tarball
     build_removable_media
-    # remove_temporary_directories
+    remove_temporary_directories
 }
 
 main

@@ -4,6 +4,12 @@ policy_module(misc-fixes, 1.0.0)
 # policy)
 
 ###############################################################################
+# Mark unconfined_t as permissive for now, until policy development is
+# completed.
+require { type unconfined_t; }
+permissive unconfined_t;
+
+###############################################################################
 # lvm / device mapper
 
 require { type lvm_t; }
@@ -31,12 +37,20 @@ require { type unlabeled_t, boot_t; }
 read_files_pattern(lvm_t, boot_t, unlabeled_t)
 read_files_pattern(lvm_t, unlabeled_t, unlabeled_t)
 
+# cryptsetup is poking around with tmpfs and pstore, probably looking for
+# encrypted volumes. As we don't have any here, forbid it.
+require { type cgroup_t, pstore_t; }
+dontaudit lvm_t cgroup_t : key { search };
+dontaudit lvm_t pstore_t : key { search };
+
 ###############################################################################
 # mount
 
 # We are dealing with vfat filesystem for the configuration injection.
 require { type mount_t, dosfs_t; }
 allow mount_t dosfs_t : filesystem { getattr };
+# Allow basic permissions around umounting
+allow mount_t initrc_tmp_t : file { read };
 
 ###############################################################################
 # partprobe

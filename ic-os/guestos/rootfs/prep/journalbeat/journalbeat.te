@@ -100,10 +100,10 @@ require {
 }
 read_files_pattern(journalbeat_t, proc_t, proc_t)
 
-# Journalbeat wants to poke PID 1 (the init process) and read various
-# information from it. There is no justification for needing this,
-# deny and silence resulting audit messages.
-init_dontaudit_read_state(journalbeat_t)
+# Journalbeat wants to read PID-1 (systemd) cgroup for getting
+# network meta data (netinfo.enabled: true).
+allow journalbeat_t init_t:dir search;
+allow journalbeat_t init_t:file { getattr open read };
 
 # Journalbeat wants to get filesystem information for various
 # filesystems. There is no reason why it would need to, deny and
@@ -115,3 +115,24 @@ require {
 dontaudit journalbeat_t tmpfs_t : filesystem { getattr };
 dontaudit journalbeat_t fs_t : filesystem { getattr };
 dontaudit journalbeat_t usr_t:file { getattr open read };
+
+# Journalbeat might be looking in `/bin` for its own executable.
+require {
+    type bin_t;
+}
+search_dirs_pattern(journalbeat_t, bin_t, bin_t)
+
+# Allow to read `/sys/fs/cgroup/unified/system.slice/journalbeat.service/cgroup.controllers`
+fs_read_cgroup_files(journalbeat_t)
+
+# Allow to read and write from/to own fifo pipe
+allow journalbeat_t self:fifo_file { read write };
+
+# allow self-signal
+allow journalbeat_t journalbeat_t : process { signal };
+
+# Journalbeat checks `hpage_pmd_size`
+dev_read_sysfs(journalbeat_t)
+
+# For some reason, it wants to read this
+kernel_read_vm_overcommit_sysctl(journalbeat_t)

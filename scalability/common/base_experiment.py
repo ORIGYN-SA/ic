@@ -12,32 +12,47 @@ This class issues API:
 WorkloadExperiment inherits BaseExperiment to follow similar workflow of initiation -> start iteration
 -> inspect iteration -> ... -> finish
 """
+import itertools
 import json
 import os
+import random
 import re
 import subprocess
 import sys
 import time
+import traceback
 from typing import List
 
 import gflags
 from common import ansible
 from common import flamegraphs
 from common import machine_failure
+from common import misc
 from common import prometheus
+from common import report
 from common import ssh
 from termcolor import colored
 
 
 NNS_SUBNET_INDEX = 0  # Subnet index of the NNS subnetwork
+MAINNET_NNS_SUBNET_ID = "tdb26-jop6k-aogll-7ltgs-eruif-6kk7m-qpktf-gdiqx-mxtrf-vb5e6-eqe"
+MAINNET_NNS_URL = "https://ic0.app"
 
 FLAGS = gflags.FLAGS
 gflags.DEFINE_string("testnet", None, 'Testnet to use. Use "mercury" to run against mainnet.')
 gflags.MarkFlagAsRequired("testnet")
-gflags.DEFINE_string("canister_id", "", "Use given canister ID instead of installing a new canister")
+gflags.DEFINE_string(
+    "canister_ids",
+    "",
+    "Use given canister IDs instead of installing new canisters. Given as JSON dict canister name -> canister.",
+)
+gflags.DEFINE_string(
+    "cache_path", "", "Path to a file that should be used as a cache. Only use if you know what you are doing."
+)
 gflags.DEFINE_string("artifacts_path", "../artifacts/release", "Path to the artifacts directory")
 gflags.DEFINE_string("workload_generator_path", "", "Path to the workload generator to be used")
 gflags.DEFINE_boolean("no_instrument", False, "Do not instrument target machine")
+gflags.DEFINE_string("targets", "", "Set load target IP adresses from this coma-separated list directly.")
 gflags.DEFINE_string("top_level_out_dir", "", "Set the top-level output directory. Default is the git commit id.")
 gflags.DEFINE_string(
     "second_level_out_dir",
@@ -47,9 +62,7 @@ gflags.DEFINE_string(
 
 gflags.DEFINE_boolean("simulate_machine_failures", False, "Simulate machine failures while testing.")
 gflags.DEFINE_string("nns_url", "", "Use the following NNS URL instead of getting it from the testnet configuration")
-gflags.DEFINE_string(
-    "artifacts_git_revision", "HEAD", "GIT revision to use for the artifacts (e.g. workload generator)"
-)
+gflags.DEFINE_integer("iter_duration", 300, "Duration in seconds to run each iteration of the experiment.")
 
 
 class BaseExperiment:
@@ -57,28 +70,97 @@ class BaseExperiment:
 
     def __init__(self, request_type="query"):
         """Init."""
+        misc.parse_command_line_args()
+
+        self.cached_topologies = {}
+        self.artifacts_path = FLAGS.artifacts_path
         self.__load_artifacts()
 
         self.testnet = FLAGS.testnet
-        self.canister_ids = []
-        self.canister = None
+
+        # Map canister name -> list of canister IDs
+        self.canister_ids = {}
+
+        # Used only to track which canister ID to return in case canister IDs have
+        # been passed as argument.
+        self.canister_id_from_argument_index = {}
+
+        # List of canisters that have been installed
+        self.canister = []
         self.metrics = []
 
-        self.t_experiment_start = None
+        self.t_experiment_start = int(time.time())
         self.iteration = 0
 
         self.request_type = request_type
+        # List of PIDs to wait for when terminating the benchmark
+        self.pids_to_finish = []
 
-    def __get_ic_version(self, m):
+        self.base_experiment_initialized = False
+        self.cache = None
+
+        # Determine if boundary nodes are used in benchmark.
+        if (
+            FLAGS.targets == "https://ic0.app"
+            or FLAGS.targets == "https://ic0.dev"
+            or FLAGS.targets == "https://icp0.io"
+        ):
+            print(colored("Benchmarking boundary nodes .. reduced function scope", "red"))
+            self.benchmark_boundary_nodes = True
+        else:
+            self.benchmark_boundary_nodes = False
+
+        if self.has_cache():
+            try:
+                with open(FLAGS.cache_path) as f:
+                    print(f"♻️  Cache has been found at {FLAGS.cache_path}.")
+                    self.cache = json.loads(f.read())
+            except Exception:
+                print(f"♻️  Cache {FLAGS.cache_path} did not exist yet, creating ..")
+                self.cache = {}
+
+    def get_ic_version(self, m):
         """Retrieve the IC version from the given machine m."""
-        sys.path.insert(1, "../ic-os/guestos/tests")
-        import ictools
+        if self.benchmark_boundary_nodes:
+            return "not-available"
+
+        from common import ictools
 
         return ictools.get_ic_version("http://[{}]:8080/api/v2/status".format(m))
 
+    def has_cache(self):
+        return len(FLAGS.cache_path) > 0
+
+    def from_cache(self, key):
+        if self.has_cache():
+            c = self.cache.get(key, None)
+            if c is not None:
+                c_out = str(c) if len(str(c)) < 100 else str(c)[:100] + ".."
+                print(f"♻️  Using cached value: {key} <- {c_out}")
+            return c
+        return None
+
+    def persist_cache(self):
+        if self.has_cache():
+            assert len(FLAGS.cache_path) > 0
+            with open(FLAGS.cache_path, "w") as f:
+                f.write(json.dumps(self.cache))
+
+    def store_cache(self, key, value):
+        if self.has_cache():
+            previous_value = self.cache.get(key, None)
+            if value != previous_value:
+                print(f"♻️  Caching: {key} <- {value}")
+                self.cache[key] = value
+                self.persist_cache()
+
     def init(self):
         """Initialize experiment."""
-        self.git_hash = self.__get_ic_version(self.get_machine_to_instrument())
+        if self.base_experiment_initialized:
+            raise Exception("Base experiment has already been initialized, aborting .. ")
+        self.base_experiment_initialized = True
+
+        self.git_hash = self.get_ic_version(self.get_machine_to_instrument())
         print(f"Running against an IC with git hash: {self.git_hash}")
 
         self.out_dir_timestamp = int(time.time())
@@ -93,41 +175,7 @@ class BaseExperiment:
         self.__store_hardware_info()
 
     def __load_artifacts(self):
-        """
-        Load artifacts.
-
-        If previously downloaded, reuse, otherwise download.
-        When downloading, store the GIT commit hash that has been used in a text file.
-        """
-        self.artifacts_path = FLAGS.artifacts_path
-        f_artifacts_hash = os.path.join(self.artifacts_path, "githash")
-        if subprocess.run(["stat", f_artifacts_hash]).returncode != 0:
-            print("Could not find artifacts, downloading .. ")
-            # Delete old artifacts directory, if it exists
-            subprocess.run(["rm", "-rf", self.artifacts_path], check=True)
-            # Download new artifacts.
-            artifacts_env = os.environ.copy()
-            artifacts_env["GIT"] = subprocess.check_output(
-                ["git", "rev-parse", FLAGS.artifacts_git_revision], encoding="utf-8"
-            )
-            artifacts_env["GET_GUEST_OS"] = "0"
-            output = subprocess.check_output(
-                ["../ic-os/guestos/scripts/get-artifacts.sh"], encoding="utf-8", env=artifacts_env
-            )
-            match = re.findall(r"Downloading artifacts for revision ([a-f0-9]*)", output)[0]
-            with open(f_artifacts_hash, "wt", encoding="utf-8") as f:
-                f.write(match)
-        else:
-            print(
-                (
-                    "⚠️  Re-using artifacts. While this is faster, there is a risk of inconsistencies."
-                    f'Call "rm -rf {self.artifacts_path}" in case something doesn\'t work.'
-                )
-            )
-        self.artifacts_hash = open(f_artifacts_hash, "r").read()
-
-        print(f"Artifacts hash is {self.artifacts_hash}")
-        print(f"Found artifacts at {self.artifacts_path}")
+        self.artifacts_hash = misc.load_artifacts(self.artifacts_path)
         self.__set_workload_generator_path()
 
     def __set_workload_generator_path(self):
@@ -139,13 +187,19 @@ class BaseExperiment:
         print(f"Using workload generator at {self.workload_generator_path}")
 
     def get_machine_to_instrument(self) -> str:
+        return self.get_machines_to_target()[0]
+
+    def get_machines_to_target(self) -> [str]:
         """Return the machine to instrument."""
+        if len(FLAGS.targets) > 0:
+            return FLAGS.targets.split(",")
+
         topology = self.__get_topology()
         for subnet, info in topology["topology"]["subnets"].items():
             subnet_type = info["records"][0]["value"]["subnet_type"]
             members = info["records"][0]["value"]["membership"]
             if subnet_type == "application":
-                return self.get_node_ip_address(members[0])
+                return [self.get_node_ip_address(m) for m in members]
 
     def get_subnet_to_instrument(self) -> str:
         """Return the subnet to instrument."""
@@ -183,6 +237,7 @@ class BaseExperiment:
         """Start a new iteration of the experiment."""
         self.iteration += 1
         self.t_iter_start = int(time.time())
+        print("Starting iteration at: ", time.time() - self.t_experiment_start)
 
         # Create output directory
         self.iter_outdir = "{}/{}".format(self.out_dir, self.iteration)
@@ -198,6 +253,14 @@ class BaseExperiment:
     def end_iteration(self, configuration={}):
         """End a new iteration of the experiment."""
         self.t_iter_end = int(time.time())
+        print(
+            (
+                "Ending iteration at: ",
+                time.time() - self.t_experiment_start,
+                " - duration:",
+                self.t_iter_end - self.t_iter_start,
+            )
+        )
 
         for m in self.metrics:
             m.end_iteration(self)
@@ -214,31 +277,65 @@ class BaseExperiment:
                 )
             )
 
-    def start_experiment(self):
-        """Start the experiment."""
-        self.t_experiment_start = int(time.time())
-
     def end_experiment(self):
         """End the experiment."""
+        print("Waiting for unfinished PIDs")
+        for pid in self.pids_to_finish:
+            pid.wait()
+        for m in self.metrics:
+            m.end_benchmark(self)
         print(
-            f"Experiment finished. Generating report like: python3 common/generate_report.py --base_dir='results/' --git_revision='{self.git_hash}' --timestamp='{self.out_dir_timestamp}'"
+            f"Experiment finished. Generating report like: pipenv run common/generate_report.py --base_dir='results/' --git_revision='{self.git_hash}' --timestamp='{self.out_dir_timestamp}'"
         )
+        print(f"📂 Experiment output has been stored in: {self.out_dir}")
 
     def _get_ic_admin_path(self):
         """Return path to ic-admin."""
         return os.path.join(self.artifacts_path, "ic-admin")
 
-    def __get_topology(self):
-        """Get the current topology from the registry."""
-        res = subprocess.check_output(
-            [self._get_ic_admin_path(), "--nns-url", self._get_nns_url(), "get-topology"], encoding="utf-8"
-        )
-        return json.loads(res)
+    def __get_topology(self, nns_url=None):
+        """
+        Get the current topology from the registry.
 
-    def __get_node_info(self, nodeid):
-        """Get info for the given node from the registry."""
+        A different NNS can be choosen by setting nns_url. This is useful, for example
+        when multiple testnets are used, one for workload generators, and one for
+        target machines.
+        """
+        if nns_url is None:
+            nns_url = self._get_nns_url()
+
+        cache_key = f"topology_{nns_url}"
+        cached_value = self.from_cache(cache_key)
+        if cached_value is not None:
+            print(
+                f"Returning persisted topology for {nns_url} (this might lead to incorrect results if redeployed since cache has been written)."
+            )
+            return cached_value
+
+        if nns_url not in self.cached_topologies:
+            print(
+                f"Getting topology from ic-admin ({nns_url}) - ",
+                colored("use --cache_path=/tmp/cache to cache", "yellow"),
+            )
+            res = subprocess.check_output(
+                [self._get_ic_admin_path(), "--nns-url", nns_url, "get-topology"], encoding="utf-8"
+            )
+            self.cached_topologies[nns_url] = json.loads(res)
+            self.store_cache(cache_key, json.loads(res))
+        return self.cached_topologies[nns_url]
+
+    def __get_node_info(self, nodeid, nns_url=None):
+        """
+        Get info for the given node from the registry.
+
+        A different NNS can be choosen by setting nns_url. This is useful, for example
+        when multiple testnets are used, one for workload generators, and one for
+        target machines.
+        """
+        if nns_url is None:
+            nns_url = self._get_nns_url()
         return subprocess.check_output(
-            [self._get_ic_admin_path(), "--nns-url", self._get_nns_url(), "get-node", nodeid], encoding="utf-8"
+            [self._get_ic_admin_path(), "--nns-url", nns_url, "get-node", nodeid], encoding="utf-8"
         )
 
     def _get_subnet_info(self, subnet_idx):
@@ -250,9 +347,14 @@ class BaseExperiment:
 
     def __store_ic_info(self):
         """Store subnet info for the subnet that we are targeting in the experiment output directory."""
-        jsondata = self._get_subnet_info(self.get_subnet_to_instrument())
-        with open(os.path.join(self.out_dir, "subnet_info.json"), "w") as subnet_file:
-            subnet_file.write(jsondata)
+        try:
+            jsondata = self._get_subnet_info(self.get_subnet_to_instrument())
+            with open(os.path.join(self.out_dir, "subnet_info.json"), "w") as subnet_file:
+                subnet_file.write(jsondata)
+        except subprocess.CalledProcessError as e:
+            if self.has_cache():
+                print(colored(f"Failed to get subnet info. Retry after deleting cache file {FLAGS.cache_path}", "red"))
+                raise e
 
         jsondata = self.__get_topology()
         with open(os.path.join(self.out_dir, "topology.json"), "w") as subnet_file:
@@ -262,20 +364,27 @@ class BaseExperiment:
         """Store info for the target machine in the experiment output directory."""
         if FLAGS.no_instrument:
             return
-        for (cmd, name) in [("lscpu", "lscpu"), ("free -h", "free"), ("df -h", "df")]:
-            p = ssh.run_ssh(
-                self.get_machine_to_instrument(),
-                cmd,
-                f_stdout=os.path.join(self.out_dir, f"{name}.stdout.txt"),
-                f_stderr=os.path.join(self.out_dir, f"{name}.stderr.txt"),
+        for (cmd, name) in [("lscpu", "lscpu"), ("free -h", "free"), ("df -h", "df"), ("uname -r", "uname")]:
+            self.pids_to_finish.append(
+                ssh.run_ssh(
+                    self.get_machine_to_instrument(),
+                    cmd,
+                    f_stdout=os.path.join(self.out_dir, f"{name}.stdout.txt"),
+                    f_stderr=os.path.join(self.out_dir, f"{name}.stderr.txt"),
+                )
             )
-            p.wait()
 
-    def get_node_ip_address(self, nodeid):
+    def get_node_ip_address(self, nodeid, nns_url=None):
         """Get HTTP endpoint for the given node."""
-        nodeinfo = self.__get_node_info(nodeid)
+        nodeinfo = self.__get_node_info(nodeid, nns_url)
         ip = re.findall(r'ip_addr: "([a-f0-9:A-F]+)"', nodeinfo)
         return ip[0]
+
+    def get_nodeoperator_of_node(self, nodeid):
+        """Get node operator entry in node record."""
+        nodeinfo = self.get_node_info(nodeid)
+        no = re.findall(r"node_operator_id: (\[.+?\])", nodeinfo)
+        return no[0]
 
     def get_unassigned_nodes(self):
         """Return a list of unassigned node IDs in the given subnetwork."""
@@ -293,6 +402,21 @@ class BaseExperiment:
         subnet_info = [info for (_, info) in topo["topology"]["subnets"].items()]
         return subnet_info[subnet_index]["records"][0]["value"]["membership"]
 
+    def get_mainnet_nns_ip(self):
+        """Get NNS IP address on mainnet."""
+        topology = self.__get_topology(nns_url=MAINNET_NNS_URL)
+        for subnet, info in topology["topology"]["subnets"].items():
+            if subnet == MAINNET_NNS_SUBNET_ID:
+                node_id = random.choice(info["records"][0]["value"]["membership"])
+                return self.get_node_ip_address(node_id, nns_url=MAINNET_NNS_URL)
+        raise Exception(f"Failed to get the mainnet NNS url from {MAINNET_NNS_URL}")
+
+    def _get_nns_ip(self):
+        if FLAGS.testnet == "mercury":
+            return self.get_mainnet_nns_ip()
+        else:
+            return ansible.get_ansible_hostnames_for_subnet(FLAGS.testnet, NNS_SUBNET_INDEX, sort=False)[0]
+
     def _get_nns_url(self):
         """
         Get the testnets NNS url.
@@ -302,11 +426,7 @@ class BaseExperiment:
         """
         if len(FLAGS.nns_url) > 0:
             return FLAGS.nns_url
-        ip = (
-            "2001:920:401a:1708:5000:4fff:fe92:48f1"
-            if FLAGS.testnet == "mercury"
-            else ansible.get_ansible_hostnames_for_subnet(FLAGS.testnet, NNS_SUBNET_INDEX, sort=False)[0]
-        )
+        ip = self._get_nns_ip()
         return f"http://[{ip}]:8080"
 
     def add_node_to_subnet(self, subnet_index, node_ids):
@@ -322,6 +442,8 @@ class BaseExperiment:
                 "--test-neuron-proposer",
                 "--subnet-id",
                 str(subnet_index),
+                "--summary",
+                "'Adding nodes to subnet'",
                 node_id,
             ]
             print(f"Executing {cmd}")
@@ -344,12 +466,6 @@ class BaseExperiment:
             for node_id in node_ids:
                 node_added &= node_id in self.get_subnet_members(subnet_index)
 
-    def _turn_off_replica(self, machines):
-        """Turn of replicas on the given machines."""
-        for m in machines:
-            print(f"💣 Stopping machine {m}")
-        return ssh.run_ssh_in_parallel(machines, "sudo systemctl stop ic-replica")
-
     def install_canister_nonblocking(self, target, canister=None):
         """
         Install the canister on the given machine.
@@ -357,32 +473,55 @@ class BaseExperiment:
         Note that canisters are currently always installed as best effort.
         """
         print("Installing canister .. ")
-        cmd = [self.workload_generator_path, "http://[{}]:8080".format(target), "-n", "1", "-r", "1"]
+        cmd = [self.workload_generator_path, "http://[{}]:8080".format(target), "-n", "1", "-r", "0"]
         if canister is not None:
             cmd += ["--canister", canister]
         return subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
-    def install_canister(self, target: str, canister=None, check=True) -> str:
+    def install_canister(self, target: str = None, canister=None, check=True) -> str:
         """
-        Install the canister on the given machine.
+        Install the canister on the machine given by IPv6 address.
 
         Note that canisters are currently always installed as best effort.
 
         Returns the canister ID if installation was successful.
         """
-        if FLAGS.canister_id is not None and len(FLAGS.canister_id) > 0:
-            print(f"⚠️  Not installing canister, using {FLAGS.canister_id} ")
-            self.canister = f"pre-installed canister {FLAGS.canister_id}"
-            self.canister_ids = FLAGS.canister_id.split(",")
-            return None
+        if target is None:
+            target = self.get_machine_to_instrument()
+        print(f"Installing canister .. {canister} on {target}")
+        this_canister = canister if canister is not None else "counter"
+        this_canister_name = "".join(this_canister.split("#")[0])
+
+        if FLAGS.canister_ids is not None and len(FLAGS.canister_ids) > 0:
+            canister_id_map_as_json = json.loads(FLAGS.canister_ids)
+            print(f"⚠️  Not installing canister, using {FLAGS.canister_ids} ")
+            self.canister = list(canister_id_map_as_json.keys())
+            self.canister_ids = canister_id_map_as_json
+            # Attempt to return a useful canister ID in case of using canisters parsed as argument.
+            this_idx = self.canister_id_from_argument_index.get(this_canister_name, 0)
+            assert this_canister_name in self.canister_ids
+            assert this_idx < len(self.canister_ids[this_canister_name])
+            cid = self.canister_ids[this_canister_name][this_idx]
+            this_idx += 1
+            self.canister_id_from_argument_index[this_canister_name] = this_idx
+            return cid
 
         this_canister_id = None
 
-        print(f"Installing canister .. {canister} on {target}")
-        self.canister = canister if canister is not None else "counter"
-        cmd = [self.workload_generator_path, f"http://[{target}]:8080", "-n", "1", "-r", "1"]
-        if canister is not None:
-            cmd += ["--canister", canister]
+        cmd = [self.workload_generator_path, f"http://[{target}]:8080", "-n", "1", "-r", "0"]
+        if this_canister_name != "counter":
+            canister_in_artifacts = os.path.join(self.artifacts_path, f"../canisters/{this_canister_name}.wasm")
+            canister_in_repo = os.path.join("canisters", f"{this_canister_name}.wasm")
+            canister_in_repo_gzip = os.path.join("canisters", f"{this_canister_name}.wasm.gz")
+            print(f"Looking for canister at locations: {canister_in_artifacts} and {canister_in_repo}")
+            if os.path.exists(canister_in_artifacts):
+                cmd += ["--canister", canister_in_artifacts]
+            elif os.path.exists(canister_in_repo):
+                cmd += ["--canister", canister_in_repo]
+            elif os.path.exists(canister_in_repo_gzip):
+                cmd += ["--canister", canister_in_repo_gzip]
+            else:
+                cmd += ["--canister", this_canister]
         try:
             p = subprocess.run(
                 cmd,
@@ -394,20 +533,25 @@ class BaseExperiment:
                 canister_id = re.findall(r"Successfully created canister at URL [^ ]*. ID: [^ ]*", line)
                 if len(canister_id):
                     cid = canister_id[0].split()[7]
-                    self.canister_ids.append(cid)
+                    if this_canister not in self.canister_ids:
+                        self.canister_ids[this_canister] = []
+                    self.canister_ids[this_canister].append(cid)
+                    self.canister = list(set(self.canister + [this_canister]))
                     this_canister_id = cid
                     print("Found canister ID: ", cid)
                     print(
+                        "Canister(s) installed successfully, reuse across runs: ",
                         colored(
-                            f"Cannister installed successfully (to reuse across runs, specify --canister_id={cid})",
+                            f"--canister_ids='{json.dumps(self.canister_ids)}'",
                             "yellow",
-                        )
+                        ),
                     )
             wg_err_output = p.stderr.decode("utf-8").strip()
             for line in wg_err_output.split("\n"):
                 if "The response of a canister query call contained status 'rejected'" not in line:
                     print("Output (stderr):", line)
         except Exception as e:
+            traceback.print_stack()
             print(f"Failed to install canister, return code: {e.returncode}")
             print(f"Command was: {cmd}")
             print(e.output.decode("utf-8"))
@@ -416,18 +560,42 @@ class BaseExperiment:
 
         return this_canister_id
 
-    def get_hostnames(self, for_subnet_idx=0):
+    def get_hostnames(self, for_subnet_idx=0, nns_url=None):
         """Return hostnames of all machines in the given testnet and subnet from the registry."""
-        topology = self.__get_topology()
+        topology = self.__get_topology(nns_url)
         for curr_subnet_idx, (subnet, info) in enumerate(topology["topology"]["subnets"].items()):
             subnet_type = info["records"][0]["value"]["subnet_type"]
             members = info["records"][0]["value"]["membership"]
             assert curr_subnet_idx != 0 or subnet_type == "system"
             if for_subnet_idx == curr_subnet_idx:
-                return sorted([self.get_node_ip_address(member) for member in members])
+                return sorted([self.get_node_ip_address(member, nns_url) for member in members])
 
-    def __build_summary_file(self):
-        """Build dictionary to be used to build the summary file."""
+    def get_app_subnet_hostnames(self, nns_url=None, idx=-1):
+        """
+        Return hostnames of application subnetworks.
+
+        If no subnet index is given as idx, all machines in given
+        testnet that are part of an application subnet from the given
+        registry will be returned.
+
+        Otherwise, all machines from the given subnet are going to be
+        returned.
+        """
+        ips = []
+        topology = self.__get_topology(nns_url)
+        for curr_subnet_idx, (subnet, info) in enumerate(topology["topology"]["subnets"].items()):
+            subnet_type = info["records"][0]["value"]["subnet_type"]
+            members = info["records"][0]["value"]["membership"]
+            if (subnet_type != "system" and idx < 0) or (idx >= 0 and curr_subnet_idx == idx):
+                ips += [self.get_node_ip_address(member, nns_url) for member in members]
+        return sorted(ips)
+
+    def _build_summary_file(self):
+        """
+        Build dictionary to be used to build the summary file.
+
+        This is overriden by workload experiment, so visibility needs to be _ not __.
+        """
         return {}
 
     def write_summary_file(
@@ -439,7 +607,10 @@ class BaseExperiment:
         The idea is that we write one after each iteration, so that we can
         generate reports from intermediate versions.
         """
-        d = self.__build_summary_file()
+        # Attempt to parse experiment details to check "schema"
+        _ = report.parse_experiment_details(experiment_details)
+
+        d = self._build_summary_file()
         d.update(
             {
                 "xlabels": xlabels,
@@ -451,7 +622,7 @@ class BaseExperiment:
                 "workload": self.canister,
                 "testnet": self.testnet,
                 "user": subprocess.check_output(["whoami"], encoding="utf-8"),
-                "canister_id": self.canister_ids,
+                "canister_id": json.dumps(self.canister_ids),
                 "artifacts_githash": self.artifacts_hash,
                 "t_experiment_start": self.t_experiment_start,
                 "t_experiment_end": int(time.time()),
@@ -459,7 +630,7 @@ class BaseExperiment:
             }
         )
         with open(os.path.join(self.out_dir, "experiment.json"), "w") as iter_file:
-            iter_file.write(json.dumps(d))
+            iter_file.write(json.dumps(d, indent=4))
 
     def get_iter_logs_from_targets(self, machines: List[str], since_time: str, outdir: str):
         """Fetch logs from target machines since the given time."""
@@ -469,3 +640,7 @@ class BaseExperiment:
             outdir + "/replica-log-{}-stdout.txt",
             outdir + "/replica-log-{}-stderr.txt",
         )
+
+    def get_canister_ids(self):
+        """Return canister IDs of all canisters installed by the suite."""
+        return list(itertools.chain.from_iterable([k for _, k in self.canister_ids.items()]))

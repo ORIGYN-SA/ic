@@ -40,9 +40,7 @@ import common.misc as misc  # noqa
 import common.workload_experiment as workload_experiment  # noqa
 
 FLAGS = gflags.FLAGS
-gflags.DEFINE_integer("load", 50, "Load in requests per second to issue")
-gflags.DEFINE_integer("num_workload_generators", 2, "Number of workload generators to run")
-gflags.DEFINE_integer("iter_duration", 300, "Duration in seconds for which to execute workload in each round.")
+gflags.DEFINE_integer("num_workload_generators", -1, "Number of workload generators to run")
 
 
 class BaselineExperiment(workload_experiment.WorkloadExperiment):
@@ -54,12 +52,6 @@ class BaselineExperiment(workload_experiment.WorkloadExperiment):
             num_workload_gen=FLAGS.num_workload_generators,
             request_type="call" if FLAGS.use_updates else "query",
         )
-        self.init()
-        self.init_experiment()
-
-    def init_experiment(self):
-        """Install counter canister."""
-        super().init_experiment()
         self.install_canister(self.target_nodes[0])
 
     def run_experiment_internal(self, config):
@@ -78,17 +70,14 @@ class BaselineExperiment(workload_experiment.WorkloadExperiment):
             self.machines,
             self.target_nodes,
             config["load_total"],
-            outdir=self.iter_outdir,
             arguments=arguments,
             duration=duration,
         )
 
-    def run_iterations(self, datapoints=None):
+    def run_iterations(self, iterations=None):
         """Exercise the experiment with specified iterations."""
-        if datapoints is None:
-            datapoints = []
-
-        self.start_experiment()
+        if iterations is None:
+            iterations = []
 
         run = True
         iteration = 0
@@ -106,11 +95,10 @@ class BaselineExperiment(workload_experiment.WorkloadExperiment):
         total_requests = 0
         num_success = 0
         num_failure = 0
-        allowable_t_median = 0
 
         while run:
 
-            load_total = datapoints[iteration]
+            load_total = iterations[iteration]
             iteration += 1
 
             rps.append(load_total)
@@ -137,37 +125,37 @@ class BaselineExperiment(workload_experiment.WorkloadExperiment):
             ) = evaluated_summaries.convert_tuple()
             duration_in_iteration = int(time.time()) - t_start
 
-            from statistics import mean
-
-            t_median = mean(t_median_list)
-            t_average = max(t_average_list)
-            t_max = max(t_max_list)
-            t_min = max(t_min_list)
+            t_median, t_average, t_max, t_min, p99 = evaluated_summaries.get_latencies()
 
             num_succ_per_iteration.append(num_success)
+            avg_succ_rate = evaluated_summaries.get_avg_success_rate(iter_duration)
 
-            print(f"🚀  ... failure rate for {load_total} rps was {failure_rate} median latency is {t_median}")
+            print(
+                f"🚀  ... failure rate for {load_total} rps was {failure_rate} p99 latency is {p99} (median: {t_median} from {t_median_list}, {avg_succ_rate})"
+            )
 
             duration.append(duration_in_iteration)
 
-            if len(datapoints) == 1:
+            if len(iterations) == 1:
                 rps_max = num_success / duration_in_iteration
                 rps_max_iter.append(rps_max)
                 rps_max_in = load_total
                 run = False
 
             else:
-                allowable_t_median = FLAGS.update_allowable_t_median if self.use_updates else FLAGS.allowable_t_median
                 rps_max_iter.append(rps_max)
-                if failure_rate < FLAGS.allowable_failure_rate and t_median < allowable_t_median:
-                    if num_success / duration_in_iteration > rps_max:
-                        rps_max = evaluated_summaries.get_avg_success_rate(iter_duration)
+                if (
+                    failure_rate < workload_experiment.ALLOWABLE_FAILURE_RATE
+                    and t_median < workload_experiment.ALLOWABLE_LATENCY
+                ):
+                    if avg_succ_rate > rps_max:
+                        rps_max = avg_succ_rate
                         rps_max_in = load_total
 
                 run = (
-                    failure_rate < FLAGS.stop_failure_rate
-                    and t_median < FLAGS.stop_t_median
-                    and iteration < len(datapoints)
+                    failure_rate < workload_experiment.STOP_FAILURE_RATE
+                    and t_median < workload_experiment.STOP_T_MEDIAN
+                    and iteration < len(iterations)
                 )
 
             # Write summary file in each iteration including experiment specific data.
@@ -189,8 +177,12 @@ class BaselineExperiment(workload_experiment.WorkloadExperiment):
                     "t_max": t_max,
                     "t_min": t_min,
                     "duration": duration,
-                    "target_duration": iter_duration,
+                    "iter_duration": iter_duration,
                     "target_load": load_total,
+                    "allowable_failure_rate": workload_experiment.ALLOWABLE_FAILURE_RATE
+                    if len(iterations) > 1
+                    else "n.a.",
+                    "allowable_latency": workload_experiment.ALLOWABLE_LATENCY if len(iterations) > 1 else "n.a.",
                 },
                 rps,
                 "requests / s",
@@ -207,4 +199,4 @@ class BaselineExperiment(workload_experiment.WorkloadExperiment):
 if __name__ == "__main__":
     misc.parse_command_line_args()
     exp = BaselineExperiment()
-    exp.run_iterations([FLAGS.load])
+    exp.run_iterations([FLAGS.target_rps])

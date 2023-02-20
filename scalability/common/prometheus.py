@@ -1,15 +1,22 @@
 import json
 import os
+import sys
+import time
 import traceback
 from typing import List
 
 import gflags
 import requests
-from common import metrics
 from termcolor import colored
+
+sys.path.insert(1, ".")
+from common import metrics  # noqa
 
 FLAGS = gflags.FLAGS
 gflags.DEFINE_boolean("no_prometheus", False, "Set true to disable querying Prometheus.")
+gflags.DEFINE_string(
+    "prometheus_url", "https://prometheus.testnet.dfinity.network", "The URL to the prometheus service."
+)
 
 
 class Prometheus(metrics.Metric):
@@ -125,7 +132,9 @@ def get_http_request_rate_for_timestamp(testnet, load_hosts, timestamp):
     j = json.loads(r.text)
 
     # Ensure the returned data's timestamp matches
-    assert int(j["data"]["result"][0]["value"][0]) == timestamp
+    assert (
+        int(j["data"]["result"][0]["value"][0]) == timestamp
+    ), f"Timestamp incorrect in Prometheus data: {j} with query {query}"
 
     return j
 
@@ -215,7 +224,9 @@ def get_http_request_duration(testnet, hosts: List[str], t_start, t_end, request
     r = get_prometheus_range(payload)
     data = json.loads(r.text)
 
+    print(data)
     r = parse(data)
+
     values, metric = r[0]
 
     http_request_duration = [val[1] for val in values]
@@ -239,6 +250,23 @@ def get_finalization_rate(testnet, hosts, t_start, t_end):
     r = get_prometheus(payload)
     print(f"Prometheus response is: {r.text}")
     return json.loads(r.text)
+
+
+def get_state_sync_duration(testnet, load_hosts, timestamp):
+    """
+    Get the state sync duration summed up until timestamp from the given machines.
+
+    Results are not aggregated. This function will return a list of results, where
+    each element corresponds to one machine.
+    """
+    query = 'state_sync_duration_seconds_sum{{{}, status="ok"}}'.format(get_common(load_hosts, testnet))
+
+    payload = {"time": timestamp, "query": query}
+
+    r = get_prometheus(payload)
+    j = json.loads(r.text)
+
+    return j
 
 
 def get_common(hosts, testnet):
@@ -267,7 +295,7 @@ def get_prometheus(payload):
         raise Exception("Use get_prometheus_range for range queries")
     print("Executing Prometheus query: ", colored(json.dumps(payload, indent=2), "yellow"))
     print(payload["query"].replace("\\\\\\\\", "\\\\"))
-    r = requests.get("http://prometheus.dfinity.systems:9090/api/v1/query", headers=headers, params=payload)
+    r = requests.get(f"{FLAGS.prometheus_url}/api/v1/query", headers=headers, params=payload)
     return r
 
 
@@ -276,7 +304,7 @@ def get_prometheus_range(payload):
     headers = {"Accept": "application/json"}
 
     print("Executing Prometheus query: ", colored(json.dumps(payload, indent=2), "yellow"))
-    r = requests.get("http://prometheus.dfinity.systems:9090/api/v1/query_range", headers=headers, params=payload)
+    r = requests.get(f"{FLAGS.prometheus_url}/api/v1/query_range", headers=headers, params=payload)
     return r
 
 
@@ -306,6 +334,6 @@ def parse_xnet(r):
 
 
 if __name__ == "__main__":
-    r = get_xnet_stream_size("large04", 1638357985, 1638358627)
+    r = get_http_request_duration("large02", [], int(time.time()) - 642, int(time.time()))
     print(json.dumps(r, indent=2))
     print(parse_xnet(r))

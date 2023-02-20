@@ -28,8 +28,6 @@ service are started in the IC-OS boot sequence:
 
 - IPv6 address monitor / retry
 
-- Start journalbeat
-
 - Start node exporter
 
 - Start nginx
@@ -126,15 +124,6 @@ interface and issues `networkctl reconfigure` as needed. The reason is that
 so systems will fail to receive network configuration under certain conditions
 if the router in their network is down at boot.
 
-== Start journalbeat
-
-Service: `journalbeat.service`. Pre-exec script `/opt/ic/bin/generate-journalbeat-config.sh`.
-Depends on `bootstrap-ic-node.service`.
-
-This launches journalbeat (if requested so by injected configuration). The configuration
-for the binary itself is generated dynamically from the configuration pieces held
-in the `config` partition.
-
 == Start node_exporter
 
 Service: `node_exporter.service`. Depends on `setup-node_exporter-keys.service`.
@@ -152,13 +141,7 @@ Default starter script that comes with the package. Relevant information is here
 
 Service:  `boundary-node-control-plane.service`. Has a pre-execution phase that extracts the NNS URLs from `/boot/config/nns.conf`
 
-Generates JSON with routing tables, IP:port, node certificates these are stored in `/etc/nginx/ic_routes`
-
-==  Start ic_router_control_plane_watcher
-Service: `ic-router-control-plane-watcher.service`
-
-Starts `/etc/nginx/ic/ic_router_control_plane_watcher.sh`, which on chnage collects information from `/etc/nginx/ic_routes` and feeds them into `ic_router_control_plane.py` which produces `ic_router_table.js`
-that is usd by the njs-plugin of nginx to route requests to the IC.
+Generates JSON with routing tables, IP:port, node certificates these are stored in `/var/cache/ic_routes`
 
 ==  Start icx_proxy
 

@@ -47,7 +47,7 @@ options may be specified:
   --journalbeat_hosts hosts
     Logging hosts to use. Can be multiple hosts separated by space (make sure
     to quote the argument string so it appears as a single argument to the
-    script, e.g. --journalbeat_hosts "h1.domain.tld:9220 h2.domain.tld:9230").
+    script, e.g. --journalbeat_hosts "h1.domain.tld h2.domain.tld").
 
   --journalbeat_tags tags
     Tags to be used by Journalbeat. Can be multiple tags separated by space
@@ -70,6 +70,9 @@ options may be specified:
     the target). The presently recognized accounts are: backup, readonly,
     admin and root (the latter one for testing purposes only!)
 
+  --node_operator_private_key path
+    Should point to a file containing a node provider private key PEM.
+
   --backup_retention_time seconds
     How long the backed up consensus artifacts should stay on the spool
     before they get purged.
@@ -77,7 +80,7 @@ options may be specified:
   --backup_puging_interval seconds
     How often the backup purging should be executed.
 
-  --log_debug_overrides overrides
+  --replica_log_debug_overrides overrides
     A list of fully qualified Rust module paths. For each of the listed
     modules, at least DEBUG logs will be produced by the node software.
     Primarily intended for testing.
@@ -100,6 +103,10 @@ options may be specified:
     The IP address of a running bitcoind instance. To be used in
     systems tests only.
 
+  --socks_proxy url
+    The URL of the socks proxy to use. To be used in
+    systems tests only.
+
     Be sure to properly quote the string.
 EOF
 }
@@ -113,11 +120,11 @@ function build_ic_bootstrap_tar() {
 
     local IPV6_ADDRESS IPV6_GATEWAY NAME_SERVERS HOSTNAME
     local IC_CRYPTO IC_REGISTRY_LOCAL_STORE
-    local NNS_URL NNS_PUBLIC_KEY
+    local NNS_URL NNS_PUBLIC_KEY NODE_OPERATOR_PRIVATE_KEY
     local BACKUP_RETENTION_TIME_SECS BACKUP_PURGING_INTERVAL_SECS
     local JOURNALBEAT_HOSTS JOURNALBEAT_TAGS
     local ACCOUNTS_SSH_AUTHORIZED_KEYS
-    local LOG_DEBUG_OVERRIDES
+    local REPLICA_LOG_DEBUG_OVERRIDES
     local MALICIOUS_BEHAVIOR
     local BITCOIND_ADDR
     while true; do
@@ -158,20 +165,26 @@ function build_ic_bootstrap_tar() {
             --accounts_ssh_authorized_keys)
                 ACCOUNTS_SSH_AUTHORIZED_KEYS="$2"
                 ;;
+            --node_operator_private_key)
+                NODE_OPERATOR_PRIVATE_KEY="$2"
+                ;;
             --backup_retention_time)
                 BACKUP_RETENTION_TIME_SECS="$2"
                 ;;
             --backup_puging_interval)
                 BACKUP_PURGING_INTERVAL_SECS="$2"
                 ;;
-            --log_debug_overrides)
-                LOG_DEBUG_OVERRIDES="$2"
+            --replica_log_debug_overrides)
+                REPLICA_LOG_DEBUG_OVERRIDES="$2"
                 ;;
             --malicious_behavior)
                 MALICIOUS_BEHAVIOR="$2"
                 ;;
             --bitcoind_addr)
                 BITCOIND_ADDR="$2"
+                ;;
+            --socks_proxy)
+                SOCKS_PROXY="$2"
                 ;;
             *)
                 echo "Unrecognized option: $1"
@@ -212,14 +225,17 @@ EOF
         echo "backup_retention_time_secs=${BACKUP_RETENTION_TIME_SECS}" >"${BOOTSTRAP_TMPDIR}/backup.conf"
         echo "backup_puging_interval_secs=${BACKUP_PURGING_INTERVAL_SECS}" >>"${BOOTSTRAP_TMPDIR}/backup.conf"
     fi
-    if [ "${LOG_DEBUG_OVERRIDES}" != "" ]; then
-        echo "log_debug_overrides=${LOG_DEBUG_OVERRIDES}" >"${BOOTSTRAP_TMPDIR}/log.conf"
+    if [ "${REPLICA_LOG_DEBUG_OVERRIDES}" != "" ]; then
+        echo "replica_log_debug_overrides=${REPLICA_LOG_DEBUG_OVERRIDES}" >"${BOOTSTRAP_TMPDIR}/log.conf"
     fi
     if [ "${MALICIOUS_BEHAVIOR}" != "" ]; then
         echo "malicious_behavior=${MALICIOUS_BEHAVIOR}" >"${BOOTSTRAP_TMPDIR}/malicious_behavior.conf"
     fi
     if [ "${BITCOIND_ADDR}" != "" ]; then
         echo "bitcoind_addr=${BITCOIND_ADDR}" >"${BOOTSTRAP_TMPDIR}/bitcoind_addr.conf"
+    fi
+    if [ "${SOCKS_PROXY}" != "" ]; then
+        echo "socks_proxy=${SOCKS_PROXY}" >"${BOOTSTRAP_TMPDIR}/socks_proxy.conf"
     fi
     if [ "${IC_CRYPTO}" != "" ]; then
         cp -r "${IC_CRYPTO}" "${BOOTSTRAP_TMPDIR}/ic_crypto"
@@ -229,6 +245,9 @@ EOF
     fi
     if [ "${ACCOUNTS_SSH_AUTHORIZED_KEYS}" != "" ]; then
         cp -r "${ACCOUNTS_SSH_AUTHORIZED_KEYS}" "${BOOTSTRAP_TMPDIR}/accounts_ssh_authorized_keys"
+    fi
+    if [ "${NODE_OPERATOR_PRIVATE_KEY}" != "" ]; then
+        cp "${NODE_OPERATOR_PRIVATE_KEY}" "${BOOTSTRAP_TMPDIR}/node_operator_private_key.pem"
     fi
 
     tar cf "${OUT_FILE}" -C "${BOOTSTRAP_TMPDIR}" .

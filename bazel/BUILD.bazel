@@ -1,0 +1,115 @@
+load("@bazel_skylib//rules:common_settings.bzl", "bool_flag", "string_flag")
+load("@buildifier_prebuilt//:rules.bzl", "buildifier")
+load("//bazel:version.bzl", "ic_version_or_git_sha")
+
+bool_flag(
+    name = "enable_malicious_code",
+    build_setting_default = False,
+)
+
+config_setting(
+    name = "malicious_code_enabled",
+    flag_values = {
+        ":enable_malicious_code": "True",
+    },
+)
+
+string_flag(
+    name = "ic_version",
+    build_setting_default = "",
+    visibility = ["//visibility:public"],
+)
+
+string_flag(
+    name = "ic_version_rc_only",
+    build_setting_default = "0000000000000000000000000000000000000000",
+    visibility = ["//visibility:public"],
+)
+
+# Generates version.txt file that contains the value of `--ic_version` flag if set, otherwise <git sha>-<timestamp>.
+# It has to be tagged as `no-cache` as bazel treats version_file as never changing.
+ic_version_or_git_sha(
+    name = "version.txt",
+    ic_version = ":ic_version",
+    tags = ["no-cache"],
+    visibility = ["//visibility:public"],
+)
+
+# Similar to the above target, but use the `ic_version_rc_only` flag. The intention is to set this flag to a dummy value on MR pipelines to preserve caching
+# but on master and release candidate branches set to the current git commit sha.
+ic_version_or_git_sha(
+    name = "rc_only_version.txt",
+    ic_version = ":ic_version_rc_only",
+    tags = ["no-cache"],
+    visibility = ["//visibility:public"],
+)
+
+sh_binary(
+    name = "ic_version_or_git_sha_sh",
+    srcs = ["ic_version_or_git_sha.sh"],
+)
+
+exports_files(
+    [
+        "prost_generator.sh",
+        "generic_rust_bench.sh",
+    ],
+    visibility = ["//visibility:public"],
+)
+
+BUILDIFIER_EXCLUDES = [
+    "./.git/*",
+    "./gitlab-ci/src/git_changes/test_data/**",
+]
+
+buildifier(
+    name = "buildifier",
+    exclude_patterns = BUILDIFIER_EXCLUDES,
+    lint_mode = "fix",
+    mode = "fix",
+    visibility = ["//visibility:public"],
+)
+
+buildifier(
+    name = "buildifier.check",
+    exclude_patterns = BUILDIFIER_EXCLUDES,
+    lint_mode = "warn",
+    mode = "diff",
+)
+
+py_test(
+    name = "buildifier_test",
+    size = "small",
+    srcs = ["buildifier_test.py"],
+    data = [
+        ":buildifier.check",
+        "//:WORKSPACE.bazel",
+    ],
+    env = {
+        "BUILDIFIER_CHECK_BIN": "$(location :buildifier.check)",
+        "WORKSPACE": "$(location //:WORKSPACE.bazel)",
+    },
+    tags = [
+        "external",  # force test to be unconditionally executed.
+        "local",  # precludes the action or test from being remotely cached, remotely executed, or run inside the sandbox.
+        "smoke",  # it should be run before committing code changes into the version control system.
+    ],
+    visibility = ["//visibility:public"],
+)
+
+sh_test(
+    name = "gazelle_test",
+    srcs = ["gazelle_test.sh"],
+    data = [
+        "//:WORKSPACE.bazel",
+        "//:gazelle",
+    ],
+    env = {
+        "GAZELLE_BIN": "$(rootpath //:gazelle)",
+        "WORKSPACE": "$(rootpath //:WORKSPACE.bazel)",
+    },
+    tags = [
+        "external",  # force test to be unconditionally executed.
+        "local",  # precludes the action or test from being remotely cached, remotely executed, or run inside the sandbox.
+    ],
+)

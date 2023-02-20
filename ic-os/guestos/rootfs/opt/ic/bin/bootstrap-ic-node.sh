@@ -62,16 +62,16 @@ function process_bootstrap() {
         echo "Installing initial crypto material"
         cp -r -T "${TMPDIR}/ic_crypto" "${STATE_ROOT}/crypto"
     fi
-    for DIR in ic_registry_local_store nns_public_key.pem; do
-        if [ -e "${TMPDIR}/${DIR}" ]; then
-            echo "Setting up initial ${DIR}"
-            cp -r -T "${TMPDIR}/${DIR}" "${STATE_ROOT}/data/${DIR}"
+    for ITEM in ic_registry_local_store nns_public_key.pem node_operator_private_key.pem; do
+        if [ -e "${TMPDIR}/${ITEM}" ]; then
+            echo "Setting up initial ${ITEM}"
+            cp -r -T "${TMPDIR}/${ITEM}" "${STATE_ROOT}/data/${ITEM}"
         fi
     done
 
     # stash the following configuration files to config store
     # note: keep this list in sync with configurations supported in build-bootstrap-config-image.sh
-    for FILE in journalbeat.conf network.conf nns.conf backup.conf log.conf malicious_behavior.conf bitcoind_addr.conf; do
+    for FILE in journalbeat.conf network.conf nns.conf backup.conf log.conf malicious_behavior.conf bitcoind_addr.conf socks_proxy.conf; do
         if [ -e "${TMPDIR}/${FILE}" ]; then
             echo "Setting up ${FILE}"
             cp "${TMPDIR}/${FILE}" "${CONFIG_ROOT}/${FILE}"

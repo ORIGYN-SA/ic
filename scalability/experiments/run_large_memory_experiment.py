@@ -28,11 +28,11 @@ Suggested success criteria (Updates):
 Maximum number of updates not be below xxx updates per second with less than 20% failure and a maximum latency of 10000ms
 """
 import codecs
+import itertools
 import json
 import os
 import sys
 import time
-from statistics import mean
 
 import gflags
 
@@ -40,13 +40,11 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from common import misc  # noqa
 from common import workload_experiment  # noqa
 
-CANISTER = "memory-test-canister.wasm"
+CANISTER = "memory-test-canister"
 
 FLAGS = gflags.FLAGS
-gflags.DEFINE_integer("target_query_load", 160, "Target query load in queries per second to issue.")
-gflags.DEFINE_integer("target_update_load", 20, "Target update load in queries per second to issue.")
 gflags.DEFINE_integer("payload_size", 5000000, "Payload size to pass to memory test canister")
-gflags.DEFINE_integer("iter_duration", 60, "Duration in seconds for which to execute workload in each round.")
+gflags.DEFINE_integer("num_canisters", 1, "Number of canisters to install and benchmark against.")
 
 
 class LargeMemoryExperiment(workload_experiment.WorkloadExperiment):
@@ -54,18 +52,9 @@ class LargeMemoryExperiment(workload_experiment.WorkloadExperiment):
 
     def __init__(self):
         """Construct experiment 2."""
-        super().__init__(num_workload_gen=1)
-        self.init()
-        if self.use_updates:
-            self.request_type = "call"
-        self.init_experiment()
-
-    def init_experiment(self):
-        """Install counter canister."""
-        super().init_experiment()
-        self.install_canister(
-            self.target_nodes[0], canister=os.path.join(self.artifacts_path, f"../canisters/{CANISTER}")
-        )
+        super().__init__()
+        for _ in range(FLAGS.num_canisters):
+            self.install_canister(self.target_nodes[0], CANISTER)
 
     def run_experiment_internal(self, config):
         """Run workload generator with the load specified in config."""
@@ -73,11 +62,15 @@ class LargeMemoryExperiment(workload_experiment.WorkloadExperiment):
         load = config["load_total"]
         call_method = config["call_method"]
         t_start = int(time.time())
+        # The workload generator can only target a single canister.
+        # If we want to target num_canister canisters, we hence need num_canister workload generators.
+        # They can all be on the same machine.
+        num_canisters_installed = len(list(itertools.chain.from_iterable([i for _, i in self.canister_ids.items()])))
+        assert num_canisters_installed == FLAGS.num_canisters
         r = self.run_workload_generator(
-            self.machines,
+            [self.machines[i % len(self.machines)] for i in range(FLAGS.num_canisters)],
             self.target_nodes,
             load,
-            outdir=self.iter_outdir,
             payload=codecs.encode(json.dumps({"size": config["payload_size"]}).encode("utf-8"), "hex"),
             method="Update" if self.use_updates else "Query",
             call_method=call_method,
@@ -85,14 +78,12 @@ class LargeMemoryExperiment(workload_experiment.WorkloadExperiment):
         )
         self.last_duration = int(time.time()) - t_start
 
-        t_median = max(r.t_median)
+        t_median = max(r.t_median) if len(r.t_median) > 0 else None
         print(f"🚀  ... failure rate for {load} rps was {r.failure_rate} median latency is {t_median}")
         return r
 
-    def run_iterations(self, datapoints=None):
+    def run_iterations(self, iterations=None):
         """Run heavy memory experiment in defined iterations."""
-        self.start_experiment()
-
         failure_rate = 0.0
         t_median = 0.0
         run = True
@@ -107,7 +98,7 @@ class LargeMemoryExperiment(workload_experiment.WorkloadExperiment):
 
         while run:
 
-            load_total = datapoints[iteration]
+            load_total = iterations[iteration]
             iteration += 1
 
             rps.append(load_total)
@@ -121,6 +112,8 @@ class LargeMemoryExperiment(workload_experiment.WorkloadExperiment):
                     "call_method": "update_copy" if self.use_updates else "query_copy",
                 }
             )
+
+            avg_succ_rate = evaluated_summaries.get_avg_success_rate(FLAGS.iter_duration)
             (
                 failure_rate,
                 t_median_list,
@@ -133,30 +126,27 @@ class LargeMemoryExperiment(workload_experiment.WorkloadExperiment):
                 num_failure,
             ) = evaluated_summaries.convert_tuple()
 
-            t_median = max(t_median_list)
-            t_average = mean(t_average_list)
-            t_max = max(t_max_list)
-            t_min = max(t_min_list)
-            num_succ_per_iteration.append(num_success)
+            t_median, t_average, t_max, t_min, p99 = evaluated_summaries.get_latencies()
 
             print(f"🚀  ... failure rate for {load_total} rps was {failure_rate} median latency is {t_median}")
 
-            if len(datapoints) == 1:
-                rps_max = num_success / self.last_duration
-                rps_max_in = load_total
-                run = False
+            if (
+                failure_rate < workload_experiment.ALLOWABLE_FAILURE_RATE
+                and t_median < workload_experiment.ALLOWABLE_LATENCY
+            ):
+                if avg_succ_rate > rps_max:
+                    rps_max = avg_succ_rate
+                    rps_max_in = load_total
 
-            else:
-                if failure_rate < FLAGS.allowable_failure_rate and t_median < FLAGS.allowable_t_median:
-                    if num_success / self.last_duration > rps_max:
-                        rps_max = num_success / self.last_duration
-                        rps_max_in = load_total
-
-                run = (
-                    failure_rate < FLAGS.stop_failure_rate
-                    and t_median < FLAGS.stop_t_median
-                    and iteration < len(datapoints)
-                )
+            # Check termination condition
+            run = misc.evaluate_stop_latency_failure_iter(
+                t_median,
+                workload_experiment.STOP_T_MEDIAN,
+                failure_rate,
+                workload_experiment.STOP_FAILURE_RATE,
+                iteration,
+                len(iterations),
+            )
 
             # Write summary file in each iteration including experiment specific data.
             rtype = "update_copy" if self.use_updates else "query_copy"
@@ -169,7 +159,7 @@ class LargeMemoryExperiment(workload_experiment.WorkloadExperiment):
                     "rps_max": rps_max,
                     "rps_max_in": rps_max_in,
                     "num_succ_per_iteration": num_succ_per_iteration,
-                    "target_duration": FLAGS.iter_duration,
+                    "iter_duration": FLAGS.iter_duration,
                     "success_rate": (num_success / total_requests) * 100,
                     "failure_rate": failure_rate * 100,
                     "failure_rate_color": "green" if failure_rate < 0.01 else "red",
@@ -186,13 +176,13 @@ class LargeMemoryExperiment(workload_experiment.WorkloadExperiment):
             )
 
             print(f"🚀  ... maximum capacity so far is {rps_max}")
-            return (failure_rate, t_median, t_average, t_max, t_min, total_requests, num_success, num_failure, rps_max)
 
-        exp.end_experiment()
+        self.end_experiment()
+        return (failure_rate, t_median, t_average, t_max, t_min, total_requests, num_success, num_failure, rps_max)
 
 
 if __name__ == "__main__":
     misc.parse_command_line_args()
     exp = LargeMemoryExperiment()
-    datapoints = [FLAGS.target_update_load]
-    exp.run_iterations(datapoints)
+    iterations = [FLAGS.target_rps]
+    exp.run_iterations(iterations)

@@ -38,9 +38,9 @@ if [[ -z "${GIT_REVISION:-}" ]]; then
 fi
 function disk_image_exists() {
     curl --output /dev/null --silent --head --fail \
-        "https://download.dfinity.systems/ic/$GIT_REVISION/guest-os/disk-img/disk-img.tar.gz" \
+        "https://download.dfinity.systems/ic/$GIT_REVISION/guest-os/disk-img/disk-img.tar.zst" \
         || curl --output /dev/null --silent --head --fail \
-            "https://download.dfinity.systems/ic/$GIT_REVISION/guest-os/disk-img.tar.gz"
+            "https://download.dfinity.systems/ic/$GIT_REVISION/guest-os/disk-img.tar.zst"
 }
 
 for i in {1..60}; do
@@ -230,7 +230,7 @@ function collect_metrics() {
         # Calculate the averages over the large interval.
         # We split into smaller buckets, then apply avg_over_time. The outer avg it
         # to get an aggregate, instead of having values per replica.
-        curl -G "http://prometheus.dfinity.systems:9090/api/v1/query" \
+        curl -XPOST -G "https://prometheus.testnet.dfinity.network/api/v1/query" \
             -o "$experiment_dir/metrics/${metric}_avg_total.json" \
             -fsSL -m 30 --retry 10 --retry-connrefused \
             -H "Accept: application/json" \

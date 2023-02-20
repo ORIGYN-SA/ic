@@ -19,7 +19,14 @@ require_read_efivarfs_files(syslogd_t)
 require_read_run_systemd(syslogd_t)
 
 # XXX: not clear
-allow syslogd_t syslogd_t : netlink_generic_socket { create };
+allow syslogd_t syslogd_t : netlink_generic_socket { create ioctl };
+
+# journald wants to scan the /run/user hierarchy (presumably relating to login sessions)
+require { type user_runtime_root_t, user_runtime_t; }
+allow syslogd_t user_runtime_root_t : dir { search };
+allow syslogd_t user_runtime_t : dir { search };
+# it wants to override dac read permissions for the /run/user hierarchy
+allow syslogd_t syslogd_t : capability { dac_read_search };
 
 ###############################################################################
 # systemd-networkd
@@ -32,6 +39,11 @@ require_read_run_systemd(systemd_networkd_t)
 init_dbus_send_script(systemd_networkd_t)
 # netlink socket to actually monitor network interfaces
 allow systemd_networkd_t systemd_networkd_t : netlink_generic_socket { bind create getattr getopt setopt };
+# allow networkd to operate dhcp client socket
+corenet_udp_bind_dhcpc_port(systemd_networkd_t)
+corenet_udp_bind_generic_node(systemd_networkd_t)
+# allow self-signal
+allow systemd_networkd_t systemd_networkd_t : process { signal };
 
 ###############################################################################
 # systemd-detect-virt
@@ -98,6 +110,9 @@ require { type tmpfs_t, unlabeled_t; }
 relabelfrom_dirs_pattern(systemd_tmpfiles_t, { tmpfs_t unlabeled_t }, { tmpfs_t unlabeled_t })
 list_dirs_pattern(systemd_tmpfiles_t, unlabeled_t, unlabeled_t)
 
+# A tempfile is used as part of setting up machine-id
+read_files_pattern(systemd_tmpfiles_t, tmpfs_t, tmpfs_t)
+
 ###############################################################################
 # udev
 
@@ -124,3 +139,11 @@ systemd_connect_userdb(local_login_t)
 
 # ssh also needs access to userdb
 systemd_connect_userdb(sshd_t)
+
+###############################################################################
+# pcscd
+
+# allow smart card daemon access to /run/udev
+require { type udev_var_run_t, pcscd_t; }
+read_files_pattern(pcscd_t, udev_var_run_t, udev_var_run_t)
+kernel_read_vm_overcommit_sysctl(pcscd_t)

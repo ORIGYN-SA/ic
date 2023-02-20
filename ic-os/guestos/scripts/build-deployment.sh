@@ -10,7 +10,7 @@ set -o errexit
 set -o pipefail
 
 BASE_DIR="$(dirname "${BASH_SOURCE[0]}")/.."
-REPO_ROOT=$(git rev-parse --show-toplevel)
+REPO_ROOT=${REPO_ROOT:-$(git rev-parse --show-toplevel)}
 
 # Set argument defaults
 DEBUG=0
@@ -29,7 +29,9 @@ Arguments:
   -h,  --help                           show this help message and exit
   -i=, --input=                         JSON formatted input file (Default: ./subnet.json)
   -o=, --output=                        removable media output directory (Default: ./build-out/)
+       --output-nns-public-key=         An optional path to output nns_public_key.pem if desired
   -s=, --ssh=                           specify directory holding SSH authorized_key files (Default: ../../testnet/config/ssh_authorized_keys)
+       --node-operator-private-key=     specify the node provider private key
        --git-revision=                  git revision for which to prepare the media
        --whitelist=                     path to provisional whitelist that allows canister creation
        --dkg-interval-length=           number of consensus rounds between DKG (-1 if not provided explicitly, which means - default will be used)
@@ -47,8 +49,16 @@ Arguments:
             OUTPUT="${argument#*=}"
             shift
             ;;
+        --output-nns-public-key=*)
+            OUTPUT_NNS_PUBLIC_KEY="${argument#*=}"
+            shift
+            ;;
         -s=* | --ssh=*)
             SSH="${argument#*=}"
+            shift
+            ;;
+        --node-operator-private-key=*)
+            NODE_OPERATOR_PRIVATE_KEY="${argument#*=}"
             shift
             ;;
         --git-revision=*)
@@ -84,6 +94,7 @@ done
 INPUT="${INPUT:=${BASE_DIR}/subnet.json}"
 OUTPUT="${OUTPUT:=${BASE_DIR}/build-out}"
 SSH="${SSH:=${BASE_DIR}/../../testnet/config/ssh_authorized_keys}"
+NODE_OPERATOR_PRIVATE_KEY="${NODE_OPERATOR_PRIVATE_KEY:=}"
 GIT_REVISION="${GIT_REVISION:=}"
 WHITELIST="${WHITELIST:=}"
 # Negative DKG value means unset (default will be used)
@@ -135,8 +146,8 @@ while IFS=$'\1' read -r ipv6_prefix ipv6_subnet ipv6_address hostname subnet_typ
         ['ipv6_prefix']=$ipv6_prefix
         ['ipv6_subnet']=$ipv6_subnet
         ['ipv6_address']=$ipv6_address
-        ['subnet_type']=$subnet_type
         ['hostname']=$hostname
+        ['subnet_type']=$subnet_type
         ['subnet_idx']=$subnet_idx
         ['node_idx']=$node_idx
         ['use_hsm']=$use_hsm
@@ -195,8 +206,6 @@ function generate_subnet_config() {
 
     cp -a ${IC_PREP_DIR}/bin/replica "$REPO_ROOT/ic-os/guestos/rootfs/opt/ic/bin/replica"
     cp -a ${IC_PREP_DIR}/bin/orchestrator "$REPO_ROOT/ic-os/guestos/rootfs/opt/ic/bin/orchestrator"
-    cp -a ${IC_PREP_DIR}/bin/boundary-node-control-plane "$REPO_ROOT/ic-os/generic-guestos/rootfs/opt/dfinity/boundary-node-control-plane"
-    cp -a ${IC_PREP_DIR}/bin/boundary-node-prober "$REPO_ROOT/ic-os/generic-guestos/rootfs/opt/dfinity/boundary-node-prober"
 
     NODES_NNS=()
     NODES_APP=()
@@ -295,12 +304,11 @@ function generate_node_config() {
         local ipv6_address=${NODE["ipv6_address"]}
         local subnet_idx=${NODE["subnet_idx"]}
         local node_idx=${NODE["node_idx"]}
-        local subnet_type=${NODE["subnet_type"]}
 
         if [[ "${NODE["type"]}" != "replica" ]]; then
             continue
         fi
-        if [[ "$subnet_type" != "root_subnet" ]]; then
+        if [[ "${NODE["subnet_type"]}" != "root_subnet" ]]; then
             continue
         fi
 
@@ -336,13 +344,12 @@ function generate_node_config() {
             # Copy the NNS public key in the correct place
             cp "${IC_PREP_DIR}/nns_public_key.pem" "${CONFIG_DIR}/$NODE_PREFIX/nns_public_key.pem"
             echo "nns_url=${NNS_URL}" >"${CONFIG_DIR}/$NODE_PREFIX/nns.conf"
-
-        elif [[ "$type" == "boundary" ]]; then
-            # Copy the NNS public key in the correct place
-            cp "${IC_PREP_DIR}/nns_public_key.pem" "${CONFIG_DIR}/$NODE_PREFIX/nns_public_key.pem"
-            echo "nns_url=${NNS_URL}" >"${CONFIG_DIR}/$NODE_PREFIX/nns.conf"
         fi
     done
+
+    if [[ -n "${OUTPUT_NNS_PUBLIC_KEY:-}" ]]; then
+        cp "${IC_PREP_DIR}/nns_public_key.pem" "${OUTPUT_NNS_PUBLIC_KEY}"
+    fi
 }
 
 function generate_network_config() {
@@ -364,6 +371,23 @@ function generate_network_config() {
     done
 }
 
+# Adds a .conf file that includes the testnet socks proxy. The testnet socks proxy url is 'socks5://socks5.testnet.dfinity.network:1080'.
+# This config is used to inject the testnet socks into the node for testing. The mainnet socks proxy is hardcoded in the config generation files
+# for the bitcoin and canister http adapter.
+# MAKE SURE THIS IS ONLY CALLED FOR TESTNET DEPLOYMENTS!!! (In the future this should consolidated with 'build-bootstrap-config-image.sh')
+function generate_socks_config() {
+    for n in $NODES; do
+        declare -n NODE=$n
+        local subnet_idx=${NODE["subnet_idx"]}
+        local node_idx=${NODE["node_idx"]}
+
+        NODE_PREFIX=${DEPLOYMENT}.$subnet_idx.$node_idx
+
+        # Adapters have validity check for socks proxy url. Scheme, Host and Port are required. I.e socks5://someurl.com:1080.
+        echo "socks_proxy=socks5://socks5.testnet.dfinity.network:1080" >>"${CONFIG_DIR}/$NODE_PREFIX/socks_proxy.conf"
+    done
+}
+
 function copy_ssh_keys() {
     for n in $NODES; do
         declare -n NODE=$n
@@ -378,6 +402,25 @@ function copy_ssh_keys() {
         # can lead to confusion and side effects when overwriting one
         # file changes another).
         cp -Lr "${SSH}" "${CONFIG_DIR}/$NODE_PREFIX/accounts_ssh_authorized_keys"
+    done
+}
+
+function copy_node_provider_key() {
+    for n in $NODES; do
+        declare -n NODE=$n
+        local subnet_idx=${NODE["subnet_idx"]}
+        local node_idx=${NODE["node_idx"]}
+
+        NODE_PREFIX=${DEPLOYMENT}.$subnet_idx.$node_idx
+
+        # Copy the file, but make sure that we do not
+        # copy/create symlinks (but rather dereference file contents).
+        # Symlinks must be refused by the config injection script (they
+        # can lead to confusion and side effects when overwriting one
+        # file changes another).
+        if [[ -n "$NODE_OPERATOR_PRIVATE_KEY" ]]; then
+            cp -Lr "${NODE_OPERATOR_PRIVATE_KEY}" "${CONFIG_DIR}/$NODE_PREFIX/node_provider_public_key.pem"
+        fi
     done
 }
 
@@ -403,12 +446,19 @@ function build_removable_media() {
         declare -n NODE=$n
         local subnet_idx=${NODE["subnet_idx"]}
         local node_idx=${NODE["node_idx"]}
+        local type=${NODE["type"]}
 
         #echo "${DEPLOYMENT}.$subnet_idx.$node_idx"
         NODE_PREFIX=${DEPLOYMENT}.$subnet_idx.$node_idx
         truncate --size 4M "${OUTPUT}/$NODE_PREFIX.img"
-        mkfs.vfat "${OUTPUT}/$NODE_PREFIX.img"
-        mcopy -i "${OUTPUT}/$NODE_PREFIX.img" -o -s ${TARBALL_DIR}/$NODE_PREFIX/ic-bootstrap.tar ::
+        mkfs.vfat -n CONFIG "${OUTPUT}/$NODE_PREFIX.img"
+
+        # Universal VMs take keys in a different format
+        if [ $type == "aux" ]; then
+            mcopy -i "${OUTPUT}/$NODE_PREFIX.img" -o -s ${CONFIG_DIR}/$NODE_PREFIX/accounts_ssh_authorized_keys ::ssh-authorized-keys
+        else
+            mcopy -i "${OUTPUT}/$NODE_PREFIX.img" -o -s ${TARBALL_DIR}/$NODE_PREFIX/ic-bootstrap.tar ::
+        fi
     done
 }
 
@@ -416,8 +466,7 @@ function remove_temporary_directories() {
     rm -rf ${TEMPDIR}
 }
 
-# See how we were called
-if [ ${DEBUG} -eq 1 ]; then
+function main() {
     cleanup_rootfs
     prepare_build_directories
     download_binaries &
@@ -429,26 +478,19 @@ if [ ${DEBUG} -eq 1 ]; then
     generate_journalbeat_config
     generate_node_config
     generate_network_config
+    generate_socks_config
     copy_ssh_keys
+    copy_node_provider_key
     build_tarball
     build_removable_media
     remove_temporary_directories
     cleanup_rootfs
+
+}
+
+# See how we were called
+if [ ${DEBUG} -eq 1 ]; then
+    main
 else
-    cleanup_rootfs >/dev/null 2>&1
-    prepare_build_directories >/dev/null 2>&1
-    download_binaries >/dev/null 2>&1 &
-    DOWNLOAD_PID=$!
-    download_registry_canisters >/dev/null 2>&1
-    wait $DOWNLOAD_PID
-    generate_subnet_config >/dev/null 2>&1
-    create_tarball_structure >/dev/null 2>&1
-    generate_journalbeat_config >/dev/null 2>&1
-    generate_node_config >/dev/null 2>&1
-    generate_network_config >/dev/null 2>&1
-    copy_ssh_keys >/dev/null 2>&1
-    build_tarball >/dev/null 2>&1
-    build_removable_media >/dev/null 2>&1
-    remove_temporary_directories >/dev/null 2>&1
-    cleanup_rootfs >/dev/null 2>&1
+    main >/dev/null 2>&1
 fi

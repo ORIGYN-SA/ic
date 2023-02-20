@@ -14,6 +14,8 @@ Usage:
   Build update artifact image for IC guest OS. This is a gzip'ed tar file containing
   the boot and root filesystem images for the operating system as well version metadata.
 
+  -f image compression format: The image compression format to build.
+     Must be either "gz" or "zstd".
   -i ubuntu.dockerimg: Points to the output of "docker save"
      of the ubuntu docker image. If not given, will implicitly call
      docker build.
@@ -29,9 +31,14 @@ Usage:
 EOF
 }
 
+FORMAT="gz"
 BUILD_TYPE=prod
-while getopts "i:o:p:t:v:x:" OPT; do
+
+while getopts "f:i:o:p:t:v:x:" OPT; do
     case "${OPT}" in
+        f)
+            FORMAT="${OPTARG}"
+            ;;
         i)
             IN_FILE="${OPTARG}"
             ;;
@@ -51,38 +58,102 @@ while getopts "i:o:p:t:v:x:" OPT; do
             EXEC_SRCDIR="${OPTARG}"
             ;;
         *)
-            usage
+            usage >&2
             exit 1
             ;;
     esac
 done
 
-if [ "${OUT_FILE}" == "" ]; then
-    usage
+# Preparatory steps and temporary build directory.
+BASE_DIR=$(dirname "${BASH_SOURCE[0]}")/..
+
+TOOL_DIR="${BASE_DIR}/../../toolchains/sysimage/"
+
+TMPDIR=$(mktemp -d -t build-image-XXXXXXXXXXXX)
+trap "rm -rf $TMPDIR" exit
+
+# Validate and process arguments
+
+if [ "${FORMAT}" != "gz" -a "${FORMAT}" != "zstd" ]; then
+    echo "Unknown compression format: ${FORMAT}" >&2
+    usage >&2
     exit 1
 fi
 
-TMPDIR=$(mktemp -d)
-trap "rm -rf ${TMPDIR}" exit
-BASE_DIR=$(dirname "${BASH_SOURCE[0]}")/..
-
-BOOT_IMG="${TMPDIR}"/boot.img
-ROOT_IMG="${TMPDIR}"/root.img
-
-if [ "${IN_FILE}" != "" ]; then
-    "${BASE_DIR}/scripts/build-ubuntu.sh" -i "${IN_FILE}" -r "${ROOT_IMG}" -b "${BOOT_IMG}" -t "${BUILD_TYPE}"
-    # HACK: allow running without explicitly given version, extract version
-    # from rootfs. This is NOT good, but workable for the moment.
-    VERSION=$(debugfs "${ROOT_IMG}" cat /opt/ic/share/version.txt)
-else
-    "${BASE_DIR}/scripts/build-ubuntu.sh" -r "${ROOT_IMG}" -b "${BOOT_IMG}" -p "${ROOT_PASSWORD}" -v "${VERSION}" -x "${EXEC_SRCDIR}" -t "${BUILD_TYPE}"
+if [ "${OUT_FILE}" == "" ]; then
+    usage >&2
+    exit 1
 fi
 
-echo "${VERSION}" >"${TMPDIR}/VERSION.TXT"
-# Sort by name in tar file -- makes ordering deterministic and ensures
-# that VERSION.TXT is first entry, making it quick & easy to extract.
-# Override owner, group and mtime to make build independent of the user
-# building it.
-tar czf "${OUT_FILE}" --sort=name --owner=root:0 --group=root:0 --mtime='UTC 2020-01-01' --sparse -C "${TMPDIR}" .
+if [ "${BUILD_TYPE}" != "dev" -a "${BUILD_TYPE}" != "prod" ]; then
+    echo "Unknown build type: ${BUILD_TYPE}" >&2
+    usage >&2
+    exit 1
+fi
 
-rm -rf "${TMPDIR}"
+if [ "${ROOT_PASSWORD}" != "" -a "${BUILD_TYPE}" != "dev" ]; then
+    echo "Root password is valid only for build type 'dev'" >&2
+    usage >&2
+    exit 1
+fi
+
+if [ "${VERSION}" == "" ]; then
+    echo "Version needs to be specified for build to succeed" >&2
+    usage >&2
+    exit 1
+fi
+
+BASE_IMAGE=$(cat "${BASE_DIR}/rootfs/docker-base.${BUILD_TYPE}")
+
+# HACK: build required system binaries
+make -C ${BASE_DIR}/src infogetty prestorecon
+
+# Compute arguments for actual build stage.
+
+declare -a IC_EXECUTABLES=(orchestrator replica canister_sandbox sandbox_launcher vsock_agent state-tool ic-consensus-pool-util ic-crypto-csp ic-regedit ic-recovery ic-btc-adapter ic-https-outcalls-adapter ic-onchain-observability-adapter)
+declare -a INSTALL_EXEC_ARGS=()
+for IC_EXECUTABLE in "${IC_EXECUTABLES[@]}"; do
+    INSTALL_EXEC_ARGS+=("${EXEC_SRCDIR}/${IC_EXECUTABLE}:/opt/ic/bin/${IC_EXECUTABLE}:0755")
+done
+INSTALL_EXEC_ARGS+=("${BASE_DIR}/src/infogetty:/opt/ic/bin/infogetty:0755")
+INSTALL_EXEC_ARGS+=("${BASE_DIR}/src/prestorecon:/opt/ic/bin/prestorecon:0755")
+
+if [ "${BUILD_TYPE}" == "dev" ]; then
+    INSTALL_EXEC_ARGS+=("${BASE_DIR}/rootfs/allow_console_root:/etc/allow_console_root:0644")
+fi
+
+echo "${VERSION}" >"${TMPDIR}/version.txt"
+
+# Build all pieces and assemble the disk image.
+
+"${TOOL_DIR}"/docker_tar.py -o "${TMPDIR}/rootfs-tree.tar" \
+    --build-arg BUILD_TYPE="${BUILD_TYPE}" \
+    --build-arg ROOT_PASSWORD="${ROOT_PASSWORD}" \
+    --build-arg BASE_IMAGE="${BASE_IMAGE}" \
+    "${BASE_DIR}/rootfs"
+tar xOf "${TMPDIR}"/rootfs-tree.tar --occurrence=1 etc/selinux/default/contexts/files/file_contexts >"${TMPDIR}/file_contexts"
+"${TOOL_DIR}"/build_ext4_image.py --strip-paths /run /boot -o "${TMPDIR}/partition-root-unsigned.tar" -s 3G -i "${TMPDIR}/rootfs-tree.tar" -S "${TMPDIR}/file_contexts" \
+    "${INSTALL_EXEC_ARGS[@]}" \
+    "${TMPDIR}/version.txt:/opt/ic/share/version.txt:0644"
+"${TOOL_DIR}"/verity_sign.py -i "${TMPDIR}/partition-root-unsigned.tar" -o "${TMPDIR}/partition-root.tar" -r "${TMPDIR}/partition-root-hash"
+sed -e s/ROOT_HASH/$(cat "${TMPDIR}/partition-root-hash")/ <"${BASE_DIR}/bootloader/extra_boot_args.template" >"${TMPDIR}/extra_boot_args"
+"${TOOL_DIR}"/build_ext4_image.py -o "${TMPDIR}/partition-boot.tar" -s 1G -i "${TMPDIR}/rootfs-tree.tar" -S "${TMPDIR}/file_contexts" -p boot/ \
+    "${TMPDIR}/version.txt:/boot/version.txt:0644" \
+    "${TMPDIR}/extra_boot_args:/boot/extra_boot_args:0644"
+
+# Now assemble the upgrade image
+
+mkdir -p "${TMPDIR}/tar"
+
+tar xf "${TMPDIR}/partition-boot.tar" --transform="s/partition.img/boot.img/" -C "${TMPDIR}/tar"
+tar xf "${TMPDIR}/partition-root.tar" --transform="s/partition.img/root.img/" -C "${TMPDIR}/tar"
+echo "${VERSION}" >"${TMPDIR}/tar/VERSION.TXT"
+
+if [ "${FORMAT}" == "gz" ]; then
+    tar -czf "${OUT_FILE}" --sort=name --owner=root:0 --group=root:0 --mtime='UTC 1970-01-01 00:00:00' \
+        --sparse -C "${TMPDIR}/tar" .
+else
+    tar -cf "${OUT_FILE}" --sort=name --owner=root:0 --group=root:0 --mtime='UTC 1970-01-01 00:00:00' \
+        --use-compress-program="zstd --threads=0 -10" \
+        --sparse -C "${TMPDIR}/tar" .
+fi

@@ -1,4 +1,5 @@
 import subprocess
+import uuid
 
 from termcolor import colored
 
@@ -10,18 +11,28 @@ def scp_file(source, destination):
     return p
 
 
-def run_ssh(machine, command, f_stdout=None, f_stderr=None):
-    """Run the given command on the given machine."""
-    print("{}: Running {}".format(colored(machine, "blue"), command))
+def get_ssh_args(machine, command, extra_args=[]):
     args = [
         "ssh",
         "-o",
         "UserKnownHostsFile=/dev/null",
         "-o",
         "StrictHostKeyChecking=No",
-        "admin@{}".format(machine),
-        command,
     ]
+    return (
+        args
+        + extra_args
+        + [
+            "admin@{}".format(machine),
+            command,
+        ]
+    )
+
+
+def run_ssh(machine: str, command: str, f_stdout=None, f_stderr=None) -> subprocess.Popen:
+    """Run the given command on the given machine."""
+    print("{}: Running {}".format(colored(machine, "blue"), command))
+    args = get_ssh_args(machine, command)
 
     if f_stdout is not None and f_stderr is not None:
         p = subprocess.Popen(args, stdout=open(f_stdout, "w"), stderr=open(f_stderr, "w"))
@@ -38,16 +49,7 @@ def run_ssh_with_t(machine, command, f_stdout, f_stderr):
     """
     print("{}: Running in terminal mode {}".format(colored(machine, "blue"), command))
     return subprocess.Popen(
-        [
-            "ssh",
-            "-tt",
-            "-o",
-            "UserKnownHostsFile=/dev/null",
-            "-o",
-            "StrictHostKeyChecking=No",
-            "admin@{}".format(machine),
-            command,
-        ],
+        get_ssh_args(machine, command, ["-tt"]),
         universal_newlines=True,
         stdin=subprocess.DEVNULL,
     )
@@ -69,22 +71,31 @@ def scp_in_parallel(sources, destinations):
     return rc
 
 
-def run_ssh_in_parallel(machines, command, f_stdout=None, f_stderr=None):
-    """Run the given command in parallel on all given machines and wait for completion."""
+def __get_machine_label(machine):
+    return machine.replace("/", "_")
+
+
+def spawn_ssh_in_parallel(machines, command, f_stdout=None, f_stderr=None):
+    """Run the given command in parallel on all given machines and return Popen objects for further processing."""
     ps = []
     for machine in machines:
+        m = __get_machine_label(machine)
         ps.append(
             (
                 machine,
                 run_ssh(
                     machine,
                     command,
-                    f_stdout.format(machine) if f_stdout is not None else None,
-                    f_stderr.format(machine) if f_stderr is not None else None,
+                    str(f_stdout.format(m + str(uuid.uuid4()))) if f_stdout is not None else None,
+                    str(f_stderr.format(m + str(uuid.uuid4()))) if f_stderr is not None else None,
                 ),
             )
         )
+    return ps
 
+
+def run_ssh_in_parallel(machines, command, f_stdout=None, f_stderr=None):
+    ps = spawn_ssh_in_parallel(machines, command, f_stdout, f_stderr)
     rc = []
     for (machine, p) in ps:
         rc.append(p.wait())
@@ -95,25 +106,62 @@ def run_ssh_in_parallel(machines, command, f_stdout=None, f_stderr=None):
 
 def run_all_ssh_in_parallel(
     machines: [str], commands: [str], f_stdout: str = None, f_stderr: str = None, timeout: int = None
-):
+) -> [int]:
     """Run the given command in parallel on all given machines and wait for completion."""
-    ps = []
+    ps = []  # Array of type: [(str, str, subprocess.Popen)]
     for command, machine in zip(commands, machines):
+        m = __get_machine_label(machine)
+        this_f_stdout = f_stdout.format(m + str(uuid.uuid4())) if f_stdout is not None else None
+        this_f_stderr = f_stderr.format(m + str(uuid.uuid4())) if f_stderr is not None else None
         ps.append(
             (
                 machine,
+                command,
                 run_ssh(
                     machine,
                     command,
-                    f_stdout.format(machine) if f_stdout is not None else None,
-                    f_stderr.format(machine) if f_stderr is not None else None,
+                    this_f_stdout,
+                    this_f_stderr,
                 ),
+                this_f_stdout,
+                this_f_stderr,
             )
         )
 
-    rc = []
-    for (machine, p) in ps:
-        rc.append(p.wait(timeout=timeout))
-        print("Done running {} on {}".format(command, machine))
+    rcs = []
+    for (machine, command, p, this_f_stdout, this_f_stderr) in ps:
+        try:
+            # Note: timeout == None means no timeout (it's the default)
+            # Note 2: wait() is actually synchronous, see info here:
+            # https://docs.python.org/3/library/subprocess.html#subprocess.Popen.wait
+            rc = p.wait(timeout)
+            rcs.append(rc)
+            status = colored("OK", "green") if rc == 0 else colored(f"rc={rc}", "red")
+            print(
+                "{}: {} Done running {} on {} (timeout: {})".format(
+                    colored(machine, "blue"), status, command, machine, timeout
+                )
+            )
+            if rc != 0 and (this_f_stderr is not None or this_f_stdout is not None):
+                print(f"SSH failed, output is: err={this_f_stderr} out={this_f_stdout}")
+                try:
+                    content_stderr = open(this_f_stderr).readlines()
+                    print(colored("".join(content_stderr[:10]), "red"))
+                except Exception:
+                    print(colored("Failed to read content of stderr file", "red"))
 
-    return rc
+        except subprocess.TimeoutExpired:
+            print(
+                "{}: {} Timeout running {} on {}".format(
+                    colored(machine, "blue"), colored("fail", "red"), command, machine
+                )
+            )
+            # The timeout does not actually mean that the process itself is terminated,
+            # we just stop waiting. In order to terminate the subprocess, we explictly
+            # need to do so and wait again.
+            print("{}: Terminating {} ".format(colored(machine, "blue"), command))
+            p.terminate()
+            print("{}: Waiting for termination {} ".format(colored(machine, "blue"), command))
+            p.wait()
+
+    return rcs

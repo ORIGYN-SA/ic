@@ -4,10 +4,18 @@ module.exports = {
   testEnvironment: 'jsdom',
   roots: ['src/'],
   testMatch: ['**/src/**/?(*.)+(spec|test).[jt]s?(x)'],
-  setupFiles: [`<rootDir>/test-setup.ts`],
+  setupFiles: [`<rootDir>/test-setup.ts`, 'fake-indexeddb/auto'],
   moduleDirectories: ['node_modules'],
   transform: {
-    '^.+\\.ts$': 'ts-jest',
+    '^.+\\.[tj]s$': 'ts-jest',
   },
+  timers: 'fake',
   reporters: ['default', 'jest-junit'],
+  globals: {
+    'ts-jest': {
+      tsconfig: {
+        allowJs: true,
+      },
+    },
+  },
 };

@@ -1,6 +1,10 @@
 #!/usr/bin/env bash
 
-set -e
+set -euo pipefail
+
+function err() {
+    echo "[$(date +'%Y-%m-%dT%H:%M:%S%z')]: $*" >&2
+}
 
 function usage() {
     cat >&2 <<EOF
@@ -40,19 +44,15 @@ options may be specified:
     to quote the argument string so it appears as a single argument to the
     script, e.g. --name_servers "8.8.8.8 1.1.1.1").
 
-  --journalbeat_hosts hosts
-    Logging hosts to use. Can be multiple hosts separated by space (make sure
-    to quote the argument string so it appears as a single argument to the
-    script, e.g. --journalbeat_hosts "h1.domain.tld:9220 h2.domain.tld:9230").
+  --elasticsearch_url url
+    Logging url to use.
 
-  --journalbeat_tags tags
-    Tags to be used by Journalbeat. Can be multiple tags separated by space
-    (make sure to quote the argument string so it appears as a single argument
-    to the script, e.g. --journalbeat_tags "testnet1 slo")
+  --elasticsearch_tags tags
+    Tags to apply
 
   --nns_url url
     URL of NNS nodes for sign up or registry access. Can be multiple nodes
-    separated by spaces (make sure to quote the argument string in that
+    separated by commas (make sure to quote the argument string in that
     case).
 
   --nns_public_key path
@@ -65,7 +65,84 @@ options may be specified:
     "PATH/admin" then it is transferred to "~admin/.ssh/authorized_keys" on
     the target). The presently recognized accounts are: backup, readonly,
     admin and root (the latter one for testing purposes only!)
+
+  --denylist path
+    Specify an initial denylist of canisters for the Boundary Nodes
+
+  --denylist_url url
+    Specify the url for the denylist updater
+
+  --prober-identity path
+    specify an identity file for the prober
+
+  --system-domains
+    comma-delimited list of domains serving system canisters (e.g. ic0.dev or ic0.app)
+
+  --application-domains
+    comma-delimited list of domains serving application canisters (e.g. ic0.dev or ic0.app)
+
+  --certdir
+    specify the directory holding TLS certificates for the hosted domain
+    (default: None i.e. snakeoil/self certified certificate will be used)
+
+  --ipv4_http_ips
+    the ipv4 blocks (e.g. "1.2.3.4/5") to be whitelisted for inbound http(s)
+    traffic. Multiple block may be specified separated by commas.
+
+  --ipv6_http_ips)
+    the ipv6 blocks (e.g. "1:2:3:4::/64") to be whitelisted for inbound http(s)
+    traffic. Multiple block may be specified separated by commas.
+
+  --ipv6_debug_ips)
+    the ipv6 blocks (e.g. "1:2:3:4::/64") to be whitelisted for inbound debug
+    (e.g. ssh) traffic. Multiple block may be specified separated by commas.
+
+  --ipv6_monitoring_ips)
+    the ipv6 blocks (e.g. "1:2:3:4::/64") to be whitelisted for inbound
+    monitoring (e.g. prometheus) traffic. Multiple block may be specified separated by
+    commas.
+
 EOF
+}
+
+# Arguments:
+# - $1 the comma seperated list of IPv4 addresses/prefixes
+function check_ipv4_prefixes() {
+    local ipv4_prefixes="$1"
+    local fail=0
+    for ipv4_prefix in ${ipv4_prefixes//,/ }; do
+        IFS=/ read -r ipv4_address ipv4_length <<<${ipv4_prefix}
+
+        if [[ ! ${ipv4_address} =~ ^(25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)(\.(25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)){3}$ ]]; then
+            echo "Incorrectly formatted IPv4 address: ${ipv4_address}"
+            fail=1
+        fi
+
+        if [[ ! -z "${ipv4_length:-}" ]] && ((ipv4_length < 0 || ipv4_length > 32)); then
+            echo "IPv4 prefix length out of bounds: ${ipv4_length}"
+            fail=1
+        fi
+    done
+    return ${fail}
+}
+
+# Arguments:
+# - $1 the comma seperated list of IPv6 addresses/prefixes
+function check_ipv6_prefixes() {
+    local ipv6_prefixes="$1"
+    local fail=0
+    for ipv6_prefix in ${ipv6_prefixes//,/ }; do
+        IFS=/ read -r ipv6_address ipv6_length <<<${ipv6_prefix}
+        if [[ ! ${ipv6_address} =~ ^(([0-9a-fA-F]{1,4}:){7,7}[0-9a-fA-F]{1,4}|([0-9a-fA-F]{1,4}:){1,7}:|([0-9a-fA-F]{1,4}:){1,6}:[0-9a-fA-F]{1,4}|([0-9a-fA-F]{1,4}:){1,5}(:[0-9a-fA-F]{1,4}){1,2}|([0-9a-fA-F]{1,4}:){1,4}(:[0-9a-fA-F]{1,4}){1,3}|([0-9a-fA-F]{1,4}:){1,3}(:[0-9a-fA-F]{1,4}){1,4}|([0-9a-fA-F]{1,4}:){1,2}(:[0-9a-fA-F]{1,4}){1,5}|[0-9a-fA-F]{1,4}:((:[0-9a-fA-F]{1,4}){1,6})|:((:[0-9a-fA-F]{1,4}){1,7}|:)|fe80:(:[0-9a-fA-F]{0,4}){0,4}%[0-9a-zA-Z]{1,}|::(ffff(:0{1,4}){0,1}:){0,1}((25[0-5]|(2[0-4]|1{0,1}[0-9]){0,1}[0-9])\.){3,3}(25[0-5]|(2[0-4]|1{0,1}[0-9]){0,1}[0-9])|([0-9a-fA-F]{1,4}:){1,4}:((25[0-5]|(2[0-4]|1{0,1}[0-9]){0,1}[0-9])\.){3,3}(25[0-5]|(2[0-4]|1{0,1}[0-9]){0,1}[0-9]))$ ]]; then
+            err "Incorrectly formatted IPv6 address: ${ipv6_address}"
+            fail=1
+        fi
+        if [[ ! -z "${ipv6_length:-}" ]] && ((ipv6_length < 0 || ipv6_length > 128)); then
+            err "IPv6 prefix length out of bounds: ${ipv6_length}"
+            fail=1
+        fi
+    done
+    return ${fail}
 }
 
 # Arguments:
@@ -75,51 +152,86 @@ function build_ic_bootstrap_tar() {
     local OUT_FILE="$1"
     shift
 
-    local IPV6_ADDRESS IPV6_GATEWAY NAME_SERVERS HOSTNAME
-    local IPV4_ADDRESS IPV4_GATEWAY NAME_SERVERS HOSTNAME
-    local NNS_URL NNS_PUBLIC_KEY
-    local JOURNALBEAT_HOSTS JOURNALBEAT_TAGS
-    local ACCOUNTS_SSH_AUTHORIZED_KEYS
+    local IPV4_HTTP_IPS IPV6_HTTP_IPS IPV6_DEBUG_IPS IPV6_MONITORING_IPS REQUIRE_SEO_CERTIFICATION REQUIRE_UNDERSCORE_CERTIFICATION
     while true; do
         if [ $# == 0 ]; then
             break
         fi
         case "$1" in
             --ipv6_address)
-                IPV6_ADDRESS="$2"
+                local IPV6_ADDRESS="$2"
                 ;;
             --ipv6_gateway)
-                IPV6_GATEWAY="$2"
+                local IPV6_GATEWAY="$2"
                 ;;
             --ipv4_address)
-                IPV4_ADDRESS="$2"
+                local IPV4_ADDRESS="$2"
                 ;;
             --ipv4_gateway)
-                IPV4_GATEWAY="$2"
+                local IPV4_GATEWAY="$2"
                 ;;
             --hostname)
-                HOSTNAME="$2"
+                local HOSTNAME="$2"
                 ;;
             --name_servers)
-                NAME_SERVERS="$2"
+                local NAME_SERVERS="$2"
                 ;;
-            --journalbeat_hosts)
-                JOURNALBEAT_HOSTS="$2"
+            --elasticsearch_url)
+                local ELASTICSEARCH_URL="$2"
                 ;;
-            --journalbeat_tags)
-                JOURNALBEAT_TAGS="$2"
+            --elasticsearch_tags)
+                local ELASTICSEARCH_TAGS="$2"
                 ;;
             --nns_url)
-                NNS_URL="$2"
+                local NNS_URL="$2"
                 ;;
             --nns_public_key)
-                NNS_PUBLIC_KEY="$2"
+                local NNS_PUBLIC_KEY="$2"
                 ;;
             --accounts_ssh_authorized_keys)
-                ACCOUNTS_SSH_AUTHORIZED_KEYS="$2"
+                local ACCOUNTS_SSH_AUTHORIZED_KEYS="$2"
+                ;;
+            --denylist)
+                local DENYLIST="$2"
+                ;;
+            --denylist_url)
+                local DENYLIST_URL="$2"
+                ;;
+            --prober-identity)
+                local PROBER_IDENTITY="$2"
+                ;;
+            --system-domains)
+                local SYSTEM_DOMAINS="$2"
+                ;;
+            --application-domains)
+                local APPLICATION_DOMAINS="$2"
+                ;;
+            --certdir)
+                local CERT_DIR="$2"
+                ;;
+            --ipv6_replica_ips)
+                local IPV6_REPLICA_IPS="$2"
+                ;;
+            --ipv4_http_ips)
+                IPV4_HTTP_IPS="$2"
+                ;;
+            --ipv6_http_ips)
+                IPV6_HTTP_IPS="$2"
+                ;;
+            --ipv6_debug_ips)
+                IPV6_DEBUG_IPS="$2"
+                ;;
+            --ipv6_monitoring_ips)
+                IPV6_MONITORING_IPS="$2"
+                ;;
+            --require_seo_certification)
+                REQUIRE_SEO_CERTIFICATION="$2"
+                ;;
+            --require_underscore_certification)
+                REQUIRE_UNDERSCORE_CERTIFICATION="$2"
                 ;;
             *)
-                echo "Unrecognized option: $1"
+                err "Unrecognized option: $1"
                 usage
                 exit 1
                 break
@@ -128,39 +240,132 @@ function build_ic_bootstrap_tar() {
         shift 2
     done
 
-    [[ "$HOSTNAME" == "" ]] || [[ "$HOSTNAME" == [a-zA-Z]*([a-zA-Z0-9])*(-+([a-zA-Z0-9])) ]] || {
-        echo "Invalid hostname: '$HOSTNAME'" >&2
+    local fail=0
+    if [[ -z "${HOSTNAME:-}" ]]; then
+        err "missing hostname"
+        fail=1
+    elif [[ ! "${HOSTNAME}" =~ ^[a-zA-Z]+([a-zA-Z0-9])*(-+[a-zA-Z0-9]*)*$ ]]; then
+        err "Invalid hostname: '${HOSTNAME}'"
+        fail=1
+    fi
+
+    if [[ -z "${NNS_PUBLIC_KEY:-}" ]]; then
+        err "missing nns_public_key"
+        fail=1
+    fi
+
+    if [[ -z "${SYSTEM_DOMAINS:-}" ]]; then
+        SYSTEM_DOMAINS=ic0.app
+    fi
+
+    IFS="," read -a SYSTEM_DOMAINS <<<$SYSTEM_DOMAINS
+
+    for DOMAIN in "${SYSTEM_DOMAINS[@]}"; do
+        if [[ ! "${DOMAIN}" =~ ^.*\..*$ ]]; then
+            err "malformed domain name: '${DOMAIN}'"
+            fail=1
+        fi
+    done
+
+    if [[ -z "${APPLICATION_DOMAINS:-}" ]]; then
+        APPLICATION_DOMAINS=ic0.app
+    fi
+
+    IFS="," read -a APPLICATION_DOMAINS <<<$APPLICATION_DOMAINS
+
+    for DOMAIN in "${APPLICATION_DOMAINS[@]}"; do
+        if [[ ! "${DOMAIN}" =~ ^.*\..*$ ]]; then
+            err "malformed domain name: '${DOMAIN}'"
+            fail=1
+        fi
+    done
+
+    CERT_DIR="${CERT_DIR:-}"
+
+    if [[ -z "${ELASTICSEARCH_URL:-}" ]]; then
+        err "missing elasticsearch_url"
+        fail=1
+    fi
+
+    if [ -z "${NNS_URL:-}" ]; then
+        err "missing nns_url"
+        fail=1
+    fi
+
+    check_ipv4_prefixes ${IPV4_HTTP_IPS:=""} || fail=1
+    check_ipv6_prefixes ${IPV6_REPLICA_IPS:=""} || fail=1
+    check_ipv6_prefixes ${IPV6_HTTP_IPS:=""} || fail=1
+    check_ipv6_prefixes ${IPV6_DEBUG_IPS:=""} || fail=1
+    check_ipv6_prefixes ${IPV6_MONITORING_IPS:=""} || fail=1
+
+    if [[ "${fail}" == 1 ]]; then
         exit 1
-    }
+    fi
 
     local BOOTSTRAP_TMPDIR=$(mktemp -d)
 
     cat >"${BOOTSTRAP_TMPDIR}/network.conf" <<EOF
-ipv6_address=$IPV6_ADDRESS
-ipv6_gateway=$IPV6_GATEWAY
-ipv4_address=$IPV4_ADDRESS
-ipv4_gateway=$IPV4_GATEWAY
-name_servers=$NAME_SERVERS
-hostname=$HOSTNAME
+ipv6_address=${IPV6_ADDRESS:-}
+ipv6_gateway=${IPV6_GATEWAY:-}
+ipv4_address=${IPV4_ADDRESS:-}
+ipv4_gateway=${IPV4_GATEWAY:-}
+name_servers=${NAME_SERVERS:-}
+hostname=${HOSTNAME}
+ipv6_replica_ips=${IPV6_REPLICA_IPS}
 EOF
-    if [ "${JOURNALBEAT_HOSTS}" != "" ]; then
-        echo "journalbeat_hosts=$JOURNALBEAT_HOSTS" >"${BOOTSTRAP_TMPDIR}/journalbeat.conf"
-    fi
-    if [ "${JOURNALBEAT_TAGS}" != "" ]; then
-        echo "journalbeat_tags=$JOURNALBEAT_TAGS" >>"${BOOTSTRAP_TMPDIR}/journalbeat.conf"
-    fi
-    if [ "${NNS_PUBLIC_KEY}" != "" ]; then
-        cp "${NNS_PUBLIC_KEY}" "${BOOTSTRAP_TMPDIR}/nns_public_key.pem"
-    fi
-    if [ "${NNS_URL}" != "" ]; then
-        echo "nns_url=${NNS_URL}" >"${BOOTSTRAP_TMPDIR}/nns.conf"
-    fi
-    if [ "${ACCOUNTS_SSH_AUTHORIZED_KEYS}" != "" ]; then
+
+    cp "${NNS_PUBLIC_KEY}" "${BOOTSTRAP_TMPDIR}/nns_public_key.pem"
+
+    # list of NNS ipv6 addresses
+    echo "nns_url=${NNS_URL}" >"${BOOTSTRAP_TMPDIR}/nns.conf"
+
+    # ssh access
+    if [ -n "${ACCOUNTS_SSH_AUTHORIZED_KEYS:-}" ]; then
         cp -r "${ACCOUNTS_SSH_AUTHORIZED_KEYS}" "${BOOTSTRAP_TMPDIR}/accounts_ssh_authorized_keys"
     fi
 
-    tar cf "${OUT_FILE}" -C "${BOOTSTRAP_TMPDIR}" .
+    # setup the deny list
+    if [[ -n "${DENYLIST:-}" ]]; then
+        echo "Using deny list ${DENYLIST}"
+        cp "${DENYLIST}" "${BOOTSTRAP_TMPDIR}/denylist.map"
+    else
+        echo "Using empty denylist"
+        touch "${BOOTSTRAP_TMPDIR}/denylist.map"
+    fi
 
+    # setup the bn_vars
+    BN_VARS_PATH="${BOOTSTRAP_TMPDIR}/bn_vars.conf"
+
+    cat >"${BN_VARS_PATH}" <<EOF
+$(printf "system_domains=%s\n" "${SYSTEM_DOMAINS[@]}")
+$(printf "application_domains=%s\n" "${APPLICATION_DOMAINS[@]}")
+denylist_url=${DENYLIST_URL:-}
+elasticsearch_url=${ELASTICSEARCH_URL}
+elasticsearch_tags=${ELASTICSEARCH_TAGS:-}
+ipv4_http_ips=${IPV4_HTTP_IPS}
+ipv6_http_ips=${IPV6_HTTP_IPS}
+ipv6_debug_ips=${IPV6_DEBUG_IPS}
+ipv6_monitoring_ips=${IPV6_MONITORING_IPS}
+require_seo_certification=${REQUIRE_SEO_CERTIFICATION:-}
+require_underscore_certification=${REQUIRE_UNDERSCORE_CERTIFICATION:-}
+EOF
+
+    # setup the prober identity
+    if [[ -n "${PROBER_IDENTITY:-}" ]]; then
+        echo "Using prober identity ${PROBER_IDENTITY}"
+        cp "${PROBER_IDENTITY}" "${BOOTSTRAP_TMPDIR}/prober_identity.pem"
+    fi
+
+    # setup the certificates
+    if [[ -n "${CERT_DIR:-}" && -f "${CERT_DIR}/fullchain.pem" && -f "${CERT_DIR}/privkey.pem" && -f "${CERT_DIR}/chain.pem" ]]; then
+        echo "Using certificates ${CERT_DIR}/fullchain.pem ${CERT_DIR}/privkey.pem ${CERT_DIR}/chain.pem"
+        mkdir -p "${BOOTSTRAP_TMPDIR}/certs"
+        cp "${CERT_DIR}/fullchain.pem" "${BOOTSTRAP_TMPDIR}/certs"
+        cp "${CERT_DIR}/privkey.pem" "${BOOTSTRAP_TMPDIR}/certs"
+        cp "${CERT_DIR}/chain.pem" "${BOOTSTRAP_TMPDIR}/certs"
+    fi
+
+    tar cf "${OUT_FILE}" -C "${BOOTSTRAP_TMPDIR}" .
     rm -rf "${BOOTSTRAP_TMPDIR}"
 }
 

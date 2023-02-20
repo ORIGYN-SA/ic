@@ -1,16 +1,417 @@
-load("@bazel_tools//tools/build_defs/repo:http.bzl", "http_archive")
+workspace(
+    name = "ic",
+    managed_directories = {"@sw_npm": ["node_modules"]},
+)
+
+load("//third_party/lmdb-0.9.70:repository.bzl", "lmdb_repository")
+load("//third_party/lmdb-rkv-0.14.99:repository.bzl", "lmdb_rkv_repository")
+load("@bazel_tools//tools/build_defs/repo:http.bzl", "http_archive", "http_file", "http_jar")
+load("@bazel_tools//tools/build_defs/repo:git.bzl", "git_repository", "new_git_repository")
 
 http_archive(
-    name = "rules_rust",
-    sha256 = "7453856d239a004c9e29cde2e45903a068446e4a69501ee7393faf08e1a30403",
+    name = "io_bazel_rules_go",
+    sha256 = "099a9fb96a376ccbbb7d291ed4ecbdfd42f6bc822ab77ae6f1b5cb9e914e94fa",
     urls = [
-        "https://mirror.bazel.build/github.com/bazelbuild/rules_rust/releases/download/0.1.0/rules_rust-v0.1.0.tar.gz",
-        "https://github.com/bazelbuild/rules_rust/releases/download/0.1.0/rules_rust-v0.1.0.tar.gz",
+        "https://mirror.bazel.build/github.com/bazelbuild/rules_go/releases/download/v0.35.0/rules_go-v0.35.0.zip",
+        "https://github.com/bazelbuild/rules_go/releases/download/v0.35.0/rules_go-v0.35.0.zip",
     ],
+)
+
+http_archive(
+    name = "bazel_gazelle",
+    sha256 = "448e37e0dbf61d6fa8f00aaa12d191745e14f07c31cabfa731f0c8e8a4f41b97",
+    urls = [
+        "https://mirror.bazel.build/github.com/bazelbuild/bazel-gazelle/releases/download/v0.28.0/bazel-gazelle-v0.28.0.tar.gz",
+        "https://github.com/bazelbuild/bazel-gazelle/releases/download/v0.28.0/bazel-gazelle-v0.28.0.tar.gz",
+    ],
+)
+
+load("@io_bazel_rules_go//go:deps.bzl", "go_register_toolchains", "go_rules_dependencies")
+load("@bazel_gazelle//:deps.bzl", "gazelle_dependencies")
+
+go_rules_dependencies()
+
+go_register_toolchains(go_version = "1.19.3")
+
+gazelle_dependencies(go_repository_default_config = "//:WORKSPACE.bazel")
+
+http_archive(
+    name = "bazel_skylib",
+    sha256 = "f7be3474d42aae265405a592bb7da8e171919d74c16f082a5457840f06054728",
+    urls = [
+        "https://mirror.bazel.build/github.com/bazelbuild/bazel-skylib/releases/download/1.2.1/bazel-skylib-1.2.1.tar.gz",
+        "https://github.com/bazelbuild/bazel-skylib/releases/download/1.2.1/bazel-skylib-1.2.1.tar.gz",
+    ],
+)
+
+git_repository(
+    name = "rules_rust",
+    commit = "1b6d0bdaefee12846bd6eba4b7b8f598d7a2da59",
+    remote = "https://github.com/dfinity-lab/rules_rust.git",
+    shallow_since = "1671727029 +0000",
 )
 
 load("@rules_rust//rust:repositories.bzl", "rules_rust_dependencies", "rust_register_toolchains")
 
 rules_rust_dependencies()
-rust_register_toolchains(version = "1.58.1")
 
+rust_register_toolchains(
+    edition = "2021",
+    version = "1.66.1",
+)
+
+git_repository(
+    name = "rules_foreign_cc",
+    commit = "9acbb356916760192d4c16301a69267fe44e6dec",
+    remote = "https://github.com/bazelbuild/rules_foreign_cc.git",
+)
+
+load("@rules_foreign_cc//foreign_cc:repositories.bzl", "rules_foreign_cc_dependencies")
+
+rules_foreign_cc_dependencies()
+
+http_archive(
+    name = "rules_proto",
+    sha256 = "66bfdf8782796239d3875d37e7de19b1d94301e8972b3cbd2446b332429b4df1",
+    strip_prefix = "rules_proto-4.0.0",
+    urls = [
+        "https://mirror.bazel.build/github.com/bazelbuild/rules_proto/archive/refs/tags/4.0.0.tar.gz",
+        "https://github.com/bazelbuild/rules_proto/archive/refs/tags/4.0.0.tar.gz",
+    ],
+)
+
+load("@rules_proto//proto:repositories.bzl", "rules_proto_dependencies", "rules_proto_toolchains")
+load("//:go_deps.bzl", "go_dependencies")
+
+# gazelle:repository_macro go_deps.bzl%go_dependencies
+go_dependencies()
+
+rules_proto_dependencies()
+
+rules_proto_toolchains()
+
+load("//bazel:external_crates.bzl", "external_crates_repository")
+load("//bazel/openssl_static_env:defs.bzl", "openssl_static_env")
+
+openssl_static_env(name = "openssl_static_env")
+
+load("@openssl_static_env//:defs.bzl", "DFINITY_OPENSSL_STATIC")
+
+external_crates_repository(
+    name = "crate_index",
+    cargo_lockfile = "//:Cargo.Bazel.StaticOpenSSL.toml.lock" if DFINITY_OPENSSL_STATIC else "//:Cargo.Bazel.toml.lock",
+    lockfile = "//:Cargo.Bazel.StaticOpenSSL.json.lock" if DFINITY_OPENSSL_STATIC else "//:Cargo.Bazel.json.lock",
+    static_openssl = DFINITY_OPENSSL_STATIC,
+)
+
+load("@crate_index//:defs.bzl", "crate_repositories")
+
+crate_repositories()
+
+# Motoko support
+
+http_archive(
+    name = "rules_motoko",
+    sha256 = "9b677fc5d3b42749d13b7734b3a87d4d40135499a189e843ae3f183965e255b7",
+    strip_prefix = "rules_motoko-0.1.0",
+    urls = ["https://github.com/dfinity/rules_motoko/archive/refs/tags/v0.1.0.zip"],
+)
+
+http_archive(
+    name = "motoko_base",
+    build_file_content = """
+filegroup(name = "sources", srcs = glob(["*.mo"]), visibility = ["//visibility:public"])
+      """,
+    sha256 = "582d1c90faa65047354ae7530f09160dd7e04882991287ced7ea7a72bd89d06e",
+    strip_prefix = "motoko-base-moc-0.6.24/src",
+    urls = ["https://github.com/dfinity/motoko-base/archive/refs/tags/moc-0.6.24.zip"],
+)
+
+load("@rules_motoko//motoko:repositories.bzl", "rules_motoko_dependencies")
+
+rules_motoko_dependencies()
+
+# Support for constructing archives
+http_archive(
+    name = "rules_pkg",
+    sha256 = "451e08a4d78988c06fa3f9306ec813b836b1d076d0f055595444ba4ff22b867f",
+    urls = [
+        "https://mirror.bazel.build/github.com/bazelbuild/rules_pkg/releases/download/0.7.1/rules_pkg-0.7.1.tar.gz",
+        "https://github.com/bazelbuild/rules_pkg/releases/download/0.7.1/rules_pkg-0.7.1.tar.gz",
+    ],
+)
+
+load("@rules_pkg//:deps.bzl", "rules_pkg_dependencies")
+
+rules_pkg_dependencies()
+
+# Docker container support
+
+http_archive(
+    name = "io_bazel_rules_docker",
+    sha256 = "b1e80761a8a8243d03ebca8845e9cc1ba6c82ce7c5179ce2b295cd36f7e394bf",
+    urls = ["https://github.com/bazelbuild/rules_docker/releases/download/v0.25.0/rules_docker-v0.25.0.tar.gz"],
+)
+
+load(
+    "@io_bazel_rules_docker//toolchains/docker:toolchain.bzl",
+    docker_toolchain_configure = "toolchain_configure",
+)
+
+docker_toolchain_configure(
+    name = "docker_config",
+    gzip_target = "@pigz",
+)
+
+load(
+    "@io_bazel_rules_docker//repositories:repositories.bzl",
+    container_repositories = "repositories",
+)
+load("//third_party/openssl:openssl_repositories.bzl", "openssl_repositories")
+
+openssl_repositories()
+
+load("//third_party/openssl:openssl_setup.bzl", "openssl_setup")
+
+openssl_setup()
+
+container_repositories()
+
+load("@io_bazel_rules_docker//repositories:deps.bzl", container_deps = "deps")
+
+container_deps(go_repository_default_config = "@//:WORKSPACE.bazel")
+
+load(
+    "@io_bazel_rules_docker//container:container.bzl",
+    "container_pull",
+)
+
+container_pull(
+    name = "rust_base",
+    digest = "sha256:8e94f031353596c3fc9db6a2499bcc82dacc40cb71e0703476f9fad41677efdf",
+    registry = "gcr.io",
+    repository = "distroless/cc-debian11",
+)
+
+container_pull(
+    name = "ubuntu_base",
+    digest = "sha256:965fbcae990b0467ed5657caceaec165018ef44a4d2d46c7cdea80a9dff0d1ea",
+    registry = "docker.io",
+    repository = "ubuntu:latest",
+)
+
+# URL: registry.gitlab.com/dfinity-lab/open/public-docker-registry/nns-dapp-specs:latest
+container_pull(
+    name = "nns-dapp-specs",
+    digest = "sha256:9e003fe2740f2813bf9e776b9cabd5cdb1fbe15581fc4b78876708fdf3791b3f",
+    registry = "registry.gitlab.com",
+    repository = "dfinity-lab/open/public-docker-registry/nns-dapp-specs",
+)
+
+# Third party dependencies that require special treatment
+
+lmdb_repository(name = "lmdb")
+
+lmdb_rkv_repository(name = "lmdb_rkv")
+
+http_archive(
+    name = "pigz",
+    build_file_content = """
+cc_library(
+    name = "zopfli",
+    hdrs = glob(["zopfli/src/zopfli/*.h"]),
+    srcs = glob(["zopfli/src/zopfli/*.c"]),
+)
+
+cc_binary(
+    name = "pigz",
+    srcs = [
+        "pigz.c",
+        "try.c",
+        "try.h",
+        "yarn.c",
+        "yarn.h",
+    ],
+    linkopts = [
+        "-lm",
+        "-lpthread",
+        "-lz",
+    ],
+    deps = [":zopfli"],
+    visibility = ["//visibility:public"],
+)""",
+    sha256 = "d4396b58bc2875daf8dc3ae9a657be945c2c2697944894fea8a72634eded93ab",
+    strip_prefix = "pigz-2.7",
+    url = "https://github.com/madler/pigz/archive/refs/tags/v2.7.zip",
+)
+
+http_archive(
+    name = "buildifier_prebuilt",
+    sha256 = "0450069a99db3d414eff738dd8ad4c0969928af13dc8614adbd1c603a835caad",
+    strip_prefix = "buildifier-prebuilt-0.4.0",
+    urls = [
+        "http://github.com/keith/buildifier-prebuilt/archive/0.4.0.tar.gz",
+    ],
+)
+
+load("@buildifier_prebuilt//:deps.bzl", "buildifier_prebuilt_deps")
+
+buildifier_prebuilt_deps()
+
+load("@bazel_skylib//:workspace.bzl", "bazel_skylib_workspace")
+
+bazel_skylib_workspace()
+
+load("@buildifier_prebuilt//:defs.bzl", "buildifier_prebuilt_register_toolchains")
+
+buildifier_prebuilt_register_toolchains()
+
+new_git_repository(
+    name = "sevtool",
+    build_file = "//ic-os:BUILD.sevtool.bazel",
+    commit = "3e6418e09f5ca91d789e115d0751ead1227aab47",
+    remote = "https://github.com/AMDESE/sev-tool.git",
+)
+
+# Rosetta CLI
+
+load("//bazel:rosetta_cli.bzl", "rosetta_cli_repository")
+
+rosetta_cli_repository(name = "rosetta-cli")
+
+# NodeJS dependencies
+
+http_archive(
+    name = "build_bazel_rules_nodejs",
+    sha256 = "f10a3a12894fc3c9bf578ee5a5691769f6805c4be84359681a785a0c12e8d2b6",
+    urls = ["https://github.com/bazelbuild/rules_nodejs/releases/download/5.5.3/rules_nodejs-5.5.3.tar.gz"],
+)
+
+load("@build_bazel_rules_nodejs//:repositories.bzl", "build_bazel_rules_nodejs_dependencies")
+
+build_bazel_rules_nodejs_dependencies()
+
+load("@build_bazel_rules_nodejs//:index.bzl", "node_repositories", "npm_install")
+
+node_repositories(node_version = "17.9.1")
+
+npm_install(
+    name = "sw_npm",
+    package_json = "//typescript/service-worker:package.json",
+    package_lock_json = "//typescript/service-worker:package-lock.json",
+)
+
+# rclone binary for upload_artifacts
+load("//bazel:rclone.bzl", "rclone_repository")
+
+rclone_repository(name = "rclone")
+
+# trivy binary for upload_artifacts
+load("//bazel:trivy.bzl", "trivy_scan")
+
+trivy_scan(name = "trivy")
+
+load("//bazel:jq.bzl", "jq_repository")
+
+jq_repository(name = "jq")
+
+http_archive(
+    name = "aspect_bazel_lib",
+    sha256 = "79381b0975ba7d2d5653239e5bab12cf54d89b10217fe771b8edd95047a2e44b",
+    strip_prefix = "bazel-lib-1.12.1",
+    url = "https://github.com/aspect-build/bazel-lib/archive/refs/tags/v1.12.1.tar.gz",
+)
+
+load("@aspect_bazel_lib//lib:repositories.bzl", "aspect_bazel_lib_dependencies")
+
+aspect_bazel_lib_dependencies()
+
+# TLA+ tools
+http_jar(
+    name = "tlaplus",
+    sha256 = "fa18543e44ed5974a85bd2c60c0dc16620ae117680ea8e693d2691999ed90b22",
+    url = "https://github.com/tlaplus/tlaplus/releases/download/v1.7.2/tla2tools.jar",
+)
+
+# Official WebAssembly test suite.
+# To be used for testing libraries that handle canister Wasm code.
+
+new_git_repository(
+    name = "wasm_spec_testsuite",
+    build_file_content = """filegroup(
+        name = "wast_files",
+        srcs = glob(["**/*.wast"]),
+        visibility = ["//visibility:public"]
+    )""",
+    commit = "4f77306bb63151631d84f58dedf67958eb9911b9",
+    remote = "https://github.com/WebAssembly/testsuite.git",
+)
+
+http_archive(
+    name = "ic-hs",
+    build_file_content = """
+package(default_visibility = ["//visibility:public"])
+filegroup(name = "artifacts", srcs = glob(["build/*", "test-data/*"]), visibility = ["//visibility:public"])
+      """,
+    sha256 = "e104cbf30fd704121f7f739dca4e9e81d11a12a26d821080d210e5f51c29f63b",
+    urls = ["https://download.dfinity.systems/ic-ref/ic-ref-test-0.0.1-67029cb8-x86_64-linux.tar.gz"],
+)
+
+# Bitcoin canister
+
+http_file(
+    name = "btc_canister",
+    downloaded_file_path = "ic-btc-canister.wasm.gz",
+    sha256 = "8ade1e03964a70b3204f26d05bf714150db98f016294dd38f18cd24ceadd2276",
+    url = "https://github.com/dfinity/bitcoin-canister/releases/download/release%2F2022-12-02/ic-btc-canister.wasm.gz",
+)
+
+# Internet Identity canister (test build)
+
+http_file(
+    name = "ii_test_canister",
+    downloaded_file_path = "internet_identity_test.wasm",
+    sha256 = "5f179b2e8bdd637043a223a8ee1be6563ffa699dec071f84c8f8487a9dc8d54c",
+    url = "https://github.com/dfinity/internet-identity/releases/download/release-2023-01-16/internet_identity_test.wasm",
+)
+
+# SNS aggregator canister (https://github.com/dfinity/nns-dapp/releases/tag/tip)
+
+http_file(
+    name = "sns_aggregator",
+    downloaded_file_path = "sns_aggregator.wasm",
+    sha256 = "428b21acccfa442101096d95f74ab8368724d0e87e14d08f21d9a3bed77b69f3",
+    # Keep this dependency while the aggregator release process is WIP (IDX-2661)
+    url = "https://github.com/dfinity/nns-dapp/releases/download/ci-pin/sns_aggregator2.wasm",
+)
+
+# Import Python rules
+
+http_archive(
+    name = "rules_python",
+    sha256 = "8c15896f6686beb5c631a4459a3aa8392daccaab805ea899c9d14215074b60ef",
+    strip_prefix = "rules_python-0.17.3",
+    url = "https://github.com/bazelbuild/rules_python/archive/refs/tags/0.17.3.tar.gz",
+)
+
+load("@rules_python//python:repositories.bzl", "python_register_toolchains")
+
+python_register_toolchains(
+    name = "python3_10",
+    python_version = "3.10",
+)
+
+load("@python3_10//:defs.bzl", "interpreter")
+load("@rules_python//python:pip.bzl", "pip_parse")
+
+# pip installation needs to be executed in WORKSPACE
+# if more python modules need to be installed, we will need to create separate rules for them
+pip_parse(
+    name = "scalability_deps",
+    python_interpreter_target = interpreter,
+    requirements_lock = "//scalability:requirements.txt",
+)
+
+load("@scalability_deps//:requirements.bzl", "install_deps")
+
+install_deps()

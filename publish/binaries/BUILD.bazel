@@ -1,0 +1,124 @@
+load("//publish:defs.bzl", "release_nostrip_binary", "release_strip_binary")
+load("//bazel:defs.bzl", "gzip_compress")
+load("//gitlab-ci/src/artifacts:upload.bzl", "upload_artifacts")
+
+LINUX_ONLY = [
+    "prod-test-driver",
+    "sevctl",
+    "vsock_agent",
+]
+
+NO_STRIP = [
+    "canister_sandbox",
+    "ic-btc-adapter",
+    "ic-https-outcalls-adapter",
+    "ic-onchain-observability-adapter",
+    "replica",
+]
+
+BINARIES = {
+    "canister_sandbox": "//rs/canister_sandbox",
+    "ic-btc-adapter": "//rs/bitcoin/adapter:ic-btc-adapter",
+    "replica": "//rs/replica",
+    "boundary-node-control-plane": "//rs/boundary_node/control_plane:boundary-node-control-plane",
+    "boundary-node-prober": "//rs/boundary_node/prober:boundary-node-prober",
+    "certificate-issuer": "//rs/boundary_node/certificate_issuance/certificate_issuer:certificate-issuer",
+    "certificate-syncer": "//rs/boundary_node/certificate_issuance/certificate_syncer:certificate-syncer",
+    "denylist-updater": "//rs/boundary_node/denylist_updater:denylist-updater",
+    "e2e-test-driver": "//rs/scenario_tests:e2e-test-driver",
+    "ic-admin": "//rs/registry/admin:ic-admin",
+    "ic-backup": "//rs/backup:ic-backup",
+    "ic-balance-exporter": "//rs/boundary_node/ic_balance_exporter:ic-balance-exporter",
+    "ic-starter": "//rs/starter:ic-starter",
+    "ic-https-outcalls-adapter": "//rs/https_outcalls/adapter:ic-https-outcalls-adapter",
+    "ic-consensus-pool-util": "//rs/artifact_pool:ic-consensus-pool-util",
+    "ic-crypto-csp": "//rs/crypto:ic-crypto-csp",
+    "ic-onchain-observability-adapter": "//rs/monitoring/onchain_observability/adapter:ic-onchain-observability-adapter",
+    "ic-nns-init": "//rs/nns/init:ic-nns-init",
+    "ic-p8s-sd": "//rs/ic_p8s_service_discovery:ic-p8s-sd",
+    "ic-p8s-service-discovery": "//rs/ic_p8s_service_discovery:ic-p8s-service-discovery",
+    "ic-prep": "//rs/prep:ic-prep",
+    "ic-recovery": "//rs/recovery:ic-recovery",
+    "ic-regedit": "//rs/registry/regedit:ic-regedit",
+    "ic-registry-replicator": "//rs/orchestrator/registry_replicator:ic-registry-replicator",
+    "ic-replay": "//rs/replay:ic-replay",
+    "ic-rosetta-api": "//rs/rosetta-api:ic-rosetta-api",
+    "ic-test-state-machine": "//rs/state_machine_tests:ic-test-state-machine",
+    "ic-workload-generator": "//rs/workload_generator:ic-workload-generator",
+    "icx-proxy": "//rs/boundary_node/icx_proxy:icx-proxy",
+    "log-vector-config-generator": "//rs/observability/log_vector_config_generator:log_vector_config_generator",
+    "orchestrator": "//rs/orchestrator",
+    "prod-test-driver": "//rs/tests:prod-test-driver",
+    "sandbox_launcher": "//rs/canister_sandbox/sandbox_launcher",
+    "sevctl": "//rs/ic_os/sevctl:sevctl",
+    "sns": "//rs/sns/cli:sns",
+    "state-tool": "//rs/state_tool:state-tool",
+    "vector-config-generator": "//rs/observability/vector_config_generator:vector_config_generator",
+    "vsock_agent": "//rs/guestos_vsock_agent:vsock_agent",
+}
+
+[release_nostrip_binary(
+    name = name,
+    binary = BINARIES[name],
+    visibility = [
+        "//ic-os/guestos/dev:__pkg__",
+        "//ic-os/guestos/dev-malicious:__pkg__",
+        "//ic-os/guestos/prod:__pkg__",
+    ],
+) for name in BINARIES if name in NO_STRIP]
+
+[release_strip_binary(
+    name = name,
+    binary = BINARIES[name],
+    visibility = [
+        "//ic-os/boundary-guestos/envs/dev:__pkg__",
+        "//ic-os/boundary-guestos/envs/dev-sev:__pkg__",
+        "//ic-os/boundary-guestos/envs/prod:__pkg__",
+        "//ic-os/boundary-guestos/envs/prod-sev:__pkg__",
+        "//ic-os/guestos/dev:__pkg__",
+        "//ic-os/guestos/dev-malicious:__pkg__",
+        "//ic-os/guestos/prod:__pkg__",
+    ],
+) for name in BINARIES if name not in NO_STRIP]
+
+[
+    gzip_compress(
+        name = name + ".gz",
+        srcs = [name],
+    )
+    for name in BINARIES
+]
+
+filegroup(
+    name = "binaries",
+    srcs = select({
+        "@platforms//os:linux": [name + ".gz" for name in BINARIES],
+        "@platforms//os:osx": [name + ".gz" for name in BINARIES if name not in LINUX_ONLY],
+    }),
+)
+
+upload_artifacts(
+    name = "upload",
+    allow_openssl_static = True,
+    inputs = [":binaries"],
+    remote_subdir = "binaries/" + select({
+        "@platforms//cpu:x86_64": "x86_64",
+        "@platforms//cpu:arm64": "arm64",
+        "//conditions:default": "unknown",
+    }) + "-" + select({
+        "@platforms//os:linux": "linux",
+        "@platforms//os:osx": "darwin",
+        "//conditions:default": "unknown",
+    }),
+)
+
+# https://dfinity.atlassian.net/browse/IDX-2599
+# various places in the source code, and possibly other repositories reference
+# the legacy upload path. Unwinding it without a will involve an unpredictable amount of time.
+upload_artifacts(
+    name = "legacy_upload",
+    inputs = [":binaries"],
+    remote_subdir = "release",
+    target_compatible_with = ["@platforms//os:linux"],
+    visibility = ["//testnet/tools:__pkg__"],
+)

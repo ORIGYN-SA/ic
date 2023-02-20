@@ -1,4 +1,29 @@
-"""Class for sending metrics to ElasticSearch ci-performance-test index."""
+"""
+Class for sending metrics to ElasticSearch ci-performance-test index.
+
+Expected JSON format for max-capacity run:
+{
+    ...,
+    "experiment_details": {
+        "rps_max": 3.850419,
+        "is_update": true
+    }
+}
+
+Expected JSON format for spot run:
+{
+    ...,
+    "is_success": true,
+    "experiment_details": {
+        "rps_max": 3.850419,
+        "is_update": true,
+        "median_latency_threshold": 200,  //This field should come from "verify_perf.py" which runs before current script
+        "target_load": 50,
+        "t_median": 120,
+        "failure_rate": 0
+    }
+}
+"""
 import datetime
 import json
 import os
@@ -88,7 +113,7 @@ class NotifyDashboard:
                 time.sleep(3)
         return False
 
-    def notify_spot_run(name, is_success, request_type, revision, summaries):
+    def notify_spot_run(name, is_success, request_type, revision, summaries, out_dir):
         """Send a performance nightly data point performance-trend index in ElasticSearch."""
         (
             failure_rate,
@@ -100,10 +125,11 @@ class NotifyDashboard:
         ) = summaries
 
         metric = {
-            "timestamp": datetime.datetime.now().isoformat(),
+            "timestamp": datetime.datetime.utcfromtimestamp(int(FLAGS.timestamp)).isoformat(),
             "rev": revision,
             "branch": FLAGS.branch,
             "package": "replica-perf-trend",
+            "report_url": f"https://dfinity-lab.gitlab.io/-/public/ic/-/jobs/{FLAGS.gitlab_job_id}/artifacts/scalability/{out_dir}/report.html",
             "performance": {
                 "title": name,
                 "request_type": request_type,
@@ -129,7 +155,7 @@ class NotifyDashboard:
     def notify_max_run(name, request_type, experiment_revision, rps, out_dir):
         """Send a maximum capacity data point to performance-trend index in ElasticSearch."""
         metric = {
-            "timestamp": FLAGS.timestamp,
+            "timestamp": datetime.datetime.utcfromtimestamp(int(FLAGS.timestamp)).isoformat(),
             "rev": experiment_revision,
             "branch": FLAGS.branch,
             "package": "replica-perf-trend",
@@ -179,4 +205,5 @@ if __name__ == "__main__":
                 throughput,
                 target_load,
             ),
+            dir,
         )

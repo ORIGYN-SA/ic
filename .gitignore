@@ -53,6 +53,8 @@ tarpaulin-report.html
 
 dist-newstyle
 
+**/.stack-work
+
 ### Rust tags created by rusty-tags
 **/rusty-tags.vi
 **/rusty-tags.emacs
@@ -66,33 +68,66 @@ dist-newstyle
 # JUnit files
 test_report.xml
 
-# IC-OS disk images
-ic-os.img.tar
-ic-os.img
+# IC-OS disk image files
+*-os.iso
+*os.img
+disk.img
+*-img.tar.gz
+*-img.tar.zst
+dev-root-ca.crt
+
+# IC-OS binaries
+infogetty
+infogetty.o
+network_info.o
+prestorecon
+prestorecon.o
 
 # Various build artifacts
 /artifacts/
 **/build
 **/build-tmp
+**/build-out
 **/boot/version.txt
 **/bin/canister_sandbox
 **/bin/ic-btc-adapter
-**/bin/ic-canister-http-adapter
+**/bin/ic-https-outcalls-adapter
 **/bin/ic-consensus-pool-util
 **/bin/ic-crypto-csp
 **/bin/ic-regedit
+**/bin/ic-onchain-observability-adapter
 **/bin/orchestrator
 **/bin/replica
 **/bin/state-tool
 **/bin/vsock_agent
-**/bin/canister_sandbox
+**/bin/sandbox_launcher
+**/bin/boundary-node-prober
+**/bin/ic-balance-exporter
 
 # Boundary node control plane binary
 boundary-node-control-plane
 
+# Boundary node prober binary
+boundary-node-prober
+
 # Scalability test results
 scalability/results/
 *Pipfile*
-rs/rosetta-api/build-output-2/
-rs/rosetta-api/originalogyledger/release/
-rs/rosetta-api/originalogyledger/
+
+# Bazel outdir dirs
+/bazel-*
+bazel-build-log.json
+bazel-bep.pb
+bazel-bep.txt
+bazel-timestamp.txt
+user.bazelrc
+
+# Visual Studio Code
+.vscode
+
+# Intellij
+.idea
+.clwb
+
+# OS X
+.DS_Store

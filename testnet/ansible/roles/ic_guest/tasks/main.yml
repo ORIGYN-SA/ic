@@ -16,7 +16,7 @@
   tags: [ "ic_guest" ]
 
 - name: import tasks disk_push
-  import_tasks: "generic_disk_push.yml"
+  import_tasks: "aux_disk_push.yml"
   when: ic_state == "create" and ic_disk_path
   tags: [ "ic_guest" ]
 
@@ -38,6 +38,11 @@
 - name: import tasks start
   import_tasks: "start.yml"
   when: ic_state == "start"
+  tags: [ "ic_guest" ]
+
+- name: import tasks shutdown
+  import_tasks: "shutdown.yml"
+  when: ic_state == "shutdown"
   tags: [ "ic_guest" ]
 
 - name: import tasks install

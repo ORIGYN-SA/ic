@@ -57,8 +57,8 @@ if [[ ! " ${SUBNET_TYPES[*]} " =~ ${subnet_type} ]]; then
     echo >&2 "Invalid subnet type specified, choose between normal, large, large_nns, 46_nns and 56_nns."
     exit_usage
 fi
-if ! printf '%s\n' "boundary_nodes" "icos_boundary_nodes" "replica_nodes" "dns" | grep -q "^$load_dest\$"; then
-    echo >&2 "Invalid load destination specified, choose between 'boundary_nodes | icos_boundary_nodes | replica_nodes | dns'"
+if ! printf '%s\n' "boundary_nodes" "replica_nodes" | grep -q "^$load_dest\$"; then
+    echo >&2 "Invalid load destination specified, choose between 'boundary_nodes | replica_nodes '"
     exit_usage
 fi
 
@@ -97,18 +97,18 @@ install_endpoints=$(jq_hostvars 'map(select(.subnet_index=='"${subnet_index}"') 
 
 STATUS_CHECK=""
 http2_only=false
-if [[ "$load_dest" == "dns" ]]; then
-    loadhosts="https://$testnet.dfinity.network/"
-elif [[ "$load_dest" == "replica_nodes" ]]; then
+if [[ "$load_dest" == "replica_nodes" ]]; then
     loadhosts=$install_endpoints
-elif [[ "$load_dest" == "boundary_nodes" || "$load_dest" == "icos_boundary_nodes" ]]; then
+    host="ic0.app"
+elif [[ "$load_dest" == "boundary_nodes" ]]; then
     loadhosts=$(jq_hostvars 'map(select(.subnet_index=="boundary") | .api_listen_url) | join(",")')
+    host=$(jq_hostvars 'map(select(.subnet_index=="boundary") | .domain) | .[0]')
     http2_only=true
     STATUS_CHECK="--no-status-check"
 else
     exit_usage
 fi
-echo "Using loadhosts = $loadhosts"
+echo "Using loadhosts = $loadhosts, host = $host"
 echo "$loadhosts" >"$experiment_dir/loadhosts"
 
 # Results will be stored in $results_dir/$experiment_id -- this will allow us to collect all runs
@@ -141,14 +141,8 @@ calltime="$(date '+%s')"
 echo "Testcase Start time: $(dateFromEpoch "$calltime")"
 
 # re-deploy the testnet
-# For new ICOS boundary nodes, specify --icos-boundary-nodes paramter while deploying
-if [[ "$load_dest" == "icos_boundary_nodes" ]]; then
-    deploy_with_timeout "$testnet" \
-        --git-revision "$GIT_REVISION" --icos-boundary-nodes "${HOSTS_INI_ARGUMENTS[@]}"
-else
-    deploy_with_timeout "$testnet" \
-        --git-revision "$GIT_REVISION" "${HOSTS_INI_ARGUMENTS[@]}"
-fi
+deploy_with_timeout "$testnet" \
+    --git-revision "$GIT_REVISION" "${HOSTS_INI_ARGUMENTS[@]}"
 
 echo "Testnet deployment successful. Test starts now."
 
@@ -186,6 +180,7 @@ wg_status_file="$experiment_dir/wg_exit_status"
             --periodic-output $STATUS_CHECK \
             --http2-only "$http2_only" \
             --install-endpoint="$install_endpoints" \
+            --host "$host" \
             --summary-file "$experiment_dir/workload-summary.json" 2>"$wg_err_log" \
             || local_wg_status=$?
         echo "$local_wg_status" >"$wg_status_file"
@@ -221,7 +216,7 @@ selector="$metric{$common_labels,type=\"finalization\",pool_type=\"validated\",s
 # Calculate the averages over the large interval.
 # We split into smaller buckets, then apply avg_over_time. The outer avg it
 # to get an aggregate, instead of having values per replica.
-curl -G "http://prometheus.dfinity.systems:9090/api/v1/query" \
+curl -XPOST -G "https://prometheus.testnet.dfinity.network/api/v1/query" \
     -o "$experiment_dir/metrics/${metric}_avg_total.json" \
     -fsSL -m 30 --retry 10 --retry-connrefused \
     -H "Accept: application/json" \
@@ -230,7 +225,7 @@ curl -G "http://prometheus.dfinity.systems:9090/api/v1/query" \
 
 # Gather latency alerts from Prometheus
 latency_alert="IC_Replica_CallRequests_ResponseTooSlow"
-curl -G "http://prometheus.dfinity.systems:9090/api/v1/query_range" \
+curl -XPOST -G "https://prometheus.testnet.dfinity.network/api/v1/query_range" \
     -o "$experiment_dir/metrics/${latency_alert}.json" \
     -fsSL -m 30 --retry 10 --retry-connrefused \
     -H "Accept: application/json" \

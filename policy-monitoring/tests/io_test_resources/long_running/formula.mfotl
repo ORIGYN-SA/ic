@@ -1,0 +1,1 @@
+(s <- SUM x ((NOT Q(x)) SINCE[100000,200000] P(x))) AND R(x)

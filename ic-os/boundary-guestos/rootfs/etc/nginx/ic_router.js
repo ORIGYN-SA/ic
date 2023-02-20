@@ -1,158 +1,242 @@
-import qs from 'querystring';
+import qs from "querystring";
 
-import subnet_table from 'ic/ic_router_table.js';
+import SUBNET_TABLE from "/var/opt/nginx/ic/ic_routes.js";
+import CANISTER_ID_ALIASES from "/var/opt/nginx/canister_aliases/canister_id_aliases.js";
+import DOMAIN_CANISTER_MAPPINGS from "/var/opt/nginx/domain_canister_mappings.js";
+
+const CANISTER_ID_LENGTH = 27;
 
 function leftpad(s, len, pad) {
-  return len + 1 >= s.length && (s = new Array(len + 1 - s.length).join(pad) + s), s
+  return (
+    len + 1 >= s.length && (s = new Array(len + 1 - s.length).join(pad) + s), s
+  );
 }
 
-function decode_canister_id(canister_id) {
-  canister_id = canister_id.replace(/-/g, '');
-  var RFC4628 = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ234567';
-  var hex = '';
-  var bits = '';
-  for (var i = 0; i < canister_id.length; i++) {
-    var val = RFC4628.indexOf(canister_id.charAt(i).toUpperCase());
-    bits += leftpad(val.toString(2), 5, '0')
+function decodeCanisterId(canister_id) {
+  canister_id = canister_id.replace(/-/g, "");
+  const RFC4628 = "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";
+  let hex = "";
+  let bits = "";
+  for (let i = 0; i < canister_id.length; i++) {
+    let val = RFC4628.indexOf(canister_id.charAt(i).toUpperCase());
+    bits += leftpad(val.toString(2), 5, "0");
   }
-  for (i = 32; i + 4 <= bits.length; i += 4) {
-    var chunk = bits.substr(i, 4);
-    hex += parseInt(chunk, 2).toString(16)
+  for (let i = 32; i + 4 <= bits.length; i += 4) {
+    let chunk = bits.substr(i, 4);
+    hex += parseInt(chunk, 2).toString(16);
   }
-  return hex
+  return hex;
 }
 
 // Find the first row before the given canister_id.
-function find_subnet(canister_id, table) {
-  var start = 0;
-  var end = table.canister_range_starts.length - 1;
+function findSubnet(canisterId, table) {
+  let start = 0;
+  let end = table.canister_range_starts.length - 1;
   while (start <= end) {
-    var mid = Math.floor((start + end) / 2);
-    var mid_value = table.canister_range_starts[mid];
-    if (mid_value >= canister_id) {
+    let mid = Math.floor((start + end) / 2);
+    let mid_value = table.canister_range_starts[mid];
+
+    if (mid_value >= canisterId) {
       end = mid - 1;
     } else {
       start = mid + 1;
     }
   }
-  if (start > 0 && canister_id < table.canister_range_starts[start]) {
-    return start - 1;
-  } else {
-    return Math.min(start, table.canister_range_starts.length - 1);
-  }
+
+  return start > 0 && canisterId < table.canister_range_starts[start]
+    ? start - 1
+    : Math.min(start, table.canister_range_starts.length - 1);
 }
 
-function resolve_canister_id_from_uri(uri) {
-  var re = /^\/api\/v2\/canister\/([0-9a-z\-]+)\//;
-  var m = re.exec(uri);
+function resolveCanisterIdFromUri(uri) {
+  const re = /^\/api\/v2\/canister\/([0-9a-z\-]+)\//;
+  const m = re.exec(uri);
   if (!m) {
-    return '';
+    return "";
   }
-  var canister_id = m[1];
-  if (canister_id.length < 27) {  // not a canister id
-    return '';
+  const canister_id = m[1];
+  if (canister_id.length != CANISTER_ID_LENGTH) {
+    // not a canister id
+    return "";
   }
   return canister_id;
 }
 
-function resolve_canister_id_from_host(host) {
-  var re = /^([0-9a-zA-Z\-]+)\./
-  var m = re.exec(host);
+function extractCanisterIdFromHost(host) {
+  const re = /^([0-9a-zA-Z\-]+)\./;
+  const m = re.exec(host);
   if (!m) {
-    return '';
+    return "";
   }
-  var canister_id = m[1];
-  if (canister_id.length < 27) {  // not a canister id
-    return '';
+  let canisterId = m[1];
+
+  // Check if ID is an alias
+  if (!!CANISTER_ID_ALIASES[canisterId]) {
+    canisterId = CANISTER_ID_ALIASES[canisterId];
   }
-  return canister_id;
+
+  if (canisterId.length != CANISTER_ID_LENGTH) {
+    return "";
+  }
+
+  return canisterId;
 }
 
-function resolve_ci_from_host(host) {
-  var pieces = host.split('.');
-  if (pieces.length < 3) {
-    return '';
-  }
-  var ic = pieces[pieces.length-3];
-  if (ic.length >= 27) {
-    // This is a canister_id.
-    return '';
-  }
-  return ic;
-}
-
-function get_hostname_from_uri(uri) {
-  var re = /^https?\:\/\/([^:\/?#]*)/
-  var m = re.exec(uri);
+function getHostnameFromUri(uri) {
+  const re = /^https?\:\/\/([^:\/?#]*)/;
+  const m = re.exec(uri);
   if (!m) {
-    return '';
+    return "";
   }
   return m[1];
 }
 
-function route(r) {
-  var canister_id = resolve_canister_id_from_uri(r.uri);
-  if (!canister_id) {
-    canister_id = resolve_canister_id_from_host(r.headersIn.host);
-  }
-  if (!canister_id) {
-    canister_id = r.args['canisterId'];
-  }
-  var referer = r.headersIn.referer;
-  if (!canister_id && referer) {
-    var host = get_hostname_from_uri(referer);
-    if (host) {
-      canister_id = resolve_canister_id_from_host(host);
-    }
-    if (!canister_id) {
-      var i = referer.indexOf('?');
-      if (i >= 0) {
-        var args = referer.substring(i + 1);
-        canister_id = qs.parse(args)['canisterId'];
-      }
-    }
+function extractCanisterIdFromReferer(r) {
+  const refererHeader = r.headersIn.referer;
+  if (!refererHeader) {
+    return "";
   }
 
-  // TODO: Lookup custom domain via ci
-  // if (!canister_id && ci) {
-  //   var custom_route = lookup_custom_route(ci);
-  //   if (custom_route) {
-  //     canister_id = custom_route.canister_id;
-  //     ic = custom_route.ic;
-  //   }
-  // }
-  if (!("canister_subnets" in subnet_table)) {
-    return '';
+  const refererHost = getHostnameFromUri(refererHeader);
+  if (!refererHost) {
+    return "";
   }
-  var subnet_index = 0;
-  var status_re = /^\/api\/v2\/status/
-  if (r.uri.match(status_re)) { 
-    subnet_index = Math.floor(Math.random() * Math.floor(subnet_table.canister_subnets.length));
-  } else {
-    if (!canister_id) {
-      return '';
-    }
-    canister_id = decode_canister_id(canister_id);
-    subnet_index = find_subnet(canister_id, subnet_table);
-    if (canister_id < subnet_table.canister_range_starts[subnet_index] ||
-        canister_id > subnet_table.canister_range_ends[subnet_index]) {
-      return '';
-    }
+
+  const canisterId = extractCanisterIdFromHost(refererHost);
+  if (!!canisterId) {
+    return canisterId;
   }
-  var subnet_id = subnet_table.canister_subnets[subnet_index];
-  var nodes = subnet_table.subnet_nodes[subnet_index];
-  if (nodes.length < 1) {
-    return '';
+
+  const idx = refererHeader.indexOf("?");
+  if (i != -1) {
+    return "";
   }
-  var node_index = Math.floor(Math.random() * Math.floor(nodes.length));
-  var node_ids = subnet_table.subnet_node_ids[subnet_index];
-  var node_id = node_ids[node_index]
-  r.headersOut['x-ic-subnet-id'] = subnet_id;
-  r.headersOut['x-ic-node-id'] = node_id;
-  if (canister_id) {
-    r.headersOut['x-ic-canister-id'] = canister_id;
-  }
-  return node_id.concat(',', subnet_id);
+
+  const queryParams = qs.parse(refererHeader.substr(idx + 1));
+  return queryParams["canisterId"];
 }
 
-export default { route }
+function hostCanisterId(r) {
+  return extractCanisterIdFromHost(r.headersIn.host);
+}
+
+function domainToCanisterId(d) {
+  return DOMAIN_CANISTER_MAPPINGS[d] || "";
+}
+
+function inferCanisterId(r) {
+  // Domain
+  let canisterId = domainToCanisterId(r.headersIn.host);
+  if (!!canisterId) {
+    return canisterId;
+  }
+
+  // URI
+  canisterId = resolveCanisterIdFromUri(r.uri);
+  if (!!canisterId) {
+    return canisterId;
+  }
+
+  // Host
+  canisterId = extractCanisterIdFromHost(r.headersIn.host);
+  if (!!canisterId) {
+    return canisterId;
+  }
+
+  // Query param
+  canisterId = r.args["canisterId"];
+  if (!!canisterId) {
+    return canisterId;
+  }
+
+  // Referer
+  return extractCanisterIdFromReferer(r);
+}
+
+function isTableEmpty(r) {
+  return !SUBNET_TABLE["canister_subnets"] ? "1" : "";
+}
+
+function normalizeSubnetType(typ) {
+  return (
+    {
+      application: "application",
+      system: "system",
+    }[typ] || ""
+  );
+}
+
+function route(r) {
+  // Canister ID
+  let canisterId = inferCanisterId(r);
+  if (!canisterId) {
+    return "";
+  }
+
+  if (!("canister_subnets" in SUBNET_TABLE)) {
+    return "";
+  }
+
+  canisterId = decodeCanisterId(canisterId);
+
+  // Determine subnet
+  const subnetIdx = findSubnet(canisterId, SUBNET_TABLE);
+  if (
+    canisterId < SUBNET_TABLE.canister_range_starts[subnetIdx] ||
+    canisterId > SUBNET_TABLE.canister_range_ends[subnetIdx]
+  ) {
+    return "";
+  }
+
+  const subnetId = SUBNET_TABLE.canister_subnets[subnetIdx];
+
+  const subnetNodeIds = SUBNET_TABLE.subnet_node_ids[subnetId] || [];
+  const nodeCount = subnetNodeIds.length;
+  if (nodeCount == 0) {
+    return "";
+  }
+
+  const subnetTypes = SUBNET_TABLE["subnet_types"] || {};
+  const subnetType = normalizeSubnetType(subnetTypes[subnetId]);
+
+  // Choose random node
+  const nodeIdx = Math.floor(Math.random() * nodeCount);
+  const nodeId = subnetNodeIds[nodeIdx];
+
+  return `${nodeId},${subnetId},${subnetType}`;
+}
+
+function randomRoute() {
+  const canisterSubnets = SUBNET_TABLE.canister_subnets || [];
+  const subnetCount = canisterSubnets.length;
+  if (subnetCount == 0) {
+    return "";
+  }
+
+  // Choose random subnet
+  const subnetIdx = Math.floor(Math.random() * subnetCount);
+  const subnetId = canisterSubnets[subnetIdx];
+
+  const subnetNodeIds = SUBNET_TABLE.subnet_node_ids[subnetId] || [];
+  const nodeCount = subnetNodeIds.length;
+  if (nodeCount == 0) {
+    return "";
+  }
+
+  const subnetTypes = SUBNET_TABLE["subnet_types"] || {};
+  const subnetType = normalizeSubnetType(subnetTypes[subnetId]);
+
+  // Choose random node
+  const nodeIdx = Math.floor(Math.random() * nodeCount);
+  const nodeId = subnetNodeIds[nodeIdx];
+
+  return `${subnetId},${subnetType},${nodeId}`;
+}
+
+export default {
+  hostCanisterId,
+  inferCanisterId,
+  isTableEmpty,
+  randomRoute,
+  route,
+};

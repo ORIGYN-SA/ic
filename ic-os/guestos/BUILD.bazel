@@ -1,0 +1,34 @@
+package(default_visibility = ["__subpackages__"])
+
+exports_files([
+    "bootloader/extra_boot_args.template",
+    "partitions.csv",
+    "rootfs",
+    "rootfs/docker-base.dev",
+    "rootfs/docker-base.prod",
+    "rootfs/allow_console_root",
+    "rootfs/dev-certs/canister_http_test_ca.cert",
+    "rootfs/dev-certs/canister_http_test_ca.key",
+    "rootfs/opt/ic/share/ic.json5.template",
+    "scripts/build-bootstrap-config-image.sh",
+])
+
+filegroup(
+    name = "rootfs-files",
+    srcs = glob(["rootfs/**"]),
+)
+
+sh_test(
+    name = "validate-ic-json5",
+    srcs = ["rootfs/opt/ic/bin/validate-replica-config.sh"],
+    args = ["$(execpath :rootfs/opt/ic/share/ic.json5.template)"],
+    data = [":rootfs/opt/ic/share/ic.json5.template"],
+)
+
+# All guest-os targets are named the same, just stay in different submodules.
+# To build or run specific target:
+#
+# bazel run   //ic-os/guestos/prod:upload_disk-img           [--s3_endpoint=<internal endpoint address>]
+# bazel build //ic-os/guestos/dev/...
+#
+# check //ic-os/defs.bzl for the full list of targets.

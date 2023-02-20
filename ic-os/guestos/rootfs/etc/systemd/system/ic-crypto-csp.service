@@ -4,11 +4,15 @@ Description=IC Crypto Service Provider
 # state files and may also be needed to obtain network config.
 After=bootstrap-ic-node.service
 Wants=bootstrap-ic-node.service
+# We must also wait for storage permission fixup to have finished.
+After=setup-permissions.service
+Wants=setup-permissions.service
 Requires=ic-crypto-csp.socket
+StartLimitIntervalSec=0
 
 [Service]
 User=ic-replica
-ExecStartPre=+sudo /opt/ic/bin/setup-permissions.sh
+Environment=RUST_BACKTRACE=1
 # When starting ic-crypto-csp, ideally --replica-config-file would directly point to
 # /run/ic-node/config/ic.json5, but this file may be not available yet as it is generated
 # only on ExecStartPre by ic-replica.service. As a temporary workaround, we are generating
@@ -17,7 +21,9 @@ ExecStartPre=+sudo /opt/ic/bin/setup-permissions.sh
 ExecStartPre=+/opt/ic/bin/generate-replica-config.sh -i /opt/ic/share/ic.json5.template -o /run/ic-node/config/ic-crypto-csp.json5
 ExecStart=/opt/ic/bin/ic-crypto-csp --replica-config-file /run/ic-node/config/ic-crypto-csp.json5
 NotifyAccess=main
+Restart=always
+RestartSec=10
 
 [Install]
-RequiredBy=ic-replica.service
+WantedBy=ic-replica.service
 Also=ic-crypto-csp.socket

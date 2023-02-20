@@ -1,4 +1,5 @@
 import random
+import tempfile
 import threading
 import time
 
@@ -21,21 +22,41 @@ class MachineFailure(threading.Thread):
 
     def get_services():
         # Doesn't seem like the order of those things matters
-        return ["ic-replica", "ic-btc-adapter", "ic-canister-http-adapter", "ic-crypto-csp"]
+        return [
+            "ic-replica",
+            "ic-btc-adapter",
+            "ic-https-outcalls-adapter",
+            "ic-crypto-csp",
+            "ic-onchain-observability-adapter",
+        ]
 
-    def run(self):
-        """Simulate failures on the given machines."""
-        print(f"💥 Killing replicas on ${self.machines}")
+    def kill_nodes(machines: [str]):
         # The order in which services are killed shouldn't matter (any order can happen in reality).
         services = MachineFailure.get_services()
         random.shuffle(services)
         for service in services:
-            ssh.run_ssh_in_parallel(self.machines, "sudo systemctl kill --signal SIGKILL {service}")
-            ssh.run_ssh_in_parallel(self.machines, f"sudo systemctl stop {service}")
-            ssh.run_ssh_in_parallel(self.machines, f"sudo systemctl status {service}")
+            print(f"💥 Killing replicas on {machines}")
+            ssh.run_ssh_in_parallel(
+                machines,
+                f"sudo systemctl kill --signal SIGKILL {service}; "
+                f"sudo systemctl stop {service}; "
+                f"sudo systemctl status {service}",
+                f_stdout=tempfile.NamedTemporaryFile().name,
+                f_stderr=tempfile.NamedTemporaryFile().name,
+            )
 
-        time.sleep(FLAGS.sleep_time)
-        print(f"🔄 Restarting replicas on ${self.machines}")
+    def start_nodes(machines: [str]):
+        print(f"🔄 Restarting replicas on {machines}")
         for service in MachineFailure.get_services():
-            ssh.run_ssh_in_parallel(self.machines, f"sudo systemctl start {service}")
-            ssh.run_ssh_in_parallel(self.machines, f"sudo systemctl status {service}")
+            ssh.run_ssh_in_parallel(
+                machines,
+                f"sudo systemctl start {service}; sudo systemctl status {service}",
+                f_stdout=tempfile.NamedTemporaryFile().name,
+                f_stderr=tempfile.NamedTemporaryFile().name,
+            )
+
+    def run(self):
+        """Simulate failures on the given machines."""
+        MachineFailure.kill_nodes(self.machines)
+        time.sleep(FLAGS.sleep_time)
+        MachineFailure.start_nodes(self.machines)

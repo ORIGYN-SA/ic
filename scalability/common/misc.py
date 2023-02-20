@@ -1,14 +1,14 @@
 import argparse
+import math
+import operator
 import os
+import re
 import subprocess
 import sys
 import traceback
 from statistics import mean
 
 import gflags
-from ic.agent import Agent
-from ic.client import Client
-from ic.identity import Identity
 from termcolor import colored
 
 FLAGS = gflags.FLAGS
@@ -113,7 +113,7 @@ def get_latest_ic_version_on_branch(branch: str):
     return result_newest_revision.decode("utf-8").strip()
 
 
-def get_datapoints(target_rps=500, rps_min=50, rps_max=20000, increment=50, exponent=0.5):
+def get_iterations(target_rps=500, rps_min=50, rps_max=20000, increment=50, exponent=0.5):
     """Get a distribution around target_rps from rps_min to rps_max with increasing distance between individual measurements."""
     rps = [rps_min, target_rps, rps_max]
     for inc in sorted(set([increment * round(2 ** (i * exponent)) for i in range(100)])):
@@ -136,7 +136,7 @@ def get_equally_distributed_datapoints(rps_min, rps_max, increment):
     return range(rps_min, rps_max, increment)
 
 
-def get_threshold_approaching_datapoints(threshold, num_exp_points, num_lin_points):
+def get_threshold_approaching_iterations(threshold, num_exp_points, num_lin_points):
     """
     Use if you want to measure the behaviour when the benchmark approaches some threshold value.
 
@@ -165,7 +165,84 @@ def mean_or_minus_one(x):
         return -1
 
 
-def get_anonymous_agent(hostname: str):
-    ident = Identity(anonymous=True)
-    client = Client(url="http://[{}]:8080".format(hostname))
+def get_agent_for_url(url: str, anonymous=True):
+    from ic.agent import Agent
+    from ic.client import Client
+    from ic.identity import Identity
+
+    ident = Identity(anonymous=anonymous)
+    client = Client(url=url)
     return Agent(ident, client)
+
+
+def get_agent(hostname: str, anonymous=True):
+    return get_agent_for_url("http://[{}]:8080".format(hostname), anonymous)
+
+
+def evaluate_stop_conditions(conditions):
+    okay = True
+    op_labels = {
+        operator.ge: ">=",
+    }
+    for (val1, val2, op, label1, label2) in conditions:
+
+        op_label = op_labels[op] if op in op_labels else str(op)
+        if op(val1, val2):
+            okay = False
+            print(colored(f"Stopping because {label1} {val1} {op_label} {label2} {val2}", "red"))
+        else:
+            print(colored(f"Okay since not {label1} {val1} {op_label} {label2} {val2}", "green"))
+
+    return okay
+
+
+def evaluate_stop_latency_failure_iter(latency, latency_threshold, failure, failure_threshold, iteration, max_iter):
+    return evaluate_stop_conditions(
+        [
+            (latency, latency_threshold, operator.ge, "latency", "threshold"),
+            (failure, failure_threshold, operator.ge, "failure rate", "threshold"),
+            (iteration, max_iter, operator.ge, "iteration", "number datapointswork"),
+        ]
+    )
+
+
+def distribute_load_to_n(load: float, n: int):
+    """Distribute the given load to n entities."""
+    return [math.floor(100 * load / n) / 100] * n
+
+
+def load_artifacts(artifacts_path: str):
+    """
+    Load artifacts.
+
+    If previously downloaded, reuse, otherwise download.
+    When downloading, store the GIT commit hash that has been used in a text file.
+    """
+    f_artifacts_hash = os.path.join(artifacts_path, "githash")
+    if subprocess.run(["stat", f_artifacts_hash], stdout=subprocess.DEVNULL).returncode != 0:
+        print("Could not find artifacts, downloading .. ")
+        # Delete old artifacts directory, if it exists
+        subprocess.run(["rm", "-rf", artifacts_path], check=True)
+        # Download new artifacts.
+        artifacts_env = os.environ.copy()
+        artifacts_env["GIT"] = subprocess.check_output(["git", "rev-parse", "HEAD"], encoding="utf-8")
+        artifacts_env["GET_GUEST_OS"] = "0"
+        output = subprocess.check_output(
+            ["../ic-os/guestos/scripts/get-artifacts.sh"], encoding="utf-8", env=artifacts_env
+        )
+        match = re.findall(r"Downloading artifacts for revision ([a-f0-9]*)", output)[0]
+        with open(f_artifacts_hash, "wt", encoding="utf-8") as f:
+            f.write(match)
+    else:
+        print(
+            (
+                "⚠️  Re-using artifacts. While this is faster, there is a risk of inconsistencies."
+                f'Call "rm -rf {artifacts_path}" in case something doesn\'t work.'
+            )
+        )
+    artifacts_hash = open(f_artifacts_hash, "r").read()
+
+    print(f"Artifacts hash is {artifacts_hash}")
+    print(f"Found artifacts at {artifacts_path}")
+
+    return artifacts_hash

@@ -26,7 +26,7 @@ The system is considered healthy iff:
   <li>The failure rate perceived by the workload generators is less than:
     <span class="w3-tag w3-light-grey exp_value">{{experiment_details.allowable_failure_rate}}</span>
   <li>The median latency is less than:
-    <span class="w3-tag w3-light-grey exp_value">{{experiment_details.allowable_t_median}}</span>
+    <span class="w3-tag w3-light-grey exp_value">{{experiment_details.allowable_latency}}{{experiment_details.allowable_t_median}}</span>
 </ul>
 </p>
 
@@ -43,7 +43,7 @@ The system is considered healthy iff:
     <li>Requests per second: <span class="w3-tag w3-light-grey exp_value">{{experiment_details.rps}}</span>
     <li>Duration of load generation in each iteration:
       <span class="w3-tag w3-light-grey exp_value">{{experiment_details.duration}}</span> vs. target duration of
-      <span class="w3-tag w3-light-grey exp_value">{{experiment_details.target_duration}}</span>
+      <span class="w3-tag w3-light-grey exp_value">{{experiment_details.iter_duration}}</span>
   </ul>
 </div>
 
@@ -56,10 +56,4 @@ The system is considered healthy iff:
     (achieved in iteration with {{experiment_details.rps_max_in}} requests per second)
   </div>
   
-  
-  <div class="w3-panel w3-leftbar w3-border-orange w3-sand">
-    This is determined by the number of successful request the workload generator has recorded divided by the length
-    of the iteration run. The latter might be longer than what is given as argument to the workload generator (-n), since
-    some request might take long before they time out.
-  </div>
 </div>

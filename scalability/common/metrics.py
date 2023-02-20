@@ -1,7 +1,7 @@
 class Metric(object):
     """Base class for all types of metrics."""
 
-    def __init__(self, name, target, do_instrument):
+    def __init__(self, name: str, target: str, do_instrument: bool):
         """Init Metric."""
         self.name = name
         self.target = target
@@ -22,3 +22,7 @@ class Metric(object):
     def end_iteration(self, exp):
         """Benchmark iteration is started."""
         print("{} ending".format(self.name))
+
+    def end_benchmark(self, exp):
+        """Benchmark is finished."""
+        print("{} terminating".format(self.name))

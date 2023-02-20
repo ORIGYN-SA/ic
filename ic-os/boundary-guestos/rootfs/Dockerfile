@@ -1,133 +1,156 @@
+# BoundaryGuestOS - Main Docker Image
+#
+# Build step for exmaple:
+# - `docker build --pull -t dfinity/boundaryos-main --build-arg BUILD_TYPE=dev --build-arg SW=true \ `
+#   `--build-arg BASE_IMAGE=dfinity/boundaryos-base@sha256:dc1a2892b0241131dd97ddd4dce560ab274d00a90110a4b5fc4cb2245ff1f0db -f Dockerfile .`
+#
+#
+# The base images are defined in docker-base.prod and docker-base.dev. Update
+# the references there when a new base image has been built. Note that this
+# argument MUST be given by the build script, otherwise build will fail.
+ARG BASE_IMAGE=
 
-# Service worker verion and sha256
-ARG sw_version=1.0.0
-ARG sw_sha256=1e4d288888c493318970fa0134090a8b2539963c2f6e67a4d04b3a0546f3788e
+# We support prod and dev images
+ARG BUILD_TYPE=
 
-# First build stage: download software, build and verify it (such that it
+# Service worker version and sha256; only if SW is `true` the service worker from npm is used
+ARG SW=
+ARG sw_version=1.5.1
+ARG sw_sha256=71637a9c20ab26950a4de4d989879ca636f364dce3208e7fb5c6d7e608ccd5d0
+
+#
+# First build stage: download software (service worker) that frequently changes, build and verify it (such that it
 # does not change under our noses).
-FROM ubuntu:20.04 AS download
+#
+FROM $BASE_IMAGE AS download
 
-ENV TZ=UTC
-RUN ln -snf /usr/share/zoneinfo/$TZ /etc/localtime && echo $TZ > /etc/timezone
-RUN apt-get -y update && apt-get -y upgrade && apt-get -y --no-install-recommends install \
-    ca-certificates \
-    curl \
-    pkg-config \
-    libffi-dev \
-    libssl-dev \
-    ssl-cert \
-    rustc \
-    cargo \
-    perl
+USER root:root
 
-# Download and verify journalbeat
-RUN cd /tmp/ && \
-    curl -L -O https://artifacts.elastic.co/downloads/beats/journalbeat/journalbeat-oss-7.5.1-linux-x86_64.tar.gz && \
-    echo "b1c4c12a5ea8b0e95ed78243ad08dc6e82dc414186da8324d86833c5114846c6edf06590b45cf6c0f29f57e4631c4bf4163e0020d466cf3a2cb65910540f39c5  journalbeat-oss-7.5.1-linux-x86_64.tar.gz" > journalbeat.sha512 && \
-    shasum -c journalbeat.sha512
+WORKDIR /tmp
 
-# Download and verify node_exporter
-RUN cd /tmp/ && \
-    curl -L -O https://github.com/prometheus/node_exporter/releases/download/v1.3.1/node_exporter-1.3.1.linux-amd64.tar.gz && \
-    echo "68f3802c2dd3980667e4ba65ea2e1fb03f4a4ba026cca375f15a0390ff850949  node_exporter-1.3.1.linux-amd64.tar.gz" > node_exporter.sha256 && \
-    shasum -c node_exporter.sha256
-
-# Download libnginx-mod-http-ndk.deb
-RUN cd /tmp/ && \
-   curl -L -O https://github.com/dfinity/nginx-module-cbor-input/releases/download/v0.0.9/libnginx-mod-http-ndk_0.3.1_amd64.deb && \
-   echo "6a496d8c7f3357fda9e5adeb7a729e76c453f32c6d67bc0ec563b0f71e2a0aca  libnginx-mod-http-ndk_0.3.1_amd64.deb" > libnginx-mod-http-ndk.sha256 && \
-   shasum -c  libnginx-mod-http-ndk.sha256
-
-# Download libnginx-mod-http-cbor-input.deb
-RUN cd /tmp/ && \
-   curl -L -O https://github.com/dfinity/nginx-module-cbor-input/releases/download/v0.0.9/libnginx-mod-http-cbor-input_0.0.9_amd64.deb && \
-   echo "8dca8fb93a6645c4aee23f601e9d9f62a00638ff29f95ceafcd10f422a3126f0  libnginx-mod-http-cbor-input_0.0.9_amd64.deb" > libnginx-mod-httpor-input.sha256 && \
-   shasum -c  libnginx-mod-httpor-input.sha256
-
-
-# Download icx-proxy.deb 
-RUN cd /tmp/ && \
-   curl -L -O https://github.com/dfinity/icx-proxy/releases/download/f289318/icx-proxy.deb && \
-   echo "9b434ce9ec1cddb2caf5e6550d5b8bcebd225614809280233334187e088017a9  ./icx-proxy.deb" > icx-proxy.sha256 && \
-   shasum -c icx-proxy.sha256
-
-# Download and check service worker
+# Download and check service worker production version
+# from: https://registry.npmjs.org/@dfinity/service-worker/-/
 ARG sw_version
 ARG sw_sha256
-RUN cd /tmp/ && \
-   curl -L -O https://registry.npmjs.org/@dfinity/service-worker/-/service-worker-${sw_version}.tgz && \
-   echo "${sw_sha256}  ./service-worker-${sw_version}.tgz" > sw.sha256 && \
-   shasum -c sw.sha256
+RUN \
+   curl -L https://registry.npmjs.org/@dfinity/service-worker/-/service-worker-${sw_version}.tgz -o service-worker.tgz && \
+   echo "${sw_sha256}  service-worker.tgz" | shasum -c
 
-# Second build stage: construct the actual target image (root filesystem of the
-# boundary node VM).
-# The downloads from previous stage will be used and installed into the target
-# image.
+# Download Nginx NJS Plugins
+ARG NGINX_NJS_PLUGINS_PROJECT_ID=38466408
+ARG NGINX_NJS_PLUGINS_REF_NAME=v1.0.1
+ARG NGINX_NJS_PLUGINS_GITLAB_READ_ONLY_CI_TOKEN=glpat-2s2iXys15ZmVpgdxok58
+
+RUN \
+    curl -sL -o njs-plugin-is-bot.js \
+        -H "Private-Token: ${NGINX_NJS_PLUGINS_GITLAB_READ_ONLY_CI_TOKEN}" \
+        https://gitlab.com/api/v4/projects/${NGINX_NJS_PLUGINS_PROJECT_ID}/jobs/artifacts/${NGINX_NJS_PLUGINS_REF_NAME}/raw/dist/njs-plugin-is-bot.js?job=build-plugins && \
+    echo "22be6801bab3d38c1feec4eb78d95bcd40e3dc840f7254dd54655eb5dd88daae02743c7489ff2783870a13201b8091f5786af614faf9d9538d5fa96f17bc5859  njs-plugin-is-bot.js" | shasum -c
+
 #
-# Build steps:
-# - `docker build --pull -t dfinity/boundaryos-main -f Dockerfile .`
+# Second build stage:
+# - Construct base images with the differences between dev and prod (IC-OS root filesystem)
 #
+FROM $BASE_IMAGE as image-dev
+# nns public key will be on the USB stick
+
+FROM $BASE_IMAGE as image-prod
+USER root:root
+
+# Bake the nns public key into the image
+# For the dev image the public key will come from the usb stick
+# See get_nns_pem_path in ic-os/boundary-guestos/rootfs/opt/ic/bin/helpers.shlib
+RUN printf '%s\n' >/etc/nns_public_key.pem \
+    '-----BEGIN PUBLIC KEY-----' \
+    'MIGCMB0GDSsGAQQBgtx8BQMBAgEGDCsGAQQBgtx8BQMCAQNhAIFMDm7HH6tYOwi9' \
+    'gTc8JVw8NxsuhIY8mKTx4It0I10U+12cDNVG2WhfkToMCyzFNBWDv0tDkuRn25bW' \
+    'W5u0y3FxEvhHLg1aTRRQX/10hLASkQkcX4e5iINGP5gJGguqrg==' \
+    '-----END PUBLIC KEY-----'
+
+
+#
+# Third build stage:
+# - Construct base images with the differences between npm sw and local sw
+#
+FROM image-${BUILD_TYPE} as image-sw-false
+# /var/www/html/ files injected by caller
+
+FROM image-${BUILD_TYPE} as image-sw-true
+USER root:root
+
+# Fetch and install npm ic service worker for dev/prod
+COPY --from=download /tmp/service-worker.tgz /tmp/service-worker.tgz
+ARG BUILD_TYPE=
+RUN cd /tmp && \
+    tar xfvz service-worker.tgz && \
+    mkdir -p /var/www/html/ &&\
+    cp -rf /tmp/package/dist-${BUILD_TYPE}/* /var/www/html/; \
+    rm -rf /tmp/package /tmp/service-worker.tgz
+
+#
+# Fourth build stage:
 # - Construct the actual target image (IC-OS root filesystem)
 #
-# Update below image when new dfinity/boundaryos-base image gets produced (see deploy-guest-os-baseimg CI job on master/rc).
-FROM dfinity/boundaryos-base@sha256:aa6724deaf12f10fb4ec298adf86397d6fdd61bea950460eb7e0dc182505a647
+FROM image-sw-${SW}
+
+USER root:root
 
 RUN mkdir -p /boot/config \
              /boot/efi \
              /boot/grub
+
 COPY etc /etc
+
+# Install Nginx NJS Plugins
+COPY --from=download \
+    /tmp/njs-plugin-is-bot.js /etc/nginx/njs/
 
 # Update POSIX permissions in /etc/
 RUN find /etc -type d -exec chmod 0755 {} \+ && \
     find /etc -type f -not -path "/etc/hostname" -not -path "/etc/hosts" -not -path "/etc/resolv.conf" -exec chmod 0644 {} \+ && \
-    chmod 0755 /etc/systemd/system-generators/mount-generator && \
+    chmod 0755 /etc/systemd/system-generators/* && \
     chmod 0440 /etc/sudoers && \
-    chmod 755 /etc/initramfs-tools/scripts/init-bottom/set-machine-id
+    chmod 755 /etc/initramfs-tools/scripts/init-bottom/set-machine-id && \
+    chmod 755 /etc/initramfs-tools/scripts/init-premount/verity-root && \
+    chmod 755 /etc/initramfs-tools/hooks/veritysetup
 
-# Deactivate motd, it tries creating $HOME/.cache/motd.legal-displayed,
-# but we want to prohibit it from writing to user home dirs
+    # Deactivate motd, it tries creating $HOME/.cache/motd.legal-displayed,
+    # but we want to prohibit it from writing to user home dirs
 RUN sed -e '/.*pam_motd.so.*/d' -i /etc/pam.d/login && \
-    sed -e '/.*pam_motd.so.*/d' -i /etc/pam.d/sshd
-
-# Deactivate lvm backup/archive: It writes backup information to /etc/lvm, but a) this is
-# per system (so backups are not persisted across upgrades) and thus not very
-# useful, and b) we want to turn /etc read-only eventually. So simply suppress
-# generating backups.
-RUN sed -e 's/\(backup *= *\)1/\10/' -e 's/\(archive *= *\)1/\10/' -i /etc/lvm/lvm.conf
-
-# Deactivate systemd userdb. We don't use it.
-RUN sed -e 's/ *systemd//' -i /etc/nsswitch.conf
+    sed -e '/.*pam_motd.so.*/d' -i /etc/pam.d/sshd && \
+    # Deactivate lvm backup/archive: It writes backup information to /etc/lvm, but a) this is
+    # per system (so backups are not persisted across upgrades) and thus not very
+    # useful, and b) we want to turn /etc read-only eventually. So simply suppress
+    # generating backups.
+    sed -e 's/\(backup *= *\)1/\10/' -e 's/\(archive *= *\)1/\10/' -i /etc/lvm/lvm.conf && \
+    # Deactivate systemd userdb. We don't use it.
+    sed -e 's/ *systemd//' -i /etc/nsswitch.conf
 
 # Regenerate initramfs (config changed after copying in /etc)
 RUN RESUME=none update-initramfs -c -k all
 
 ARG ROOT_PASSWORD=
-RUN \
-    if [ "${ROOT_PASSWORD}" != "" ]; then \
+RUN if [ "${ROOT_PASSWORD}" != "" ]; then \
         echo "root:$(openssl passwd -6 -salt jE8zzDEHeRg/DuGq ${ROOT_PASSWORD})" | chpasswd -e ; \
-    fi
-
-# Prepare for bind mount of authorized_keys
-RUN mkdir -p /root/.ssh && chmod 0700 /root/.ssh
-
-# Delete generated ssh keys, otherwise every host will have the same key pair.
-# They will be generated on first boot.
-RUN rm /etc/ssh/ssh*key*
-# Allow root login only via keys. In prod deployments there are never any
-# keys set up for root, but in dev deployments there may be.
-# Actually, prohibit-password is the default config, so would not be
-# strictly necessary to be explicit here.
-RUN sed -e "s/.*PermitRootLogin.*/PermitRootLogin prohibit-password/" -i /etc/ssh/sshd_config
+    fi && \
+    # Prepare for bind mount of authorized_keys
+    mkdir -p /root/.ssh && chmod 0700 /root/.ssh && \
+    # Delete generated ssh keys, otherwise every host will have the same key pair.
+    # They will be generated on first boot.
+    rm /etc/ssh/ssh*key* && \
+    # Allow root login only via keys. In prod deployments there are never any
+    # keys set up for root, but in dev deployments there may be.
+    # Actually, prohibit-password is the default config, so would not be
+    # strictly necessary to be explicit here.
+    sed -e "s/.*PermitRootLogin.*/PermitRootLogin prohibit-password/" -i /etc/ssh/sshd_config
 
 # All of the above sets up the base operating system. Everything below relates
 # to node operation.
 
-RUN \
-    for SERVICE in /etc/systemd/system/*; do \
+RUN for SERVICE in /etc/systemd/system/*; do \
         if [ -f "$SERVICE" -a ! -L "$SERVICE" ] ; then systemctl enable "${SERVICE#/etc/systemd/system/}" ; fi ; \
-    done
-
-RUN systemctl enable \
+    done && \
+    systemctl enable \
     chrony \
     nftables \
     systemd-networkd \
@@ -135,96 +158,78 @@ RUN systemctl enable \
     systemd-resolved \
     systemd-journal-gatewayd
 
-# Add user/group entries specified here: /usr/lib/sysusers.d/systemd.conf E.g., systemd-timesync/coredump
-RUN faketime "1970-1-1 0" systemd-sysusers
-
-# Set /bin/sh to point to /bin/bash instead of the default /bin/dash
-RUN echo "set dash/sh false" | debconf-communicate && dpkg-reconfigure -fnoninteractive dash
+    # Add user/group entries specified here: /usr/lib/sysusers.d/systemd.conf
+    # E.g., systemd-timesync/coredump
+RUN faketime "1970-1-1 0" systemd-sysusers && \
+    # Set /bin/sh to point to /bin/bash instead of the default /bin/dash
+    echo "set dash/sh false" | debconf-communicate && dpkg-reconfigure -fnoninteractive dash
 
 # Group accounts to which parts of the runtime state are assigned such that
 # user accounts can be granted individual access rights.
 # Note that a group "backup" already exists and is used for the purpose of
 # allowing backup read access.
 RUN addgroup --system nonconfidential && \
-    addgroup --system confidential
-
-# Accounts to allow remote access to state bits
-
-# The "backup" user account. We simply use the existing "backup" account and
-# reconfigure it for our purposes.
-RUN chsh -s /bin/bash backup && \
+    addgroup --system confidential && \
+    # Accounts to allow remote access to state bits
+    # The "backup" user account. We simply use the existing "backup" account and
+    # reconfigure it for our purposes.
+    chsh -s /bin/bash backup && \
     mkdir /var/lib/backup && \
     chown backup:backup /var/lib/backup && \
     usermod -d /var/lib/backup backup && \
-    adduser backup systemd-journal
-
-# The "read-only" user account. May read everything besides crypto.
-RUN adduser --system --disabled-password --home /var/lib/readonly --shell /bin/bash readonly && \
+    adduser backup systemd-journal && \
+    # The "read-only" user account. May read everything besides crypto.
+    adduser --system --disabled-password --home /var/lib/readonly --shell /bin/bash readonly && \
     adduser readonly backup && \
     adduser readonly nonconfidential && \
-    adduser readonly systemd-journal
-
-# The omnipotent "admin" account. May read everything and crucially can also
-# arbitrarily change system state via sudo.
-RUN adduser --system --disabled-password --home /var/lib/admin --shell /bin/bash admin && \
+    adduser readonly systemd-journal && \
+    # The omnipotent "admin" account. May read everything and crucially can also
+    # arbitrarily change system state via sudo.
+    adduser --system --disabled-password --home /var/lib/admin --shell /bin/bash admin && \
     chown admin:staff /var/lib/admin && \
     adduser admin backup && \
     adduser admin nonconfidential && \
     adduser admin systemd-journal && \
-    adduser admin sudo
+    adduser admin sudo && \
+    # The "vector" account. Used to run vector binary
+    adduser --system --disabled-password --shell /usr/sbin/nologin --no-create-home vector && \
+    adduser vector vector
 
-# The "journalbeat" account. Used to run journalbeat binary to send logs of the
-# GuestOS.
-RUN addgroup journalbeat && \
-    adduser --system --disabled-password --shell /usr/sbin/nologin -c "Journalbeat" journalbeat && \
-    adduser journalbeat journalbeat && \
-    adduser journalbeat systemd-journal
 
 # The "node_exporter" account. Used to run node_exporter binary to export
 # telemetry metrics of the GuestOS.
 RUN addgroup node_exporter && \
-    adduser --system --disabled-password --shell /usr/sbin/nologin -c "Node Exporter" node_exporter && \
-    adduser node_exporter node_exporter
+    adduser --system --disabled-password --shell /usr/sbin/nologin --no-create-home node_exporter && \
+    adduser node_exporter node_exporter && \
+    # The "socks" account for socks proxy
+    # Also set correct permissions for dante.
+    addgroup socks && \
+    adduser --system --disabled-password --shell /usr/sbin/nologin --no-create-home socks && \
+    adduser socks socks && chmod +s /usr/sbin/danted
 
-# The "socks" account for socks proxy
-# Also set correct permissions for dante and stunnel.
-# Stunnel4 cannot be started as a systemctl service so starting it as `stunnel4 start`
-RUN addgroup socks && \
-    adduser --system --disabled-password --shell /usr/sbin/nologin -c "Socks" socks && \
-    adduser socks socks && chmod +s /usr/sbin/danted && \
-    chmod 0755 /etc/init.d/stunnel4
+# Setup prober
+RUN \
+    addgroup prober && \
+    adduser --system --disabled-password --shell /usr/sbin/nologin --no-create-home prober && \
+    adduser prober prober && \
+    mkdir -p /var/log/prober && \
+    chown prober:prober /var/log/prober && \
+    chmod 755 /var/log/prober
 
-# Install journalbeat
-COPY --from=download /tmp/journalbeat-oss-7.5.1-linux-x86_64.tar.gz /tmp/journalbeat-oss-7.5.1-linux-x86_64.tar.gz
-RUN cd /tmp/ && \
-    mkdir -p /etc/journalbeat \
-             /var/lib/journalbeat \
-             /var/log/journalbeat && \
-    tar --strip-components=1 -C /etc/journalbeat/ -zvxf journalbeat-oss-7.5.1-linux-x86_64.tar.gz journalbeat-7.5.1-linux-x86_64/fields.yml && \
-    tar --strip-components=1 -C /etc/journalbeat/ -zvxf journalbeat-oss-7.5.1-linux-x86_64.tar.gz journalbeat-7.5.1-linux-x86_64/journalbeat.reference.yml && \
-    tar --strip-components=1 -C /usr/local/bin/ -zvxf journalbeat-oss-7.5.1-linux-x86_64.tar.gz journalbeat-7.5.1-linux-x86_64/journalbeat && \
-    chown root:root /etc/journalbeat/*.yml \
-                    /usr/local/bin/journalbeat && \
-    chown journalbeat:journalbeat /var/lib/journalbeat \
-                                  /var/log/journalbeat && \
-    chmod 0755 /etc/journalbeat && \
-    chmod 0750 /var/lib/journalbeat \
-               /var/log/journalbeat && \
-    chmod 0644 /etc/journalbeat/*.yml && \
-    rm /tmp/journalbeat-oss-7.5.1-linux-x86_64.tar.gz
+# Setup denylist-updater
+RUN \
+    addgroup denylist-updater && \
+    adduser --system --disabled-password --shell /usr/sbin/nologin --no-create-home denylist-updater && \
+    adduser denylist-updater denylist-updater && \
+    mkdir -p /var/opt/nginx/denylist && \
+    chown denylist-updater:denylist-updater /var/opt/nginx/denylist && \
+    chmod 644 /var/opt/nginx/denylist
 
 # Install node_exporter
-COPY --from=download /tmp/node_exporter-1.3.1.linux-amd64.tar.gz /tmp/node_exporter-1.3.1.linux-amd64.tar.gz
-RUN cd /tmp/ && \
-    mkdir -p /etc/node_exporter && \
-    tar --strip-components=1 -C /usr/local/bin/ -zvxf node_exporter-1.3.1.linux-amd64.tar.gz node_exporter-1.3.1.linux-amd64/node_exporter && \
-    chown root:root /etc/node_exporter \
+RUN chown root:root /etc/node_exporter \
                     /usr/local/bin/node_exporter && \
     chmod 0755 /etc/node_exporter \
-               /usr/local/bin/node_exporter && \
-    chmod 0644 /etc/default/node_exporter \
-               /etc/node_exporter/web.yml && \
-    rm /tmp/node_exporter-1.3.1.linux-amd64.tar.gz
+               /usr/local/bin/node_exporter
 
 # Install IC binaries and other data late -- this means everything above
 # will be cached when only the binaries change.
@@ -232,38 +237,31 @@ COPY opt /opt
 
 RUN rm -rf /etc/nginx/sites-enabled/nginx.conf
 
-# Install libnginx-mod-http-ndk 
-COPY --from=download /tmp/libnginx-mod-http-ndk_0.3.1_amd64.deb /tmp/
-RUN dpkg -i /tmp/libnginx-mod-http-ndk_0.3.1_amd64.deb &&\
-    rm /tmp/libnginx-mod-http-ndk_0.3.1_amd64.deb
+# Install ic service worker production version from: https://registry.npmjs.org/@dfinity/service-worker/-/
+RUN mkdir -p /var/www/html && chown www-data:www-data /var/www/html
 
-# Install libnginx-mod-http-cbor-input
-COPY --from=download /tmp/libnginx-mod-http-cbor-input_0.0.9_amd64.deb /tmp/libnginx-mod-http-cbor-input_0.0.9_amd64.deb
-RUN dpkg -i /tmp/libnginx-mod-http-cbor-input_0.0.9_amd64.deb &&\
-    rm /tmp/libnginx-mod-http-cbor-input_0.0.9_amd64.deb
-
-# Install icx-proxy
-COPY --from=download /tmp/icx-proxy.deb /tmp/icx-proxy.deb
-RUN dpkg -i /tmp/icx-proxy.deb &&\
-    rm /tmp/icx-proxy.deb
-
-# Install ic service worker porduction version from: https://registry.npmjs.org/@dfinity/service-worker/-/
-ARG sw_version
-COPY --from=download /tmp/service-worker-${sw_version}.tgz /tmp/service-worker-${sw_version}.tgz
-RUN cd /tmp && tar xfvz service-worker-${sw_version}.tgz &&\
-    mkdir -p /var/www/html/service_worker &&\
-    cp -rf /tmp/package/dist-prod/* /var/www/html/service_worker/ &&\
-    rm -rf /tmp/package /tmp/service-worker-${sw_version}.tgz
-RUN chown www-data:www-data /var/www/html && \
-    chmod 0755 /var/www/html/*
 # Install other files (e.g. the uninstall-script)
 COPY var/www/html /var/www/html
+RUN chmod 0644 /var/www/html/*
+
+# Install cgi-scripts
+RUN mkdir -p /var/www/cgi-bin && \
+    chown www-data:www-data /var/www/cgi-bin
+COPY var/www/cgi-bin/* /var/www/cgi-bin/
+RUN mkdir -p /var/www/cgi-bin/artifacts && \
+    mkdir -p /var/www/cgi-bin/artifacts/certs && \
+    chown www-data:www-data /var/www/cgi-bin/artifacts && \
+    chown www-data:www-data /var/www/cgi-bin/artifacts/certs && \
+    touch /var/www/cgi-bin/cgi.log && \
+    chown www-data:www-data /var/www/cgi-bin/* && \
+    chmod 0755 /var/www/cgi-bin/*
 
 # Clear all files that may lead to indeterministic build.
 RUN apt-get clean && \
     rm -rf \
         /var/cache/fontconfig/* /var/cache/ldconfig/aux-cache \
-        /var/log/alternatives.log /var/log/apt/history.log /var/log/apt/term.log /var/log/dpkg.log \
+        /var/log/alternatives.log /var/log/apt/history.log \
+        /var/log/apt/term.log /var/log/dpkg.log \
         /var/lib/apt/lists/* /var/lib/dbus/machine-id \
         /var/lib/initramfs-tools/5.8.0-50-generic && \
     find /usr/local/share/fonts -name .uuid | xargs rm && \
@@ -272,55 +270,21 @@ RUN apt-get clean && \
     find /usr/share -name "*.pyc" | xargs rm -rf&& \
     truncate --size 0 /etc/machine-id
 
-# Update POSIX permissions in /opt/ic/
+# Update POSIX permissions in /opt
 RUN find /opt -type d -exec chmod 0755 {} \+ && \
     find /opt -type f -exec chmod 0644 {} \+ && \
-    chmod 0755 /opt/ic/bin/* && \
-    chmod 0644 /opt/ic/share/*
-
-COPY boot /boot
-# Update POSIX permissions in /boot/
-RUN chmod 0644 /boot/extra_boot_args /boot/version.txt
-
-
-
-# CERTIFICATES
-# Default image has
-# 1. fullchain.pem: self signed certificates from the ssl-cert package.
-# 2. privkey.pem: key for the self signed certificate.
-# 3. chain.pem: Dummy certficate of the issuer for OCSP stapling to work.
-#    This cert is irrelevant because the certificate is self signed.
-#
-# Prod image
-#
-# Has the above 3 certificates in /boot/config/cert. The setup-nginx service
-# copies over the certificates in the correct location to match the nginx conf
-# file
-#
-# The naming convetion is the same a certificates generated by certbot renew
-RUN mkdir -p /etc/nginx/certs
-RUN mkdir -p /etc/nginx/keys
-RUN cp /etc/ssl/certs/ssl-cert-snakeoil.pem /etc/nginx/certs/fullchain.pem
-RUN cp /etc/ssl/private/ssl-cert-snakeoil.key /etc/nginx/keys/privkey.pem
-RUN cp /etc/ssl/certs/ssl-cert-snakeoil.pem /etc/nginx/certs/chain.pem
-
-
-# trusted_cert.pem contains all certificates for the upstream replica. This file
-# is periodically updated by the proxy+watcher service. To bootstrap the process
-# we initially place a dummy trusted cert. This dummy is the copy of the
-# snakeoil cert. This allows the nginx service to start, but upstream routing
-# will only happen once the control plane pulls the initial set of routes
-#
-RUN cp /etc/nginx/certs/fullchain.pem /etc/nginx/ic/trusted_certs.pem
+    chmod 0755 /opt/ic/bin/*
 
 # Take care of nginx files
-RUN chmod 0755 /etc/nginx/*
-RUN chmod 0644 /etc/nginx/ic_public_key.pem
-RUN chmod 0644 /etc/nginx/nginx.conf
-RUN chmod 0644 /etc/nginx/modules-enabled/ngx_http_cbor_input_module.conf
-RUN chmod 0644 /etc/nginx/modules-enabled/ngx_http_js_module.conf
-RUN chmod 0755 /etc/nginx/ic/ic_router_control_plane_watcher.sh
-RUN rm -rf /etc/nginx/conf.d/nginx-global.conf
-RUN rm -rf /etc/nginx/conf.d/default.conf
-RUN rm -rf /etc/nginx/sites-enabled/default
-RUN rm -rf /etc/nginx/conf.d/default
+RUN chmod 0755 /etc/nginx/* && \
+    chmod 0644 /etc/nginx/nginx.conf && \
+    chmod 0644 /etc/nginx/modules-enabled/ngx_http_cbor_input_module.conf && \
+    chmod 0644 /etc/nginx/modules-enabled/ngx_http_js_module.conf && \
+    rm -rf /etc/nginx/conf.d/nginx-global.conf && \
+    rm -rf /etc/nginx/conf.d/default.conf && \
+    rm -rf /etc/nginx/sites-enabled/default && \
+    rm -rf /etc/nginx/conf.d/default
+
+# Configure incron
+COPY etc/incron.tb /etc/incron.d/incron.tb
+RUN echo root >> /etc/incron.allow

@@ -5,7 +5,7 @@
     set -eExuo pipefail
 
     MEDIA_DIR="/var/local/ic/media/{{ ic_deployment_name }}/{{ ic_git_revision }}"
-    ITEMS=({{ hostvars[inventory_hostname].ic_guests | join(' ') }})
+    ITEMS=({{ hostvars[inventory_hostname].ic_guests | default([]) | join(' ') }})
     parallel -a <(printf '%s\n' "${ITEMS[@]}") --no-run-if-empty cp -v --reflink=auto --sparse=always $MEDIA_DIR/'{}.img' /var/lib/libvirt/media/'{}.img'
     chown libvirt-qemu:kvm /var/lib/libvirt/media/*.img
     chmod 0664 /var/lib/libvirt/media/*.img
@@ -17,80 +17,81 @@
 
 - name: copy file disk.img for replica
   vars:
-    boundary_nodes: "{{ hostvars[inventory_hostname].groups.boundary  | default([]) }}"
-    aux_nodes: "{{ hostvars[inventory_hostname].groups.aux  | default([]) }}"
-    replica_nodes: "{{ hostvars[inventory_hostname].ic_guests | difference(boundary_nodes) | difference(aux_nodes) | join(' ') }}"
+    boundary_nodes: "{{ hostvars[inventory_hostname].groups.boundary | intersect(hostvars[inventory_hostname].ic_guests) | default([]) }}"
+    aux_nodes: "{{ hostvars[inventory_hostname].groups.aux | intersect(hostvars[inventory_hostname].ic_guests) | default([]) }}"
+    replica_nodes: "{{ hostvars[inventory_hostname].ic_guests | default([]) | difference(boundary_nodes) | difference(aux_nodes) }}"
     ic_disk_size_bytes: "{{ ic_disk_gb | int * (1024 | pow(3)) | int }}"
   shell: |
     set -eExuo pipefail
 
     # Deploy replica images
     IMAGE_DIR="/var/local/ic/disk/{{ ic_deployment_name }}/{{ ic_git_revision }}"
-    ITEMS=({{ replica_nodes }})
+    ITEMS=({{ replica_nodes | join(' ') }})
     parallel -a <(printf '%s\n' "${ITEMS[@]}") --no-run-if-empty test -r /var/lib/libvirt/images/'{}.img' \|\| cp -v --reflink=auto --sparse=always "$IMAGE_DIR/disk.img" /var/lib/libvirt/images/'{}.img'
 
-    chown libvirt-qemu:kvm /var/lib/libvirt/images/*.img
-    chmod 0664 /var/lib/libvirt/images/*.img
+    parallel -a <(printf '%s\n' "${ITEMS[@]}") --no-run-if-empty chown libvirt-qemu:kvm /var/lib/libvirt/images/'{}.img'
+    parallel -a <(printf '%s\n' "${ITEMS[@]}") --no-run-if-empty chmod 0664 /var/lib/libvirt/images/'{}.img'
     parallel -a <(printf '%s\n' "${ITEMS[@]}") --no-run-if-empty truncate --size {{ ic_disk_size_bytes }} /var/lib/libvirt/images/'{}.img'
   register: script_res
   changed_when: "'stdout' in script_res and script_res.stdout"
   args:
     executable: /bin/bash
+  when: replica_nodes | length > 0
   tags: [ "ic_guest" ]
 
 - name: copy file media.img for boundary node VMs
   vars:
-    boundary_nodes: "{{ hostvars[inventory_hostname].groups.boundary  | default([]) | join(' ') }}"
+    boundary_nodes: "{{ hostvars[inventory_hostname].groups.boundary | intersect(hostvars[inventory_hostname].ic_guests) | default([]) }}"
   shell: |
     set -eExuo pipefail
 
     MEDIA_DIR="/var/local/ic/media/{{ ic_deployment_name }}/{{ ic_git_revision }}/boundary"
-    ITEMS=({{ boundary_nodes }})
+    ITEMS=({{ boundary_nodes | join(' ') }})
     parallel -a <(printf '%s\n' "${ITEMS[@]}") --no-run-if-empty cp -v --reflink=auto --sparse=always $MEDIA_DIR/'{}.img' /var/lib/libvirt/media/'{}.img'
-    chown libvirt-qemu:kvm /var/lib/libvirt/media/*.img
-    chmod 0664 /var/lib/libvirt/media/*.img
+    parallel -a <(printf '%s\n' "${ITEMS[@]}") --no-run-if-empty chown libvirt-qemu:kvm /var/lib/libvirt/media/'{}.img'
+    parallel -a <(printf '%s\n' "${ITEMS[@]}") --no-run-if-empty chmod 0664 /var/lib/libvirt/media/'{}.img'
   register: script_res
   changed_when: "script_res.stdout | default('')"
   args:
     executable: /bin/bash
+  when: boundary_nodes | length > 0
   tags: [ "boundary_node_vm" ]
 
 - name: copy file disk.img for boundary nodes
   vars:
-    boundary_nodes: "{{ hostvars[inventory_hostname].groups.boundary  | default([]) | join(' ') }}"
+    boundary_nodes: "{{ hostvars[inventory_hostname].groups.boundary | intersect(hostvars[inventory_hostname].ic_guests) | default([]) }}"
     ic_disk_size_bytes: "{{ ic_disk_gb | int * (1024 | pow(3)) | int }}"
   shell: |
     set -eExuo pipefail
 
     # Deploy replica images
-    IMAGE_DIR="/var/local/ic/disk/{{ ic_deployment_name }}/{{ ic_git_revision }}/{{ ic_boundary_node_image }}"
-    ITEMS=({{ boundary_nodes }})
+    IMAGE_DIR="/var/local/ic/disk/{{ ic_deployment_name }}/{{ ic_git_revision }}/boundary{{ bn_image_type }}"
+    ITEMS=({{ boundary_nodes | join(' ') }})
     parallel -a <(printf '%s\n' "${ITEMS[@]}") --no-run-if-empty test -r /var/lib/libvirt/images/'{}.img' \|\| cp -v --reflink=auto --sparse=always "$IMAGE_DIR/disk.img" /var/lib/libvirt/images/'{}.img'
 
-    chown libvirt-qemu:kvm /var/lib/libvirt/images/*.img
-    chmod 0664 /var/lib/libvirt/images/*.img
+    parallel -a <(printf '%s\n' "${ITEMS[@]}") --no-run-if-empty chown libvirt-qemu:kvm /var/lib/libvirt/images/'{}.img'
+    parallel -a <(printf '%s\n' "${ITEMS[@]}") --no-run-if-empty chmod 0664 /var/lib/libvirt/images/'{}.img'
     parallel -a <(printf '%s\n' "${ITEMS[@]}") --no-run-if-empty truncate --size {{ ic_disk_size_bytes }} /var/lib/libvirt/images/'{}.img'
   register: script_res
   changed_when: "script_res.stdout | default('')"
   args:
     executable: /bin/bash
   when: boundary_nodes | length > 0
-  tags: [ "ic_guest" ]
+  tags: [ "boundary_node_vm" ]
 
 - name: copy file disk.img for aux nodes
   vars:
-    aux_nodes: "{{ hostvars[inventory_hostname].groups.aux  | default([]) | join(' ') }}"
+    aux_nodes: "{{ hostvars[inventory_hostname].groups.aux | intersect(hostvars[inventory_hostname].ic_guests) | default([]) }}"
     ic_disk_size_bytes: "{{ ic_disk_gb | int * (1024 | pow(3)) | int }}"
   shell: |
     set -eExuo pipefail
 
-    # Deploy replica images
-    IMAGE_DIR="/var/local/ic/disk/{{ ic_deployment_name }}/{{ ic_git_revision }}/generic"
-    ITEMS=({{ aux_nodes }})
+    IMAGE_DIR="/var/local/ic/disk/{{ ic_deployment_name }}/{{ ic_git_revision }}/aux"
+    ITEMS=({{ aux_nodes | join(' ') }})
     parallel -a <(printf '%s\n' "${ITEMS[@]}") --no-run-if-empty test -r /var/lib/libvirt/images/'{}.img' \|\| cp -v --reflink=auto --sparse=always "$IMAGE_DIR/disk.img" /var/lib/libvirt/images/'{}.img'
 
-    chown libvirt-qemu:kvm /var/lib/libvirt/images/*.img
-    chmod 0664 /var/lib/libvirt/images/*.img
+    parallel -a <(printf '%s\n' "${ITEMS[@]}") --no-run-if-empty chown libvirt-qemu:kvm /var/lib/libvirt/images/'{}.img'
+    parallel -a <(printf '%s\n' "${ITEMS[@]}") --no-run-if-empty chmod 0664 /var/lib/libvirt/images/'{}.img'
     parallel -a <(printf '%s\n' "${ITEMS[@]}") --no-run-if-empty truncate --size {{ ic_disk_size_bytes }} /var/lib/libvirt/images/'{}.img'
   register: script_res
   changed_when: "script_res.stdout | default('')"
@@ -103,13 +104,15 @@
   vars:
     ic_memory_kib: "{{ ic_memory_gb | int * (1024 | pow(2)) }}"
     mac_address: "{{ hostvars[item].mac_address }}"
+    ipv4_interface: "{{ hostvars[item].ipv4_interface | default('vlan66') }}"
+    ipv6_interface: "{{ hostvars[item].ipv6_interface | default('vlan66') }}"
   template:
     src: "../ic_guest/templates/guest.xml"
     dest: "/var/local/ic/disk/{{ ic_deployment_name }}/{{ item }}.xml"
     owner: root
     group: root
     mode: 0644
-  loop: "{{ hostvars[inventory_hostname].ic_guests }}"
+  loop: "{{ hostvars[inventory_hostname].ic_guests | default([]) }}"
   loop_control:
     label:
   tags: [ "ic_guest" ]
@@ -119,17 +122,23 @@
     set -eExuo pipefail
     virsh define "/var/local/ic/disk/{{ ic_deployment_name }}/{{ item }}.xml"
     virsh dominfo "{{ item }}"
-  loop: "{{ hostvars[inventory_hostname].ic_guests }}"
+  loop: "{{ hostvars[inventory_hostname].ic_guests | default([]) }}"
   loop_control:
     label:
   args:
     executable: /bin/bash
   tags: [ "ic_guest" ]
 
+- name: Check if dfinity-hsm-agent service exist
+  shell: service dfinity-hsm-agent status
+  register: dfinity_hsm_agent_status
+  failed_when: not(dfinity_hsm_agent_status.rc == 4 or dfinity_hsm_agent_status.rc == 3 or dfinity_hsm_agent_status.rc == 0)
+
 - name: Stop the dfinity-hsm-agent.service
   systemd:
     state: stopped
     name: dfinity-hsm-agent
+  when: dfinity_hsm_agent_status.rc == 0
   tags: [ "ic_guest" ]
 
 - name: Ensure potentially conflicting kernel modules are not loaded
@@ -155,4 +164,5 @@
   systemd:
     state: started
     name: dfinity-hsm-agent
+  when: dfinity_hsm_agent_status.rc == 0
   tags: [ "ic_guest" ]

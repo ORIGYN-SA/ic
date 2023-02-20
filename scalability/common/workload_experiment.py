@@ -1,20 +1,24 @@
 import json
 import logging
 import os
-import re
+import random
 import subprocess
+import tempfile
 import time
+import uuid
 from statistics import mean
 from typing import List
 
 import gflags
+from common import ansible
 from common import base_experiment
 from common import prometheus
 from common import report
 from common import ssh
+from common import workload
 from termcolor import colored
 
-NUM_WORKLOAD_GEN = 2  # Number of machines to run the workload generator on
+NUM_WORKLOAD_GEN = -1  # Number of machines to run the workload generator on
 
 FLAGS = gflags.FLAGS
 gflags.DEFINE_bool("use_updates", False, "Issue update calls instead of query calls.")
@@ -24,10 +28,8 @@ gflags.DEFINE_string(
 gflags.MarkFlagAsRequired("wg_testnet")
 gflags.DEFINE_integer("subnet", 1, "Subnet from which to choose the target machine.")
 gflags.DEFINE_integer("wg_subnet", 0, "Subnet in which to run the workload generator.")
-gflags.DEFINE_integer("wg_connections_per_host", 1, "Number of connections to use per workload generator.")
-gflags.DEFINE_string("target_subnet_id", "", "Subnet ID that is running the canister specified by canister_id.")
+gflags.DEFINE_string("mainnet_target_subnet_id", "", "Subnet ID that is running the canister specified by canister_id.")
 gflags.DEFINE_boolean("target_all", False, "Target all nodes, even when running query calls.")
-gflags.DEFINE_string("targets", "", "Set load target IP adresses from this coma-separated list directly.")
 gflags.DEFINE_string(
     "workload_generator_machines", "", "Set workload generator IP adresses from this coma-separated list directly."
 )
@@ -36,6 +38,22 @@ gflags.DEFINE_integer(
     0,
     "The node idx to use within the subnetwork to target for query calls. Only relevant when running against mainnet.",
 )
+gflags.DEFINE_integer("target_rps", 10, "Requests per second the workload generator should execute.")
+
+
+# When failure rate reaches this level, there is no point keep running, so stop following experiments.
+STOP_FAILURE_RATE = 0.9
+# When median latency reaches this level, there is no point keep running, so stop following experiments.
+STOP_T_MEDIAN = 300000
+
+# When failure rate is below this level, we consider the experiment successful.
+ALLOWABLE_FAILURE_RATE = 0.2
+# When median latency is below this level, we consider the experiment successful.
+ALLOWABLE_LATENCY = 5000
+
+# Default rate to use in wait_for_quiet to determine if the IC has recovered from stressing.
+# The suite will wait between two benchmarking iterations until the HTTP request rate is below this value.
+DEFAULT_QUIET_RATE_RPS = 2
 
 
 class WorkloadExperiment(base_experiment.BaseExperiment):
@@ -43,11 +61,18 @@ class WorkloadExperiment(base_experiment.BaseExperiment):
 
     def __init__(self, num_workload_gen=NUM_WORKLOAD_GEN, request_type="query"):
         """Init."""
+        self.num_workload_gen = num_workload_gen
+
         super().__init__(request_type)
 
         self.wg_testnet = FLAGS.wg_testnet
+        self.quiet_rate_rps = DEFAULT_QUIET_RATE_RPS
         self.use_updates = FLAGS.use_updates
-        self.num_workload_gen = num_workload_gen
+        if self.use_updates:
+            self.request_type = "call"
+        self.experiment_initialized = False
+        self.kill_pids = []
+        print(f"Update calls: {self.use_updates} {self.request_type}")
 
         print(
             (
@@ -55,18 +80,58 @@ class WorkloadExperiment(base_experiment.BaseExperiment):
                 f" with workload generators on {self.wg_testnet} subnet {FLAGS.wg_subnet}"
             )
         )
+        self.init()
+
+    def get_mainnet_targets(self) -> List[str]:
+        """Get target if running in mainnet."""
+        # If we want boundary nodes, we can see here:
+        # https://prometheus.testnet.dfinity.network/graph?g0.expr=nginx_up&g0.tab=1&g0.stacked=0&g0.range_input=1h
+        r = json.loads(self._get_subnet_info(FLAGS.mainnet_target_subnet_id))
+        node_ips = []
+        for node_id in r["records"][0]["value"]["membership"]:
+            node_ips.append(self.get_node_ip_address(node_id))
+        if self.request_type == "call" or FLAGS.target_all:
+            return node_ips
+        else:
+            return [node_ips[FLAGS.query_target_node_idx]]
 
     def init(self):
         """More init."""
-        self.target_nodes = self.get_mainnet_targets() if self.testnet == "mercury" else self.__get_targets()
-        super().init()
+        self.target_nodes = self.__get_targets()
 
-        workload_generator_machines = (
-            FLAGS.workload_generator_machines.split(",")
-            if len(FLAGS.workload_generator_machines) > 0
-            else self.get_hostnames(FLAGS.wg_subnet)
-        )
-        if self.num_workload_gen > len(workload_generator_machines):
+        # Determine which machines run workload generators.
+        # For that, we need to query the NNS of the workload generator subnetwork
+        if len(FLAGS.workload_generator_machines) > 0:
+            workload_generator_machines = FLAGS.workload_generator_machines.split(",")
+        else:
+            wg_testnet_nns_host = random.choice(
+                ansible.get_ansible_hostnames_for_subnet(FLAGS.wg_testnet, base_experiment.NNS_SUBNET_INDEX, sort=False)
+            )
+
+            if FLAGS.wg_testnet != FLAGS.testnet:
+                # In case wg_testnet and testnet are different, we can use all app-subnet hosts as workload generators
+                workload_generator_machines = self.get_app_subnet_hostnames(f"http://[{wg_testnet_nns_host}]:8080")
+                print(
+                    (
+                        f"Selecting workload generator machines from all subnets {wg_testnet_nns_host}: "
+                        f"{workload_generator_machines}"
+                    )
+                )
+            else:
+                workload_generator_machines = self.get_app_subnet_hostnames(
+                    f"http://[{wg_testnet_nns_host}]:8080", FLAGS.wg_subnet
+                )
+                print(
+                    (
+                        f"Selecting workload generator machines from {wg_testnet_nns_host} on subnet {FLAGS.wg_subnet}: "
+                        f"{workload_generator_machines}"
+                    )
+                )
+
+        if workload_generator_machines is None:
+            raise Exception(f"Could not find any machines in subnet {FLAGS.wg_subnet} in {FLAGS.wg_testnet}")
+
+        if self.num_workload_gen > 0 and self.num_workload_gen > len(workload_generator_machines):
             raise Exception(
                 colored(
                     (
@@ -78,37 +143,68 @@ class WorkloadExperiment(base_experiment.BaseExperiment):
                 "red",
             )
 
-        self.machines = workload_generator_machines[: self.num_workload_gen]
+        if self.num_workload_gen > 0:
+            self.machines = workload_generator_machines[: self.num_workload_gen]
+        else:
+            self.machines = workload_generator_machines
+
         self.subnet_id = (
-            FLAGS.target_subnet_id
-            if FLAGS.target_subnet_id is not None and len(FLAGS.target_subnet_id) > 0
+            FLAGS.mainnet_target_subnet_id
+            if FLAGS.mainnet_target_subnet_id is not None and len(FLAGS.mainnet_target_subnet_id) > 0
             else self.__get_subnet_for_target()
         )
 
+        assert len(self.machines) > 0
         print(f"Running against an IC {self.target_nodes} from {self.machines}")
+
+        super().init()
+        self.init_experiment()
 
     def init_experiment(self):
         """Initialize the experiment."""
+        if self.experiment_initialized:
+            raise Exception("Experiment is already initialized")
+        self.experiment_initialized = True
         if not self.__check_workload_generator_installed(self.machines):
             rcs = self.__install_workload_generator(self.machines)
             if not rcs == [0 for _ in range(len(self.machines))]:
                 raise Exception(f"Failed to install workload generators, return codes are {rcs}")
         else:
             print(f"Workload generator already installed on {self.machines}")
-        self._turn_off_replica(self.machines)
         self.__kill_workload_generator(self.machines)
         super().init_experiment()
 
     def __kill_workload_generator(self, machines):
         """Kill all workload generators on the given machine."""
-        ssh.run_ssh_in_parallel(machines, "kill $(pidof ic-workload-generator) || true")
+        self.kill_pids = ssh.spawn_ssh_in_parallel(
+            machines,
+            "sudo systemctl stop ic-replica",
+            f_stdout=tempfile.NamedTemporaryFile().name,
+            f_stderr=tempfile.NamedTemporaryFile().name,
+        )
+        for _, s in self.kill_pids:
+            s.wait()
+        self.kill_pids = []
+
+    def __restart_services(self, machines):
+        """Kill all workload generators on the given machine."""
+        print("Removed for now")
+
+    def end_experiment(self):
+        self.__restart_services(self.machines)
+        super().end_experiment()
 
     def __check_workload_generator_installed(self, machines):
         """Check if the workload generator is already installed on the given machines."""
         if len(FLAGS.workload_generator_path) > 0:
             print("Reinstalling workload generators since using locally built workload generator")
             return False
-        r = ssh.run_ssh_in_parallel(machines, "stat ./ic-workload-generator")
+        r = ssh.run_ssh_in_parallel(
+            machines,
+            "stat ./ic-workload-generator",
+            f_stdout=tempfile.NamedTemporaryFile().name,
+            f_stderr=tempfile.NamedTemporaryFile().name,
+        )
         return r == [0 for _ in machines]
 
     def __install_workload_generator(self, machines):
@@ -117,15 +213,17 @@ class WorkloadExperiment(base_experiment.BaseExperiment):
         destinations = ["admin@[{}]:".format(m) for m in machines]
         sources = [self.workload_generator_path for _ in machines]
         r = ssh.scp_in_parallel(sources, destinations)
-        ssh.run_ssh_in_parallel(machines, "chmod a+x ic-workload-generator")
+        ssh.run_ssh_in_parallel(machines, "chmod a+x ic-workload-generator; ulimit -S -n 4096")
 
         return r
 
     def __get_subnet_for_target(self):
         """Determine the subnet ID of the node we are targeting."""
-        if len(FLAGS.target_subnet_id) > 0:
-            return FLAGS.target_subnet_id
         target = self.target_nodes[0]
+        key = f"subnet_for_target_{target}"
+        cached = self.from_cache(key)
+        if cached is not None:
+            return cached
         res = subprocess.check_output(
             [self._get_ic_admin_path(), "--nns-url", self._get_nns_url(), "get-subnet-list"], encoding="utf-8"
         )
@@ -134,17 +232,9 @@ class WorkloadExperiment(base_experiment.BaseExperiment):
             r = json.loads(self._get_subnet_info(subnet))
             for node_id in r["records"][0]["value"]["membership"]:
                 if self.get_node_ip_address(node_id) == target:
-                    print(
-                        colored(
-                            (
-                                f"Node {target} is in subnet {subnet} "
-                                f"(to speed up suite for this deployment in the future, use --target_subnet_id={subnet})"
-                            ),
-                            "yellow",
-                        )
-                    )
+                    self.store_cache(key, subnet)
                     return subnet
-        raise Exception("Could not find subnet for benchmark target")
+        raise Exception(f"Could not find subnet for {target} benchmark target")
 
     def get_machine_to_instrument(self):
         """Instrument the machine that we target the load for."""
@@ -159,6 +249,9 @@ class WorkloadExperiment(base_experiment.BaseExperiment):
         if len(FLAGS.targets) > 0:
             return FLAGS.targets.split(",")
 
+        if self.testnet == "mercury":
+            return self.get_mainnet_targets()
+
         node_ips = self.get_hostnames(FLAGS.subnet)
 
         if self.request_type == "call" or FLAGS.target_all:
@@ -166,18 +259,18 @@ class WorkloadExperiment(base_experiment.BaseExperiment):
         else:
             return [node_ips[FLAGS.query_target_node_idx]]
 
-    def __wait_for_quiet(self, max_num_iterations: int = 60, quiet_rate_rps: int = 2, sleep_per_iteration_s: int = 10):
+    def __wait_for_quiet(self, max_num_iterations: int = 60, sleep_per_iteration_s: int = 10):
         """
-        Wait until target subnetwork recovered.
+        Wait until target subnetwork recovered by observing the HTTP request rate.
 
-        Wait until the HTTP request rate reported by replicas is below quiet_rate_rps.
+        Wait until the HTTP request rate reported by replicas is below self.quiet_rate_rps.
         Sleep sleep_per_iteration_s seconds after each check. Check at most
         max_num_iterations times and return unconditionally once reached.
         """
         recovered = False
         curr_i = 0
 
-        if FLAGS.no_instrument or FLAGS.no_prometheus:
+        if FLAGS.no_prometheus:
             time.sleep(60)
             return
 
@@ -191,11 +284,11 @@ class WorkloadExperiment(base_experiment.BaseExperiment):
                 print(
                     (
                         f"{curr_i}/{max_num_iterations} Current mean HTTP rate of {self.testnet} "
-                        f"{rate_rps} (want < {quiet_rate_rps})"
+                        f"{rate_rps} (want < {self.quiet_rate_rps})"
                     )
                 )
 
-                if rate_rps <= quiet_rate_rps:
+                if rate_rps <= self.quiet_rate_rps:
                     recovered = True
 
             except Exception as ex:
@@ -211,16 +304,29 @@ class WorkloadExperiment(base_experiment.BaseExperiment):
         since_time = self.t_iter_end - self.t_iter_start
         self.get_iter_logs_from_targets(self.target_nodes, f"-{since_time}", self.iter_outdir)
 
+    def __wait_kill(self):
+        """Wait for previously asynchronously started processes that kill running workload generator instances."""
+        print(f"Waiting for previous workload generator kill commands: {self.kill_pids}")
+        for (machine, p) in self.kill_pids:
+            p.wait()
+        self.kill_pids = []
+
+    def __del__(self):
+        """Make sure all asynchronously spawned processes are terminated."""
+        self.__wait_kill()
+
     def start_iteration(self):
         """Start a new iteration of the experiment."""
+        self.__wait_kill()
+
         super().start_iteration()
         self.__wait_for_quiet()
 
     def __get_mainnet_target(self) -> List[str]:
         """Get target if running in mainnet."""
         # If we want boundary nodes, we can see here:
-        # http://prometheus.dfinity.systems:9090/graph?g0.expr=nginx_up&g0.tab=1&g0.stacked=0&g0.range_input=1h
-        r = json.loads(self._get_subnet_info(FLAGS.target_subnet_id))
+        # https://prometheus.testnet.dfinity.network/graph?g0.expr=nginx_up&g0.tab=1&g0.stacked=0&g0.range_input=1h
+        r = json.loads(self._get_subnet_info(FLAGS.mainnet_target_subnet_id))
         node_ips = []
         for node_id in r["records"][0]["value"]["membership"]:
             node_ips.append(self.get_node_ip_address(node_id))
@@ -236,89 +342,79 @@ class WorkloadExperiment(base_experiment.BaseExperiment):
         requests_per_second,
         canister_ids=None,
         duration=300,
-        outdir=None,
         payload=None,
         method=None,
         call_method=None,
         arguments=[],
     ):
         """Run the workload generator on all given machines."""
+        assert (
+            len(self.kill_pids) == 0
+        ), "Some previous commands to kill workload generators has not been completed when attempting to start new ones. This might lead to races. Make sure to start an iteration via start_iteration() before calling run_workload_generator()"
         if canister_ids is None:
-            canister_ids = self.canister_ids
-
-        assert requests_per_second % self.num_workload_gen == 0
-        rps_per_machine = int(requests_per_second / self.num_workload_gen)
+            canister_ids = self.get_canister_ids()
 
         print("Got targets: ", targets)
-        target_list = ",".join(f"http://[{target}]:8080" for target in targets)
         print("Running against target_list")
 
-        curr_outdir = self.out_dir if outdir is None else outdir
-        cmd = (
-            f'./ic-workload-generator "{target_list}" --summary-file wg_summary'
-            f" -n {duration} -r {rps_per_machine} -p 9090 --no-status-check"
+        curr_outdir = self.iter_outdir
+        f_stdout = os.path.join(curr_outdir, "workload-generator-%s-{}.stdout.txt" % uuid.uuid4())
+        f_stderr = os.path.join(curr_outdir, "workload-generator-%s-{}.stderr.txt" % uuid.uuid4())
+
+        print(f"Running on {targets}")
+        workload_description = workload.WorkloadDescription(
+            canister_ids,
+            method,
+            call_method,
+            requests_per_second,
+            duration,
+            payload,
+            None,
+            arguments,
+            0,
+            1.0,
+            -1,
         )
-        cmd += " " + " ".join(arguments)
-
-        # Dump worklod generator command in output directory.
-        if payload is not None:
-            cmd += " --payload '{}'".format(payload.decode("utf-8"))
-        if method is not None:
-            cmd += " -m {}".format(method)
-        if call_method is not None:
-            cmd += ' --call-method "{}"'.format(call_method)
-
-        commands = [
-            "{} --canister-id {}".format(cmd, canister_ids[i % len(canister_ids)]) for i in range(len(machines))
-        ]
+        load = workload.Workload(
+            machines,
+            targets,
+            workload_description,
+            0,
+            self.iter_outdir,
+            f_stdout,
+            f_stderr,
+        )
+        commands = load.get_commands()
 
         n = 0
-        while n >= 0:
+        while True:
             n += 1
             try:
                 filename = os.path.join(self.iter_outdir, f"workload-generator-cmd-{n}")
+                # Try to open file in exclusive mode
                 with open(filename, "x") as cmd_file:
-                    for cmd in commands:
-                        cmd_file.write(cmd + "\n")
-                n = -1
+                    for cmd, generator in zip(commands, machines):
+                        cmd_file.write(generator + ":" + cmd + "\n")
+                break
             except FileExistsError:
-                print("Failed to open - file already exists")
+                print(f"Failed to open - file {filename} already exists, trying next sequential file name.")
 
         print(f"🚚  Running workload generator with {commands}")
-
-        f_stdout = os.path.join(curr_outdir, "workload-generator-{}.stdout.txt")
-        f_stderr = os.path.join(curr_outdir, "workload-generator-{}.stderr.txt")
-
-        # Set timeout to 2 + len(targets) of the duration.
-        # E.g. timeout will linearly increase as target machines number incrase
-        # Wait at least 120s, as there is a potentially high startup overhead for super-small
-        # workloads.
-        timeout = max((len(targets) / 10 + 2) * duration, 120)
-        print(f"Setting workload generator timeout to: {timeout}")
-        ssh.run_all_ssh_in_parallel(machines, commands, f_stdout, f_stderr, timeout)
+        load.start()
+        load.join()
 
         print("Fetching workload generator results")
-
-        sources = ["admin@[{}]:wg_summary".format(m) for m in machines]
-        destinations = ["{}/summary_machine_{}".format(curr_outdir, m.replace(":", "_")) for m in machines]
-
-        rc = ssh.scp_in_parallel(sources, destinations)
-        if not rc == [0 for _ in range(len(sources))]:
-            print(colored("⚠️  Some workload generators failed:", "red"))
-            for fname in os.listdir(curr_outdir):
-                if re.match("workload-generator.*stderr.*", fname):
-                    with open(os.path.join(curr_outdir, fname)) as ferr:
-                        lines = ferr.read().split("\n")
-                        print("\n".join(lines[-10:]))
+        destinations = load.fetch_results()
 
         print("Evaluating results from {} machines".format(len(destinations)))
         return report.evaluate_summaries(destinations)
 
-    def __build_summary_file(self):
+    def _build_summary_file(self):
         """Build dictionary used to render summary file for report."""
         return {
             "wg_testnet": self.wg_testnet,
             "load_generator_machines": self.machines,
             "target_machines": self.target_nodes,
             "subnet_id": self.subnet_id,
+            "canister_ids": ",".join(self.canister_ids),
         }

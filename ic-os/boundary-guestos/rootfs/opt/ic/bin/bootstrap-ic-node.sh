@@ -58,14 +58,26 @@ function process_bootstrap() {
     tar xf "${BOOTSTRAP_TAR}" -C "${TMPDIR}"
 
     # stash a couple of things away to config store
-    for FILE in journalbeat.conf network.conf nns.conf nns_public_key.pem; do
+    FILES=(
+        bn_vars.conf network.conf nns.conf
+        nns_public_key.pem denylist.map prober_identity.pem
+        certificate_issuer.conf certificate_issuer_identity.pem certificate_issuer_enc_key.pem
+    )
+    for FILE in ${FILES[@]}; do
         if [ -e "${TMPDIR}/${FILE}" ]; then
             echo "Setting up ${FILE}"
             cp "${TMPDIR}/${FILE}" "${CONFIG_ROOT}/${FILE}"
         fi
     done
 
-    for DIR in accounts_ssh_authorized_keys certs; do
+    DIRS=(
+        accounts_ssh_authorized_keys
+        buildinfo
+        certs
+        geolite2_dbs
+    )
+
+    for DIR in "${DIRS[@]}"; do
         if [ -e "${TMPDIR}/${DIR}" ]; then
             echo "Setting up ${DIR}"
             cp -r "${TMPDIR}/${DIR}" "${CONFIG_ROOT}/${DIR}"

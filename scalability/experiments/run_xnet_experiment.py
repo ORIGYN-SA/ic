@@ -28,17 +28,12 @@ FLAGS = gflags.FLAGS
 gflags.DEFINE_integer("num_canisters_per_subnet", 5, "Number of canisters per subnetwork")
 
 # Configuration for load
-gflags.DEFINE_integer("iter_duration", 600, "Duration of each iteration of the Xnet benchmark")
 gflags.DEFINE_integer("payload_size", 1024, "Payload size for Xnet messages")
-gflags.DEFINE_integer("initial_rate", 500, "Initial total rate at which to send Xnet messages")
-gflags.DEFINE_integer("rate_increment", 250, "Increment for total rate in each iteration")
-gflags.DEFINE_integer("max_iterations", 25, "Maximum number of iterations")
-
 gflags.DEFINE_float("max_error_rate", 0.05, "Maximum number of failed Xnet messages accepted per iteration.")
 gflags.DEFINE_float("max_seq_errors", 0.0, "Maximum number of sequence errors to accept for iteration.")
 gflags.DEFINE_float("min_send_rate", 0.3, "Minimum send rate accepted for success of iteration.")
 gflags.DEFINE_integer("target_latency_secs", 40, "Targeted latency of Xnet requests.")
-
+gflags.DEFINE_integer("target_rps", 500, "Target total rate at which to send Xnet messages.")
 gflags.DEFINE_integer(
     "tests_first_subnet_index",
     1,
@@ -55,12 +50,7 @@ class XnetExperiment(base_experiment.BaseExperiment):
     def __init__(self):
         """Construct Xnet experiment."""
         super().__init__()
-        self.init()
-        self.init_experiment()
-        self.canister = CANISTER
-
-    def init_experiment(self):
-        """Install counter canister."""
+        super().init()
         super().init_experiment()
 
         self.host_each_subnet = []
@@ -99,7 +89,7 @@ class XnetExperiment(base_experiment.BaseExperiment):
         for (hostname, canister_id) in zip(hostnames, canister_ids):
             while True:
                 try:
-                    agent = misc.get_anonymous_agent(hostname)
+                    agent = misc.get_agent(hostname)
                     response = agent.update_raw(canister_id, "stop", encode([]), schema)
                     canister_state = response[0]["value"]
                     assert canister_state == "stopped"
@@ -220,8 +210,9 @@ class XnetExperiment(base_experiment.BaseExperiment):
 
         results = {}
         for (hostname, canister_id) in zip(hostnames, canister_ids):
-            agent = misc.get_anonymous_agent(hostname)
+            agent = misc.get_agent(hostname)
             req = agent.query_raw(canister_id, "metrics", encode([]), schema)
+            assert canister_id not in results  # We query each canister only once
             results[canister_id] = req[0]["value"]
         return results
 
@@ -237,7 +228,7 @@ class XnetExperiment(base_experiment.BaseExperiment):
 
             while True:
                 try:
-                    agent = misc.get_anonymous_agent(hostname)
+                    agent = misc.get_agent(hostname)
                     params = [
                         {"type": Types.Vec(Types.Vec(Types.Vec(Types.Nat8))), "value": topology},
                         {"type": Types.Nat64, "value": subnet_to_subnet_rate},
@@ -286,10 +277,14 @@ class XnetExperiment(base_experiment.BaseExperiment):
 
         # Get metrics
         # --------------------------------------------------
-        results = {}
+        metrics = {}
         for hostname, canisters in self.canisters_per_host.items():
-            results.update(XnetExperiment.metrics([hostname for _ in canisters], canisters))
-        # print(results)
+            new = XnetExperiment.metrics([hostname for _ in canisters], canisters)
+            assert len(new.keys()) + len(metrics.keys()) == len(
+                (new.keys() | metrics.keys())
+            ), "Metrics contain duplicate keys (overwriting each other)"
+            metrics.update(new)
+        print(metrics)
 
         # Get Prometheus metrics
         # --------------------------------------------------
@@ -299,7 +294,7 @@ class XnetExperiment(base_experiment.BaseExperiment):
             with open(os.path.join(self.iter_outdir, "xnet-stream-size.json"), "w") as iter_file:
                 iter_file.write(out)
 
-        return results
+        return metrics
 
     def parse(path: str):
         """Parse the given json file containing Prometheus xnet-stream data."""
@@ -320,41 +315,39 @@ class XnetExperiment(base_experiment.BaseExperiment):
 
 
 if __name__ == "__main__":
-    misc.parse_command_line_args()
-
     exp = XnetExperiment()
-    exp.init()
 
-    exp.start_experiment()
+    total_rate = FLAGS.target_rps
+    subnet_to_subnet_rate = int(math.ceil(FLAGS.target_rps / (exp.num_subnets - 1)))
+    canister_to_subnet_rate = int(math.ceil(subnet_to_subnet_rate / FLAGS.num_canisters_per_subnet))
+    print(
+        f"🚀 Running with total rate of {total_rate} ({subnet_to_subnet_rate} per subnet, {canister_to_subnet_rate} per canister)"
+    )
 
-    max_capacity = None
+    config = {
+        "duration": FLAGS.iter_duration,
+        "payload_size": FLAGS.payload_size,
+        "num_subnets": exp.num_subnets,
+        "total_rate": total_rate,
+        "subnet_to_subnet_rate": subnet_to_subnet_rate,
+        "canister_to_subnet_rate": canister_to_subnet_rate,
+    }
 
-    for i in range(FLAGS.max_iterations):
-
-        total_rate = FLAGS.initial_rate + i * FLAGS.rate_increment
-        subnet_to_subnet_rate = int(math.ceil(total_rate / (exp.num_subnets - 1)))
-        canister_to_subnet_rate = int(math.ceil(subnet_to_subnet_rate / FLAGS.num_canisters_per_subnet))
-        print(
-            f"🚀 Running iteration {i} with total rate of {total_rate} ({subnet_to_subnet_rate} per subnet, {canister_to_subnet_rate} per canister)"
-        )
-
-        config = {
-            "duration": FLAGS.iter_duration,
-            "payload_size": FLAGS.payload_size,
-            "num_subnets": exp.num_subnets,
-            "total_rate": total_rate,
-            "subnet_to_subnet_rate": subnet_to_subnet_rate,
-            "canister_to_subnet_rate": canister_to_subnet_rate,
-        }
-
-        metrics = exp.run_experiment(config)
-
-        if exp.run_accepted(metrics, config):
-            max_capacity = total_rate
+    metrics = exp.run_experiment(config)
+    output = exp.run_accepted(metrics, config)
 
     exp.write_summary_file(
         "run_xnet_experiment",
-        {"rps": [FLAGS.payload_size]},
+        {
+            "rps": total_rate,
+            "rps_max": total_rate,
+            "iter_duration": config["duration"],
+            "metrics": metrics,
+            "target_load": FLAGS.target_rps,
+            "t_median": 0,  # TODO correction
+            "failure_rate": 0,  # TODO correction
+            "is_update": True,
+        },
         [FLAGS.payload_size],
         "payload size [bytes]",
     )
