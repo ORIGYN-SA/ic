@@ -1,4 +1,5 @@
 use dfn_core::api::now;
+use candid::CandidType;
 use ic_base_types::{CanisterId, PrincipalId};
 use ic_icrc1::Account;
 use ic_ledger_canister_core::archive::ArchiveCanisterWasm;
@@ -59,6 +60,18 @@ fn unknown_token() -> String {
     "???".to_string()
 }
 
+/// Argument taken by get_admin_dfx endpoint
+#[derive(Serialize, Deserialize, CandidType, Clone, Hash, Debug, PartialEq, Eq)]
+pub struct GetAdminArgs {}
+
+/// Argument taken by tip_of_chain_dfx endpoint
+#[derive(Serialize, Deserialize, CandidType, Clone, Hash, Debug, PartialEq, Eq)]
+pub struct GetSendWhitelistArgs {}
+
+/// Argument taken by tip_of_chain_dfx endpoint
+#[derive(Serialize, Deserialize, CandidType, Clone, Hash, Debug, PartialEq, Eq)]
+pub struct GetMintingAccountArgs {}
+
 #[derive(Serialize, Deserialize, Debug)]
 pub struct Ledger {
     pub balances: LedgerBalances,
@@ -85,6 +98,11 @@ pub struct Ledger {
     transactions_by_height: VecDeque<TransactionInfo<Transaction>>,
     /// Used to prevent non-whitelisted canisters from sending tokens
     send_whitelist: HashSet<CanisterId>,
+
+    /// Used to allow sending from passthrough standard canisters
+    #[serde(default)]
+    standard_whitelist: HashSet<CanisterId>,
+    
     /// Maximum number of transactions which ledger will accept
     /// within the transaction_window.
     #[serde(default = "default_max_transactions_in_window")]
@@ -99,6 +117,9 @@ pub struct Ledger {
     /// Token name
     #[serde(default = "unknown_token")]
     pub token_name: String,
+
+    /// Used to set send_whitelist
+    pub admin: PrincipalId,
 }
 
 impl LedgerData for Ledger {
@@ -188,10 +209,12 @@ impl Default for Ledger {
             transactions_by_hash: BTreeMap::new(),
             transactions_by_height: VecDeque::new(),
             send_whitelist: HashSet::new(),
+            standard_whitelist: HashSet::new(),
             max_transactions_in_window: Self::DEFAULT_MAX_TRANSACTIONS_IN_WINDOW,
             transfer_fee: DEFAULT_TRANSFER_FEE,
             token_symbol: unknown_token(),
             token_name: unknown_token(),
+            admin: PrincipalId::new_anonymous(),
         }
     }
 }
@@ -382,6 +405,93 @@ impl Ledger {
             transfer_fee: self.transfer_fee,
         }
     }
+    
+
+    pub fn is_standard(&self, _principal_id: &PrincipalId) -> bool {
+        LEDGER
+            .read()
+            .unwrap()
+            .standard_whitelist
+            .contains(&CanisterId::new(*_principal_id).unwrap())
+    }
+
+    /// Check if it's allowed to notify this canister
+    /// Currently we reuse whitelist for that
+    pub fn set_send_whitelist(&mut self, new_send_whitelist: HashSet<CanisterId>) {
+        self.send_whitelist = new_send_whitelist;
+    }
+
+    pub fn set_standard_whitelist(&mut self, new_standard_whitelist: HashSet<CanisterId>) {
+        self.standard_whitelist = new_standard_whitelist;
+    }
+    pub fn get_send_whitelist(&self) -> HashSet<CanisterId> {
+        self.send_whitelist.clone() // .into_iter().collect()
+    }
+
+    pub fn get_standard_whitelist(&self) -> HashSet<CanisterId> {
+        self.standard_whitelist.clone() // .into_iter().collect()
+    }
+
+    pub fn set_minting_account_id(&mut self, new_minting_account: AccountIdentifier) {
+        self.minting_account_id = Some(new_minting_account);
+    }
+
+    pub fn get_minting_account_id(&self) -> Option<AccountIdentifier> {
+        self.minting_account_id
+    }
+
+    pub fn get_admin(&self) -> PrincipalId {
+        self.admin
+    }
+
+    pub fn set_admin(&mut self, new_admin: PrincipalId) {
+        self.admin = new_admin;
+    }
+
+    pub fn is_admin(&self, _principal_id: &PrincipalId) -> bool {
+        self.admin == *_principal_id
+    }
+}
+
+pub fn set_send_whitelist(new_send_whitelist: HashSet<CanisterId>) {
+    LEDGER
+        .write()
+        .unwrap()
+        .set_send_whitelist(new_send_whitelist)
+}
+
+pub fn set_standard_whitelist(new_standard_whitelist: HashSet<CanisterId>) {
+    LEDGER
+        .write()
+        .unwrap()
+        .set_standard_whitelist(new_standard_whitelist)
+}
+
+pub fn get_send_whitelist() -> HashSet<CanisterId> {
+    LEDGER.read().unwrap().get_send_whitelist()
+}
+
+pub fn get_standard_whitelist() -> HashSet<CanisterId> {
+    LEDGER.read().unwrap().get_standard_whitelist()
+}
+
+pub fn get_admin() -> PrincipalId {
+    LEDGER.read().unwrap().get_admin()
+}
+
+pub fn set_minting_account_id(new_minting_account: AccountIdentifier) {
+    LEDGER
+        .write()
+        .unwrap()
+        .set_minting_account_id(new_minting_account)
+}
+
+pub fn set_admin(new_admin: PrincipalId) {
+    LEDGER.write().unwrap().set_admin(new_admin)
+}
+
+pub fn get_minting_account_id() -> Option<AccountIdentifier> {
+    LEDGER.read().unwrap().get_minting_account_id()
 }
 
 pub fn add_payment(

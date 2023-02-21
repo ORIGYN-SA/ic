@@ -31,7 +31,7 @@ use icp_ledger::{
     TipOfChainRes, TotalSupplyArgs, Transaction, TransferArgs, TransferError, TransferFee,
     TransferFeeArgs, MAX_BLOCKS_PER_REQUEST,
 };
-use ledger_canister::{Ledger, LEDGER, MAX_MESSAGE_SIZE_BYTES};
+use ledger_canister::{Ledger, LEDGER, MAX_MESSAGE_SIZE_BYTES, GetMintingAccountArgs, GetSendWhitelistArgs, GetAdminArgs};
 use num_traits::cast::ToPrimitive;
 use std::cell::RefCell;
 use std::{
@@ -643,6 +643,10 @@ fn post_upgrade() {
             .expect("Decoding stable memory failed");
 
         ledger.maximum_number_of_accounts = 28_000_000;
+        //Force token data to OGY
+        ledger.token_symbol = "OGY".to_string();
+        ledger.token_name = "Origyn".to_string();
+        ledger.transfer_fee = Tokens::from_e8s(200_000);
 
         set_certified_data(
             &ledger
@@ -985,6 +989,145 @@ fn get_blocks_() {
         let blockchain = &LEDGER.read().unwrap().blockchain;
         let start_offset = blockchain.num_archived_blocks();
         icp_ledger::get_blocks(&blockchain.blocks, start_offset, start, length)
+    });
+}
+
+async fn _get_block_dfx(block_height: u64) -> Result<Result<Block, CanisterId>, String> {
+    use dfn_core::api::{call_with_cleanup};
+    let raw_block: EncodedBlock =
+        match block(block_height).unwrap_or_else(|| panic!("Block {} not found", block_height)) {
+            Ok(raw_block) => raw_block,
+            Err(cid) => {
+                print(format!(
+                    "Searching canister {} for block {}",
+                    cid, block_height
+                ));
+                // Lookup the block on the archive
+                let BlockRes(res) = call_with_cleanup(cid, "get_block_pb", protobuf, block_height)
+                    .await
+                    .map_err(|e| format!("Failed to fetch block {}", e.1))?;
+                res.ok_or("Block not found")?
+                    .map_err(|c| format!("Tried to redirect lookup a second time to {}", c))?
+            }
+        };
+
+    let block = Block::decode(raw_block).unwrap();
+
+    Ok(Ok(block))
+}
+
+#[export_name = "canister_update update_archive_option"]
+fn update_archive_option() {
+    over(candid_one, |options| {
+        let ledger_guard = LEDGER.write().expect("Failed to get ledger write lock");
+
+        let caller_principal_id = caller();
+        if !ledger_guard.is_admin(&caller_principal_id) {
+            panic!("Not authorized {}", caller_principal_id);
+        };
+
+        let mut archive_guard = ledger_guard.blockchain.archive.write().unwrap();
+
+        (*archive_guard)
+            .as_mut()
+            .map(|archive| archive.update_archive_option(options));
+        print("[Ledger] update archive options done.");
+    });
+}
+
+async fn set_send_whitelist(new_send_whitelist: HashSet<CanisterId>) {
+    let caller_principal_id = caller();
+
+    if !LEDGER.read().unwrap().is_admin(&caller_principal_id) {
+        panic!("Not authorized {}", caller_principal_id);
+    };
+
+    ledger_canister::set_send_whitelist(new_send_whitelist);
+    ()
+}
+
+async fn set_standard_whitelist(new_standard_whitelist: HashSet<CanisterId>) {
+    let caller_principal_id = caller();
+
+    if !LEDGER.read().unwrap().is_admin(&caller_principal_id) {
+        panic!("Not authorized {}", caller_principal_id);
+    };
+
+    ledger_canister::set_standard_whitelist(new_standard_whitelist);
+    ()
+}
+
+async fn set_admin(new_admin: PrincipalId) {
+    let caller_principal_id = caller();
+
+    if !LEDGER.read().unwrap().is_admin(&caller_principal_id) {
+        panic!("Not authorized {}", caller_principal_id);
+    };
+
+    ledger_canister::set_admin(new_admin);
+    ()
+}
+
+#[export_name = "canister_update set_standard_whitelist_dfx"]
+fn set_standard_whitelist_dfx_() {
+    over_async(candid_one, |new_standard_whitelist: HashSet<CanisterId>| {
+        set_standard_whitelist(new_standard_whitelist)
+    });
+}
+
+#[export_name = "canister_update set_admin_dfx"]
+fn set_admin_dfx_() {
+    over_async(candid_one, |new_admin: PrincipalId| set_admin(new_admin));
+}
+
+#[export_name = "canister_query get_send_whitelist_dfx"]
+fn get_send_whitelist_dfx_() {
+    over(candid_one, |GetSendWhitelistArgs {}| {
+        ledger_canister::get_send_whitelist()
+    });
+}
+
+#[export_name = "canister_query get_standard_whitelist_dfx"]
+fn get_standard_whitelist_dfx_() {
+    over(candid_one, |GetSendWhitelistArgs {}| {
+        ledger_canister::get_standard_whitelist()
+    });
+}
+
+#[export_name = "canister_query get_admin_dfx"]
+fn get_admin_dfx_() {
+    over(candid_one, |GetAdminArgs {}| ledger_canister::get_admin());
+}
+
+async fn set_minting_account_id(new_minting_account: AccountIdentifier) {
+    let caller_principal_id = caller();
+
+    if !LEDGER.read().unwrap().is_admin(&caller_principal_id) {
+        panic!("Not authorized {}", caller_principal_id);
+    };
+
+    ledger_canister::set_minting_account_id(new_minting_account);
+    ()
+}
+
+#[export_name = "canister_update set_send_whitelist_dfx"]
+fn set_send_whitelist_dfx_() {
+    over_async(candid_one, |new_send_whitelist: HashSet<CanisterId>| {
+        set_send_whitelist(new_send_whitelist)
+    });
+}
+
+#[export_name = "canister_update set_minting_account_id_dfx"]
+fn set_minting_account_dfx_() {
+    over_async(candid_one, |new_minting_account: AccountIdentifier| {
+        set_minting_account_id(new_minting_account)
+    });
+}
+
+#[export_name = "canister_query get_minting_account_id_dfx"]
+fn get_minting_account_dfx_() {
+    over(candid_one, |GetMintingAccountArgs {}| {
+        ledger_canister::get_minting_account_id()
     });
 }
 
