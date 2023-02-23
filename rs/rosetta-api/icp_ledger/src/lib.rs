@@ -481,6 +481,54 @@ pub struct TransferArgs {
     pub created_at_time: Option<TimeStamp>,
 }
 
+/// Argument taken by the transfer_standard_stdleg endpoint
+#[derive(Serialize, Deserialize, CandidType, Clone, Hash, Debug, PartialEq, Eq)]
+pub struct TransferStandardArgs {
+    pub memo: Memo,
+    pub amount: Tokens,
+    pub fee: Tokens,
+    pub from_principal: PrincipalId,
+    pub from_subaccount: Option<Subaccount>,
+    pub to: AccountIdBlob,
+    pub created_at_time: Option<TimeStamp>,
+}
+
+impl From<SendStandardArgs> for TransferStandardArgs {
+    fn from(
+        SendStandardArgs {
+            memo,
+            amount,
+            fee,
+            from_principal,
+            from_subaccount,
+            to,
+            created_at_time,
+        }: SendStandardArgs,
+    ) -> Self {
+        Self {
+            memo,
+            amount,
+            fee,
+            from_principal,
+            from_subaccount,
+            to: to.to_address(),
+            created_at_time,
+        }
+    }
+}
+
+/// Argument taken by the send endpoint
+#[derive(Serialize, Deserialize, CandidType, Clone, Hash, Debug, PartialEq, Eq)]
+pub struct SendStandardArgs {
+    pub memo: Memo,
+    pub amount: Tokens,
+    pub fee: Tokens,
+    pub from_principal: PrincipalId,
+    pub from_subaccount: Option<Subaccount>,
+    pub to: AccountIdentifier,
+    pub created_at_time: Option<TimeStamp>,
+}
+
 #[derive(Serialize, Deserialize, CandidType, Clone, Debug, PartialEq, Eq)]
 pub enum TransferError {
     BadFee { expected_fee: Tokens },

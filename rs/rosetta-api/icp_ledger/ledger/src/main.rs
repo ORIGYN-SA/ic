@@ -27,8 +27,8 @@ use icp_ledger::{
     protobuf, tokens_into_proto, AccountBalanceArgs, AccountIdentifier, ArchiveInfo,
     ArchivedBlocksRange, Archives, BinaryAccountBalanceArgs, Block, BlockArg, BlockRes,
     CandidBlock, Decimals, GetBlocksArgs, IterBlocksArgs, LedgerCanisterInitPayload, Memo, Name,
-    Operation, PaymentError, QueryArchiveFn, QueryBlocksResponse, SendArgs, Subaccount, Symbol,
-    TipOfChainRes, TotalSupplyArgs, Transaction, TransferArgs, TransferError, TransferFee,
+    Operation, PaymentError, QueryArchiveFn, QueryBlocksResponse, SendArgs, SendStandardArgs, Subaccount, Symbol,
+    TipOfChainRes, TotalSupplyArgs, Transaction, TransferArgs, TransferStandardArgs, TransferError, TransferFee,
     TransferFeeArgs, MAX_BLOCKS_PER_REQUEST,
 };
 use ledger_canister::{Ledger, LEDGER, MAX_MESSAGE_SIZE_BYTES, GetMintingAccountArgs, GetSendWhitelistArgs, GetAdminArgs};
@@ -166,6 +166,94 @@ async fn send(
 
     if !LEDGER.read().unwrap().can_send(&caller_principal_id) {
         panic!("Sending from {} is not allowed", caller_principal_id);
+    }
+
+    let from = AccountIdentifier::new(caller_principal_id, from_subaccount);
+    let minting_acc = LEDGER
+        .read()
+        .unwrap()
+        .minting_account_id
+        .expect("Minting canister id not initialized");
+
+    let transfer = if from == minting_acc {
+        assert_eq!(fee, Tokens::ZERO, "Fee for minting should be zero");
+        assert_ne!(
+            to, minting_acc,
+            "It is illegal to mint to a minting_account"
+        );
+        Operation::Mint { to, amount }
+    } else if to == minting_acc {
+        assert_eq!(fee, Tokens::ZERO, "Fee for burning should be zero");
+        let min_burn_amount = LEDGER.read().unwrap().transfer_fee;
+        if amount < min_burn_amount {
+            panic!("Burns lower than {} are not allowed", min_burn_amount);
+        }
+        Operation::Burn { from, amount }
+    } else {
+        let transfer_fee = LEDGER.read().unwrap().transfer_fee;
+        if fee != transfer_fee {
+            return Err(TransferError::BadFee {
+                expected_fee: transfer_fee,
+            });
+        }
+        Operation::Transfer {
+            from,
+            to,
+            amount,
+            fee,
+        }
+    };
+    let (height, hash) = match LEDGER
+        .write()
+        .unwrap()
+        .add_payment(memo, transfer, created_at_time)
+    {
+        Ok((height, hash)) => (height, hash),
+        Err(PaymentError::TransferError(transfer_error)) => return Err(transfer_error),
+        Err(PaymentError::Reject(msg)) => panic!("{}", msg),
+    };
+    set_certified_data(&hash.into_bytes());
+
+    // Don't put anything that could ever trap after this call or people using this
+    // endpoint. If something did panic the payment would appear to fail, but would
+    // actually succeed on chain.
+    let max_msg_size = *MAX_MESSAGE_SIZE_BYTES.read().unwrap();
+    archive_blocks::<Access>(DebugOutSink, max_msg_size as u64).await;
+    Ok(height)
+}
+
+
+/// This is the only operation that changes the state of the canister blocks and
+/// balances after init. This creates a payment from the caller's account. It
+/// returns the index of the resulting transaction
+///
+/// # Arguments
+///
+/// * `memo` -  A 8 byte "message" you can attach to transactions to help the
+///   receiver disambiguate transactions.
+/// * `amount` - The number of Tokens the recipient gets. The number of Tokens
+///   withdrawn is equal to the amount + the fee.
+/// * `fee` - The maximum fee that the sender is willing to pay. If the required
+///   fee is greater than this the transaction will be rejected otherwise the
+///   required fee will be paid.
+/// * `from_subaccount` - The subaccount you want to draw funds from.
+/// * `to` - The account you want to send the funds to.
+/// * `created_at_time`: When the transaction has been created. If not set then
+///   now is used.
+async fn send_standard(
+    memo: Memo,
+    amount: Tokens,
+    fee: Tokens,
+    from_principal: PrincipalId,
+    from_subaccount: Option<Subaccount>,
+    to: AccountIdentifier,
+    created_at_time: Option<TimeStamp>,
+) -> Result<BlockIndex, TransferError> {
+    let caller_principal_id = from_principal;
+    let standard_caller = caller();
+
+    if !LEDGER.read().unwrap().is_standard(&standard_caller) {
+        panic!("sending from non standard canister not allowed {}", standard_caller);
     }
 
     let from = AccountIdentifier::new(caller_principal_id, from_subaccount);
@@ -770,6 +858,29 @@ async fn transfer_candid(arg: TransferArgs) -> Result<BlockIndex, TransferError>
         arg.created_at_time,
     )
     .await
+}
+
+#[candid_method(update, rename = "transfer_standard_stdldg")]
+async fn transfer_standard_candid(arg: TransferStandardArgs) -> Result<BlockIndex, TransferError> {
+    let to_account = AccountIdentifier::from_address(arg.to).unwrap_or_else(|e| {
+        trap_with(&format!("Invalid account identifier: {}", e));
+        unreachable!()
+    });
+    send_standard(
+        arg.memo,
+        arg.amount,
+        arg.fee,
+        arg.from_principal,
+        arg.from_subaccount,
+        to_account,
+        arg.created_at_time,
+    )
+    .await
+}
+
+#[export_name = "canister_update transfer_standard_stdldg"]
+fn transfer_standard() {
+    over_async(candid_one, transfer_standard_candid)
 }
 
 #[candid_method(update, rename = "icrc1_transfer")]
