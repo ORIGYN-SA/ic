@@ -19,23 +19,21 @@ impl ControllerClientStub {
 }
 
 impl ControllerService for ControllerClientStub {
-    fn exec_finished(&self, req: ExecFinishedRequest) -> Call<ExecFinishedReply> {
+    fn execution_finished(&self, req: ExecutionFinishedRequest) -> Call<ExecutionFinishedReply> {
         let cell = self
             .channel
-            .call(Request::ExecFinished(req), |rep| match rep {
-                Reply::ExecFinished(rep) => Ok(rep),
+            .call(Request::ExecutionFinished(req), |rep| match rep {
+                Reply::ExecutionFinished(rep) => Ok(rep),
                 _ => Err(Error::ServerError),
             });
         Call::new(cell)
     }
-    fn canister_system_call(
-        &self,
-        req: CanisterSystemCallRequest,
-    ) -> Call<CanisterSystemCallReply> {
+
+    fn execution_paused(&self, req: ExecutionPausedRequest) -> Call<ExecutionPausedReply> {
         let cell = self
             .channel
-            .call(Request::CanisterSystemCall(req), |rep| match rep {
-                Reply::CanisterSystemCall(rep) => Ok(rep),
+            .call(Request::ExecutionPaused(req), |rep| match rep {
+                Reply::ExecutionPaused(rep) => Ok(rep),
                 _ => Err(Error::ServerError),
             });
         Call::new(cell)

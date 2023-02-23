@@ -1,12 +1,14 @@
-use ic_crypto::utils::{NodeKeysToGenerate, TempCryptoComponent};
+use ic_crypto_temp_crypto::{NodeKeysToGenerate, TempCryptoComponent};
+use ic_crypto_test_utils_keygen::{add_public_key_to_registry, add_tls_cert_to_registry};
+use ic_interfaces::crypto::KeyManager;
+use ic_interfaces_registry::RegistryDataProvider;
 use ic_protobuf::registry::crypto::v1::PublicKey;
 use ic_protobuf::registry::crypto::v1::X509PublicKeyCert;
-use ic_registry_client::fake::FakeRegistryClient;
-use ic_registry_common::proto_registry_data_provider::ProtoRegistryDataProvider;
-use ic_registry_keys::{make_crypto_node_key, make_crypto_tls_cert_key};
-use ic_test_utilities::types::ids::node_test_id;
-use ic_types::crypto::{KeyId, KeyPurpose, UserPublicKey};
+use ic_registry_client_fake::FakeRegistryClient;
+use ic_registry_proto_data_provider::ProtoRegistryDataProvider;
+use ic_types::crypto::KeyPurpose;
 use ic_types::{NodeId, RegistryVersion};
+use ic_types_test_utils::ids::node_test_id;
 use std::sync::Arc;
 
 pub struct TestKeygenCryptoBuilder {
@@ -17,6 +19,8 @@ pub struct TestKeygenCryptoBuilder {
     committee_signing_key: Option<PublicKey>,
     add_dkg_dealing_enc_key_to_registry: bool,
     dkg_dealing_enc_key: Option<PublicKey>,
+    add_idkg_dealing_enc_key_to_registry: bool,
+    idkg_dealing_enc_key: Option<PublicKey>,
     add_tls_cert_to_registry: bool,
     tls_cert: Option<X509PublicKeyCert>,
 }
@@ -57,6 +61,16 @@ impl TestKeygenCryptoBuilder {
         self
     }
 
+    pub fn add_generated_idkg_dealing_enc_key_to_registry(mut self) -> Self {
+        self.add_idkg_dealing_enc_key_to_registry = true;
+        self
+    }
+
+    pub fn with_idkg_dealing_enc_key_in_registry(mut self, key: PublicKey) -> Self {
+        self.idkg_dealing_enc_key = Some(key);
+        self
+    }
+
     pub fn add_generated_tls_cert_to_registry(mut self) -> Self {
         self.add_tls_cert_to_registry = true;
         self
@@ -71,34 +85,47 @@ impl TestKeygenCryptoBuilder {
         let node_id = node_test_id(node_id);
         let data_provider = Arc::new(ProtoRegistryDataProvider::new());
         let registry_client = Arc::new(FakeRegistryClient::new(data_provider.clone()));
-        let (temp_crypto, node_pubkeys) = TempCryptoComponent::new_with_node_keys_generation(
-            Arc::clone(&registry_client) as Arc<_>,
-            node_id,
-            self.node_keys_to_generate.clone(),
-        );
+        let temp_crypto = TempCryptoComponent::builder()
+            .with_registry(Arc::clone(&registry_client) as Arc<_>)
+            .with_node_id(node_id)
+            .with_keys(self.node_keys_to_generate.clone())
+            .build();
+        let node_pubkeys = temp_crypto
+            .current_node_public_keys()
+            .expect("Failed to retrieve node public keys");
         self.add_node_signing_key_to_registry_if_present(
             registry_version,
             node_id,
             &data_provider,
-            &node_pubkeys.node_signing_pk,
+            &node_pubkeys.node_signing_public_key,
         )
         .add_committee_signing_key_to_registry_if_present(
             registry_version,
             node_id,
             &data_provider,
-            &node_pubkeys.committee_signing_pk,
+            &node_pubkeys.committee_signing_public_key,
         )
         .add_dkg_dealing_enc_key_to_registry_if_present(
             registry_version,
             node_id,
             &data_provider,
-            &node_pubkeys.dkg_dealing_encryption_pk,
+            &node_pubkeys.dkg_dealing_encryption_public_key,
+        )
+        .add_idkg_dealing_enc_key_to_registry_if_present(
+            registry_version,
+            node_id,
+            &data_provider,
+            &node_pubkeys.idkg_dealing_encryption_public_key,
         )
         .add_tls_cert_to_registry_if_present(
             registry_version,
             node_id,
             &data_provider,
             node_pubkeys.tls_certificate,
+        )
+        .add_dummy_registry_entry_if_necessary_to_ensure_existence_of_registry_version(
+            registry_version,
+            &data_provider,
         );
         registry_client.update_to_latest_version();
         TestKeygenCrypto { temp_crypto }
@@ -122,7 +149,7 @@ impl TestKeygenCryptoBuilder {
                     .clone(),
                 node_id,
                 KeyPurpose::NodeSigning,
-                Arc::clone(&data_provider),
+                Arc::clone(data_provider),
                 registry_version,
             );
         }
@@ -131,7 +158,7 @@ impl TestKeygenCryptoBuilder {
                 pub_key.clone(),
                 node_id,
                 KeyPurpose::NodeSigning,
-                Arc::clone(&data_provider),
+                Arc::clone(data_provider),
                 registry_version,
             );
         }
@@ -156,7 +183,7 @@ impl TestKeygenCryptoBuilder {
                     .clone(),
                 node_id,
                 KeyPurpose::CommitteeSigning,
-                Arc::clone(&data_provider),
+                Arc::clone(data_provider),
                 registry_version,
             );
         }
@@ -165,7 +192,7 @@ impl TestKeygenCryptoBuilder {
                 pub_key.clone(),
                 node_id,
                 KeyPurpose::CommitteeSigning,
-                Arc::clone(&data_provider),
+                Arc::clone(data_provider),
                 registry_version,
             );
         }
@@ -190,7 +217,7 @@ impl TestKeygenCryptoBuilder {
                     .clone(),
                 node_id,
                 KeyPurpose::DkgDealingEncryption,
-                Arc::clone(&data_provider),
+                Arc::clone(data_provider),
                 registry_version,
             );
         }
@@ -199,7 +226,43 @@ impl TestKeygenCryptoBuilder {
                 pub_key.clone(),
                 node_id,
                 KeyPurpose::DkgDealingEncryption,
-                Arc::clone(&data_provider),
+                Arc::clone(data_provider),
+                registry_version,
+            );
+        }
+        self
+    }
+
+    fn add_idkg_dealing_enc_key_to_registry_if_present(
+        self,
+        registry_version: RegistryVersion,
+        node_id: NodeId,
+        data_provider: &Arc<ProtoRegistryDataProvider>,
+        public_key: &Option<PublicKey>,
+    ) -> Self {
+        if self.add_idkg_dealing_enc_key_to_registry && self.idkg_dealing_enc_key.is_some() {
+            panic!("invalid use of builder: cannot add default and custom I-DKG dealing enc key!")
+        }
+        if self.add_idkg_dealing_enc_key_to_registry {
+            add_public_key_to_registry(
+                public_key
+                    .as_ref()
+                    .expect(
+                        "invalid use of builder: I-DKG dealing encryption key was not generated.",
+                    )
+                    .clone(),
+                node_id,
+                KeyPurpose::IDkgMEGaEncryption,
+                Arc::clone(data_provider),
+                registry_version,
+            );
+        }
+        if let Some(pub_key) = self.idkg_dealing_enc_key.as_ref() {
+            add_public_key_to_registry(
+                pub_key.clone(),
+                node_id,
+                KeyPurpose::IDkgMEGaEncryption,
+                Arc::clone(data_provider),
                 registry_version,
             );
         }
@@ -220,7 +283,7 @@ impl TestKeygenCryptoBuilder {
             add_tls_cert_to_registry(
                 tls_certificate.expect("invalid use of builder: tls cert was not generated."),
                 node_id,
-                Arc::clone(&data_provider),
+                Arc::clone(data_provider),
                 registry_version,
             );
         }
@@ -228,9 +291,34 @@ impl TestKeygenCryptoBuilder {
             add_tls_cert_to_registry(
                 cert.clone(),
                 node_id,
-                Arc::clone(&data_provider),
+                Arc::clone(data_provider),
                 registry_version,
             );
+        }
+        self
+    }
+
+    fn add_dummy_registry_entry_if_necessary_to_ensure_existence_of_registry_version(
+        self,
+        registry_version: RegistryVersion,
+        data_provider: &Arc<ProtoRegistryDataProvider>,
+    ) -> Self {
+        if data_provider
+            .get_updates_since(RegistryVersion::from(0))
+            .expect("failed to get updates")
+            .is_empty()
+        {
+            let dummy_registry_key = "dummy_registry_key";
+            let dummy_registry_value = X509PublicKeyCert {
+                certificate_der: vec![],
+            };
+            data_provider
+                .add(
+                    dummy_registry_key,
+                    registry_version,
+                    Some(dummy_registry_value),
+                )
+                .expect("Could not add dummy registry entry to registry");
         }
         self
     }
@@ -247,9 +335,11 @@ impl TestKeygenCrypto {
             add_node_signing_key_to_registry: false,
             node_signing_key: None,
             add_committee_signing_key_to_registry: false,
+            committee_signing_key: None,
             add_dkg_dealing_enc_key_to_registry: false,
             dkg_dealing_enc_key: None,
-            committee_signing_key: None,
+            add_idkg_dealing_enc_key_to_registry: false,
+            idkg_dealing_enc_key: None,
             add_tls_cert_to_registry: false,
             tls_cert: None,
         }
@@ -258,74 +348,4 @@ impl TestKeygenCrypto {
     pub fn get(&self) -> &TempCryptoComponent {
         &self.temp_crypto
     }
-}
-
-fn add_tls_cert_to_registry(
-    cert: X509PublicKeyCert,
-    node_id: NodeId,
-    registry: Arc<ProtoRegistryDataProvider>,
-    registry_version: RegistryVersion,
-) {
-    registry
-        .add(
-            &make_crypto_tls_cert_key(node_id),
-            registry_version,
-            Some(cert),
-        )
-        .expect("Could not add TLS cert key to registry");
-}
-
-pub fn add_keys_to_registry(
-    registry: Arc<ProtoRegistryDataProvider>,
-    keys: Vec<(KeyId, UserPublicKey)>,
-) -> Vec<NodeId> {
-    let mut node_ids = Vec::new();
-    for (node_id_index, (_key_id, pk)) in keys.iter().enumerate() {
-        let node_id = node_test_id(node_id_index as u64);
-        add_user_pk_to_registry(
-            node_id,
-            pk.to_owned(),
-            Arc::clone(&registry),
-            RegistryVersion::from(1),
-        );
-        node_ids.push(node_id);
-    }
-    node_ids
-}
-
-fn add_user_pk_to_registry(
-    node_id: NodeId,
-    pk: UserPublicKey,
-    registry: Arc<ProtoRegistryDataProvider>,
-    version: RegistryVersion,
-) {
-    let pk = PublicKey {
-        algorithm: pk.algorithm_id as i32,
-        key_value: pk.key,
-        version: 0,
-        proof_data: None,
-    };
-    registry
-        .add(
-            &make_crypto_node_key(node_id, KeyPurpose::NodeSigning),
-            version,
-            Some(pk),
-        )
-        .expect("Could not add keys to registry");
-}
-
-fn add_public_key_to_registry(
-    public_key: PublicKey,
-    node_id: NodeId,
-    key_purpose: KeyPurpose,
-    registry: Arc<ProtoRegistryDataProvider>,
-    registry_version: RegistryVersion,
-) {
-    registry
-        .add(
-            &make_crypto_node_key(node_id, key_purpose),
-            registry_version,
-            Some(public_key),
-        )
-        .expect("Could not add public key to registry");
 }

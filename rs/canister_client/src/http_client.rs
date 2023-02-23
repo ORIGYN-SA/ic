@@ -1,36 +1,139 @@
 //! The hyper based HTTP client
-
-use hyper::client::HttpConnector as HyperConnector;
-use hyper::client::ResponseFuture as HyperFuture;
-use hyper::Client as HyperClient;
-use hyper::Uri as HyperUri;
+use futures_util::{
+    future::{Either as EitherFut, Map, Ready},
+    FutureExt,
+};
+use hyper::{
+    client::{
+        connect::dns::{self, GaiResolver},
+        HttpConnector as HyperConnector, ResponseFuture as HyperFuture,
+    },
+    header::CONTENT_TYPE,
+    service::Service,
+    Client as HyperClient, Method, Uri as HyperUri,
+};
 use hyper_tls::HttpsConnector as HyperTlsConnector;
-use std::time::Duration;
+use itertools::Either;
+use std::{
+    borrow::Cow,
+    collections::HashMap,
+    io,
+    iter::{once, Once},
+    net::SocketAddr,
+    task::{Context, Poll},
+    time::Duration,
+};
 use url::Url;
+
+#[derive(Clone)]
+pub struct HttpClientConfig {
+    pub pool_idle_timeout: Option<Duration>,
+    pub pool_max_idle_per_host: usize,
+    pub http2_only: bool,
+    pub overrides: HashMap<String, Either<SocketAddr, dns::Name>>,
+}
+
+impl Default for HttpClientConfig {
+    fn default() -> Self {
+        Self {
+            pool_idle_timeout: Some(Duration::from_secs(600)),
+            pool_max_idle_per_host: 1,
+            http2_only: true,
+            overrides: HashMap::new(),
+        }
+    }
+}
 
 /// An HTTP Client to communicate with a replica.
 #[derive(Clone)]
 pub struct HttpClient {
-    hyper: HyperClient<HyperTlsConnector<HyperConnector>>,
+    hyper: HyperClient<HyperTlsConnector<HyperConnector<DnsResolverWithOverrides>>>,
+}
+
+#[derive(Clone)]
+pub(crate) struct DnsResolverWithOverrides {
+    dns_resolver: GaiResolver,
+    overrides: HashMap<String, Either<SocketAddr, dns::Name>>,
+}
+
+impl DnsResolverWithOverrides {
+    fn new(overrides: HashMap<String, Either<SocketAddr, dns::Name>>) -> Self {
+        DnsResolverWithOverrides {
+            dns_resolver: GaiResolver::new(),
+            overrides,
+        }
+    }
+}
+
+impl Service<dns::Name> for DnsResolverWithOverrides {
+    type Response = Either<dns::GaiAddrs, Once<SocketAddr>>;
+    type Error = io::Error;
+    type Future = EitherFut<
+        Map<
+            dns::GaiFuture,
+            fn(Result<dns::GaiAddrs, io::Error>) -> Result<Self::Response, io::Error>,
+        >,
+        Ready<Result<Self::Response, io::Error>>,
+    >;
+
+    fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), io::Error>> {
+        self.dns_resolver.poll_ready(cx)
+    }
+
+    fn call(&mut self, name: dns::Name) -> Self::Future {
+        const MAX_DEPTH: usize = 128;
+        let mut name: Cow<dns::Name> = Cow::Owned(name);
+        for _ in 0..MAX_DEPTH {
+            match self.overrides.get(name.as_str()) {
+                Some(Either::Left(dest)) => {
+                    let fut = futures_util::future::ready(Ok(Either::Right(once(dest.to_owned()))));
+                    return EitherFut::Right(fut);
+                }
+                Some(Either::Right(new_name)) => name = Cow::Borrowed(new_name),
+                None => {
+                    let resolver_fut = self.dns_resolver.call(name.into_owned());
+                    fn map(
+                        v: Result<dns::GaiAddrs, io::Error>,
+                    ) -> Result<Either<dns::GaiAddrs, Once<SocketAddr>>, io::Error>
+                    {
+                        v.map(Either::Left)
+                    }
+                    return EitherFut::Left(resolver_fut.map(map));
+                }
+            }
+        }
+        EitherFut::Right(futures_util::future::ready(Err(io::Error::new(
+            io::ErrorKind::Other,
+            "unable to resolve dns query",
+        ))))
+    }
 }
 
 impl HttpClient {
-    pub fn new() -> Self {
+    pub fn new_with_config(config: HttpClientConfig) -> Self {
         let native_tls_connector = native_tls::TlsConnector::builder()
+            .use_sni(false)
+            .request_alpns(&["h2"])
             .danger_accept_invalid_certs(true)
             .build()
             .expect("failed to build tls connector");
-        let mut http_connector = HyperConnector::new();
+        let mut http_connector =
+            HyperConnector::new_with_resolver(DnsResolverWithOverrides::new(config.overrides));
         http_connector.enforce_http(false);
         let https_connector =
             HyperTlsConnector::from((http_connector, native_tls_connector.into()));
 
         let hyper = HyperClient::builder()
-            .pool_idle_timeout(Some(Duration::from_secs(600)))
-            .pool_max_idle_per_host(1)
+            .pool_idle_timeout(config.pool_idle_timeout)
+            .pool_max_idle_per_host(config.pool_max_idle_per_host)
+            .http2_only(config.http2_only)
             .build::<_, hyper::Body>(https_connector);
 
         Self { hyper }
+    }
+
+    pub fn new() -> Self {
+        Self::new_with_config(HttpClientConfig::default())
     }
 
     fn build_uri(&self, url: &Url, end_point: &str) -> Result<HyperUri, String> {
@@ -48,9 +151,9 @@ impl HttpClient {
 
     fn build_post_request(&self, uri: HyperUri, http_body: Vec<u8>) -> Result<HyperFuture, String> {
         let req = hyper::Request::builder()
-            .method("POST")
+            .method(Method::POST)
             .uri(uri.clone())
-            .header("Content-Type", "application/cbor")
+            .header(CONTENT_TYPE, "application/cbor")
             .body(hyper::Body::from(http_body))
             .map_err(|e| {
                 format!(
@@ -70,21 +173,32 @@ impl HttpClient {
             .await
             .map_err(|e| format!("HttpClient: Request timed out for {:?}: {:?}", uri, e))?;
         let response = result.map_err(|e| format!("Request failed for {:?}: {:?}", uri, e))?;
-        if !response.status().is_success() {
-            return Err(format!(
-                "HTTP Client: Request for {:?} failed: {:?}",
-                uri, response
-            ));
-        }
-        hyper::body::to_bytes(response)
+        let status = response.status();
+        let parsed_body = tokio::time::timeout_at(deadline, hyper::body::to_bytes(response))
             .await
+            .map_err(|e| {
+                format!(
+                    "HttpClient: Request to {:?} timed out while waiting for body: {:?}. Returned status {:?}.",
+                    uri, e, status.canonical_reason().unwrap_or("empty status"),
+                )
+            })?
             .map(|bytes| bytes.to_vec())
             .map_err(|e| {
                 format!(
-                    "HttpClient: Request failed to get bytes for {:?}: {:?}",
-                    uri, e
+                    "HttpClient: Request to {:?} failed to get bytes: {:?}. Returned status: {:?}.",
+                    uri, e, status.canonical_reason().unwrap_or("empty status"),
                 )
-            })
+            })?;
+        if !status.is_success() {
+            let readable_response = std::str::from_utf8(&parsed_body);
+            return Err(format!(
+                "HTTP Client: Request to {:?} failed with {:?}, {:?}",
+                uri,
+                status.canonical_reason().unwrap_or("empty status"),
+                readable_response,
+            ));
+        }
+        Ok(parsed_body)
     }
 
     pub(crate) async fn get_with_response(
@@ -120,9 +234,9 @@ impl HttpClient {
             .parse::<HyperUri>()
             .map_err(|e| format!("HttpClient: Failed to parse URL {:?}: {:?}", url, e))?;
         let req = hyper::Request::builder()
-            .method("POST")
+            .method(Method::POST)
             .uri(uri.clone())
-            .header("Content-Type", "application/cbor")
+            .header(CONTENT_TYPE, "application/cbor")
             .body(hyper::Body::from(http_body))
             .map_err(|e| format!("HttpClient: Failed to fill body {:?}: {:?}", url, e))?;
         let response_future = self.hyper.request(req);

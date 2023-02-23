@@ -39,11 +39,11 @@ impl fmt::Debug for Blob {
 impl fmt::Display for Blob {
     // Just like Debug, except we truncate long ones
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        self.format(f, 40 as usize)
+        self.format(f, 40_usize)
     }
 }
 
-impl<'a, T: AsRef<[u8]>> From<T> for Blob {
+impl<T: AsRef<[u8]>> From<T> for Blob {
     fn from(v: T) -> Blob {
         Blob(v.as_ref().to_vec())
     }

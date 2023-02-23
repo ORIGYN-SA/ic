@@ -1,0 +1,44 @@
+#!/usr/bin/env bash
+
+set -exuo pipefail
+
+if [ "$(uname)" != "Linux" ]; then
+    echo "This script is only supported on Linux."
+    exit 1
+fi
+
+REPO_ROOT=$(git rev-parse --show-toplevel)
+TAG=$(openssl rand -hex 4)
+DOCKER_IMG_VERSION=$(cat "$REPO_ROOT/gitlab-ci/docker/TAG")
+
+echo "Pulling dfinity/ic-build:$DOCKER_IMG_VERSION docker image"
+if ! docker pull dfinity/ic-build:"$DOCKER_IMG_VERSION"; then
+    # dfinity/ic-build:<tag> is not yet in dockerhub
+    # handle the case when Dockerfile is updated in a MR
+    echo "Image 'dfinity/ic-build:$DOCKER_IMG_VERSION' not in DockerHub"
+    echo "Building 'dfinity/ic-build:$DOCKER_IMG_VERSION' image (--no-cache)"
+    export DOCKER_BUILD_ARGS='--no-cache'
+    "$REPO_ROOT"/gitlab-ci/docker/docker-build-local-image.sh
+    unset DOCKER_BUILD_ARGS
+fi
+
+docker image build -t ic-build-bd:$TAG -f- . <<EOF
+FROM dfinity/ic-build:$DOCKER_IMG_VERSION
+COPY --chown=ubuntu:ubuntu . /ic
+RUN sudo mkdir /ic/artifacts && sudo chown -R ubuntu:ubuntu /ic/artifacts
+EOF
+
+export IMAGE=ic-build-bd:$TAG
+"$REPO_ROOT"/gitlab-ci/tools/docker-run /ic/gitlab-ci/tools/build-ic "${1:--a=b,c,i}"
+
+if docker volume inspect "ic-artifacts${CI_JOB_ID:-}" 2>/dev/null; then
+    mkdir -p artifacts
+    cd artifacts
+
+    # docker doesn't seem to provide means of getting data from the volume directly
+    # we need to run a container with that volume and copy the data from the container
+    DID=$(docker run --rm -it -d -v "ic-artifacts${CI_JOB_ID:-}":/artifacts $IMAGE sleep 300)
+    docker cp $DID:/artifacts docker-build-ic
+    docker rm -f $DID
+    docker volume rm -f "ic-artifacts${CI_JOB_ID:-}"
+fi

@@ -1,32 +1,30 @@
-use crate::metrics::{PoolMetrics, POOL_TYPE_UNVALIDATED, POOL_TYPE_VALIDATED};
-use ic_crypto::crypto_hash;
-use ic_interfaces::artifact_pool::{UnvalidatedArtifact, ValidatedArtifact};
-use ic_interfaces::dkg::{ChangeAction, ChangeSet, DkgPool, MutableDkgPool};
-use ic_interfaces::gossip_pool::{DkgGossipPool, GossipPool};
+use crate::{
+    metrics::{POOL_TYPE_UNVALIDATED, POOL_TYPE_VALIDATED},
+    pool_common::PoolSection,
+};
+use ic_interfaces::{
+    artifact_pool::{UnvalidatedArtifact, ValidatedArtifact},
+    dkg::{ChangeAction, ChangeSet, DkgPool, MutableDkgPool},
+    gossip_pool::{DkgGossipPool, GossipPool},
+};
 use ic_metrics::MetricsRegistry;
-use ic_types::consensus;
 use ic_types::consensus::dkg;
-use ic_types::crypto;
-use ic_types::crypto::CryptoHashOf;
-use ic_types::time::{current_time, Time};
-use ic_types::*;
-use std::collections::BTreeMap;
-use std::ops::Sub;
-use std::time::Duration;
-
-/// Workaround for `consensus::dkg::Message` not implementing `CountBytes`.
-// TODO (cm, idkg): implement `CountBytes`
-const MESSAGE_SIZE_BYTES: usize = 0;
+use ic_types::{consensus, Height};
+use ic_types::{
+    crypto::CryptoHashOf,
+    time::{current_time, Time},
+};
+use std::{ops::Sub, time::Duration};
 
 /// The DkgPool is used to store messages that are exchanged between replicas in
 /// the process of executing DKG.
 pub struct DkgPoolImpl {
     validated: PoolSection<
-        crypto::CryptoHashOf<consensus::dkg::Message>,
+        CryptoHashOf<consensus::dkg::Message>,
         ValidatedArtifact<consensus::dkg::Message>,
     >,
     unvalidated: PoolSection<
-        crypto::CryptoHashOf<consensus::dkg::Message>,
+        CryptoHashOf<consensus::dkg::Message>,
         UnvalidatedArtifact<consensus::dkg::Message>,
     >,
     current_start_height: Height,
@@ -46,10 +44,7 @@ impl DkgPoolImpl {
 
     /// Returns a DKG message by hash if available in either the validated or
     /// unvalidated sections.
-    pub fn get(
-        &self,
-        hash: &crypto::CryptoHashOf<consensus::dkg::Message>,
-    ) -> Option<&dkg::Message> {
+    pub fn get(&self, hash: &CryptoHashOf<consensus::dkg::Message>) -> Option<&dkg::Message> {
         self.validated
             .get(hash)
             .map(|artifact| artifact.as_ref())
@@ -99,7 +94,7 @@ impl MutableDkgPool for DkgPoolImpl {
     /// Inserts an unvalidated artifact into the unvalidated section.
     fn insert(&mut self, artifact: UnvalidatedArtifact<consensus::dkg::Message>) {
         self.unvalidated
-            .insert(ic_crypto::crypto_hash(&artifact.message), artifact);
+            .insert(ic_types::crypto::crypto_hash(&artifact.message), artifact);
     }
 
     /// Applies the provided change set atomically.
@@ -117,7 +112,7 @@ impl MutableDkgPool for DkgPoolImpl {
                 }
                 ChangeAction::AddToValidated(message) => {
                     self.validated.insert(
-                        ic_crypto::crypto_hash(&message),
+                        ic_types::crypto::crypto_hash(&message),
                         ValidatedArtifact {
                             msg: message,
                             timestamp: current_time(),
@@ -125,7 +120,7 @@ impl MutableDkgPool for DkgPoolImpl {
                     );
                 }
                 ChangeAction::MoveToValidated(message) => {
-                    let hash = crypto_hash(&message);
+                    let hash = ic_types::crypto::crypto_hash(&message);
                     self.unvalidated
                         .remove(&hash)
                         .expect("Unvalidated artifact was not found.");
@@ -136,6 +131,12 @@ impl MutableDkgPool for DkgPoolImpl {
                             timestamp: current_time(),
                         },
                     );
+                }
+                ChangeAction::RemoveFromUnvalidated(message) => {
+                    let hash = ic_types::crypto::crypto_hash(&message);
+                    self.unvalidated
+                        .remove(&hash)
+                        .expect("Unvalidated artifact was not found.");
                 }
                 ChangeAction::Purge(height) => self.purge(height),
             }
@@ -193,55 +194,8 @@ impl DkgPool for DkgPoolImpl {
     }
 
     fn validated_contains(&self, msg: &dkg::Message) -> bool {
-        self.validated.contains_key(&ic_crypto::crypto_hash(msg))
-    }
-}
-
-/// Wrapper around `BTreeMap`, instrumenting insertions and removals.
-struct PoolSection<K, V> {
-    messages: BTreeMap<K, V>,
-    metrics: PoolMetrics,
-}
-
-impl<K: Ord, V> PoolSection<K, V> {
-    fn new(metrics_registry: MetricsRegistry, pool: &str, pool_type: &str) -> Self {
-        Self {
-            messages: Default::default(),
-            metrics: PoolMetrics::new(metrics_registry, pool, pool_type),
-        }
-    }
-
-    fn insert(&mut self, key: K, value: V) -> Option<V> {
-        self.metrics.observe_insert(MESSAGE_SIZE_BYTES);
-        let replaced = self.messages.insert(key, value);
-        if replaced.is_some() {
-            self.metrics.observe_remove(MESSAGE_SIZE_BYTES);
-        }
-        replaced
-    }
-
-    fn remove(&mut self, key: &K) -> Option<V> {
-        let removed = self.messages.remove(key);
-        if removed.is_some() {
-            self.metrics.observe_remove(MESSAGE_SIZE_BYTES);
-        }
-        removed
-    }
-
-    fn get(&self, key: &K) -> Option<&V> {
-        self.messages.get(key)
-    }
-
-    fn contains_key(&self, key: &K) -> bool {
-        self.messages.contains_key(key)
-    }
-
-    fn iter(&self) -> std::collections::btree_map::Iter<'_, K, V> {
-        self.messages.iter()
-    }
-
-    fn values(&self) -> std::collections::btree_map::Values<'_, K, V> {
-        self.messages.values()
+        self.validated
+            .contains_key(&ic_types::crypto::crypto_hash(msg))
     }
 }
 
@@ -255,11 +209,11 @@ mod test {
         types::ids::{node_test_id, subnet_test_id},
     };
     use ic_types::{
-        consensus::BasicSignature,
         crypto::threshold_sig::ni_dkg::{NiDkgDealing, NiDkgId, NiDkgTag, NiDkgTargetSubnet},
+        signature::BasicSignature,
+        NodeId,
     };
-    use std::ops::Add;
-    use std::ops::Sub;
+    use std::ops::{Add, Sub};
 
     fn make_message(start_height: Height, node_id: NodeId) -> dkg::Message {
         let dkg_id = NiDkgId {
@@ -328,7 +282,7 @@ mod test {
         // 200 sec old
         let msg = make_message(Height::from(1), node_test_id(1));
         pool.validated.insert(
-            ic_crypto::crypto_hash(&msg),
+            ic_types::crypto::crypto_hash(&msg),
             ValidatedArtifact {
                 msg,
                 timestamp: now.sub(Duration::from_secs(200)),
@@ -338,7 +292,7 @@ mod test {
         // 100 sec old
         let msg = make_message(Height::from(2), node_test_id(2));
         pool.validated.insert(
-            ic_crypto::crypto_hash(&msg),
+            ic_types::crypto::crypto_hash(&msg),
             ValidatedArtifact {
                 msg,
                 timestamp: now.sub(Duration::from_secs(100)),
@@ -348,7 +302,7 @@ mod test {
         // 50 sec old
         let msg = make_message(Height::from(3), node_test_id(3));
         pool.validated.insert(
-            ic_crypto::crypto_hash(&msg),
+            ic_types::crypto::crypto_hash(&msg),
             ValidatedArtifact {
                 msg,
                 timestamp: now.sub(Duration::from_secs(50)),
@@ -358,7 +312,7 @@ mod test {
         // In future
         let msg = make_message(Height::from(4), node_test_id(4));
         pool.validated.insert(
-            ic_crypto::crypto_hash(&msg),
+            ic_types::crypto::crypto_hash(&msg),
             ValidatedArtifact {
                 msg,
                 timestamp: now.add(Duration::from_secs(50)),

@@ -31,8 +31,8 @@ use crate::consensus::{
     utils::{find_lowest_ranked_proposals, get_adjusted_notary_delay},
     ConsensusCrypto,
 };
-use ic_interfaces::state_manager::StateManager;
 use ic_interfaces::time_source::TimeSource;
+use ic_interfaces_state_manager::StateManager;
 use ic_logger::{error, trace, warn, ReplicaLogger};
 use ic_metrics::MetricsRegistry;
 use ic_replicated_state::ReplicatedState;
@@ -128,7 +128,7 @@ impl Notary {
     fn is_notary(&self, pool: &PoolReader<'_>, previous_beacon: &RandomBeacon) -> bool {
         match self.membership.node_belongs_to_notarization_committee(
             previous_beacon.height().increment(),
-            &previous_beacon,
+            previous_beacon,
             self.replica_config.node_id,
         ) {
             Ok(value) => value,
@@ -156,7 +156,7 @@ impl Notary {
         block: &'a Block,
     ) -> Option<NotarizationShare> {
         let registry_version = pool.registry_version(block.height)?;
-        let content = NotarizationContent::new(block.height, ic_crypto::crypto_hash(block));
+        let content = NotarizationContent::new(block.height, ic_types::crypto::crypto_hash(block));
         match self
             .crypto
             .sign(&content, self.replica_config.node_id, registry_version)
@@ -206,7 +206,7 @@ impl Notary {
         for proposal in proposals {
             if !self.is_proposal_already_notarized_by_me(pool, &proposal) {
                 let block = proposal.as_ref();
-                if let Some(share) = self.notarize_block(pool, block).map(|share| share) {
+                if let Some(share) = self.notarize_block(pool, block) {
                     notarization_shares.push(share);
                 }
             }
@@ -235,9 +235,9 @@ mod tests {
     use ic_metrics::MetricsRegistry;
     use ic_test_utilities::{
         consensus::fake::*,
-        registry::SubnetRecordBuilder,
         types::ids::{node_test_id, subnet_test_id},
     };
+    use ic_test_utilities_registry::SubnetRecordBuilder;
     use std::sync::Arc;
     use std::time::Duration;
 

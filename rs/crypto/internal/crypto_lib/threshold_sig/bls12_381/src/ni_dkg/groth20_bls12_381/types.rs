@@ -1,14 +1,14 @@
 //! Types for the Groth20-BLS12-381 implementation of Non-interactive
 //! Distributed Key Generation.
 
-use ic_crypto_internal_types::curves::bls12_381::{Fr as FrBytes, G1 as G1Bytes, G2 as G2Bytes};
+use ic_crypto_internal_types::curves::bls12_381::{FrBytes, G1Bytes, G2Bytes};
 use ic_crypto_internal_types::encrypt::forward_secure::groth20_bls12_381::{
     FsEncryptionPok, FsEncryptionPop, FsEncryptionPublicKey,
 };
 use serde::{Deserialize, Serialize};
 
 use std::fmt;
-use zeroize::Zeroize;
+use zeroize::{Zeroize, ZeroizeOnDrop};
 
 #[cfg(test)]
 pub mod arbitrary;
@@ -22,29 +22,24 @@ mod tests;
 /// list is bounded in size we could use a fixed size representation.  We
 /// may also want to expose the data structure here, depending on the
 /// strategic decisions regarding CBOR and protobufs.
-#[derive(Clone, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Eq, PartialEq, Serialize, Deserialize, Zeroize, ZeroizeOnDrop)]
 pub struct FsEncryptionSecretKey {
-    pub bte_nodes: Vec<BTENode>,
+    pub bte_nodes: Vec<BTENodeBytes>,
 }
-impl Zeroize for FsEncryptionSecretKey {
-    fn zeroize(&mut self) {
-        for node in self.bte_nodes.iter_mut() {
-            node.zeroize();
-        }
-    }
-}
+
 impl fmt::Debug for FsEncryptionSecretKey {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        // this prints no secret key parts since Debug for BTENode is redacted:
-        write!(f, "bte_nodes: {}", format!("{:?}", self.bte_nodes))
+        // this prints no secret key parts since Debug for BTENodeBytes is redacted:
+        write!(f, "bte_nodes: {:?}", self.bte_nodes)
     }
 }
 
 /// Library-independent representation of binary tree encryption leaf keys.
-#[derive(Clone, Eq, PartialEq, Serialize, Deserialize)]
-pub struct BTENode {
+#[derive(Clone, Eq, PartialEq, Serialize, Deserialize, Zeroize, ZeroizeOnDrop)]
+pub struct BTENodeBytes {
     // Notation from section 7.2.
     #[serde(with = "serde_bytes")]
+    #[zeroize(skip)] // tau is public and does not need to be zeroized
     pub tau: Vec<u8>,
     pub a: G1Bytes,
     pub b: G2Bytes,
@@ -53,27 +48,12 @@ pub struct BTENode {
     pub e: G2Bytes,
 }
 
-impl Zeroize for BTENode {
-    fn zeroize(&mut self) {
-        // tau is not secret.  It is a common parameter and doesn't need to be zeroed.
-        self.a.zeroize();
-        self.b.zeroize();
-        for node in self.d_t.iter_mut() {
-            node.zeroize();
-        }
-        for node in self.d_h.iter_mut() {
-            node.zeroize();
-        }
-        self.e.zeroize();
-    }
-}
-
-impl fmt::Debug for BTENode {
+impl fmt::Debug for BTENodeBytes {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
             "tau: {}, a: REDACTED, b: REDACTED, d_t: REDACTED, d_h: REDACTED, e: REDACTED",
-            format!("{:?}", self.tau)
+            base64::encode(&self.tau)
         )
     }
 }
@@ -81,29 +61,23 @@ impl fmt::Debug for BTENode {
 /// (deprecated) Forward-secure encryption public key, secret key, and
 /// proof-of-knowledge.
 //CRP-900: Remove the following type
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, Zeroize, ZeroizeOnDrop)]
 pub struct FsEncryptionKeySet {
+    #[zeroize(skip)]
     pub public_key: FsEncryptionPublicKey,
+    #[zeroize(skip)]
     pub pok: FsEncryptionPok,
     pub secret_key: FsEncryptionSecretKey,
 }
-impl Zeroize for FsEncryptionKeySet {
-    fn zeroize(&mut self) {
-        self.secret_key.zeroize();
-    }
-}
 
 /// Forward-secure encryption public key, secret key, and proof-of-possession.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, Zeroize, ZeroizeOnDrop)]
 pub struct FsEncryptionKeySetWithPop {
+    #[zeroize(skip)]
     pub public_key: FsEncryptionPublicKey,
+    #[zeroize(skip)]
     pub pop: FsEncryptionPop,
     pub secret_key: FsEncryptionSecretKey,
-}
-impl Zeroize for FsEncryptionKeySetWithPop {
-    fn zeroize(&mut self) {
-        self.secret_key.zeroize();
-    }
 }
 
 /// Converts an old `FsEncryptionKeySet` to a `FsEncryptionKeySetWithPop`.
@@ -125,6 +99,6 @@ pub fn convert_keyset_to_keyset_with_pop(key_set: FsEncryptionKeySet) -> FsEncry
             challenge: FrBytes([0; FrBytes::SIZE]),
             response: key_set.pok.response,
         },
-        secret_key: key_set.secret_key,
+        secret_key: key_set.secret_key.clone(),
     }
 }

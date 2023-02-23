@@ -1,6 +1,8 @@
 syntax = "proto3";
 package registry.subnet.v1;
+import "bitcoin/v1/bitcoin.proto";
 import "types/v1/types.proto";
+import "registry/crypto/v1/crypto.proto";
 
 // A subnet: A logical group of nodes that run consensus
 message SubnetRecord {
@@ -10,15 +12,12 @@ message SubnetRecord {
   reserved 6;
   reserved "ic_version_id";
   repeated bytes membership = 3;
-  InitialDkgTranscriptRecord initial_dkg_transcript = 2;
 
-  // Ingress message params used by that subnet.
-  //
-  // Maximum amount of bytes per block. This is a soft cap, which means
-  // we stop adding messages once overall size grows above this limit. This
-  // allows big messages to still get into the block, because the size of
-  // a message can exceed this limit.
-  uint64 ingress_bytes_per_block_soft_cap = 4;
+  reserved 2;
+  reserved "initial_dkg_transcript";
+
+  reserved 4;
+  reserved "ingress_bytes_per_block_soft_cap";
 
   // Maximum amount of bytes per message. This is a hard cap, which means
   // ingress messages greater than the limit will be dropped.
@@ -54,6 +53,48 @@ message SubnetRecord {
 
   // Max number of ingress messages per block.
   uint64 max_ingress_messages_per_block = 18;
+
+  // The maximum combined size of the ingress and xnet messages that fit into a block.
+  uint64 max_block_payload_size = 19; 
+
+  // The maximum number of instructions a message can execute.
+  // See the comments in `subnet_config.rs` for more details.
+  uint64 max_instructions_per_message = 20;
+
+  // The maximum number of instructions a round can execute.
+  // See the comments in `subnet_config.rs` for more details.
+  uint64 max_instructions_per_round = 21;
+
+  // The maximum number of instructions an `install_code` message can execute.
+  // See the comments in `subnet_config.rs` for more details.
+  uint64 max_instructions_per_install_code = 22;
+
+  // Information on whether a feature is supported by this subnet.
+  SubnetFeatures features = 23;
+
+  // The maximum number of canisters that may be present on the subnet at any given time.
+  //
+  // A value of 0 is equivalent to setting no limit. This also provides an easy way
+  // to maintain compatibility of different versions of replica and registry.
+  uint64 max_number_of_canisters = 24;
+
+  // The list of public keys whose owners have "readonly" SSH access to all replicas on this subnet,
+  // in case it is necessary to perform subnet recovery.
+  repeated string ssh_readonly_access = 25;
+
+  // The list of public keys whose owners have "backup" SSH access to nodes on the NNS subnet
+  // to make sure the NNS can be backed up.
+  repeated string ssh_backup_access = 26;
+
+  // ECDSA Config. This field cannot be set back to `None` once it has been set
+  // to `Some`. To remove a key, the list of `key_ids` can be set to not include a particular key.
+  // If a removed key is not held by another subnet, it will be lost.
+  EcdsaConfig ecdsa_config = 27;
+}
+
+message EcdsaInitialization {
+  registry.crypto.v1.EcdsaKeyId key_id = 1;
+  InitialIDkgDealings dealings = 2;
 }
 
 // Contains the initial DKG transcripts for the subnet and materials to construct a base CUP (i.e.
@@ -77,42 +118,27 @@ message CatchUpPackageContents {
 
   // A uri from which data to replace the registry local store should be downloaded
   RegistryStoreUri registry_store_uri = 6;
+
+  /// The initial ECDSA dealings for boot strapping target subnets.
+  repeated EcdsaInitialization ecdsa_initializations = 7;
 }
 
 message RegistryStoreUri {
 	/// The uri at which the registry store data should be retrieved. The data
 	/// must be provided as gzipped tar archive
 	string uri = 1;
-	/// A SHA-265, hex encoded hash of the contents of the data stored at the
+	/// A SHA-256, hex encoded hash of the contents of the data stored at the
 	/// provided URI
 	string hash = 2;
 	/// The registry version that should be used for the catch up package contents
 	uint64 registry_version = 3;
 }
 
-// A list of subnet ids of all subnets present in this instance of the IC.
+// Contains information pertaining to all subnets in the IC and their params.
 message SubnetListRecord {
   reserved 1;  // this is from subnet id being a uint64
+  // A list of subnet ids of all subnets present in this instance of the IC.
   repeated bytes subnets = 2;
-}
-
-message InitialDkgTranscriptRecord {
-  // the dkg id
-  DkgId id = 1;
-
-  // Node Ids of the nodes that originally participated in this subnet
-  repeated bytes committee = 4;
-  reserved 2;    // this is from committee consisting of uint64
-
-  // the transcript
-  bytes transcript_bytes = 3;
-}
-
-// The dkg id
-message DkgId {
-  uint64 instance_id = 1;
-  reserved 2;    // this is from subnet id being a uint64
-  bytes subnet_id = 3;
 }
 
 // Initial non-interactive DKG transcript record
@@ -124,9 +150,99 @@ message InitialNiDkgTranscriptRecord {
   bytes internal_csp_transcript = 5;
 }
 
+message IDkgTranscriptId {
+  uint64 id = 1;
+  types.v1.SubnetId subnet_id = 2;
+  uint64 source_height = 3;
+}
+
+message VerifiedIDkgDealing {
+  reserved 4;
+  reserved "requested_height";
+  reserved 5;
+  reserved "dealing_tuple";
+  reserved 2;
+  reserved "signature";
+  reserved 3;
+  reserved "signers";
+
+  uint32 dealer_index = 1;
+  IDkgSignedDealingTuple signed_dealing_tuple = 6;
+  repeated SignatureTuple support_tuples = 7;
+}
+
+message IDkgTranscript {
+  IDkgTranscriptId transcript_id = 1;
+  repeated types.v1.NodeId dealers = 2;
+  repeated types.v1.NodeId receivers = 3;
+  uint64 registry_version = 4;
+  repeated VerifiedIDkgDealing verified_dealings = 5;
+  bytes transcript_type = 6;  // CBOR serialized IDkgTranscriptType
+  crypto.v1.AlgorithmId algorithm_id = 7;
+  bytes raw_transcript = 8;   // serialised InternalRawTranscript
+}
+
+message DealerTuple {
+  types.v1.NodeId dealer_id = 1;
+  uint32 dealer_index = 2;
+}
+
+message SignatureTuple {
+  types.v1.NodeId signer = 1;
+  bytes signature = 2;
+}
+
+enum IDkgTranscriptOperation {
+  I_DKG_TRANSCRIPT_OPERATION_UNSPECIFIED = 0;
+  I_DKG_TRANSCRIPT_OPERATION_RANDOM = 1;
+  I_DKG_TRANSCRIPT_OPERATION_RESHARE_OF_MASKED = 2;
+  I_DKG_TRANSCRIPT_OPERATION_RESHARE_OF_UNMASKED = 3;
+  I_DKG_TRANSCRIPT_OPERATION_UNMASKED_TIMES_MASKED = 4;
+}
+
+message IDkgTranscriptParams {
+  IDkgTranscriptId transcript_id = 1;
+  repeated DealerTuple dealers = 2;
+  repeated types.v1.NodeId receivers = 3;
+  uint64 registry_version = 4;
+  crypto.v1.AlgorithmId algorithm_id = 5;
+  IDkgTranscriptOperation idkg_transcript_operation = 6;
+  repeated IDkgTranscript idkg_transcript_operation_args = 7; // 0, 1, or 2 IDkgTranscripts
+}
+
+message IDkgDealing {
+  IDkgTranscriptId transcript_id = 1;
+  bytes raw_dealing = 2;   // serialised InternalRawDealing
+}
+
+message IDkgSignedDealingTuple {
+  types.v1.NodeId dealer = 1;
+  IDkgDealing dealing = 2;
+  bytes signature = 3;
+}
+
+message InitialIDkgDealings {
+  reserved 3;
+  reserved "dealings";
+
+  uint32 version = 1;
+  IDkgTranscriptParams params = 2;
+  repeated IDkgSignedDealingTuple signed_dealings = 4;
+}
+
+message ExtendedDerivationPath {
+  types.v1.PrincipalId caller = 1;
+  repeated bytes derivation_path = 2;
+}
+
 // Per subnet P2P configuration
 // Note: protoc is mangling the name P2PConfig to P2pConfig
 message GossipConfig {
+  reserved 9;
+  reserved "relay_config";
+  reserved 10;
+  reserved "advert_config";
+
   // max outstanding request per peer MIN/DEFAULT/MAX 1/20/200
   uint32 max_artifact_streams_per_peer = 1;
   // timeout for a outstanding request 3_000/15_000/180_000
@@ -143,7 +259,9 @@ message GossipConfig {
   uint32 registry_poll_period_ms = 7;
   // period for sending a retransmission request    
   uint32 retransmission_request_ms = 8;
+  // config for advert distribution.
 }
+
 
 // Represents the type of subnet. Subnets of different type might exhibit different
 // behavior, e.g. being more restrictive in what operations are allowed or privileged
@@ -161,4 +279,141 @@ enum SubnetType {
     // A subnet type that is like application subnets but can have some
     // additional features.
     SUBNET_TYPE_VERIFIED_APPLICATION = 4;
+}
+
+message BitcoinFeatureInfo {
+  // The network for which the bitcoin feature is enabled.
+  bitcoin.v1.Network network = 1;
+
+  // The status of the feature.
+  BitcoinFeatureStatus status = 2;
+}
+
+// TODO(EXC-1114): This type is kept temporarily for backward compatibility and can safely
+// be removed once this commit is released.
+enum BitcoinFeature {
+  BITCOIN_FEATURE_UNSPECIFIED = 0;
+  BITCOIN_FEATURE_PAUSED = 1;
+  BITCOIN_FEATURE_ENABLED = 2;
+}
+
+// The status of the bitcoin feature.
+enum BitcoinFeatureStatus {
+  // The bitcoin feature is disabled.
+  //
+  // The subnet does not sync the bitcoin chain and requests to the bitcoin
+  // API are forwarded to another subnet where the feature is enabled.
+  //
+  // WARNING: Transitioning into this state deletes any bitcoin state present
+  // on the subnet, and full sync from genesis would then be required when
+  // enabling this feature again.
+  BITCOIN_FEATURE_STATUS_UNSPECIFIED = 0;
+
+  // The bitcoin feature is paused.
+  //
+  // The subnet does not sync the bitcoin chain and requests to the bitcoin
+  // API are forwarded to another subnet where the feature is enabled.
+  //
+  // Transitioning into this state does _not_ delete any bitcoin state that's
+  // present on the subnet.
+  BITCOIN_FEATURE_STATUS_PAUSED = 1;
+
+  // The bitcoin feature is enabled.
+  //
+  // The subnet syncs the bitcoin chain and handles requests to the bitcoin API.
+  BITCOIN_FEATURE_STATUS_ENABLED = 2;
+
+  // The bitcoin feature is syncing.
+  //
+  // The subnet syncs the bitcoin chain but does *not* handle requests to the bitcoin
+  // API. Requests to the bitcoin API are forwarded to another subnet where the
+  // feature is enabled.
+  BITCOIN_FEATURE_STATUS_SYNCING = 3;
+}
+
+// These modes correspond to milestones in the SEV-SNP development plan.
+enum SevFeatureStatus {
+  // The SEV-SNP feature is disabled.
+  //
+  // SEV-SNP enabled machines run the Guest without SEV-SNP.
+  //
+  // Warning: transitioning from SEV_FEATURE_STATUS_SECURE_ENABLED will result loss of all data.
+  SEV_FEATURE_STATUS_UNSPECIFIED = 0;
+
+  // The SEV-SNP feature is enabled in insecure mode.
+  //
+  // SEV-SNP enabled machines run the Guest with SEV-SNP but without disk integrity protection
+  // and storing the KEK (Key Encryption Key) in cleartext.
+  //
+  // Warning: transitioning from any mode other than SEV_FEATURE_STATUS_UNSPECIFIED will result
+  // in loss of all data.
+  SEV_FEATURE_STATUS_INSECURE_ENABLED = 1;
+
+  // The SEV-SNP feature is enabled in insecure mode with disk integrity protection.
+  //
+  // SEV-SNP enabled machines run the Guest with SEV-SNP but with disk integrity protection
+  // and storing the KEK (Key Encryption Key) in cleartext.
+  //
+  // Warning: transitioning to or from this mode will result loss of all data.
+  SEV_FEATURE_STATUS_INSECURE_INTEGRITY_ENABLED = 2;
+
+  // The SEV-SNP feature is enabled in secure mode with disk integrity protection.
+  //
+  // SEV-SNP enabled machines run the Guest with SEV-SNP with disk integrty protection
+  // and the KEK (Key Encryption Key) is derived from the measurement.  Upgrades result
+  // in the loss of all data as the KEK is not passed to the new Guest.
+  //
+  // Warning: transitioning to or from this mode except for SEV_FEATURE_STATUS_SECURE_ENABLED
+  // will resut in loss of all data.
+  SEV_FEATURE_STATUS_SECURE_NO_UPGRADE_ENABLED = 3;
+
+  // The SEV-SNP feature is enabled in secure mode with disk integrity protection.
+  //
+  // SEV-SNP enabled machines run the Guest with SEV-SNP with disk integrty protection
+  // and the KEK (Key Encryption Key) is derived from the measurement.  Upgrades do not
+  // result in the loss of data as the KEK is passed to the new Guest.
+  //
+  // Warning: transitioning to or from this mode except for SEV_FEATURE_STATUS_SECURE_NO_UPGRADE_ENABLED
+  // will result in loss of all data.
+  SEV_FEATURE_STATUS_SECURE_ENABLED = 4;
+}
+
+message SubnetFeatures {
+    reserved 1;
+    // This feature flag controls whether canister execution happens
+    // in sandboxed process or not. It is disabled by default.
+    bool canister_sandboxing = 2;
+    // This feature flag controls whether canisters of this subnet are capable of
+    // performing http(s) requests to the web2.
+    bool http_requests = 3;
+
+    reserved 4;
+
+    // Whether or not the subnet is capable of serving requests to the bitcoin testnet canister.
+    // TODO(EXC-1114): This field is kept temporarily for backward compatibility and can safely
+    // be removed once this commit is released.
+    optional BitcoinFeature bitcoin_testnet_feature = 5;
+
+    // Controls whether the bitcoin feature is enabled and which bitcoin network is
+    // supported.
+    optional BitcoinFeatureInfo bitcoin = 6;
+
+    // Status of the SEV-SNP feature.
+    optional SevFeatureStatus sev_status = 7;
+}
+
+// Per subnet ECDSA configuration
+message EcdsaConfig {
+  // Number of quadruples to create in advance.
+  uint32 quadruples_to_create_in_advance = 1;
+  reserved 2;
+  // Identifiers for threshold ECDSA keys held by the subnet.
+  repeated registry.crypto.v1.EcdsaKeyId key_ids = 3;
+  // The maximum number of signature requests that can be enqueued at once.
+  uint32 max_queue_size = 4;
+  // Signature requests will timeout after the given number of nano seconds.
+  optional uint64 signature_request_timeout_ns = 5;
+  // Key rotation period of a single node in milliseconds.
+  // If none is specified key rotation is disabled.
+  optional uint64 idkg_key_rotation_period_ms = 6;
 }

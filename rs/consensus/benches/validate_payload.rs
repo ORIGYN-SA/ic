@@ -10,49 +10,53 @@
 //!   in the past payloads, and the user signature is checked eventually, and
 //!   the message validates successfully
 
-use criterion::{criterion_group, criterion_main, Criterion};
-use ic_artifact_pool::consensus_pool::ConsensusPoolImpl;
+use criterion::{black_box, criterion_group, criterion_main, Criterion};
+use ic_artifact_pool::{consensus_pool::ConsensusPoolImpl, ingress_pool::IngressPoolImpl};
 use ic_config::state_manager::Config as StateManagerConfig;
 use ic_consensus::consensus::{
     payload_builder::{PayloadBuilder, PayloadBuilderImpl},
     pool_reader::PoolReader,
 };
-use ic_consensus_message::{make_genesis, ConsensusMessageHashable};
+use ic_constants::MAX_INGRESS_TTL;
 use ic_execution_environment::IngressHistoryReaderImpl;
+use ic_ic00_types::IC_00;
 use ic_ingress_manager::IngressManager;
 use ic_interfaces::{
     consensus::PayloadValidationError,
     consensus_pool::{ChangeAction, ChangeSet, ConsensusPool, MutableConsensusPool},
-    state_manager::{CertificationScope, StateManager},
     time_source::TimeSource,
     validation::ValidationResult,
 };
+use ic_interfaces_state_manager::{CertificationScope, StateManager};
+use ic_interfaces_state_manager_mocks::MockStateManager;
 use ic_logger::replica_logger::no_op_logger;
 use ic_metrics::MetricsRegistry;
+use ic_protobuf::types::v1 as pb;
 use ic_registry_subnet_type::SubnetType;
 use ic_state_manager::StateManagerImpl;
 use ic_test_utilities::{
-    consensus::{fake::*, MockConsensusCache},
+    canister_http::FakeCanisterHttpPayloadBuilder,
+    consensus::{fake::*, make_genesis, MockConsensusCache},
     crypto::temp_crypto_component_with_fake_registry,
     cycles_account_manager::CyclesAccountManagerBuilder,
-    registry::{setup_registry, SubnetRecordBuilder},
+    self_validating_payload_builder::FakeSelfValidatingPayloadBuilder,
     state::ReplicatedStateBuilder,
-    state_manager::MockStateManager,
     types::ids::{canister_test_id, node_test_id, subnet_test_id},
     types::messages::SignedIngressBuilder,
     xnet_payload_builder::FakeXNetPayloadBuilder,
     FastForwardTimeSource,
 };
+use ic_test_utilities_registry::{setup_registry, SubnetRecordBuilder};
 use ic_types::{
-    batch::{BatchPayload, IngressPayload, ValidationContext, XNetPayload},
+    batch::{BatchPayload, IngressPayload, ValidationContext},
     consensus::certification::*,
     consensus::*,
     crypto::Signed,
-    ic00::IC_00,
-    ingress::{IngressStatus, MAX_INGRESS_TTL},
-    Height, PrincipalId, RegistryVersion, Time, UserId,
+    ingress::{IngressState, IngressStatus},
+    signature::*,
+    Height, NumBytes, PrincipalId, RegistryVersion, Time, UserId,
 };
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 type SignedCertificationContent =
@@ -91,6 +95,7 @@ where
             no_op_logger(),
             &metrics_registry,
             &StateManagerConfig::new(tmpdir.path().to_path_buf()),
+            None,
             ic_types::malicious_flags::MaliciousFlags::default(),
         );
         setup_ingress_state(now, &mut state_manager);
@@ -103,7 +108,7 @@ where
         let mut consensus_pool = ConsensusPoolImpl::new_from_cup_without_bytes(
             subnet_test_id(0),
             make_genesis(summary),
-            pool_config,
+            pool_config.clone(),
             ic_metrics::MetricsRegistry::new(),
             no_op_logger(),
         );
@@ -115,32 +120,46 @@ where
         ));
         let mut state_manager = MockStateManager::new();
         state_manager.expect_get_state_at().return_const(Ok(
-            ic_interfaces::state_manager::Labeled::new(
+            ic_interfaces_state_manager::Labeled::new(
                 Height::new(0),
                 Arc::new(ReplicatedStateBuilder::default().build()),
             ),
         ));
 
+        let ingress_pool = Arc::new(RwLock::new(IngressPoolImpl::new(
+            pool_config,
+            metrics_registry.clone(),
+            no_op_logger(),
+        )));
+
+        let registry_client = setup_registry(
+            subnet_id,
+            vec![(1, SubnetRecordBuilder::from(&committee).build())],
+        );
         let cycles_account_manager = Arc::new(CyclesAccountManagerBuilder::new().build());
         let ingress_manager = Arc::new(IngressManager::new(
             Arc::new(MockConsensusCache::new()),
             Box::new(ingress_hist_reader),
-            setup_registry(
-                subnet_id,
-                vec![(1, SubnetRecordBuilder::from(&committee).build())],
-            ),
+            ingress_pool,
+            registry_client.clone(),
             ingress_signature_crypto,
             metrics_registry.clone(),
             subnet_id,
             no_op_logger(),
             Arc::new(state_manager),
             cycles_account_manager,
+            ic_types::malicious_flags::MaliciousFlags::default(),
         ));
 
         let payload_builder = Arc::new(PayloadBuilderImpl::new(
+            subnet_test_id(0),
+            registry_client,
             ingress_manager,
             Arc::new(FakeXNetPayloadBuilder::new()),
+            Arc::new(FakeSelfValidatingPayloadBuilder::new()),
+            Arc::new(FakeCanisterHttpPayloadBuilder::new()),
             metrics_registry,
+            no_op_logger(),
         ));
 
         test_fn(now, &mut consensus_pool, payload_builder.as_ref());
@@ -172,12 +191,14 @@ fn setup_ingress_state(now: Time, state_manager: &mut StateManagerImpl) {
             .build();
         state.metadata.ingress_history.insert(
             ingress.id(),
-            IngressStatus::Received {
+            IngressStatus::Known {
                 receiver: canister_test_id(i as u64).get(),
                 user_id: UserId::from(PrincipalId::new_user_test_id(i as u64)),
                 time: now,
+                state: IngressState::Received,
             },
             now,
+            NumBytes::from(u64::MAX),
         );
     }
 
@@ -234,21 +255,24 @@ fn add_past_blocks(
     let to_add = CERTIFIED_HEIGHT + PAST_PAYLOAD_HEIGHT + 1;
     for i in 1..=to_add {
         let mut block = Block::from_parent(&parent);
-        block.rank = Rank(i as u64);
+        block.rank = Rank(i);
         let ingress = prepare_ingress_payload(now, message_count, i as u8);
-        let xnet = XNetPayload::default();
         block.payload = Payload::new(
-            ic_crypto::crypto_hash,
+            ic_types::crypto::crypto_hash,
             (
-                BatchPayload::new(ingress, xnet),
+                BatchPayload {
+                    ingress,
+                    ..BatchPayload::default()
+                },
                 dkg::Dealings::new_empty(block.payload.as_ref().dkg_interval_start_height()),
+                None,
             )
                 .into(),
         );
 
         parent = block.clone();
-        let proposal = BlockProposal::fake(block, node_test_id(i as u64));
-        changeset.push(ChangeAction::AddToValidated(proposal.to_message()));
+        let proposal = BlockProposal::fake(block, node_test_id(i));
+        changeset.push(ChangeAction::AddToValidated(proposal.into_message()));
     }
     let time_source = FastForwardTimeSource::new();
     consensus_pool.apply_changes(time_source.as_ref(), changeset);
@@ -280,7 +304,12 @@ fn validate_payload(
         certified_height: Height::from(CERTIFIED_HEIGHT),
     };
 
-    payload_builder.validate_payload(payload, &past_payloads, &validation_context)
+    payload_builder.validate_payload(
+        Height::from(CERTIFIED_HEIGHT + 1),
+        payload,
+        &past_payloads,
+        &validation_context,
+    )
 }
 
 fn validate_payload_benchmark(criterion: &mut Criterion) {
@@ -288,7 +317,7 @@ fn validate_payload_benchmark(criterion: &mut Criterion) {
     group.sample_size(30);
     group.measurement_time(std::time::Duration::from_secs(40));
 
-    for message_count in (50..=900).step_by(50) {
+    for message_count in (50..=850).step_by(50) {
         run_test(
             "validate_payload_benchmark",
             |now: Time,
@@ -299,12 +328,15 @@ fn validate_payload_benchmark(criterion: &mut Criterion) {
 
                 let seed = CERTIFIED_HEIGHT + PAST_PAYLOAD_HEIGHT + 10;
                 let ingress = prepare_ingress_payload(now, message_count, seed as u8);
-                let xnet = XNetPayload::default();
                 let payload = Payload::new(
-                    ic_crypto::crypto_hash,
+                    ic_types::crypto::crypto_hash,
                     (
-                        BatchPayload::new(ingress, xnet),
+                        BatchPayload {
+                            ingress,
+                            ..BatchPayload::default()
+                        },
                         dkg::Dealings::new_empty(tip.payload.as_ref().dkg_interval_start_height()),
+                        None,
                     )
                         .into(),
                 );
@@ -321,6 +353,37 @@ fn validate_payload_benchmark(criterion: &mut Criterion) {
     }
 }
 
-criterion_group!(benches, validate_payload_benchmark);
+fn serialization_benchmark(criterion: &mut Criterion) {
+    let mut group = criterion.benchmark_group("serialization");
+    group.sample_size(30);
+    group.measurement_time(std::time::Duration::from_secs(10));
+
+    for message_count in (2000..=8000).step_by(2000) {
+        run_test(
+            "serialization_benchmark",
+            |now: Time, _: &mut ConsensusPoolImpl, _: &dyn PayloadBuilder| {
+                let seed = CERTIFIED_HEIGHT + PAST_PAYLOAD_HEIGHT + 10;
+                let ingress = prepare_ingress_payload(now, message_count, seed as u8);
+                let name = format!("serialization_{}_kb_payload", message_count);
+                group.bench_function(&name, |bench| {
+                    bench.iter(|| {
+                        let proto: pb::IngressPayload = (&ingress).into();
+                        black_box(proto);
+                    })
+                });
+                let name = format!("deserialization_{}_kb_payload", message_count);
+                group.bench_function(&name, |bench| {
+                    let p: pb::IngressPayload = (&ingress).into();
+                    bench.iter(|| {
+                        let proto = p.clone();
+                        let deser: IngressPayload = proto.try_into().unwrap();
+                        black_box(deser);
+                    })
+                });
+            },
+        )
+    }
+}
+criterion_group!(benches, serialization_benchmark, validate_payload_benchmark);
 
 criterion_main!(benches);

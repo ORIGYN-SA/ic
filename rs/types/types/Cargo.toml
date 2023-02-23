@@ -1,48 +1,54 @@
 [package]
 name = "ic-types"
 version = "0.8.0"
-edition = "2018"
+edition = "2021"
 
 [dependencies]
 base32 = "0.4.0"
 base64 = "0.11.0"
 bincode = "1.2.1"
-byte-unit = "3.1.3"
-candid = "0.6.15"
-chrono = "0.4"
+candid = "0.8.1"
 derive_more = { git = "https://github.com/dfinity-lab/derive_more", branch = "master" }
 hex = "0.4.2"
+http = "0.2.5"
 ic-base-types = { path = "../base_types" }
+ic-btc-types-internal = { path = "../../bitcoin/types/internal" }
+ic-constants = { path = "../../constants" }
+ic-crypto-internal-types = { path = "../../crypto/internal/crypto_lib/types" }
+ic-crypto-sha = { path = "../../crypto/sha" }
+ic-crypto-tree-hash = { path = "../../crypto/tree_hash" }
 ic-error-types = { path = "../error_types" }
 ic-ic00-types = { path = "../ic00_types" }
-ic-crypto-internal-types = { path = "../../crypto/internal/crypto_lib/types" }
-ic-crypto-sha256 = { path = "../../crypto/sha256" }
-ic-crypto-tree-hash = { path = "../../crypto/tree_hash" }
 ic-protobuf = { path = "../../protobuf" }
-ic-registry-transport = { path = "../../registry/transport" }
 ic-utils = { path = "../../utils" }
 maplit = "1.0.2"
 num-traits = "0.2.12"
-once_cell = { git = "https://github.com/dfinity-lab/once_cell", branch = "master" }
+once_cell = "1.8"
 phantom_newtype = { path = "../../phantom_newtype" }
-prost = "0.7.0"
-serde = { version = "1.0.99", features = ["derive", "rc"] }
+prost = "0.11.0"
+serde = { version = "1.0.99", features = ["derive"] }
 serde_bytes = "0.11"
 serde_cbor = "0.11.1"
-serde_with = "1.6.2"
 serde_json = "1.0.40"
-strum = "0.18.0"
-strum_macros = "0.18.0"
+serde_with = "1.6.2"
+strum = "0.23.0"
+strum_macros = "0.23.0"
 thiserror = "1.0"
+thousands = "0.2.0"
 url = { version = "2", features = ["serde"] }
+
+[target.'cfg(not(all(target_arch = "wasm32", target_os = "unknown")))'.dependencies]
+chrono = "0.4"
 
 [dev-dependencies]
 anyhow = "1"
-assert_matches = "1.3.0"
+assert_matches = "1.5.0"
 hex-literal = "0.2.1"
+ic-crypto-test-utils-canister-threshold-sigs = { path = "../../crypto/test_utils/canister_threshold_sigs" }
 pretty_assertions = "0.6.1"
+rand = "0.8"
 rusty-fork = "0.3.0"
 
 [target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
-proptest = "0.9.4"
-proptest-derive = "0.1.0"
+proptest = "1.0"
+proptest-derive = "0.3.0"

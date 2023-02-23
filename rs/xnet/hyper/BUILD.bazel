@@ -1,0 +1,18 @@
+load("@rules_rust//rust:defs.bzl", "rust_library")
+
+package(default_visibility = ["//visibility:public"])
+
+rust_library(
+    name = "hyper",
+    srcs = glob(["src/**"]),
+    crate_name = "ic_xnet_hyper",
+    version = "0.8.0",
+    deps = [
+        "//rs/crypto/tls_interfaces",
+        "//rs/interfaces/registry",
+        "//rs/xnet/uri",
+        "@crate_index//:hyper",
+        "@crate_index//:socket2",
+        "@crate_index//:tokio",
+    ],
+)

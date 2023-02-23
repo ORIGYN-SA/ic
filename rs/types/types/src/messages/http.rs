@@ -2,22 +2,26 @@
 #![cfg_attr(test, allow(clippy::unit_arg))]
 //! HTTP requests that the Internet Computer is prepared to handle.
 
-use super::{Blob, HttpHandlerError};
-use crate::messages::{MessageId, UserSignature};
+use super::Blob;
 use crate::{
-    crypto::SignedBytesWithoutDomainSeparator, messages::ingress_messages::SignedIngressContent,
-    messages::message_id::hash_of_map, messages::ReadState, messages::UserQuery, Time, UserId,
+    crypto::SignedBytesWithoutDomainSeparator,
+    messages::{
+        message_id::hash_of_map, MessageId, ReadState, SignedIngressContent, UserQuery,
+        UserSignature,
+    },
+    Height, Time, UserId,
 };
-use ic_base_types::{CanisterId, PrincipalId};
+use derive_more::Display;
+use ic_base_types::{CanisterId, CanisterIdError, PrincipalId};
 use ic_crypto_tree_hash::{MixedHashTree, Path};
 use maplit::btreemap;
 #[cfg(test)]
 use proptest_derive::Arbitrary;
 use serde::{Deserialize, Serialize};
-use std::{collections::BTreeSet, convert::TryFrom};
+use std::{collections::BTreeSet, convert::TryFrom, error::Error, fmt};
 
 /// Describes the fields of a canister update call as defined in
-/// https://sdk.dfinity.org/docs/interface-spec/index.html#api-update.
+/// `<https://sdk.dfinity.org/docs/interface-spec/index.html#api-update>`.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, Hash)]
 #[cfg_attr(test, derive(Arbitrary))]
 pub struct HttpCanisterUpdate {
@@ -58,19 +62,19 @@ impl HttpCanisterUpdate {
     }
 }
 
-/// Describes the contents of a /api/v1/submit request.
+/// Describes the contents of a /api/v2/canister/_/call request.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[cfg_attr(test, derive(Arbitrary))]
 #[serde(rename_all = "snake_case")]
 #[serde(tag = "request_type")]
-pub enum HttpSubmitContent {
+pub enum HttpCallContent {
     Call {
         #[serde(flatten)]
         update: HttpCanisterUpdate,
     },
 }
 
-impl HttpSubmitContent {
+impl HttpCallContent {
     /// Returns the representation-independent hash.
     pub fn representation_independent_hash(&self) -> [u8; 32] {
         let Self::Call { update } = self;
@@ -85,7 +89,7 @@ impl HttpSubmitContent {
 }
 
 /// Describes the fields of a canister query call (a query from a user to a
-/// canister) as defined in https://sdk.dfinity.org/docs/interface-spec/index.html#api-query.
+/// canister) as defined in `<https://sdk.dfinity.org/docs/interface-spec/index.html#api-query>`.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct HttpUserQuery {
     pub canister_id: Blob,
@@ -100,7 +104,30 @@ pub struct HttpUserQuery {
     pub nonce: Option<Blob>,
 }
 
-/// A `read_state` request as defined in https://sdk.dfinity.org/docs/interface-spec/index.html#api-request-read-state.
+/// Describes the contents of a /api/v2/canister/_/query request.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+#[serde(tag = "request_type")]
+pub enum HttpQueryContent {
+    Query {
+        #[serde(flatten)]
+        query: HttpUserQuery,
+    },
+}
+
+impl HttpQueryContent {
+    pub fn representation_independent_hash(&self) -> [u8; 32] {
+        match self {
+            Self::Query { query } => query.representation_independent_hash(),
+        }
+    }
+
+    pub fn id(&self) -> MessageId {
+        MessageId::from(self.representation_independent_hash())
+    }
+}
+
+/// A `read_state` request as defined in `<https://sdk.dfinity.org/docs/interface-spec/index.html#api-request-read-state>`.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct HttpReadState {
     pub sender: Blob,
@@ -111,26 +138,20 @@ pub struct HttpReadState {
     pub ingress_expiry: u64,
 }
 
-/// Describes the contents of a /api/v1/read request.
+/// Describes the contents of a /api/v2/canister/_/read_state request.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 #[serde(tag = "request_type")]
-pub enum HttpReadContent {
-    Query {
-        #[serde(flatten)]
-        query: HttpUserQuery,
-    },
+pub enum HttpReadStateContent {
     ReadState {
         #[serde(flatten)]
         read_state: HttpReadState,
     },
 }
 
-impl HttpReadContent {
-    /// Returns the representation-independent hash.
+impl HttpReadStateContent {
     pub fn representation_independent_hash(&self) -> [u8; 32] {
         match self {
-            Self::Query { query } => query.representation_independent_hash(),
             Self::ReadState { read_state } => read_state.representation_independent_hash(),
         }
     }
@@ -191,9 +212,10 @@ impl HttpReadState {
 }
 
 /// A request envelope as defined in
-/// https://sdk.dfinity.org/docs/interface-spec/index.html#authentication.
+/// `<https://sdk.dfinity.org/docs/interface-spec/index.html#authentication>`.
 ///
-/// The content is either an [`HttpSubmitContent`] or an [`HttpReadContent`].
+/// The content is either [`HttpCallContent`], [`HttpQueryContent`] or
+/// [`HttpReadStateContent`].
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[cfg_attr(test, derive(Arbitrary))]
 pub struct HttpRequestEnvelope<C> {
@@ -221,7 +243,7 @@ pub enum Authentication {
 }
 
 impl<C> TryFrom<&HttpRequestEnvelope<C>> for Authentication {
-    type Error = HttpHandlerError;
+    type Error = HttpRequestError;
 
     fn try_from(env: &HttpRequestEnvelope<C>) -> Result<Self, Self::Error> {
         match (&env.sender_pubkey, &env.sender_sig, &env.sender_delegation) {
@@ -289,69 +311,77 @@ impl<C> HttpRequest<C> {
     }
 }
 
-/// Internal representation of the content of a `api/v1/read` request.
-#[derive(Debug, PartialEq, Clone)]
-pub enum ReadContent {
-    Query(UserQuery),
-    ReadState(ReadState),
-}
-
-impl HttpRequestContent for ReadContent {
+impl HttpRequestContent for UserQuery {
     fn id(&self) -> MessageId {
-        match self {
-            Self::ReadState(read_state) => read_state.id(),
-            Self::Query(query) => query.id(),
-        }
+        self.id()
     }
 
     fn sender(&self) -> UserId {
-        match self {
-            Self::ReadState(read_state) => read_state.source,
-            Self::Query(query) => query.source,
-        }
+        self.source
     }
 
     fn ingress_expiry(&self) -> u64 {
-        match self {
-            Self::ReadState(read_state) => read_state.ingress_expiry,
-            Self::Query(query) => query.ingress_expiry,
-        }
+        self.ingress_expiry
     }
 
     fn nonce(&self) -> Option<Vec<u8>> {
-        match self {
-            Self::ReadState(read_state) => read_state.nonce.clone(),
-            Self::Query(query) => query.nonce.clone(),
+        self.nonce.clone()
+    }
+}
+
+impl HttpRequestContent for ReadState {
+    fn id(&self) -> MessageId {
+        self.id()
+    }
+
+    fn sender(&self) -> UserId {
+        self.source
+    }
+
+    fn ingress_expiry(&self) -> u64 {
+        self.ingress_expiry
+    }
+
+    fn nonce(&self) -> Option<Vec<u8>> {
+        self.nonce.clone()
+    }
+}
+
+impl TryFrom<HttpRequestEnvelope<HttpQueryContent>> for HttpRequest<UserQuery> {
+    type Error = HttpRequestError;
+
+    fn try_from(envelope: HttpRequestEnvelope<HttpQueryContent>) -> Result<Self, Self::Error> {
+        let auth = Authentication::try_from(&envelope)?;
+        match envelope.content {
+            HttpQueryContent::Query { query } => Ok(HttpRequest {
+                content: UserQuery::try_from(query)?,
+                auth,
+            }),
         }
     }
 }
 
-impl TryFrom<HttpRequestEnvelope<HttpReadContent>> for HttpRequest<ReadContent> {
-    type Error = HttpHandlerError;
+impl TryFrom<HttpRequestEnvelope<HttpReadStateContent>> for HttpRequest<ReadState> {
+    type Error = HttpRequestError;
 
-    fn try_from(envelope: HttpRequestEnvelope<HttpReadContent>) -> Result<Self, Self::Error> {
+    fn try_from(envelope: HttpRequestEnvelope<HttpReadStateContent>) -> Result<Self, Self::Error> {
         let auth = Authentication::try_from(&envelope)?;
         match envelope.content {
-            HttpReadContent::Query { query } => Ok(HttpRequest {
-                content: ReadContent::Query(UserQuery::try_from(query)?),
-                auth,
-            }),
-
-            HttpReadContent::ReadState { read_state } => Ok(HttpRequest {
-                content: ReadContent::ReadState(ReadState::try_from(read_state)?),
+            HttpReadStateContent::ReadState { read_state } => Ok(HttpRequest {
+                content: ReadState::try_from(read_state)?,
                 auth,
             }),
         }
     }
 }
 
-impl TryFrom<HttpRequestEnvelope<HttpSubmitContent>> for HttpRequest<SignedIngressContent> {
-    type Error = HttpHandlerError;
+impl TryFrom<HttpRequestEnvelope<HttpCallContent>> for HttpRequest<SignedIngressContent> {
+    type Error = HttpRequestError;
 
-    fn try_from(envelope: HttpRequestEnvelope<HttpSubmitContent>) -> Result<Self, Self::Error> {
+    fn try_from(envelope: HttpRequestEnvelope<HttpCallContent>) -> Result<Self, Self::Error> {
         let auth = Authentication::try_from(&envelope)?;
         match envelope.content {
-            HttpSubmitContent::Call { update } => Ok(HttpRequest {
+            HttpCallContent::Call { update } => Ok(HttpRequest {
                 content: SignedIngressContent::try_from(update)?,
                 auth,
             }),
@@ -359,8 +389,48 @@ impl TryFrom<HttpRequestEnvelope<HttpSubmitContent>> for HttpRequest<SignedIngre
     }
 }
 
+/// Errors returned by `HttpHandler` when processing ingress messages.
+#[derive(Debug, Clone, Serialize)]
+pub enum HttpRequestError {
+    InvalidMessageId(String),
+    InvalidIngressExpiry(String),
+    InvalidDelegationExpiry(String),
+    InvalidPrincipalId(String),
+    MissingPubkeyOrSignature(String),
+    InvalidEncoding(String),
+}
+
+impl From<serde_cbor::Error> for HttpRequestError {
+    fn from(err: serde_cbor::Error) -> Self {
+        HttpRequestError::InvalidEncoding(format!("{}", err))
+    }
+}
+
+impl fmt::Display for HttpRequestError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            HttpRequestError::InvalidMessageId(msg) => write!(f, "invalid message ID: {}", msg),
+            HttpRequestError::InvalidIngressExpiry(msg) => write!(f, "{}", msg),
+            HttpRequestError::InvalidDelegationExpiry(msg) => write!(f, "{}", msg),
+            HttpRequestError::InvalidPrincipalId(msg) => write!(f, "invalid princial id: {}", msg),
+            HttpRequestError::MissingPubkeyOrSignature(msg) => {
+                write!(f, "missing pubkey or signature: {}", msg)
+            }
+            HttpRequestError::InvalidEncoding(err) => write!(f, "Invalid CBOR encoding: {}", err),
+        }
+    }
+}
+
+impl Error for HttpRequestError {}
+
+impl From<CanisterIdError> for HttpRequestError {
+    fn from(err: CanisterIdError) -> Self {
+        Self::InvalidPrincipalId(format!("Converting to canister id failed with {}", err))
+    }
+}
+
 /// Describes a delegation map as defined in
-/// https://sdk.dfinity.org/docs/interface-spec/index.html#certification-delegation.
+/// `<https://sdk.dfinity.org/docs/interface-spec/index.html#certification-delegation>`.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
 #[cfg_attr(test, derive(Arbitrary))]
 pub struct Delegation {
@@ -434,7 +504,7 @@ impl SignedBytesWithoutDomainSeparator for Delegation {
 }
 
 /// Describes a delegation as defined in
-/// https://sdk.dfinity.org/docs/interface-spec/index.html#certification-delegation.
+/// `<https://sdk.dfinity.org/docs/interface-spec/index.html#certification-delegation>`.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
 #[cfg_attr(test, derive(Arbitrary))]
 pub struct SignedDelegation {
@@ -472,23 +542,6 @@ pub enum RawHttpRequestVal {
     Array(Vec<RawHttpRequestVal>),
 }
 
-/// The status of an update call.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-#[serde(tag = "status")]
-pub enum HttpResponseStatus {
-    Unknown,
-    Received,
-    Processing,
-    Replied {
-        reply: HttpReply,
-    },
-    Rejected {
-        reject_code: u64,
-        reject_message: String,
-    },
-}
-
 /// The reply to an update call.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(untagged)]
@@ -497,7 +550,8 @@ pub enum HttpReply {
     Empty {},
 }
 
-/// The response to `/api/v1/read` with `request_type` set to `query`.
+/// The response to `/api/v2/canister/_/{read_state|query}` with `request_type`
+/// set to `query`.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 #[serde(tag = "status")]
@@ -506,6 +560,7 @@ pub enum HttpQueryResponse {
         reply: HttpQueryResponseReply,
     },
     Rejected {
+        error_code: String,
         reject_code: u64,
         reject_message: String,
     },
@@ -524,7 +579,7 @@ pub struct HttpReadStateResponse {
     pub certificate: Blob,
 }
 
-/// A `Certificate` as defined in https://sdk.dfinity.org/docs/interface-spec/index.html#_certificate
+/// A `Certificate` as defined in `<https://sdk.dfinity.org/docs/interface-spec/index.html#_certificate>`
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Certificate {
     pub tree: MixedHashTree,
@@ -533,15 +588,47 @@ pub struct Certificate {
     pub delegation: Option<CertificateDelegation>,
 }
 
-/// This enum is defined as a filler to make the encoding of `Certificate`
-/// compliant with the interface spec. It is not currently being used.
+/// A `CertificateDelegation` as defined in `<https://smartcontracts.org/docs/interface-spec/index.html#certification-delegation>`
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct CertificateDelegation {
     pub subnet_id: Blob,
     pub certificate: Blob,
 }
 
-/// The response to `/api/v1/status`.
+/// Different stages required for the full initialization of the HTTPS endpoint.
+/// The fields are listed in order of execution/transition.
+#[derive(Debug, Display, Copy, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ReplicaHealthStatus {
+    /// Marks the start state of the HTTPS endpoint. Some requests will fail
+    /// while initialization is on-going.
+    Starting,
+    /// Waiting for the first non-empty certifited state available on
+    /// the node.
+    WaitingForCertifiedState,
+    /// Waiting for the root delegation in case of non-NNS subnet.
+    WaitingForRootDelegation,
+    /// Happens when the replica's finalized height is significantly greater
+    /// than the certified height.
+    /// If the finalized height is significantly greater than the
+    /// certified height, this is a signal that execution is lagging
+    /// consensus, and that consensus needs to be throttled.
+    /// More information can be found in the whitepaper
+    /// `<https://internetcomputer.org/whitepaper.pdf>`
+    /// under "Per-round certified state" section(s).
+    ///
+    /// If execution (or certification) is lagging significantly on this replica,
+    /// then we better not serve queries because we risk returning stale data.
+    /// According to the IC's spec - `<https://internetcomputer.org/docs/current/references/ic-interface-spec#query_call>`,
+    /// we should execute queries on "recent enough" state tree.
+    CertifiedStateBehind,
+    /// Signals that the replica can serve all types of API requests.
+    /// When users programatically access this information they should
+    /// check only if 'ReplicaHealthStatus' is equal to 'Healthy' or not.
+    Healthy,
+}
+
+/// The response to `/api/v2/status`.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub struct HttpStatusResponse {
@@ -552,13 +639,16 @@ pub struct HttpStatusResponse {
     pub impl_version: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub impl_hash: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub replica_health_status: Option<ReplicaHealthStatus>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub certified_height: Option<Height>,
 }
 
 #[cfg(test)]
 mod test {
     use super::*;
-
-    use crate::time::UNIX_EPOCH;
+    use crate::{time::UNIX_EPOCH, AmountOf};
     use pretty_assertions::assert_eq;
     use serde::Serialize;
     use serde_cbor::Value;
@@ -608,76 +698,13 @@ mod test {
             &HttpQueryResponse::Rejected {
                 reject_code: 1,
                 reject_message: "system error".to_string(),
+                error_code: "IC500".to_string(),
             },
             Value::Map(btreemap! {
                 text("status") => text("rejected"),
                 text("reject_code") => int(1),
                 text("reject_message") => text("system error"),
-            }),
-        );
-    }
-
-    #[test]
-    fn encoding_read_request_status_response_received() {
-        assert_cbor_ser_equal(
-            &HttpResponseStatus::Received,
-            Value::Map(btreemap! {
-                text("status") => text("received"),
-            }),
-        );
-    }
-
-    #[test]
-    fn encoding_read_request_status_response_processing() {
-        assert_cbor_ser_equal(
-            &HttpResponseStatus::Processing,
-            Value::Map(btreemap! {
-                text("status") => text("processing"),
-            }),
-        );
-    }
-
-    #[test]
-    fn encoding_read_request_status_response_replied() {
-        assert_cbor_ser_equal(
-            &HttpResponseStatus::Replied {
-                reply: HttpReply::CodeCall {
-                    arg: Blob(vec![0, 0, 0, 0]),
-                },
-            },
-            Value::Map(btreemap! {
-                text("status") => text("replied"),
-                text("reply") => Value::Map(btreemap! {
-                    text("arg") => bytes(&[0,0,0,0])
-                }),
-            }),
-        );
-    }
-
-    #[test]
-    fn encoding_read_request_status_response_replied_empty() {
-        assert_cbor_ser_equal(
-            &HttpResponseStatus::Replied {
-                reply: HttpReply::Empty {},
-            },
-            Value::Map(btreemap! {
-                text("status") => text("replied"),
-                text("reply") => Value::Map(btreemap! {}),
-            }),
-        );
-    }
-
-    #[test]
-    fn encoding_read_request_status_response_rejected() {
-        assert_cbor_ser_equal(
-            &HttpResponseStatus::Rejected {
-                reject_code: 42,
-                reject_message: "foo bar".to_string(),
-            },
-            Value::Map(btreemap! {
-                text("status") => text("rejected"),
-                text("reject_code") => int(42),
-                text("reject_message") => text("foo bar"),
+                text("error_code") => text("IC500"),
             }),
         );
     }
@@ -690,10 +717,13 @@ mod test {
                 root_key: None,
                 impl_version: Some("0.0".to_string()),
                 impl_hash: None,
+                replica_health_status: Some(ReplicaHealthStatus::Starting),
+                certified_height: None,
             },
             Value::Map(btreemap! {
                 text("ic_api_version") => text("foobar"),
-                text("impl_version") => text("0.0")
+                text("impl_version") => text("0.0"),
+                text("replica_health_status") => text("starting"),
             }),
         );
     }
@@ -706,11 +736,54 @@ mod test {
                 root_key: Some(Blob(vec![1, 2, 3])),
                 impl_version: Some("0.0".to_string()),
                 impl_hash: None,
+                replica_health_status: Some(ReplicaHealthStatus::Healthy),
+                certified_height: None,
             },
             Value::Map(btreemap! {
                 text("ic_api_version") => text("foobar"),
                 text("root_key") => bytes(&[1, 2, 3]),
-                text("impl_version") => text("0.0")
+                text("impl_version") => text("0.0"),
+                text("replica_health_status") => text("healthy"),
+            }),
+        );
+    }
+
+    #[test]
+    fn encoding_status_without_health_status() {
+        assert_cbor_ser_equal(
+            &HttpStatusResponse {
+                ic_api_version: "foobar".to_string(),
+                root_key: Some(Blob(vec![1, 2, 3])),
+                impl_version: Some("0.0".to_string()),
+                impl_hash: None,
+                replica_health_status: None,
+                certified_height: None,
+            },
+            Value::Map(btreemap! {
+                text("ic_api_version") => text("foobar"),
+                text("root_key") => bytes(&[1, 2, 3]),
+                text("impl_version") => text("0.0"),
+            }),
+        );
+    }
+
+    #[test]
+    fn encoding_status_with_certified_height() {
+        assert_cbor_ser_equal(
+            &HttpStatusResponse {
+                ic_api_version: "foobar".to_string(),
+                root_key: Some(Blob(vec![1, 2, 3])),
+                impl_version: Some("0.0".to_string()),
+                impl_hash: None,
+                replica_health_status: Some(ReplicaHealthStatus::Healthy),
+                certified_height: Some(AmountOf::new(1)),
+            },
+            Value::Map(btreemap! {
+                text("ic_api_version") => text("foobar"),
+                text("root_key") => bytes(&[1, 2, 3]),
+                text("impl_version") => text("0.0"),
+                text("replica_health_status") => text("healthy"),
+                text("certified_height") => serde_cbor::Value::Integer(1),
             }),
         );
     }

@@ -1,0 +1,111 @@
+cargo-clippy-linux:
+  extends: .cargo-build-docker
+  variables:
+    BUILD_COMMAND: "$CI_PROJECT_DIR/gitlab-ci/src/rust_lint/lint.sh"
+
+cargo-clippy-darwin:
+  extends:
+    - .cargo-build-macos
+  variables:
+    BUILD_COMMAND: "$CI_PROJECT_DIR/gitlab-ci/src/rust_lint/lint.sh"
+
+cargo-build-debug-linux:
+  extends: .cargo-build-docker
+  variables:
+    BUILD_COMMAND: "cargo build"
+
+cargo-build-debug-darwin:
+  extends: .cargo-build-macos
+  variables:
+    BUILD_COMMAND: "cargo build"
+
+# Warning! If you rename this job, you update ALL `gitlab-artifacts-download` invocations.
+cargo-build-release-linux:
+  extends: 
+  - .cargo-build-docker
+  - .rules-parent-pipeline-protected-branch-only
+  artifacts:
+    paths:
+      - artifacts/nix-release/*
+  variables:
+    BUILD_COMMAND: "cargo build --release"
+
+cargo-build-release-darwin:
+  extends: .cargo-build-macos
+  artifacts:
+    paths:
+      - artifacts/nix-release/*
+  variables:
+    BUILD_COMMAND: "cargo build --release"
+    BUILD_COMMAND_POST: "cd ${CI_PROJECT_DIR}/gitlab-ci/src && python3 -m artifacts.collect_build_binaries artifacts/nix-release"
+
+cargo-build-release-linux-native:
+  extends:
+    - .cargo-build-docker-protected
+    - .rules-parent-pipeline-autorun-on-trigger
+  image:
+    # Use the docker image without nix-shell
+    name: "registry.gitlab.com/dfinity-lab/core/docker/ic-build:2022-03-29-09b55cf44-be6eecb8e51ffc7fc98bb891a45bc77bde931b58"
+  variables:
+    ARTIFACT_EXT: ""
+  artifacts:
+    paths:
+      - "artifacts/release${ARTIFACT_EXT}/*"
+  script: >
+    "${CI_PROJECT_DIR}/gitlab-ci/tools/job-driver.py" "${CI_JOB_NAME}"
+
+cargo-build-release-linux-native-malicious:
+  extends: cargo-build-release-linux-native
+  variables:
+    ARTIFACT_EXT: "-malicious"
+
+cargo-build-canisters:
+  extends:
+    - .cargo-build-docker-protected
+    - .rules-parent-pipeline-autorun-on-trigger
+  variables:
+    ARTIFACT_EXT: ""
+  image:
+    # Use the docker image without nix-shell
+    name: "registry.gitlab.com/dfinity-lab/core/docker/ic-build:2022-03-29-09b55cf44-be6eecb8e51ffc7fc98bb891a45bc77bde931b58"
+  artifacts:
+    paths:
+      - "artifacts/canisters${ARTIFACT_EXT}/*"
+  script: >
+    "${CI_PROJECT_DIR}/gitlab-ci/tools/job-driver.py" "${CI_JOB_NAME}"
+
+dfx-build-release-darwin:
+  extends: .cargo-build-macos
+  artifacts:
+    paths:
+      - artifacts/sdk-release/*
+  variables:
+    BUILD_COMMAND: "${CI_PROJECT_DIR}/gitlab-ci/tools/build-dfx-binaries"
+    BUILD_COMMAND_POST: "cd ${CI_PROJECT_DIR}/gitlab-ci/src && python3 -m artifacts.collect_build_binaries artifacts/sdk-release/x86_64-darwin"
+
+dfx-build-release-linux:
+  extends:
+    - .cargo-build-docker-protected
+    - .rules-parent-pipeline-autorun-on-trigger
+  artifacts:
+    paths:
+      - artifacts/sdk-release/*
+  image:
+    # Use the docker image without nix-shell
+    name: "registry.gitlab.com/dfinity-lab/core/docker/ic-build:2022-03-29-09b55cf44-be6eecb8e51ffc7fc98bb891a45bc77bde931b58"
+  variables:
+    BUILD_COMMAND: ""
+    CARGO_BUILD_TARGET: x86_64-unknown-linux-gnu
+    OPENSSL_INCLUDE_DIR: /usr/include/x86_64-linux-gnu
+    OPENSSL_LIB_DIR: /usr/lib/x86_64-linux-gnu
+    OPENSSL_STATIC: "1"
+  script:
+    - |
+      set -eExuo pipefail
+
+      # the pkg-config crate ignores requests to link statically if a dylib is available
+      sudo rm /usr/lib/x86_64-linux-gnu/liblmdb.so*
+
+      "${CI_PROJECT_DIR}/gitlab-ci/tools/build-dfx-binaries"
+
+      cd "${CI_PROJECT_DIR}/gitlab-ci/src" && python3 -m artifacts.collect_build_binaries artifacts/sdk-release/x86_64-linux

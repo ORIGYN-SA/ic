@@ -2,32 +2,6 @@ use super::*;
 use ic_types::crypto::{AlgorithmId, CryptoError};
 use std::convert::{From, TryFrom};
 
-impl Into<String> for SecretKeyBytes {
-    fn into(self) -> String {
-        base64::encode(&self.0[..])
-    }
-}
-
-// From vector of bytes.
-impl From<Vec<u8>> for SecretKeyBytes {
-    fn from(key: Vec<u8>) -> Self {
-        SecretKeyBytes(key)
-    }
-}
-
-// From base64-encoded string.
-impl TryFrom<&str> for SecretKeyBytes {
-    type Error = CryptoError;
-
-    fn try_from(key: &str) -> Result<Self, CryptoError> {
-        let key = base64::decode(key).map_err(|e| CryptoError::MalformedSecretKey {
-            algorithm: AlgorithmId::EcdsaP256,
-            internal_error: format!("Key is not a valid base64 encoded string: {}", e),
-        })?;
-        Ok(SecretKeyBytes(key))
-    }
-}
-
 // From vector of bytes.
 impl From<Vec<u8>> for PublicKeyBytes {
     fn from(key: Vec<u8>) -> Self {
@@ -35,9 +9,9 @@ impl From<Vec<u8>> for PublicKeyBytes {
     }
 }
 
-impl Into<String> for PublicKeyBytes {
-    fn into(self) -> String {
-        base64::encode(&self.0[..])
+impl From<PublicKeyBytes> for String {
+    fn from(val: PublicKeyBytes) -> Self {
+        base64::encode(&val.0[..])
     }
 }
 
@@ -84,9 +58,9 @@ impl TryFrom<Vec<u8>> for SignatureBytes {
     }
 }
 
-impl Into<String> for SignatureBytes {
-    fn into(self) -> String {
-        base64::encode(&self.0.to_vec())
+impl From<SignatureBytes> for String {
+    fn from(val: SignatureBytes) -> Self {
+        base64::encode(&val.0)
     }
 }
 
@@ -129,7 +103,9 @@ mod tests {
         let bytes = vec![0; SignatureBytes::SIZE + 1];
         let result = SignatureBytes::try_from(bytes);
         assert!(result.is_err());
-        assert!(result.unwrap_err().is_malformed_signature());
+        assert!(result
+            .expect_err("Unexpected success.")
+            .is_malformed_signature());
     }
 
     #[test]
@@ -137,6 +113,8 @@ mod tests {
         let bytes = vec![0; SignatureBytes::SIZE - 1];
         let result = SignatureBytes::try_from(bytes);
         assert!(result.is_err());
-        assert!(result.unwrap_err().is_malformed_signature());
+        assert!(result
+            .expect_err("Unexpected success.")
+            .is_malformed_signature());
     }
 }

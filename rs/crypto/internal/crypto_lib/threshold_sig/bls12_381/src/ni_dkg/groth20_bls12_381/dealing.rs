@@ -8,12 +8,10 @@ use crate::api::ni_dkg_errors::{
 };
 use crate::{
     api::individual_public_key,
-    crypto::{keygen, keygen_with_secret},
+    crypto::{generate_threshold_key, threshold_share_secret_key},
 };
-use ic_crypto_internal_bls12381_common::fr_to_bytes;
-use ic_types::crypto::threshold_sig::ni_dkg::NiDkgId;
-use ic_types::{NodeIndex, NumberOfNodes, Randomness};
-use pairing::bls12_381::FrRepr;
+use ic_crypto_internal_seed::Seed;
+use ic_types::{NodeIndex, NumberOfNodes};
 use std::collections::BTreeMap;
 use std::convert::TryFrom;
 
@@ -22,9 +20,8 @@ use crate::types::{SecretKey as ThresholdSecretKey, SecretKeyBytes as ThresholdS
 
 // "New style" internal types, used for the NiDKG:
 use super::ALGORITHM_ID;
-use ic_crypto_internal_types::curves::bls12_381::Fr as FrBytes;
 use ic_crypto_internal_types::sign::threshold_sig::ni_dkg::ni_dkg_groth20_bls12_381::{
-    Dealing, FsEncryptionPlaintext, FsEncryptionPublicKey, PublicCoefficientsBytes,
+    Dealing, FsEncryptionPublicKey, PublicCoefficientsBytes,
 };
 use ic_crypto_internal_types::sign::threshold_sig::ni_dkg::Epoch;
 
@@ -62,33 +59,25 @@ use ic_crypto_internal_types::sign::threshold_sig::ni_dkg::Epoch;
 ///   `receiver_keys`.
 /// * If the key generation produces public coefficients that are malformed.
 pub fn create_dealing(
-    keygen_seed: Randomness,
-    encryption_seed: Randomness,
+    keygen_seed: Seed,
+    encryption_seed: Seed,
     threshold: NumberOfNodes,
     receiver_keys: &BTreeMap<NodeIndex, FsEncryptionPublicKey>,
     epoch: Epoch,
     dealer_index: NodeIndex,
     resharing_secret: Option<ThresholdSecretKeyBytes>,
 ) -> Result<Dealing, CspDkgCreateReshareDealingError> {
+    let number_of_receivers =
+        number_of_receivers(receiver_keys).map_err(CspDkgCreateReshareDealingError::SizeError)?;
+
     // Check parameters
     {
-        let number_of_receivers = number_of_receivers(receiver_keys)
-            .map_err(CspDkgCreateReshareDealingError::SizeError)?;
         verify_threshold(threshold, number_of_receivers)
             .map_err(CspDkgCreateReshareDealingError::InvalidThresholdError)?;
         verify_receiver_indices(receiver_keys, number_of_receivers)?;
     }
 
     let (public_coefficients, threshold_secret_key_shares) = {
-        let selected_nodes: Vec<bool> = {
-            let max_node_index = receiver_keys.keys().max();
-            let mut selected =
-                vec![false; max_node_index.map(|index| *index as usize + 1).unwrap_or(0)];
-            for index in receiver_keys.keys() {
-                selected[*index as usize] = true;
-            }
-            selected
-        };
         if let Some(resharing_secret) = resharing_secret {
             let resharing_secret: ThresholdSecretKey =
                 ThresholdSecretKey::try_from(&resharing_secret).map_err(|_| {
@@ -100,15 +89,15 @@ pub fn create_dealing(
                     )
                 })?;
 
-            keygen_with_secret(
+            threshold_share_secret_key(
                 keygen_seed,
                 threshold,
-                &selected_nodes[..],
+                number_of_receivers,
                 &resharing_secret,
             )
             .map_err(CspDkgCreateReshareDealingError::InvalidThresholdError)
         } else {
-            keygen(keygen_seed, threshold, &selected_nodes[..])
+            generate_threshold_key(keygen_seed, threshold, number_of_receivers)
                 .map_err(CspDkgCreateReshareDealingError::InvalidThresholdError)
         }
     }?;
@@ -116,21 +105,14 @@ pub fn create_dealing(
     let public_coefficients = PublicCoefficientsBytes::from(&public_coefficients); // Internal to CSP type conversion
 
     let (ciphertexts, zk_proof_decryptability, zk_proof_correct_sharing) = {
-        let key_message_pairs: Vec<(FsEncryptionPublicKey, FsEncryptionPlaintext)> = (0..)
+        let key_message_pairs: Vec<_> = (0..)
             .zip(&threshold_secret_key_shares)
             .map(|(index, share)| {
-                let share = share
-                    .clone()
-                    .expect("The keys should be contiguous but we have a missing entry.");
-                let share = FrRepr::from(share);
-                let share = FrBytes(fr_to_bytes(&share));
-                let share = FsEncryptionPlaintext::from(&share);
-                (
-                    *receiver_keys
-                        .get(&index)
-                        .expect("There should be a public key for each share"),
-                    share,
-                )
+                let share = share.clone();
+                let key = *receiver_keys
+                    .get(&index)
+                    .expect("There should be a public key for each share");
+                (key, share)
             })
             .collect();
         encrypt_and_prove(
@@ -181,7 +163,6 @@ pub fn create_dealing(
 ///   decryptability or sharing proofs of the dealing, or the integrity of the
 ///   dealing ciphertexts, don't verify.
 pub fn verify_dealing(
-    _dkg_id: NiDkgId,
     dealer_index: NodeIndex,
     threshold: NumberOfNodes,
     epoch: Epoch,
@@ -214,7 +195,6 @@ pub fn verify_dealing(
 /// Also cf. `verify_dealing`.
 ///
 /// # Arguments
-/// * `dkg_id` - Unused.
 /// * `dealer_resharing_index` - The index of the dealer that provided the given
 ///   `dealing`.
 /// * `threshold` - The threshold required by the given `dealing`.
@@ -237,7 +217,6 @@ pub fn verify_dealing(
 /// # Panics
 /// * If there are no `public_coefficients` in `dealing`.
 pub fn verify_resharing_dealing(
-    dkg_id: NiDkgId,
     dealer_resharing_index: NodeIndex,
     threshold: NumberOfNodes,
     epoch: Epoch,
@@ -246,7 +225,6 @@ pub fn verify_resharing_dealing(
     resharing_public_coefficients: &PublicCoefficientsBytes,
 ) -> Result<(), CspDkgVerifyDealingError> {
     verify_dealing(
-        dkg_id,
         dealer_resharing_index,
         threshold,
         epoch,

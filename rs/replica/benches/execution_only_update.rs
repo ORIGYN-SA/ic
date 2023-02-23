@@ -1,32 +1,32 @@
 use criterion::{criterion_group, criterion_main, Criterion};
 use ic_config::{
-    execution_environment::Config as ExecutionConfig, scheduler::Config as SchedulerConfig,
-    state_manager::Config as StateManagerConfig, subnet_config::SubnetConfigs,
+    execution_environment::Config as ExecutionConfig, state_manager::Config as StateManagerConfig,
+    subnet_config::SubnetConfigs,
 };
 use ic_cycles_account_manager::CyclesAccountManager;
-use ic_execution_environment::{setup_execution, IngressHistoryReaderImpl};
+use ic_error_types::{ErrorCode, UserError};
+use ic_execution_environment::ExecutionServices;
+use ic_ic00_types::{self as ic00, CanisterInstallMode, Payload};
 use ic_interfaces::{execution_environment::IngressHistoryReader, messaging::MessageRouting};
+use ic_interfaces_registry_mocks::MockRegistryClient;
 use ic_logger::{replica_logger::no_op_logger, ReplicaLogger};
 use ic_messaging::MessageRoutingImpl;
 use ic_metrics::MetricsRegistry;
 use ic_registry_subnet_type::SubnetType;
 use ic_state_manager::StateManagerImpl;
 use ic_test_utilities::{
-    consensus::fake::FakeVerifier, mock_time, registry::MockRegistryClient,
-    types::messages::SignedIngressBuilder,
+    consensus::fake::FakeVerifier, mock_time, types::messages::SignedIngressBuilder,
 };
 use ic_types::{
-    batch::{Batch, BatchPayload, IngressPayload, XNetPayload},
-    ic00,
-    ic00::Payload,
-    ingress::{IngressStatus, WasmResult},
-    messages::{CanisterInstallMode, SignedIngress},
-    user_error::UserError,
+    batch::{Batch, BatchPayload, IngressPayload},
+    ingress::{IngressState, IngressStatus, WasmResult},
+    malicious_flags::MaliciousFlags,
+    messages::SignedIngress,
     Randomness, RegistryVersion,
 };
 use ic_types::{messages::MessageId, replica_config::ReplicaConfig, CanisterId};
-use std::sync::Arc;
 use std::time::{Duration, Instant};
+use std::{collections::BTreeMap, sync::Arc};
 
 const HELLO_WORLD: &str = r#"
             (module
@@ -78,7 +78,7 @@ impl BenchReplica {
                 ic00::InstallCodeArgs::new(
                     CanisterInstallMode::Install,
                     CanisterId::from(42),
-                    wabt::wat2wasm(HELLO_WORLD).unwrap(),
+                    wat::parse_str(HELLO_WORLD).unwrap(),
                     vec![],
                     None,
                     None,
@@ -93,7 +93,7 @@ impl BenchReplica {
 
     fn ingress_directly(
         &self,
-        ingress_hist_reader: &IngressHistoryReaderImpl,
+        ingress_hist_reader: &dyn IngressHistoryReader,
         message_routing: &MessageRoutingImpl,
         message_id: MessageId,
         signed_ingress: SignedIngress,
@@ -113,11 +113,10 @@ fn build_batch(message_routing: &dyn MessageRouting, msgs: Vec<SignedIngress>) -
         requires_full_state_hash: !msgs.is_empty(),
         payload: BatchPayload {
             ingress: IngressPayload::from(msgs),
-            xnet: XNetPayload {
-                stream_slices: Default::default(),
-            },
+            ..BatchPayload::default()
         },
         randomness: Randomness::from([0; 32]),
+        ecdsa_subnet_public_keys: BTreeMap::new(),
         registry_version: RegistryVersion::from(1),
         time: mock_time(),
         consensus_responses: vec![],
@@ -151,13 +150,20 @@ fn execute_ingress_message(
             batch = build_batch(message_routing, vec![])
         }
 
-        let ingress_result = (ingress_history.get_latest_status())(&msg_id);
+        let ingress_result = (ingress_history.get_latest_status())(msg_id);
         match ingress_result {
-            IngressStatus::Completed { result, .. } => return Ok(result),
-            IngressStatus::Failed { error, .. } => return Err(error),
-            IngressStatus::Received { .. }
-            | IngressStatus::Processing { .. }
-            | IngressStatus::Unknown => (),
+            IngressStatus::Known { state, .. } => match state {
+                IngressState::Completed(result) => return Ok(result),
+                IngressState::Failed(error) => return Err(error),
+                IngressState::Done => {
+                    return Err(UserError::new(
+                        ErrorCode::SubnetOversubscribed,
+                        "The call has completed but the reply/reject data has been pruned.",
+                    ))
+                }
+                IngressState::Received | IngressState::Processing => (),
+            },
+            IngressStatus::Unknown => (),
         }
     }
     panic!("Ingress message did not finish executing within 30 seconds");
@@ -167,47 +173,46 @@ fn criterion_calls(criterion: &mut Criterion) {
     let bench_replica = BenchReplica::new();
     let mut id: u64 = 0;
 
-    let scheduler_config = SchedulerConfig::default();
     let registry = Arc::new(MockRegistryClient::new());
 
     let subnet_type = SubnetType::Application;
+    let subnet_config = SubnetConfigs::default().own_subnet_config(subnet_type);
     let cycles_account_manager = Arc::new(CyclesAccountManager::new(
-        scheduler_config.max_instructions_per_message,
-        ExecutionConfig::default().max_cycles_per_canister,
+        subnet_config.scheduler_config.max_instructions_per_message,
         subnet_type,
         bench_replica.replica_config.subnet_id,
         SubnetConfigs::default()
             .own_subnet_config(subnet_type)
             .cycles_account_manager_config,
     ));
-
-    let (exec_env, ingress_history_writer, _) = setup_execution(
-        bench_replica.log.clone(),
-        &bench_replica.metrics_registry,
-        bench_replica.replica_config.subnet_id,
-        subnet_type,
-        scheduler_config.scheduler_cores,
-        ExecutionConfig::default(),
-        Arc::clone(&cycles_account_manager),
-    );
-
-    let subnet_config = SubnetConfigs::default().own_subnet_config(subnet_type);
     let tmpdir = tempfile::Builder::new()
         .prefix("ic_config")
         .tempdir()
         .unwrap();
-    let state_manager = StateManagerImpl::new(
+    let state_manager = Arc::new(StateManagerImpl::new(
         Arc::new(FakeVerifier::new()),
         bench_replica.replica_config.subnet_id,
         subnet_type,
         bench_replica.log.clone(),
         &bench_replica.metrics_registry,
         &StateManagerConfig::new(tmpdir.path().to_path_buf()),
+        None,
         ic_types::malicious_flags::MaliciousFlags::default(),
-    );
-    let state_manager = Arc::new(state_manager);
+    ));
 
-    let ingress_hist_reader = IngressHistoryReaderImpl::new(Arc::clone(&state_manager) as Arc<_>);
+    let (_, ingress_history_writer, ingress_history_reader, _, _, _, scheduler) =
+        ExecutionServices::setup_execution(
+            bench_replica.log.clone(),
+            &bench_replica.metrics_registry,
+            bench_replica.replica_config.subnet_id,
+            subnet_type,
+            subnet_config.scheduler_config,
+            ExecutionConfig::default(),
+            Arc::clone(&cycles_account_manager),
+            Arc::clone(&state_manager) as Arc<_>,
+            Arc::clone(&state_manager.get_fd_factory()),
+        )
+        .into_parts();
 
     let mut group = criterion.benchmark_group("user calls");
 
@@ -215,22 +220,22 @@ fn criterion_calls(criterion: &mut Criterion) {
         Arc::clone(&state_manager) as Arc<_>,
         Arc::clone(&state_manager) as Arc<_>,
         Arc::clone(&ingress_history_writer) as Arc<_>,
-        Arc::clone(&exec_env) as Arc<_>,
+        scheduler,
+        ExecutionConfig::default(),
         cycles_account_manager,
-        subnet_config.scheduler_config,
         bench_replica.replica_config.subnet_id,
-        subnet_type,
         &bench_replica.metrics_registry,
         bench_replica.log.clone(),
         registry,
+        MaliciousFlags::default(),
     );
 
     struct BenchData {
         message_id: MessageId,
         signed_ingress: SignedIngress,
-    };
+    }
 
-    bench_replica.install(&message_routing, &ingress_hist_reader);
+    bench_replica.install(&message_routing, ingress_history_reader.as_ref());
 
     group.bench_function("single-node update", |bench| {
         bench.iter_with_setup(
@@ -256,7 +261,7 @@ fn criterion_calls(criterion: &mut Criterion) {
             },
             |data| {
                 bench_replica.ingress_directly(
-                    &ingress_hist_reader,
+                    ingress_history_reader.as_ref(),
                     &message_routing,
                     data.message_id,
                     data.signed_ingress,

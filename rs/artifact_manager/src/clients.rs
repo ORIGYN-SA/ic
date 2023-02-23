@@ -1,31 +1,230 @@
 //! The module contains implementations of the artifact client trait.
 
-use crate::artifact::*;
+use crate::processors::ArtifactProcessorManager;
+use ic_constants::{MAX_INGRESS_TTL, PERMITTED_DRIFT_AT_ARTIFACT_MANAGER};
 use ic_interfaces::{
-    artifact_manager::{ArtifactAcceptance, ArtifactClient},
-    artifact_pool::{ArtifactPoolError, ReplicaVersionMismatch},
+    artifact_manager::{AdvertMismatchError, ArtifactClient, OnArtifactError},
+    artifact_pool::{ArtifactPoolError, ReplicaVersionMismatch, UnvalidatedArtifact},
+    canister_http::*,
     certification::{CertificationPool, CertifierGossip},
     consensus::ConsensusGossip,
     consensus_pool::{ConsensusPool, ConsensusPoolCache},
     dkg::{DkgGossip, DkgPool},
-    gossip_pool::{CertificationGossipPool, ConsensusGossipPool, DkgGossipPool, IngressGossipPool},
-    ingress_pool::IngressPool,
+    ecdsa::{EcdsaGossip, EcdsaPool},
+    gossip_pool::{
+        CanisterHttpGossipPool, CertificationGossipPool, ConsensusGossipPool, DkgGossipPool,
+        EcdsaGossipPool, IngressGossipPool,
+    },
+    ingress_pool::{IngressPool, IngressPoolThrottler},
     time_source::TimeSource,
 };
 use ic_logger::{debug, ReplicaLogger};
 use ic_types::{
+    artifact,
     artifact::*,
+    artifact_kind::*,
+    canister_http::*,
     chunkable::*,
     consensus::{
         certification::CertificationMessage, dkg::Message as DkgMessage, ConsensusMessage,
         HasVersion,
     },
-    ingress::MAX_INGRESS_TTL,
-    messages::{SignedIngress, SignedRequestBytes},
+    malicious_flags::MaliciousFlags,
+    messages::SignedIngress,
+    p2p,
+    single_chunked::*,
     NodeId, ReplicaVersion,
 };
-use std::convert::TryInto;
+use std::convert::{TryFrom, TryInto};
 use std::sync::{Arc, RwLock};
+
+/// In order to let the artifact manager manage artifact clients, which can be
+/// parameterized by different artifact types, it has to use trait objects.
+/// Consequently, there has to be a translation between various artifact
+/// sub-types to the top-level enum types. The trait `ArtifactManagerBackend`
+/// achieves both goals by acting as a middleman.
+///
+/// The trick of this translation is to erase the type parameter from all
+/// interface functions. As a result, member functions of this trait mostly
+/// resemble those of `ArtifactClient`, but use top-level artifact types. The
+/// translation is mostly handled via `From/Into`, `TryFrom/Into`, `AsMut` and
+/// `AsRef` traits that are automatically derived between artifact subtypes and
+/// the top-level types.
+pub(crate) trait ArtifactManagerBackend: Send + Sync {
+    /// The method is called when an artifact is received.
+    fn on_artifact(
+        &self,
+        time_source: &dyn TimeSource,
+        msg: artifact::Artifact,
+        advert: p2p::GossipAdvert,
+        peer_id: NodeId,
+    ) -> Result<(), OnArtifactError<artifact::Artifact>>;
+
+    /// The method indicates whether an artifact exists.
+    fn has_artifact(&self, msg_id: &artifact::ArtifactId) -> Result<bool, ()>;
+
+    /// The method returns a validated artifact with the given ID, or an error.
+    fn get_validated_by_identifier(
+        &self,
+        msg_id: &artifact::ArtifactId,
+    ) -> Result<Option<Box<dyn ChunkableArtifact>>, ()>;
+
+    /// The method adds the client's filter to the given artifact filter.
+    fn get_filter(&self, filter: &mut artifact::ArtifactFilter);
+
+    /// The method returns all validated artifacts that match the given filter.
+    fn get_all_validated_by_filter(
+        &self,
+        filter: &artifact::ArtifactFilter,
+    ) -> Vec<p2p::GossipAdvert>;
+
+    /// The method returns the remaining quota for a given peer and artifact
+    /// tag.
+    fn get_remaining_quota(&self, tag: artifact::ArtifactTag, peer_id: NodeId) -> Option<usize>;
+
+    /// The method returns a priority function for a given artifact tag.
+    fn get_priority_function(&self, tag: artifact::ArtifactTag) -> Option<ArtifactPriorityFn>;
+
+    /// The method returns a chunk tracker for a given artifact ID.
+    fn get_chunk_tracker(
+        &self,
+        id: &artifact::ArtifactId,
+    ) -> Option<Box<dyn Chunkable + Send + Sync>>;
+}
+
+/// Implementation struct for `ArtifactManagerBackend`.
+pub(crate) struct ArtifactManagerBackendImpl<Artifact: ArtifactKind + 'static> {
+    /// Reference to the artifact client.
+    pub client: Box<dyn ArtifactClient<Artifact>>,
+    /// The artifact processor front end.
+    pub processor: ArtifactProcessorManager<Artifact>,
+}
+
+/// Trait implementation for `ArtifactManagerBackend`.
+impl<Artifact: ArtifactKind> ArtifactManagerBackend for ArtifactManagerBackendImpl<Artifact>
+where
+    Artifact::Message: ChunkableArtifact
+        + Send
+        + 'static
+        + TryFrom<artifact::Artifact, Error = artifact::Artifact>,
+    Advert<Artifact>:
+        Into<p2p::GossipAdvert> + TryFrom<p2p::GossipAdvert, Error = p2p::GossipAdvert> + Eq,
+    for<'a> &'a Artifact::Id: TryFrom<&'a artifact::ArtifactId, Error = &'a artifact::ArtifactId>,
+    artifact::ArtifactFilter: AsMut<Artifact::Filter> + AsRef<Artifact::Filter>,
+    for<'a> &'a Artifact::Attribute:
+        TryFrom<&'a artifact::ArtifactAttribute, Error = &'a artifact::ArtifactAttribute>,
+    Artifact::Attribute: 'static,
+    Artifact::Id: 'static,
+{
+    /// The method is called when the given artifact is received.
+    fn on_artifact(
+        &self,
+        time_source: &dyn TimeSource,
+        artifact: artifact::Artifact,
+        advert: p2p::GossipAdvert,
+        peer_id: NodeId,
+    ) -> Result<(), OnArtifactError<artifact::Artifact>> {
+        match (artifact.try_into(), advert.try_into()) {
+            (Ok(message), Ok(advert)) => {
+                Artifact::check_advert(&message, &advert).map_err(|expected| {
+                    AdvertMismatchError {
+                        received: advert.into(),
+                        expected: expected.into(),
+                    }
+                })?;
+                self.client.check_artifact_acceptance(&message, &peer_id)?;
+                // this sends to an unbounded channel, which is what we want here
+                self.processor.on_artifact(UnvalidatedArtifact {
+                    message,
+                    peer_id,
+                    timestamp: time_source.get_relative_time(),
+                });
+
+                Ok(())
+            }
+            (Err(artifact), _) => Err(OnArtifactError::NotProcessed(Box::new(artifact))),
+            (_, Err(advert)) => Err(OnArtifactError::MessageConversionfailed(advert)),
+        }
+    }
+
+    /// The method checks if the artifact with the given ID is available.
+    fn has_artifact(&self, msg_id: &artifact::ArtifactId) -> Result<bool, ()> {
+        match msg_id.try_into() {
+            Ok(id) => Ok(self.client.as_ref().has_artifact(id)),
+            Err(_) => Err(()),
+        }
+    }
+
+    /// The method returns the validated artifact for the given ID.
+    fn get_validated_by_identifier(
+        &self,
+        msg_id: &artifact::ArtifactId,
+    ) -> Result<Option<Box<dyn ChunkableArtifact>>, ()> {
+        match msg_id.try_into() {
+            Ok(id) => Ok(self
+                .client
+                .as_ref()
+                .get_validated_by_identifier(id)
+                .map(|x| Box::new(x) as Box<dyn ChunkableArtifact>)),
+            Err(_) => Err(()),
+        }
+    }
+
+    /// The method gets the client's filter and adds it to the artifact filter.
+    fn get_filter(&self, filter: &mut artifact::ArtifactFilter) {
+        *filter.as_mut() = self.client.as_ref().get_filter()
+    }
+
+    /// The method returns all validated adverts.
+    fn get_all_validated_by_filter(
+        &self,
+        filter: &artifact::ArtifactFilter,
+    ) -> Vec<p2p::GossipAdvert> {
+        self.client
+            .as_ref()
+            .get_all_validated_by_filter(filter.as_ref())
+            .into_iter()
+            .map(|x| x.into())
+            .collect::<Vec<_>>()
+    }
+
+    /// The method returns the remaining quota for the peer with the given ID.s
+    fn get_remaining_quota(&self, tag: artifact::ArtifactTag, peer_id: NodeId) -> Option<usize> {
+        if tag == Artifact::TAG {
+            Some(self.client.as_ref().get_remaining_quota(peer_id))
+        } else {
+            None
+        }
+    }
+
+    /// The method returns the priority function.
+    fn get_priority_function(&self, tag: artifact::ArtifactTag) -> Option<ArtifactPriorityFn> {
+        if tag == Artifact::TAG {
+            let func = self.client.as_ref().get_priority_function()?;
+            Some(Box::new(
+                move |id: &'_ artifact::ArtifactId, attribute: &'_ artifact::ArtifactAttribute| {
+                    match (id.try_into(), attribute.try_into()) {
+                        (Ok(idd), Ok(attr)) => func(idd, attr),
+                        _ => panic!("Priority function called on wrong id or attribute!"),
+                    }
+                },
+            ))
+        } else {
+            None
+        }
+    }
+
+    /// The method returns the artifact chunk tracker.
+    fn get_chunk_tracker(
+        &self,
+        artifact_id: &artifact::ArtifactId,
+    ) -> Option<Box<dyn Chunkable + Send + Sync>> {
+        match artifact_id.try_into() {
+            Ok(artifact_id) => Some(self.client.as_ref().get_chunk_tracker(artifact_id)),
+            Err(_) => None,
+        }
+    }
+}
 
 /// The *Consensus* `ArtifactClient` to be managed by the `ArtifactManager`.
 pub struct ConsensusClient<Pool> {
@@ -74,11 +273,11 @@ impl<Pool: ConsensusPool + ConsensusGossipPool + Send + Sync> ArtifactClient<Con
     /// `ArtifactAcceptance` enum.
     fn check_artifact_acceptance(
         &self,
-        msg: ConsensusMessage,
+        msg: &ConsensusMessage,
         _peer_id: &NodeId,
-    ) -> Result<ArtifactAcceptance<ConsensusMessage>, ArtifactPoolError> {
-        check_protocol_version(&msg)?;
-        Ok(ArtifactAcceptance::AcceptedForProcessing(msg))
+    ) -> Result<(), ArtifactPoolError> {
+        check_protocol_version(msg)?;
+        Ok(())
     }
 
     /// The method returns `true` if and only if the *Consensus* pool contains
@@ -110,7 +309,7 @@ impl<Pool: ConsensusPool + ConsensusGossipPool + Send + Sync> ArtifactClient<Con
             .read()
             .unwrap()
             .get_all_validated_by_filter(filter.height)
-            .map(|msg| ConsensusArtifact::to_advert(&msg))
+            .map(|msg| ConsensusArtifact::message_to_advert(&msg))
             .collect()
     }
 
@@ -138,6 +337,9 @@ pub struct IngressClient<Pool> {
     ingress_pool: Arc<RwLock<Pool>>,
     /// The logger.
     log: ReplicaLogger,
+
+    #[allow(dead_code)]
+    malicious_flags: MaliciousFlags,
 }
 
 impl<Pool> IngressClient<Pool> {
@@ -146,17 +348,19 @@ impl<Pool> IngressClient<Pool> {
         time_source: Arc<dyn TimeSource>,
         ingress_pool: Arc<RwLock<Pool>>,
         log: ReplicaLogger,
+        malicious_flags: MaliciousFlags,
     ) -> Self {
         Self {
             time_source,
             ingress_pool,
             log,
+            malicious_flags,
         }
     }
 }
 
-impl<Pool: IngressPool + IngressGossipPool + Send + Sync> ArtifactClient<IngressArtifact>
-    for IngressClient<Pool>
+impl<Pool: IngressPool + IngressGossipPool + IngressPoolThrottler + Send + Sync + 'static>
+    ArtifactClient<IngressArtifact> for IngressClient<Pool>
 {
     /// The method checks whether the given signed ingress bytes constitutes a
     /// valid singed ingress message.
@@ -166,20 +370,23 @@ impl<Pool: IngressPool + IngressGossipPool + Send + Sync> ArtifactClient<Ingress
     /// neither in the past nor too far in the future.
     fn check_artifact_acceptance(
         &self,
-        bytes: SignedRequestBytes,
+        msg: &SignedIngress,
         peer_id: &NodeId,
-    ) -> Result<ArtifactAcceptance<SignedIngress>, ArtifactPoolError> {
+    ) -> Result<(), ArtifactPoolError> {
+        #[cfg(feature = "malicious_code")]
+        {
+            if self.malicious_flags.maliciously_disable_ingress_validation {
+                return Ok(());
+            }
+        }
+
+        let time_now = self.time_source.get_relative_time();
         // We account for a bit of drift here and accept messages with a bit longer
         // than `MAX_INGRESS_TTL` time-to-live into the ingress pool.
         // The purpose is to be a bit more permissive than the HTTP handler when the
         // ingress was first accepted because here the ingress may have come
         // from the network.
-        let permitted_drift = std::time::Duration::from_secs(60);
-        let msg: SignedIngress = bytes
-            .try_into()
-            .map_err(|err| ArtifactPoolError::ArtifactRejected(Box::new(err)))?;
-        let time_now = self.time_source.get_relative_time();
-        let time_plus_ttl = time_now + MAX_INGRESS_TTL + permitted_drift;
+        let time_plus_ttl = time_now + MAX_INGRESS_TTL + PERMITTED_DRIFT_AT_ARTIFACT_MANAGER;
         let msg_expiry_time = msg.expiry_time();
         if msg_expiry_time < time_now {
             Err(ArtifactPoolError::MessageExpired)
@@ -198,8 +405,8 @@ impl<Pool: IngressPool + IngressGossipPool + Send + Sync> ArtifactClient<Ingress
             self.ingress_pool
                 .read()
                 .unwrap()
-                .check_quota(&msg, peer_id)?;
-            Ok(ArtifactAcceptance::AcceptedForProcessing(msg))
+                .check_quota(msg, peer_id)?;
+            Ok(())
         }
     }
 
@@ -218,30 +425,28 @@ impl<Pool: IngressPool + IngressGossipPool + Send + Sync> ArtifactClient<Ingress
             .get_validated_by_identifier(msg_id)
     }
 
-    /// The method returns the ingress message filter.
-    fn get_filter(&self) -> IngressMessageFilter {
-        Default::default()
-    }
-
-    /// The method returns all adverts for validated ingress messages.
-    fn get_all_validated_by_filter(
-        &self,
-        _filter: &IngressMessageFilter,
-    ) -> Vec<Advert<IngressArtifact>> {
-        // TODO: Send adverts of ingress messages which are generated on this node (not
-        // relayed from other node). P2P-381
-        Vec::new()
-    }
-
     /// The method returns the priority function.
     fn get_priority_function(
         &self,
     ) -> Option<PriorityFn<IngressMessageId, IngressMessageAttribute>> {
         let start = self.time_source.get_relative_time();
         let range = start..=start + MAX_INGRESS_TTL;
+        let pool = self.ingress_pool.clone();
         Some(Box::new(move |ingress_id, _| {
+            // EXPLANATION: Because ingress messages are included in blocks, consensus
+            // does not rely on ingress gossip for correctness. Ingress gossip exists to
+            // reduce latency in cases where replicas don't have enough ingress messages
+            // to fill their block. Once a replica's pool is full, ingress gossip just
+            // causes redundant traffic between replicas, and is thus not needed.
+            if pool
+                .read()
+                .expect("couldn't acquire readers lock on ingress pool")
+                .exceeds_threshold()
+            {
+                return Priority::Drop;
+            }
             if range.contains(&ingress_id.expiry()) {
-                Priority::Fetch
+                Priority::Later
             } else {
                 Priority::Drop
             }
@@ -287,10 +492,10 @@ impl<PoolCertification: CertificationPool + CertificationGossipPool + Send + Syn
     /// The method always accepts the given `CertificationMessage`.
     fn check_artifact_acceptance(
         &self,
-        msg: CertificationMessage,
+        _msg: &CertificationMessage,
         _peer_id: &NodeId,
-    ) -> Result<ArtifactAcceptance<CertificationMessage>, ArtifactPoolError> {
-        Ok(ArtifactAcceptance::AcceptedForProcessing(msg))
+    ) -> Result<(), ArtifactPoolError> {
+        Ok(())
     }
 
     /// The method checks if the certification pool contains a certification
@@ -325,7 +530,7 @@ impl<PoolCertification: CertificationPool + CertificationGossipPool + Send + Syn
             .read()
             .unwrap()
             .get_all_validated_by_filter(filter.height)
-            .map(|msg| CertificationArtifact::to_advert(&msg))
+            .map(|msg| CertificationArtifact::message_to_advert(&msg))
             .collect()
     }
 
@@ -374,11 +579,11 @@ impl<Pool: DkgPool + DkgGossipPool + Send + Sync> ArtifactClient<DkgArtifact> fo
     /// `ArtifactAcceptance` enum.
     fn check_artifact_acceptance(
         &self,
-        msg: DkgMessage,
+        msg: &DkgMessage,
         _peer_id: &NodeId,
-    ) -> Result<ArtifactAcceptance<DkgMessage>, ArtifactPoolError> {
-        check_protocol_version(&msg)?;
-        Ok(ArtifactAcceptance::AcceptedForProcessing(msg))
+    ) -> Result<(), ArtifactPoolError> {
+        check_protocol_version(msg)?;
+        Ok(())
     }
 
     /// The method checks if the DKG pool contains a DKG message with the given
@@ -405,5 +610,107 @@ impl<Pool: DkgPool + DkgGossipPool + Send + Sync> ArtifactClient<DkgArtifact> fo
     /// The method returns a new (single-chunked) DKG message tracker.
     fn get_chunk_tracker(&self, _id: &DkgMessageId) -> Box<dyn Chunkable + Send + Sync> {
         Box::new(SingleChunked::Dkg)
+    }
+}
+
+/// The ECDSA client.
+pub struct EcdsaClient<Pool> {
+    ecdsa_pool: Arc<RwLock<Pool>>,
+    ecdsa_gossip: Arc<dyn EcdsaGossip>,
+}
+
+impl<Pool> EcdsaClient<Pool> {
+    pub fn new<T: EcdsaGossip + 'static>(ecdsa_pool: Arc<RwLock<Pool>>, gossip: T) -> Self {
+        Self {
+            ecdsa_pool,
+            ecdsa_gossip: Arc::new(gossip),
+        }
+    }
+}
+
+impl<Pool: EcdsaPool + EcdsaGossipPool + Send + Sync> ArtifactClient<EcdsaArtifact>
+    for EcdsaClient<Pool>
+{
+    fn check_artifact_acceptance(
+        &self,
+        _msg: &EcdsaMessage,
+        _peer_id: &NodeId,
+    ) -> Result<(), ArtifactPoolError> {
+        Ok(())
+    }
+
+    fn has_artifact(&self, msg_id: &EcdsaMessageId) -> bool {
+        self.ecdsa_pool.read().unwrap().contains(msg_id)
+    }
+
+    fn get_validated_by_identifier(&self, msg_id: &EcdsaMessageId) -> Option<EcdsaMessage> {
+        self.ecdsa_pool
+            .read()
+            .unwrap()
+            .get_validated_by_identifier(msg_id)
+    }
+
+    fn get_priority_function(&self) -> Option<PriorityFn<EcdsaMessageId, EcdsaMessageAttribute>> {
+        let ecdsa_pool = &*self.ecdsa_pool.read().unwrap();
+        Some(self.ecdsa_gossip.get_priority_function(ecdsa_pool))
+    }
+
+    fn get_chunk_tracker(&self, _id: &EcdsaMessageId) -> Box<dyn Chunkable + Send + Sync> {
+        Box::new(SingleChunked::Ecdsa)
+    }
+}
+
+/// The CanisterHttp Client
+pub struct CanisterHttpClient<Pool> {
+    pool: Arc<RwLock<Pool>>,
+    gossip: Arc<dyn CanisterHttpGossip + Send + Sync>,
+}
+
+impl<Pool: CanisterHttpPool + CanisterHttpGossipPool + Send + Sync> CanisterHttpClient<Pool> {
+    pub fn new<T: CanisterHttpGossip + Send + Sync + 'static>(
+        pool: Arc<RwLock<Pool>>,
+        gossip: T,
+    ) -> Self {
+        Self {
+            pool,
+            gossip: Arc::new(gossip),
+        }
+    }
+}
+
+impl<Pool: CanisterHttpPool + CanisterHttpGossipPool + Send + Sync>
+    ArtifactClient<CanisterHttpArtifact> for CanisterHttpClient<Pool>
+{
+    fn check_artifact_acceptance(
+        &self,
+        _msg: &CanisterHttpResponseShare,
+        _peer_id: &NodeId,
+    ) -> Result<(), ArtifactPoolError> {
+        Ok(())
+    }
+
+    fn has_artifact(&self, msg_id: &CanisterHttpResponseId) -> bool {
+        self.pool.read().unwrap().contains(msg_id)
+    }
+
+    fn get_validated_by_identifier(
+        &self,
+        msg_id: &CanisterHttpResponseId,
+    ) -> Option<CanisterHttpResponseShare> {
+        self.pool
+            .read()
+            .unwrap()
+            .get_validated_by_identifier(msg_id)
+    }
+
+    fn get_priority_function(
+        &self,
+    ) -> Option<PriorityFn<CanisterHttpResponseId, CanisterHttpResponseAttribute>> {
+        let pool = &*self.pool.read().unwrap();
+        Some(self.gossip.get_priority_function(pool))
+    }
+
+    fn get_chunk_tracker(&self, _id: &CanisterHttpResponseId) -> Box<dyn Chunkable + Send + Sync> {
+        Box::new(SingleChunked::CanisterHttp)
     }
 }

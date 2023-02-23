@@ -52,88 +52,70 @@
 //! the current height.
 
 use crate::{
-    download_management::{DownloadManager, DownloadManagerImpl},
-    metrics::GossipMetrics,
-    P2PError, P2PErrorCode, P2PResult,
+    artifact_download_list::ArtifactDownloadListImpl,
+    download_prioritization::{DownloadPrioritizer, DownloadPrioritizerImpl},
+    gossip_types::{GossipChunk, GossipChunkRequest, GossipMessage},
+    metrics::{DownloadManagementMetrics, DownloadPrioritizerMetrics, GossipMetrics},
+    peer_context::PeerContextMap,
+    utils::TransportChannelIdMapper,
+    P2PError, P2PErrorCode,
 };
-
-use ic_artifact_manager::artifact::IngressArtifact;
-use ic_interfaces::artifact_manager::{ArtifactManager, OnArtifactError};
-use ic_logger::{info, replica_logger::ReplicaLogger, warn};
+use ic_interfaces::artifact_manager::ArtifactManager;
+use ic_interfaces::consensus_pool::ConsensusPoolCache;
+use ic_interfaces_registry::RegistryClient;
+use ic_interfaces_transport::{Transport, TransportChannelId};
+use ic_logger::{info, replica_logger::ReplicaLogger};
 use ic_metrics::MetricsRegistry;
-use ic_protobuf::p2p::v1 as pb;
-use ic_protobuf::p2p::v1::gossip_chunk::Response;
-use ic_protobuf::p2p::v1::gossip_message::Body;
-use ic_protobuf::proxy::{try_from_option_field, ProxyDecodeError, ProxyDecodeError::*};
+use ic_protobuf::registry::subnet::v1::GossipConfig;
+use ic_registry_client_helpers::subnet::SubnetRegistry;
 use ic_types::{
-    artifact::{Artifact, ArtifactFilter, ArtifactId, ArtifactKind},
-    chunkable::{ArtifactChunk, ArtifactChunkData, ChunkId},
-    messages::SignedIngress,
+    artifact::{ArtifactDestination, ArtifactFilter},
+    crypto::CryptoHash,
     p2p::GossipAdvert,
-    transport::{FlowTag, TransportError, TransportNotification, TransportStateChange},
-    NodeId,
+    NodeId, SubnetId,
 };
-
-use std::convert::{TryFrom, TryInto};
-use std::sync::Arc;
-
-use bincode::{deserialize, serialize};
-
-// Import of the malicious flags definition.
-use crate::{
-    event_handler::P2PEventHandlerControl, use_gossip_malicious_behavior_on_chunk_request,
-};
-use ic_types::malicious_flags::MaliciousFlags;
+use lru::LruCache;
+use parking_lot::{Mutex, RwLock};
+use std::collections::HashMap;
+use std::{sync::Arc, time::Instant};
 
 /// The main *Gossip* trait, specifying the P2P gossip functionality.
-pub(crate) trait Gossip {
+pub trait Gossip {
     /// The *Gossip* advert type.
     type GossipAdvert;
     /// The *Gossip* chunk request type.
     type GossipChunkRequest;
     /// The *Gossip* chunk type.
     type GossipChunk;
-    /// The node ID type.
-    type NodeId;
-    /// The *Transport* notification type.
-    type TransportNotification;
-    /// The ingress message type.
-    type Ingress;
+    /// The *Gossip* retranmision request type.
+    type GossipRetransmissionRequest;
 
     /// The method handles the given advert received from the peer
     /// with the given node ID.
-    fn on_advert(&self, gossip_advert: Self::GossipAdvert, peer_id: Self::NodeId);
+    fn on_gossip_advert(&self, gossip_advert: Self::GossipAdvert, peer_id: NodeId);
 
     /// The method handles the given chunk request received from the
     /// peer with the given node ID.
-    fn on_chunk_request(&self, gossip_request: GossipChunkRequest, node_id: NodeId);
+    fn on_chunk_request(&self, gossip_request: Self::GossipChunkRequest, node_id: NodeId);
 
     /// The method adds the given chunk to the corresponding artifact
     /// under construction.
     ///
     /// Once the download is complete, the artifact is handed over to
-    /// the artifact manager.
-    fn on_chunk(&self, gossip_chunk: Self::GossipChunk, peer_id: Self::NodeId);
-
-    /// The method handles the received user ingress message.
-    fn on_user_ingress(
-        &self,
-        ingress: Self::Ingress,
-        peer_id: Self::NodeId,
-    ) -> Result<(), OnArtifactError<Artifact>>;
+    /// the artifact manager.DownloadPrioritizer
+    fn on_gossip_chunk(&self, gossip_chunk: Self::GossipChunk, peer_id: NodeId);
 
     /// The method broadcasts the given advert to other peers.
-    fn broadcast_advert(&self, advert: GossipAdvert);
+    fn broadcast_advert(&self, advert_request: Self::GossipAdvert, dst: ArtifactDestination);
 
     /// The method reacts to a retransmission request from another peer.
-    fn on_retransmission_request(
+    fn on_gossip_retransmission_request(
         &self,
-        gossip_request: GossipRetransmissionRequest,
+        gossip_request: Self::GossipRetransmissionRequest,
         node_id: NodeId,
     );
 
-    /// The method reacts to a *Transport* state change message due to
-    /// a peer connecting or disconnecting.
+    /// The following two methods react to a peer connecting or disconnecting.
     ///
     /// Missing disconnect events in case of dropped connections are
     /// detected and handled using request timeouts. Timeouts thus
@@ -141,10 +123,243 @@ pub(crate) trait Gossip {
     /// connections.  P2P guarantees liveness relying on a) timeouts
     /// for each request and b) *Transport* having an additional error
     /// detection mechanism (not implemented yet).
-    fn on_transport_state_change(&self, transport_state_change: TransportStateChange);
+    fn on_peer_up(&self, peer_id: NodeId);
+    fn on_peer_down(&self, peer_id: NodeId);
+    /// The method is called periodically from a dedicated thread.
+    fn on_gossip_timer(&self);
+}
 
-    /// The method reacts to a transport error message.
-    fn on_transport_error(&self, transport_error: TransportError);
+/// The cache used to check if a certain artifact has been received recently.
+pub(crate) type ReceiveCheckCache = LruCache<CryptoHash, ()>;
+
+/// The canonical implementation of the `GossipMessage` trait.
+pub(crate) struct GossipImpl {
+    /// The artifact manager used to handle received artifacts.
+    pub artifact_manager: Arc<dyn ArtifactManager>,
+    /// The replica logger.
+    pub log: ReplicaLogger,
+    /// The *Gossip* metrics.
+    pub gossip_metrics: GossipMetrics,
+
+    /// The node ID of the peer.
+    pub node_id: NodeId,
+    /// The subnet ID.
+    pub subnet_id: SubnetId,
+    /// The registry client.
+    pub registry_client: Arc<dyn RegistryClient>,
+    /// The consensus pool cache.
+    pub consensus_pool_cache: Arc<dyn ConsensusPoolCache>,
+    /// The download prioritizer.
+    pub prioritizer: Arc<dyn DownloadPrioritizer>,
+    /// The peer manager.
+    pub current_peers: Mutex<PeerContextMap>,
+    /// The underlying *Transport* layer.
+    pub transport: Arc<dyn Transport>,
+    /// The flow mapper.
+    pub transport_channel_mapper: TransportChannelIdMapper,
+    /// The list of artifacts that is under construction.
+    pub artifacts_under_construction: RwLock<ArtifactDownloadListImpl>,
+    /// The download management metrics.
+    pub metrics: DownloadManagementMetrics,
+    /// The *Gossip* configuration.
+    pub gossip_config: GossipConfig,
+    /// The cache that is used to check if an artifact has been downloaded
+    /// recently.
+    pub receive_check_caches: RwLock<HashMap<NodeId, ReceiveCheckCache>>,
+    /// The priority function invocation time.
+    pub pfn_invocation_instant: Mutex<Instant>,
+    /// The last registry refresh time.
+    pub registry_refresh_instant: Mutex<Instant>,
+    /// The last retransmission request time.
+    pub retransmission_request_instant: Mutex<Instant>,
+}
+
+impl GossipImpl {
+    /// The constructor creates a new *Gossip* component.
+    ///
+    /// The *Gossip* component interacts with the download manager
+    /// component, which initiates and tracks downloads of artifacts
+    /// from a peer group.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        node_id: NodeId,
+        subnet_id: SubnetId,
+        consensus_pool_cache: Arc<dyn ConsensusPoolCache>,
+        registry_client: Arc<dyn RegistryClient>,
+        artifact_manager: Arc<dyn ArtifactManager>,
+        transport: Arc<dyn Transport>,
+        transport_channels: Vec<TransportChannelId>,
+        log: ReplicaLogger,
+        metrics_registry: &MetricsRegistry,
+    ) -> Self {
+        let prioritizer = Arc::new(DownloadPrioritizerImpl::new(
+            artifact_manager.as_ref(),
+            DownloadPrioritizerMetrics::new(metrics_registry),
+        ));
+        let gossip_config = fetch_gossip_config(registry_client.clone(), subnet_id);
+        let gossip = GossipImpl {
+            artifact_manager,
+            log: log.clone(),
+            gossip_metrics: GossipMetrics::new(metrics_registry),
+            node_id,
+            subnet_id,
+            consensus_pool_cache,
+            prioritizer,
+            current_peers: Mutex::new(PeerContextMap::default()),
+            registry_client,
+            transport,
+            transport_channel_mapper: TransportChannelIdMapper::new(transport_channels),
+            artifacts_under_construction: RwLock::new(ArtifactDownloadListImpl::new(log)),
+            metrics: DownloadManagementMetrics::new(metrics_registry),
+            gossip_config,
+            receive_check_caches: RwLock::new(HashMap::new()),
+            pfn_invocation_instant: Mutex::new(Instant::now()),
+            registry_refresh_instant: Mutex::new(Instant::now()),
+            retransmission_request_instant: Mutex::new(Instant::now()),
+        };
+        gossip.refresh_topology();
+        gossip
+    }
+}
+
+/// Canonical Implementation for the *Gossip* trait.
+impl Gossip for GossipImpl {
+    type GossipAdvert = GossipAdvert;
+    type GossipChunkRequest = GossipChunkRequest;
+    type GossipChunk = GossipChunk;
+    type GossipRetransmissionRequest = ArtifactFilter;
+
+    /// The method is called when a new advert is received from the
+    /// peer with the given node ID.
+    ///
+    /// Adverts for artifacts that have been downloaded before are
+    /// dropped.  If the artifact is not available locally, the advert
+    /// is added to this peer's advert list.
+    fn on_gossip_advert(&self, gossip_advert: GossipAdvert, peer_id: NodeId) {
+        let _timer = self
+            .gossip_metrics
+            .op_duration
+            .with_label_values(&["in_advert"])
+            .start_timer();
+        if self
+            .artifact_manager
+            .has_artifact(&gossip_advert.artifact_id)
+        {
+            return;
+        }
+
+        // The download manager handles the received advert.
+        self.on_advert(gossip_advert, peer_id);
+        // The next download is triggered for the given peer ID.
+        let _ = self.download_next(peer_id);
+    }
+
+    /// The method handles the given chunk request received from the peer with
+    /// the given node ID.
+    fn on_chunk_request(&self, chunk_request: GossipChunkRequest, node_id: NodeId) {
+        let _timer = self
+            .gossip_metrics
+            .op_duration
+            .with_label_values(&["in_chunk_request"])
+            .start_timer();
+
+        let artifact_chunk = match self
+            .artifact_manager
+            .get_validated_by_identifier(&chunk_request.artifact_id)
+        {
+            Some(artifact) => artifact.get_chunk(chunk_request.chunk_id).ok_or_else(|| {
+                self.gossip_metrics.requested_chunks_not_found.inc();
+                P2PError {
+                    p2p_error_code: P2PErrorCode::NotFound,
+                }
+            }),
+            None => {
+                self.gossip_metrics.requested_chunks_not_found.inc();
+                Err(P2PError {
+                    p2p_error_code: P2PErrorCode::NotFound,
+                })
+            }
+        };
+
+        let gossip_chunk = GossipChunk {
+            request: chunk_request,
+            artifact_chunk,
+        };
+        let message = GossipMessage::Chunk(gossip_chunk);
+        self.transport_send(message, node_id);
+    }
+
+    /// The method adds the given chunk to the corresponding artifact
+    /// under construction.
+    fn on_gossip_chunk(&self, gossip_chunk: GossipChunk, peer_id: NodeId) {
+        let _timer = self
+            .gossip_metrics
+            .op_duration
+            .with_label_values(&["in_chunk"])
+            .start_timer();
+        self.on_chunk(gossip_chunk, peer_id);
+        let _ = self.download_next(peer_id);
+    }
+
+    /// The method broadcasts the given advert to other peers.
+    fn broadcast_advert(&self, advert: GossipAdvert, dst: ArtifactDestination) {
+        let _timer = self
+            .gossip_metrics
+            .op_duration
+            .with_label_values(&["out_advert"])
+            .start_timer();
+
+        let (peers, label) = match dst {
+            ArtifactDestination::AllPeersInSubnet => (self.get_current_peer_ids(), "all_peers"),
+        };
+        self.metrics
+            .adverts_by_action
+            .with_label_values(&[label])
+            .inc_by(peers.len() as u64);
+
+        let message = GossipMessage::Advert(advert);
+        for peer_id in peers {
+            self.transport_send(message.clone(), peer_id);
+        }
+    }
+
+    /// The method reacts to a retransmission request from another
+    /// peer.
+    ///
+    /// All validated artifacts that pass the given filter are
+    /// collected and sent to the peer.
+    fn on_gossip_retransmission_request(
+        &self,
+        gossip_retransmission_request: Self::GossipRetransmissionRequest,
+        peer_id: NodeId,
+    ) {
+        let _timer = self
+            .gossip_metrics
+            .op_duration
+            .with_label_values(&["out_retransmission"])
+            .start_timer();
+        let _ = self.on_retransmission_request(&gossip_retransmission_request, peer_id);
+    }
+
+    fn on_peer_up(&self, peer_id: NodeId) {
+        let _timer = self
+            .gossip_metrics
+            .op_duration
+            .with_label_values(&["peer_up"])
+            .start_timer();
+        info!(self.log, "Peer is up: {:?}", peer_id);
+        self.peer_connection_up(peer_id)
+    }
+
+    fn on_peer_down(&self, peer_id: NodeId) {
+        let _timer = self
+            .gossip_metrics
+            .op_duration
+            .with_label_values(&["peer_down"])
+            .start_timer();
+        info!(self.log, "Peer is down: {:?}", peer_id);
+        self.peer_connection_down(peer_id)
+    }
 
     /// The method is called on a periodic timer event.
     ///
@@ -159,462 +374,26 @@ pub(crate) trait Gossip {
     ///
     /// In short, the method is a catch-all for a periodic and
     /// holistic refresh of IC state.
-    fn on_timer(&self, event_handler: &Arc<dyn P2PEventHandlerControl>);
-}
-
-/// A request for an artifact sent to the peer.
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub(crate) struct GossipChunkRequest {
-    /// The artifact ID.
-    pub artifact_id: ArtifactId,
-    /// The chunk ID.
-    pub chunk_id: ChunkId,
-}
-
-/// A re-transmission request. A filter is used to restrict the set of
-/// adverts that are to be returned as a response to this request.
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub(crate) struct GossipRetransmissionRequest {
-    /// The artifact filter used to restrict the set of returned adverts.
-    pub filter: ArtifactFilter,
-}
-
-/// A *Gossip* chunk, identified by its artifact ID and chunk ID.
-/// It contains the actual chunk data in an artifact chunk.
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub(crate) struct GossipChunk {
-    /// The artifact ID.
-    pub artifact_id: ArtifactId,
-    /// The chunk ID.
-    pub chunk_id: ChunkId,
-    /// The artifact chunk, encapsulated in a `P2PResult`.
-    pub artifact_chunk: P2PResult<ArtifactChunk>,
-}
-
-/// This is the message exchanged on the wire with other peers.  This
-/// enum is private to the gossip layer because lower layers like
-/// *Transport* do not need to interpret the content.
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
-#[allow(clippy::large_enum_variant)]
-pub(crate) enum GossipMessage {
-    /// The advert variant.
-    Advert(GossipAdvert),
-    /// The chunk request variant.
-    ChunkRequest(GossipChunkRequest),
-    /// The chunk variant.
-    Chunk(GossipChunk),
-    /// The retransmission request variant.
-    RetransmissionRequest(GossipRetransmissionRequest),
-}
-
-/// A *Gossip* message can be converted into a
-/// `FlowTag`.
-impl Into<FlowTag> for &GossipMessage {
-    /// The method returns the flow tag corresponding to the gossip message.
-    ///
-    /// Currently, the flow tag is always 0.
-    fn into(self) -> FlowTag {
-        FlowTag::from(0)
-    }
-}
-
-/// The canonical implementation of the `GossipMessage` trait.
-pub(crate) struct GossipImpl {
-    /// The download manager used to initiate and track downloads.
-    pub download_manager: DownloadManagerImpl,
-    /// The artifact manager used to handle received artifacts.
-    pub artifact_manager: Arc<dyn ArtifactManager>,
-    /// The replica logger.
-    log: ReplicaLogger,
-    /// The *Gossip* metrics.
-    pub metrics: GossipMetrics,
-    /// Flags for malicious behavior used in testing.
-    malicious_flags: MaliciousFlags,
-}
-
-impl GossipImpl {
-    /// The constructor creates a new *Gossip* component.
-    ///
-    /// The *Gossip* component interacts with the download manager
-    /// component, which initiates and tracks downloads of artifacts
-    /// from a peer group.
-    pub fn new(
-        download_manager: DownloadManagerImpl,
-        artifact_manager: Arc<dyn ArtifactManager>,
-        log: ReplicaLogger,
-        metrics_registry: &MetricsRegistry,
-        malicious_flags: MaliciousFlags,
-    ) -> Self {
-        GossipImpl {
-            malicious_flags,
-            download_manager,
-            artifact_manager,
-            log,
-            metrics: GossipMetrics::new(metrics_registry),
-        }
-    }
-
-    /// The method returns the artifact chunk matching the given chunk request
-    /// (if available).
-    fn serve_chunk(&self, gossip_request: &GossipChunkRequest) -> P2PResult<ArtifactChunk> {
-        self.artifact_manager
-            .get_validated_by_identifier(&gossip_request.artifact_id)
-            .ok_or_else(|| {
-                self.metrics.chunk_req_not_found.inc();
-                P2PError {
-                    p2p_error_code: P2PErrorCode::NotFound,
-                }
-            })?
-            .get_chunk(gossip_request.chunk_id)
-            .ok_or_else(|| {
-                self.metrics.chunk_req_not_found.inc();
-                P2PError {
-                    p2p_error_code: P2PErrorCode::NotFound,
-                }
-            })
-    }
-
-    /// The method reacts in a malicious way when receiving a chunk
-    /// request from a certain peer.
-    ///
-    /// The malicious flags define the actual behavior, which may
-    /// either drop the request, respond that the artifact could not
-    /// be found, sending too many artifacts back, or sending invalid
-    /// artifacts.
-    fn malicious_behavior_on_chunk_request(&self, gossip_chunk: GossipChunk, node_id: NodeId) {
-        if self.malicious_flags.maliciously_gossip_drop_requests {
-            warn!(self.log, "Malicious behavior: dropping requests");
-        } else if self.malicious_flags.maliciously_gossip_artifact_not_found {
-            warn!(self.log, "Malicious behavior: artifact not found");
-            let chunk_not_found = GossipChunk {
-                artifact_id: gossip_chunk.artifact_id,
-                chunk_id: gossip_chunk.chunk_id,
-                artifact_chunk: Err(P2PError {
-                    p2p_error_code: P2PErrorCode::NotFound,
-                }),
-            };
-            self.download_manager
-                .send_chunk_to_peer(chunk_not_found, node_id);
-        } else if self.malicious_flags.maliciously_gossip_send_many_artifacts {
-            warn!(self.log, "Malicious behavior: sending too many artifacts");
-            for _n in 1..10000 {
-                self.download_manager
-                    .send_chunk_to_peer(gossip_chunk.clone(), node_id);
-            }
-        } else if self
-            .malicious_flags
-            .maliciously_gossip_send_invalid_artifacts
-        {
-            warn!(self.log, "Malicious behavior: sending invalid artifacts");
-            let artifact_id = gossip_chunk.artifact_id;
-            let chunk_id = gossip_chunk.chunk_id;
-            let artifact_chunk_data = ArtifactChunkData::SemiStructuredChunkData([].to_vec());
-            let artifact_chunk = Ok(ArtifactChunk {
-                chunk_id,
-                witness: Default::default(),
-                artifact_chunk_data,
-            });
-            let invalid_chunk = GossipChunk {
-                artifact_id,
-                chunk_id,
-                artifact_chunk,
-            };
-            self.download_manager
-                .send_chunk_to_peer(invalid_chunk, node_id);
-        } else {
-            warn!(self.log, "Malicious behavior: This should never happen!");
-        }
-    }
-}
-
-/// Canonical Implementation for the *Gossip* trait.
-impl Gossip for GossipImpl {
-    type GossipAdvert = GossipAdvert;
-    type GossipChunkRequest = GossipChunkRequest;
-    type GossipChunk = GossipChunk;
-    type NodeId = NodeId;
-    type TransportNotification = TransportNotification;
-    type Ingress = SignedIngress;
-
-    /// The method is called when a new advert is received from the
-    /// peer with the given node ID.
-    ///
-    /// Adverts for artifacts that have been downloaded before are
-    /// dropped.  If the artifact is not available locally, the advert
-    /// is added to this peer's advert list.
-    fn on_advert(&self, gossip_advert: GossipAdvert, peer_id: NodeId) {
-        if self
-            .artifact_manager
-            .has_artifact(&gossip_advert.artifact_id)
-        {
-            return;
-        }
-
-        // The download manager handles the received advert.
-        self.download_manager.on_advert(gossip_advert, peer_id);
-        // The next download is triggered for the given peer ID.
-        let _ = self.download_manager.download_next(peer_id);
-    }
-
-    /// The method handles the given chunk request received from the peer with
-    /// the given node ID.
-    fn on_chunk_request(&self, gossip_request: GossipChunkRequest, node_id: NodeId) {
-        let start = std::time::Instant::now();
-        let artifact_chunk = self.serve_chunk(&gossip_request);
-        self.metrics
+    fn on_gossip_timer(&self) {
+        let _timer = self
+            .gossip_metrics
             .op_duration
-            .with_label_values(&["serve_chunk"])
-            .observe(start.elapsed().as_millis() as f64);
-        let gossip_chunk = GossipChunk {
-            artifact_id: gossip_request.artifact_id.clone(),
-            chunk_id: gossip_request.chunk_id,
-            artifact_chunk,
-        };
-        use_gossip_malicious_behavior_on_chunk_request!(
-            self,
-            self.malicious_behavior_on_chunk_request(gossip_chunk, node_id),
-            {
-                self.download_manager
-                    .send_chunk_to_peer(gossip_chunk, node_id);
-            }
-        );
-    }
-
-    /// The method adds the given chunk to the corresponding artifact
-    /// under construction.
-    fn on_chunk(&self, gossip_chunk: GossipChunk, peer_id: NodeId) {
-        self.download_manager.on_chunk(gossip_chunk, peer_id);
-        let _ = self.download_manager.download_next(peer_id);
-    }
-
-    /// The method handles the received user ingress message.
-    fn on_user_ingress(
-        &self,
-        ingress: Self::Ingress,
-        peer_id: Self::NodeId,
-    ) -> Result<(), OnArtifactError<Artifact>> {
-        let advert = IngressArtifact::to_advert(&ingress);
-        self.artifact_manager
-            .on_artifact(
-                Artifact::IngressMessage(ingress.into()),
-                advert.into(),
-                &peer_id,
-            )
-            .map_err(|e| {
-                info!(self.log, "Artifact not inserted {:?}", e);
-                e
-            })
-    }
-
-    /// The method broadcasts the given advert to other peers.
-    fn broadcast_advert(&self, advert: GossipAdvert) {
-        self.download_manager.send_advert_to_peers(advert);
-    }
-
-    /// The method reacts to a retransmission request from another
-    /// peer.
-    ///
-    /// All validated artifacts that pass the given filter are
-    /// collected and sent to the peer.
-    fn on_retransmission_request(
-        &self,
-        gossip_retransmission_request: GossipRetransmissionRequest,
-        peer_id: NodeId,
-    ) {
-        let _ = self
-            .download_manager
-            .on_retransmission_request(&gossip_retransmission_request, peer_id);
-    }
-
-    /// The method reacts to a *Transport* state change message due to a peer
-    /// connecting or disconnecting.
-    fn on_transport_state_change(&self, transport_state_change: TransportStateChange) {
-        warn!(
-            self.log,
-            "Transport state change: {:?}", transport_state_change
-        );
-        match transport_state_change {
-            TransportStateChange::PeerFlowDown(info) => {
-                self.download_manager.peer_connection_down(info.peer_id)
-            }
-            TransportStateChange::PeerFlowUp(info) => {
-                self.download_manager.peer_connection_up(info.peer_id)
-            }
-        }
-    }
-
-    /// The method reacts to a *Transport* error message.
-    fn on_transport_error(&self, _transport_error: TransportError) {
-        // TODO: P2P-435 Re-instate call to
-        //
-        // download_manager
-        //    .send_retransmission_request(flow.peer_id)
-        //
-        // when using multiple flows in Transport and when having the
-        // new throttling mechanisms in download_management JIRA
-        // Tickets:
-        //
-        // - Multiple flows: P2P-435
-        // - Error handling: P2P-261
-        //
-        // We cannot send a retransmission request without having
-        // multiple flows support as we have to be able to clear the
-        // adverts queue (and only it) before responding to such a
-        // request. Otherwise, we'll have to clear the entire queue to
-        // that peer. This queue may contain a re-transmission
-        // request. So we must send a re-transmission request before
-        // the adverts (that are sent as a response to a
-        // retransmission request from the other side).  This would
-        // create an infinite loop of re-transmission requests. We
-        // could throttle them (as we would anyway do even with
-        // multiple flows support), but then we'll end up with
-        // periodic retransmission and not event-based.
-    }
-
-    /// The method is called on a periodic timer event.
-    fn on_timer(&self, event_handler: &Arc<dyn P2PEventHandlerControl>) {
-        self.download_manager.on_timer(event_handler);
+            .with_label_values(&["timer"])
+            .start_timer();
+        self.on_timer();
     }
 }
 
-/// A *Gossip* message can be converted into a
-/// `pb::GossipMessage`.
-impl From<GossipMessage> for pb::GossipMessage {
-    /// The function converts the given *Gossip* message into the Protobuf
-    /// equivalent.
-    fn from(message: GossipMessage) -> Self {
-        match message {
-            GossipMessage::Advert(a) => Self {
-                body: Some(Body::Advert(a.into())),
-            },
-            GossipMessage::ChunkRequest(r) => Self {
-                body: Some(Body::ChunkRequest(r.into())),
-            },
-            GossipMessage::Chunk(c) => Self {
-                body: Some(Body::Chunk(c.into())),
-            },
-            GossipMessage::RetransmissionRequest(r) => Self {
-                body: Some(Body::RetransmissionRequest(r.into())),
-            },
-        }
-    }
-}
-
-/// A `pb::GossipMessage` can be converted into a *Gossip* message.
-impl TryFrom<pb::GossipMessage> for GossipMessage {
-    type Error = ProxyDecodeError;
-    /// The function attempts to convert the given
-    /// Protobuf gossip message into a *Gossip* message.
-    fn try_from(message: pb::GossipMessage) -> Result<Self, Self::Error> {
-        let body = message.body.ok_or(MissingField("GossipMessage::body"))?;
-        let message = match body {
-            Body::Advert(a) => Self::Advert(a.try_into()?),
-            Body::ChunkRequest(r) => Self::ChunkRequest(r.try_into()?),
-            Body::Chunk(c) => Self::Chunk(c.try_into()?),
-            Body::RetransmissionRequest(r) => Self::RetransmissionRequest(r.try_into()?),
-        };
-        Ok(message)
-    }
-}
-
-/// A chunk request can be converted into a `pb::GossipChunkRequest`.
-impl From<GossipChunkRequest> for pb::GossipChunkRequest {
-    /// The function converts the given chunk request into the Protobuf
-    /// equivalent.
-    fn from(gossip_chunk_request: GossipChunkRequest) -> Self {
-        Self {
-            artifact_id: serialize(&gossip_chunk_request.artifact_id).unwrap(),
-            chunk_id: gossip_chunk_request.chunk_id.get(),
-        }
-    }
-}
-
-/// A chunk request can be converted into a `pb::GossipChunkRequest`.
-impl TryFrom<pb::GossipChunkRequest> for GossipChunkRequest {
-    type Error = ProxyDecodeError;
-    /// The function attempts to convert the given Protobuf chunk request into a
-    /// GossipChunkRequest.
-    fn try_from(gossip_chunk_request: pb::GossipChunkRequest) -> Result<Self, Self::Error> {
-        Ok(Self {
-            artifact_id: deserialize(&gossip_chunk_request.artifact_id).unwrap(),
-            chunk_id: ChunkId::from(gossip_chunk_request.chunk_id),
-        })
-    }
-}
-
-/// An artifact chunk can be converted into a `pb::GossipChunk`.
-impl From<GossipChunk> for pb::GossipChunk {
-    /// The function converts the given chunk into the Protobuf equivalent.
-    fn from(gossip_chunk: GossipChunk) -> Self {
-        let response = match gossip_chunk.artifact_chunk {
-            Ok(artifact_chunk) => Some(Response::Chunk(artifact_chunk.into())),
-            // Add additional cases as required.
-            Err(_) => Some(Response::Error(pb::P2pError::NotFound as i32)),
-        };
-        Self {
-            artifact_id: serialize(&gossip_chunk.artifact_id).unwrap(),
-            chunk_id: gossip_chunk.chunk_id.get(),
-            response,
-        }
-    }
-}
-
-/// A `pb::GossipChunk` can be converted into an artifact chunk.
-impl TryFrom<pb::GossipChunk> for GossipChunk {
-    type Error = ProxyDecodeError;
-    /// The function attempts to convert a Protobuf chunk into a GossipChunk.
-    fn try_from(gossip_chunk: pb::GossipChunk) -> Result<Self, Self::Error> {
-        let response = try_from_option_field(gossip_chunk.response, "GossipChunk.response")?;
-        let chunk_id = ChunkId::from(gossip_chunk.chunk_id);
-        Ok(Self {
-            artifact_id: deserialize(&gossip_chunk.artifact_id).unwrap(),
-            chunk_id,
-            artifact_chunk: match response {
-                Response::Chunk(c) => Ok(add_chunk_id(c.try_into()?, chunk_id)),
-                Response::Error(_e) => Err(P2PError {
-                    p2p_error_code: P2PErrorCode::NotFound,
-                }),
-            },
-        })
-    }
-}
-
-/// The function returns a new artifact chunk with the given chunk ID
-/// and the same chunk data as the given artifact chunk.
-fn add_chunk_id(artifact_chunk: ArtifactChunk, chunk_id: ChunkId) -> ArtifactChunk {
-    ArtifactChunk {
-        chunk_id,
-        witness: artifact_chunk.witness,
-        artifact_chunk_data: artifact_chunk.artifact_chunk_data,
-    }
-}
-
-/// An re-transmission request can be converted into a
-/// `pb::GossipRetransmissionRequest`.
-impl From<GossipRetransmissionRequest> for pb::GossipRetransmissionRequest {
-    /// The function converts a retransmission request into the Protobuf
-    /// equivalent.
-    fn from(gossip_request: GossipRetransmissionRequest) -> Self {
-        Self {
-            filter: Some(gossip_request.filter.into()),
-        }
-    }
-}
-
-/// A `pb::GossipRetransmissionRequest` can be converted into a
-/// retransmission request.
-impl TryFrom<pb::GossipRetransmissionRequest> for GossipRetransmissionRequest {
-    type Error = ProxyDecodeError;
-    /// The function attempts to convert a Protobuf retransmission request into
-    /// a GossipRetransmissionRequest.
-    fn try_from(
-        gossip_retransmission_request: pb::GossipRetransmissionRequest,
-    ) -> Result<Self, Self::Error> {
-        Ok(Self {
-            filter: try_from_option_field(
-                gossip_retransmission_request.filter,
-                "GossipRetransmissionRequest.filter",
-            )?,
-        })
+/// Fetch the Gossip configuration from the registry.
+fn fetch_gossip_config(
+    registry_client: Arc<dyn RegistryClient>,
+    subnet_id: SubnetId,
+) -> GossipConfig {
+    if let Ok(Some(Some(gossip_config))) =
+        registry_client.get_gossip_config(subnet_id, registry_client.get_latest_version())
+    {
+        gossip_config
+    } else {
+        ic_types::p2p::build_default_gossip_config()
     }
 }

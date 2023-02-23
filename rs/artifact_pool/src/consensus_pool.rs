@@ -2,18 +2,17 @@ use crate::backup::Backup;
 use crate::{
     consensus_pool_cache::{
         get_highest_catch_up_package, get_highest_finalized_block, update_summary_block,
-        ConsensusCacheImpl,
+        ConsensusBlockChainImpl, ConsensusCacheImpl,
     },
     inmemory_pool::InMemoryPoolSection,
     metrics::{LABEL_POOL_TYPE, POOL_TYPE_UNVALIDATED, POOL_TYPE_VALIDATED},
 };
 use ic_config::artifact_pool::{ArtifactPoolConfig, PersistentPoolBackend};
-use ic_consensus_message::ConsensusMessageHashable;
 use ic_interfaces::{
     consensus_pool::{
-        ChangeAction, ChangeSet, ConsensusPool, ConsensusPoolCache, HeightIndexedPool, HeightRange,
-        MutableConsensusPool, PoolSection, UnvalidatedConsensusArtifact,
-        ValidatedConsensusArtifact,
+        ChangeAction, ChangeSet, ConsensusBlockCache, ConsensusBlockChain, ConsensusPool,
+        ConsensusPoolCache, HeightIndexedPool, HeightRange, MutableConsensusPool, PoolSection,
+        UnvalidatedConsensusArtifact, ValidatedConsensusArtifact,
     },
     gossip_pool::{ConsensusGossipPool, GossipPool},
     time_source::TimeSource,
@@ -24,6 +23,7 @@ use ic_types::{
     Height, SubnetId, Time,
 };
 use prometheus::{labels, opts, IntGauge};
+use std::cmp::Ordering;
 use std::marker::PhantomData;
 use std::sync::Arc;
 use std::time::Duration;
@@ -205,19 +205,24 @@ pub struct UncachedConsensusPoolImpl {
 impl UncachedConsensusPoolImpl {
     pub fn new(config: ArtifactPoolConfig, log: ReplicaLogger) -> UncachedConsensusPoolImpl {
         let validated = match config.persistent_pool_backend {
-            PersistentPoolBackend::LMDB(lmdb_config) => Box::new(
+            PersistentPoolBackend::Lmdb(lmdb_config) => Box::new(
                 crate::lmdb_pool::PersistentHeightIndexedPool::new_consensus_pool(
                     lmdb_config,
                     config.persistent_pool_read_only,
                     log.clone(),
                 ),
             ) as Box<_>,
+            #[cfg(feature = "rocksdb_backend")]
             PersistentPoolBackend::RocksDB(config) => Box::new(
                 crate::rocksdb_pool::PersistentHeightIndexedPool::new_consensus_pool(
                     config,
                     log.clone(),
                 ),
             ) as Box<_>,
+            #[allow(unreachable_patterns)]
+            cfg => {
+                unimplemented!("Configuration {:?} is not supported", cfg)
+            }
         };
 
         UncachedConsensusPoolImpl {
@@ -257,6 +262,18 @@ impl ConsensusPoolCache for UncachedConsensusPoolImpl {
     }
 }
 
+impl ConsensusBlockCache for UncachedConsensusPoolImpl {
+    fn finalized_chain(&self) -> Arc<dyn ConsensusBlockChain> {
+        let summary_block = self.summary_block();
+        let finalized_tip = self.finalized_block();
+        Arc::new(ConsensusBlockChainImpl::new(
+            self,
+            &summary_block,
+            &finalized_tip,
+        ))
+    }
+}
+
 impl ConsensusPool for UncachedConsensusPoolImpl {
     fn validated(&self) -> &dyn PoolSection<ValidatedConsensusArtifact> {
         self.validated.pool_section()
@@ -267,6 +284,10 @@ impl ConsensusPool for UncachedConsensusPoolImpl {
     }
 
     fn as_cache(&self) -> &dyn ConsensusPoolCache {
+        self
+    }
+
+    fn as_block_cache(&self) -> &dyn ConsensusBlockCache {
         self
     }
 }
@@ -302,6 +323,12 @@ impl ConsensusPoolImpl {
                 log,
             )
         });
+
+        // Initial update to the metrics, such that they always report the state, even
+        // when a subnet is halted.
+        pool.validated_metrics.update(pool.validated.pool_section());
+        pool.unvalidated_metrics
+            .update(pool.unvalidated.pool_section());
         pool
     }
 
@@ -314,7 +341,13 @@ impl ConsensusPoolImpl {
         if should_insert {
             let mut ops = PoolSectionOps::new();
             ops.insert(ValidatedConsensusArtifact {
-                msg: cup.cup.content.random_beacon.as_ref().clone().to_message(),
+                msg: cup
+                    .cup
+                    .content
+                    .random_beacon
+                    .as_ref()
+                    .clone()
+                    .into_message(),
                 timestamp: cup.cup.content.block.as_ref().context.time,
             });
             pool_section.mutate(ops);
@@ -359,6 +392,11 @@ impl ConsensusPoolImpl {
         Arc::clone(&self.cache) as Arc<_>
     }
 
+    /// Get a copy of ConsensusBlockCache.
+    pub fn get_block_cache(&self) -> Arc<dyn ConsensusBlockCache> {
+        Arc::clone(&self.cache) as Arc<_>
+    }
+
     fn apply_changes_validated(&mut self, ops: PoolSectionOps<ValidatedConsensusArtifact>) {
         if !ops.ops.is_empty() {
             self.validated.mutate(ops);
@@ -385,6 +423,10 @@ impl ConsensusPool for ConsensusPoolImpl {
     }
 
     fn as_cache(&self) -> &dyn ConsensusPoolCache {
+        self.cache.as_ref()
+    }
+
+    fn as_block_cache(&self) -> &dyn ConsensusBlockCache {
         self.cache.as_ref()
     }
 }
@@ -472,19 +514,22 @@ impl GossipPool<ConsensusMessage, ChangeSet> for ConsensusPoolImpl {
         self.validated.get(id)
     }
 
-    // Get max height for each Validated pool and chain all the
-    // get_by_height_range() iterators.
+    // Return an iterator of all artifacts that is required to make progress
+    // above the given height filter.
     fn get_all_validated_by_filter(
         &self,
         filter: Self::Filter,
-    ) -> Box<dyn Iterator<Item = ConsensusMessage>> {
+    ) -> Box<dyn Iterator<Item = ConsensusMessage> + '_> {
         let max_catch_up_height = self
             .validated
             .catch_up_package()
             .height_range()
             .map(|x| x.max)
             .unwrap();
-        let min = max_catch_up_height.max(filter) + Height::from(1);
+        // Since random beacon of previous height is required, min_random_beacon_height
+        // should be one less than the normal min height.
+        let min_random_beacon_height = max_catch_up_height.max(filter);
+        let min = min_random_beacon_height.increment();
         let max_finalized_height = self
             .validated
             .finalization()
@@ -518,8 +563,7 @@ impl GossipPool<ConsensusMessage, ChangeSet> for ConsensusPoolImpl {
             .random_beacon()
             .height_range()
             .map(|x| x.max)
-            .unwrap_or(min);
-        let min_random_beacon_height = min;
+            .unwrap_or(min_random_beacon_height);
         let max_random_beacon_share_height = self
             .validated
             .random_beacon_share()
@@ -559,24 +603,21 @@ impl GossipPool<ConsensusMessage, ChangeSet> for ConsensusPoolImpl {
                 .get();
         let random_tapes = tape_range
             .clone()
-            .map(|h| self.validated.random_tape().get_by_height(Height::from(h)))
-            .collect::<Vec<_>>();
-        let random_tape_shares = tape_range
-            .map(|h| {
-                self.validated
-                    .random_tape_share()
-                    .get_by_height(Height::from(h))
-            })
-            .collect::<Vec<_>>();
-        let random_tape_iterator = random_tapes
-            .into_iter()
-            .zip(random_tape_shares.into_iter())
-            .flat_map(|(mut tape, shares)| {
-                tape.next().map_or_else(
-                    || shares.map(|x| x.to_message()).collect::<Vec<_>>(),
-                    |x| vec![x.to_message()],
-                )
-            });
+            .map(move |h| self.validated.random_tape().get_by_height(Height::from(h)));
+        let random_tape_shares = tape_range.map(move |h| {
+            self.validated
+                .random_tape_share()
+                .get_by_height(Height::from(h))
+        });
+        let random_tape_iterator =
+            random_tapes
+                .zip(random_tape_shares)
+                .flat_map(|(mut tape, shares)| {
+                    tape.next().map_or_else(
+                        || shares.map(|x| x.into_message()).collect::<Vec<_>>(),
+                        |x| vec![x.into_message()],
+                    )
+                });
 
         Box::new(
             self.validated
@@ -585,7 +626,7 @@ impl GossipPool<ConsensusMessage, ChangeSet> for ConsensusPoolImpl {
                     min: max_catch_up_height.max(filter),
                     max: max_catch_up_height,
                 })
-                .map(|x| x.to_message())
+                .map(|x| x.into_message())
                 .chain(
                     self.validated
                         .finalization()
@@ -593,7 +634,7 @@ impl GossipPool<ConsensusMessage, ChangeSet> for ConsensusPoolImpl {
                             min: min_finalized_height,
                             max: max_finalized_height,
                         })
-                        .map(|x| x.to_message()),
+                        .map(|x| x.into_message()),
                 )
                 .chain(
                     self.validated
@@ -602,7 +643,7 @@ impl GossipPool<ConsensusMessage, ChangeSet> for ConsensusPoolImpl {
                             min: min_finalized_share_height,
                             max: max_finalized_share_height,
                         })
-                        .map(|x| x.to_message()),
+                        .map(|x| x.into_message()),
                 )
                 .chain(
                     self.validated
@@ -611,7 +652,7 @@ impl GossipPool<ConsensusMessage, ChangeSet> for ConsensusPoolImpl {
                             min: min_notarization_height,
                             max: max_notarization_height,
                         })
-                        .map(|x| x.to_message()),
+                        .map(|x| x.into_message()),
                 )
                 .chain(
                     self.validated
@@ -620,7 +661,7 @@ impl GossipPool<ConsensusMessage, ChangeSet> for ConsensusPoolImpl {
                             min: min_notarization_share_height,
                             max: max_notarization_share_height,
                         })
-                        .map(|x| x.to_message()),
+                        .map(|x| x.into_message()),
                 )
                 .chain(
                     self.validated
@@ -629,7 +670,7 @@ impl GossipPool<ConsensusMessage, ChangeSet> for ConsensusPoolImpl {
                             min: min_random_beacon_height,
                             max: max_random_beacon_height,
                         })
-                        .map(|x| x.to_message()),
+                        .map(|x| x.into_message()),
                 )
                 .chain(
                     self.validated
@@ -638,7 +679,7 @@ impl GossipPool<ConsensusMessage, ChangeSet> for ConsensusPoolImpl {
                             min: min_random_beacon_share_height,
                             max: max_random_beacon_share_height,
                         })
-                        .map(|x| x.to_message()),
+                        .map(|x| x.into_message()),
                 )
                 .chain(
                     self.validated
@@ -647,7 +688,7 @@ impl GossipPool<ConsensusMessage, ChangeSet> for ConsensusPoolImpl {
                             min: min_block_proposal_height,
                             max: max_block_proposal_height,
                         })
-                        .map(|x| x.to_message()),
+                        .map(|x| x.into_message()),
                 )
                 .chain(random_tape_iterator),
         )
@@ -656,20 +697,112 @@ impl GossipPool<ConsensusMessage, ChangeSet> for ConsensusPoolImpl {
 
 impl ConsensusGossipPool for ConsensusPoolImpl {}
 
+/// An iterator for block ancestors.
+/// TODO: this is currently used only for ConsensusBlockChainImpl. Migrate
+/// other call sites from ChainIterator to BlockChainIterator.
+#[allow(dead_code)]
+pub struct BlockChainIterator<'a> {
+    consensus_pool: &'a dyn ConsensusPool,
+    summary_height: Height,
+    cursor: Option<Block>,
+}
+
+impl<'a> BlockChainIterator<'a> {
+    /// Return an iterator that iterates block ancestors, going backwards
+    /// from the `from_block` to the nearest summary block ancestor (both inclusive),
+    /// or until a parent is not found in the consensus pool.
+    pub fn new(consensus_pool: &'a dyn ConsensusPool, from_block: Block) -> Self {
+        Self {
+            consensus_pool,
+            summary_height: from_block.payload.as_ref().dkg_interval_start_height(),
+            cursor: Some(from_block),
+        }
+    }
+
+    fn get_parent_block(&self, block: &Block) -> Option<Block> {
+        if block.height() == Height::from(0) {
+            return None;
+        }
+
+        let parent_height = block.height().decrement();
+        let parent_hash = &block.parent;
+
+        // First look up the block proposals
+        self.consensus_pool
+            .validated()
+            .block_proposal()
+            .get_by_height(parent_height)
+            .find_map(|proposal| {
+                if proposal.content.get_hash() == parent_hash {
+                    Some(proposal.content.into_inner())
+                } else {
+                    None
+                }
+            })
+            .or_else(|| {
+                // Parent block proposal not found, look up the CUPs only if parent
+                // is the summary height
+                if parent_height.cmp(&self.summary_height) == Ordering::Equal {
+                    self.consensus_pool
+                        .validated()
+                        .catch_up_package()
+                        .get_by_height(parent_height)
+                        .find_map(|cup| {
+                            if cup.content.block.get_hash() == parent_hash {
+                                Some(cup.content.block.into_inner())
+                            } else {
+                                None
+                            }
+                        })
+                } else {
+                    None
+                }
+            })
+    }
+}
+
+impl<'a> Iterator for BlockChainIterator<'a> {
+    type Item = Block;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let cur_block = self.cursor.as_ref()?;
+        let parent_block = match cur_block.height().cmp(&self.summary_height) {
+            Ordering::Greater => self.get_parent_block(cur_block),
+            Ordering::Equal | Ordering::Less => None,
+        };
+        std::mem::replace(&mut self.cursor, parent_block)
+    }
+}
+
+/// Returns the block chain cache between the given start/end
+/// blocks (inclusive)
+pub fn build_consensus_block_chain(
+    consensus_pool: &dyn ConsensusPool,
+    start: &Block,
+    end: &Block,
+) -> Arc<dyn ConsensusBlockChain> {
+    Arc::new(ConsensusBlockChainImpl::new(consensus_pool, start, end))
+}
+
 #[cfg(test)]
 mod tests {
+    use crate::backup::{BackupAge, PurgingError};
+
     use super::*;
-    use ic_consensus_message::make_genesis;
     use ic_interfaces::artifact_pool::UnvalidatedArtifact;
     use ic_logger::replica_logger::no_op_logger;
     use ic_metrics::MetricsRegistry;
     use ic_protobuf::types::v1 as pb;
+    use ic_test_artifact_pool::consensus_pool::TestConsensusPool;
     use ic_test_utilities::{
-        consensus::fake::*,
+        consensus::{fake::*, make_genesis},
+        crypto::CryptoReturningOk,
         mock_time,
+        state_manager::FakeStateManager,
         types::ids::{node_test_id, subnet_test_id},
         FastForwardTimeSource,
     };
+    use ic_test_utilities_registry::{setup_registry, SubnetRecordBuilder};
     use ic_types::{
         batch::ValidationContext,
         consensus::{BlockProposal, RandomBeacon},
@@ -677,8 +810,7 @@ mod tests {
         RegistryVersion,
     };
     use prost::Message;
-    use std::convert::TryFrom;
-    use std::{fs, io::Read};
+    use std::{collections::HashMap, convert::TryFrom, fs, io::Read, path::Path, sync::RwLock};
 
     #[test]
     fn test_timestamp() {
@@ -697,10 +829,10 @@ mod tests {
                 Height::from(0),
                 CryptoHashOf::from(CryptoHash(Vec::new())),
             ));
-            let msg_0 = random_beacon.clone().to_message();
+            let msg_0 = random_beacon.clone().into_message();
             let msg_id_0 = random_beacon.get_id();
             random_beacon.content.height = Height::from(1);
-            let msg_1 = random_beacon.clone().to_message();
+            let msg_1 = random_beacon.clone().into_message();
             let msg_id_1 = random_beacon.get_id();
 
             pool.insert(UnvalidatedArtifact {
@@ -722,9 +854,10 @@ mod tests {
             assert_eq!(pool.unvalidated().get_timestamp(&msg_id_0), Some(time_0));
             assert_eq!(pool.unvalidated().get_timestamp(&msg_id_1), Some(time_1));
 
-            let mut changeset = ChangeSet::new();
-            changeset.push(ChangeAction::MoveToValidated(msg_0));
-            changeset.push(ChangeAction::RemoveFromUnvalidated(msg_1));
+            let changeset = vec![
+                ChangeAction::MoveToValidated(msg_0),
+                ChangeAction::RemoveFromUnvalidated(msg_1),
+            ];
             pool.apply_changes(time_source.as_ref(), changeset);
 
             // Check timestamp is carried over for msg_0.
@@ -793,8 +926,8 @@ mod tests {
                 Block::new(
                     CryptoHashOf::from(CryptoHash(Vec::new())),
                     Payload::new(
-                        ic_crypto::crypto_hash,
-                        ic_types::consensus::dkg::Summary::fake().into(),
+                        ic_types::crypto::crypto_hash,
+                        (ic_types::consensus::dkg::Summary::fake(), None).into(),
                     ),
                     Height::from(4),
                     Rank(456),
@@ -810,7 +943,7 @@ mod tests {
             let genesis_cup = make_genesis(ic_types::consensus::dkg::Summary::fake());
             let mut cup = genesis_cup.clone();
             cup.content.random_beacon = hashed::Hashed::new(
-                ic_crypto::crypto_hash,
+                ic_types::crypto::crypto_hash,
                 RandomBeacon::fake(RandomBeaconContent::new(
                     Height::from(4),
                     CryptoHashOf::from(CryptoHash(Vec::new())),
@@ -818,23 +951,21 @@ mod tests {
             );
 
             let changeset = vec![
-                random_beacon.clone().to_message(),
-                random_tape.clone().to_message(),
-                finalization.clone().to_message(),
-                notarization.clone().to_message(),
-                proposal.clone().to_message(),
-                cup.clone().to_message(),
+                random_beacon.clone().into_message(),
+                random_tape.clone().into_message(),
+                finalization.clone().into_message(),
+                notarization.clone().into_message(),
+                proposal.clone().into_message(),
+                cup.clone().into_message(),
             ]
             .into_iter()
             .map(ChangeAction::AddToValidated)
             .collect();
 
             pool.apply_changes(time_source.as_ref(), changeset);
-            // We let the pool apply empty change set, so that it triggers the backup,
-            // which will block on the previous backup execution, which is running
-            // asynchronously. This way, we make sure the backup is written and the test
-            // can continue.
-            pool.apply_changes(time_source.as_ref(), Vec::new());
+            // We sync the backup before checking the asserts to make sure all backups have
+            // been written.
+            pool.backup.as_ref().unwrap().sync_backup();
 
             // Check backup for height 0
             assert!(
@@ -885,7 +1016,7 @@ mod tests {
             let notarization_path = path.join("2").join(format!(
                 "notarization_{}_{}.bin",
                 bytes_to_hex_str(&notarization.content.block),
-                bytes_to_hex_str(&ic_crypto::crypto_hash(&notarization)),
+                bytes_to_hex_str(&ic_types::crypto::crypto_hash(&notarization)),
             ));
             assert!(
                 path.join("2").join("random_tape.bin").exists(),
@@ -924,7 +1055,7 @@ mod tests {
             let finalization_path = path.join("3").join(format!(
                 "finalization_{}_{}.bin",
                 bytes_to_hex_str(&finalization.content.block),
-                bytes_to_hex_str(&ic_crypto::crypto_hash(&finalization)),
+                bytes_to_hex_str(&ic_types::crypto::crypto_hash(&finalization)),
             ));
             assert!(
                 finalization_path.exists(),
@@ -949,8 +1080,8 @@ mod tests {
             // Check backup for height 4
             let proposal_path = path.join("4").join(format!(
                 "block_proposal_{}_{}.bin",
-                bytes_to_hex_str(&proposal.content.get_hash()),
-                bytes_to_hex_str(&ic_crypto::crypto_hash(&proposal)),
+                bytes_to_hex_str(proposal.content.get_hash()),
+                bytes_to_hex_str(&ic_types::crypto::crypto_hash(&proposal)),
             ));
             assert!(
                 path.join("4").join("catch_up_package.bin").exists(),
@@ -988,20 +1119,12 @@ mod tests {
             );
 
             // Now we fast-forward the time for purging being definitely overdue.
-            // Before we purge, we sleep for one purging interval, making sure artifacts are
-            // old enough. Then we sleep again so that the group folder is
-            // removed as well. Note that we measure the age of artifacts using
-            // the FS timestamp and cannot fast-forward it.
-            for _ in 0..2 {
-                let sleep_time = purging_interval;
-                std::thread::sleep(sleep_time);
-                time_source
-                    .set_time(time_source.get_relative_time() + sleep_time)
-                    .unwrap();
-                // This should cause purging.
-                pool.apply_changes(time_source.as_ref(), Vec::new());
-                pool.apply_changes(time_source.as_ref(), Vec::new());
-            }
+            std::thread::sleep(purging_interval);
+            time_source
+                .set_time(time_source.get_relative_time() + purging_interval)
+                .unwrap();
+            pool.apply_changes(time_source.as_ref(), Vec::new());
+            pool.backup.as_ref().unwrap().sync_purging();
 
             // Make sure the subnet directory is empty, as we purged everything.
             assert_eq!(fs::read_dir(&path).unwrap().count(), 0);
@@ -1014,13 +1137,33 @@ mod tests {
                 .set_time(time_source.get_relative_time() + sleep_time)
                 .unwrap();
             pool.apply_changes(time_source.as_ref(), Vec::new());
-            pool.apply_changes(time_source.as_ref(), Vec::new());
+            pool.backup.as_ref().unwrap().sync_purging();
             assert!(!path.exists());
         })
     }
 
     #[test]
     fn test_backup_purging() {
+        struct FakeAge {
+            // Mapping names of directories containing artifacts to their emulated age.
+            map: Arc<RwLock<HashMap<String, Duration>>>,
+        }
+
+        impl BackupAge for FakeAge {
+            fn get_elapsed_time(&self, path: &Path) -> Result<Duration, PurgingError> {
+                // Fake age of an artifact is determined through map look up. Panics on non-existant keys.
+                let name = path
+                    .file_name()
+                    .map(|os| os.to_os_string().into_string().unwrap())
+                    .unwrap();
+                let m = self.map.read().unwrap();
+                let age = m
+                    .get(&name)
+                    .unwrap_or_else(|| panic!("No age entry found for key path: {:?}", path));
+                Ok(*age)
+            }
+        }
+
         ic_test_utilities::artifact_pool_config::with_test_pool_config(|pool_config| {
             let time_source = FastForwardTimeSource::new();
             let backup_dir = tempfile::Builder::new().tempdir().unwrap();
@@ -1034,16 +1177,35 @@ mod tests {
                 no_op_logger(),
             );
 
-            let purging_interval = Duration::from_millis(1000);
-            pool.backup = Some(Backup::new(
+            let map: Arc<RwLock<HashMap<String, Duration>>> = Default::default();
+
+            // Insert a list of directory names into the fake age map.
+            let insert_dirs = |v: &[&str]| {
+                let mut m = map.write().unwrap();
+                for h in v {
+                    m.insert(h.to_string(), Duration::ZERO);
+                }
+            };
+
+            // Increase the age of all artifacts currently stored in the map by the given duration
+            let add_age = |d: Duration| {
+                let mut m = map.write().unwrap();
+                m.iter_mut().for_each(|(_, age)| {
+                    *age += d;
+                })
+            };
+
+            let purging_interval = Duration::from_millis(3000);
+            pool.backup = Some(Backup::new_with_age_func(
                 &pool,
                 backup_dir.path().into(),
                 backup_dir.path().join(format!("{:?}", subnet_id)),
                 // Artifact retention time
-                Duration::from_millis(900),
+                Duration::from_millis(2700),
                 purging_interval,
                 MetricsRegistry::new(),
                 no_op_logger(),
+                Box::new(FakeAge { map: map.clone() }),
             ));
 
             let random_beacon = RandomBeacon::fake(RandomBeaconContent::new(
@@ -1059,8 +1221,8 @@ mod tests {
                 Block::new(
                     CryptoHashOf::from(CryptoHash(Vec::new())),
                     Payload::new(
-                        ic_crypto::crypto_hash,
-                        ic_types::consensus::dkg::Summary::fake().into(),
+                        ic_types::crypto::crypto_hash,
+                        (ic_types::consensus::dkg::Summary::fake(), None).into(),
                     ),
                     Height::from(4),
                     Rank(456),
@@ -1073,109 +1235,186 @@ mod tests {
                 node_test_id(333),
             );
 
-            let changeset = vec![random_beacon.to_message(), random_tape.to_message()]
+            let changeset = vec![random_beacon.into_message(), random_tape.into_message()]
                 .into_iter()
                 .map(ChangeAction::AddToValidated)
                 .collect();
-
-            // Trigger purging timestamp to update.
-            pool.apply_changes(time_source.as_ref(), Vec::new());
-            // sync
-            pool.apply_changes(time_source.as_ref(), Vec::new());
 
             // Apply changes
             pool.apply_changes(time_source.as_ref(), changeset);
             // sync
-            pool.apply_changes(time_source.as_ref(), Vec::new());
+            pool.backup.as_ref().unwrap().sync_backup();
 
             let group_path = &path.join("0");
             // We expect 3 folders for heights 0 to 2.
-            assert_eq!(fs::read_dir(&group_path).unwrap().count(), 3);
+            assert_eq!(fs::read_dir(group_path).unwrap().count(), 3);
+            insert_dirs(&[&subnet_id.to_string(), "0", "1", "2"]);
 
             // Let's sleep so that the previous heights are close to being purged.
+            // Instead of actually sleeping, we simply increase the emulated age of artifacts.
             let sleep_time = purging_interval / 10 * 8;
-            std::thread::sleep(sleep_time);
             time_source
                 .set_time(time_source.get_relative_time() + sleep_time)
                 .unwrap();
+            add_age(sleep_time);
 
             // Now add new artifacts
-            let changeset = vec![notarization.to_message(), proposal.to_message()]
+            let changeset = vec![notarization.into_message(), proposal.into_message()]
                 .into_iter()
                 .map(ChangeAction::AddToValidated)
                 .collect();
 
             pool.apply_changes(time_source.as_ref(), changeset);
             // sync
-            pool.apply_changes(time_source.as_ref(), Vec::new());
+            pool.backup.as_ref().unwrap().sync_backup();
 
             // We expect 5 folders for heights 0 to 4.
-            assert_eq!(fs::read_dir(&group_path).unwrap().count(), 5);
+            assert_eq!(fs::read_dir(group_path).unwrap().count(), 5);
+            insert_dirs(&["3", "4"]);
 
             // We sleep just enough so that purging is overdue and the oldest artifacts are
             // approximately 1 purging interval old.
             let sleep_time = purging_interval / 10 * 3;
-            std::thread::sleep(sleep_time);
             time_source
                 .set_time(time_source.get_relative_time() + sleep_time)
                 .unwrap();
+            add_age(sleep_time);
 
             // Trigger the purging.
             pool.apply_changes(time_source.as_ref(), Vec::new());
             // sync
-            pool.apply_changes(time_source.as_ref(), Vec::new());
+            pool.backup.as_ref().unwrap().sync_purging();
 
             // We expect only 2 folders to survive the purging: 3, 4
-            assert_eq!(fs::read_dir(&group_path).unwrap().count(), 2);
+            assert_eq!(fs::read_dir(group_path).unwrap().count(), 2);
             assert!(group_path.join("3").exists());
             assert!(group_path.join("4").exists());
 
             let sleep_time = purging_interval + purging_interval / 10 * 3;
-            std::thread::sleep(sleep_time);
             time_source
                 .set_time(time_source.get_relative_time() + sleep_time)
                 .unwrap();
+            add_age(sleep_time);
 
             // Trigger the purging.
             pool.apply_changes(time_source.as_ref(), Vec::new());
             // sync
-            pool.apply_changes(time_source.as_ref(), Vec::new());
+            pool.backup.as_ref().unwrap().sync_purging();
 
             // We deleted all artifacts, but the group folder was updated by this and needs
             // to age now.
             assert!(group_path.exists());
-            assert_eq!(fs::read_dir(&group_path).unwrap().count(), 0);
+            assert_eq!(fs::read_dir(group_path).unwrap().count(), 0);
 
             let sleep_time = purging_interval + purging_interval / 10 * 3;
-            std::thread::sleep(sleep_time);
             time_source
                 .set_time(time_source.get_relative_time() + sleep_time)
                 .unwrap();
+            add_age(sleep_time);
 
             // Trigger the purging.
             pool.apply_changes(time_source.as_ref(), Vec::new());
             // sync
-            pool.apply_changes(time_source.as_ref(), Vec::new());
+            pool.backup.as_ref().unwrap().sync_purging();
 
+            //print_time_elapsed(&test_start_time, &(purging_interval / 10 * 37));
             // The group folder expired and was deleted.
             assert!(!group_path.exists());
             assert_eq!(fs::read_dir(&path).unwrap().count(), 0);
 
             // We wait more and make sure the subnet folder is purged.
             let sleep_time = purging_interval + purging_interval / 10 * 3;
-            std::thread::sleep(sleep_time);
             time_source
                 .set_time(time_source.get_relative_time() + sleep_time)
                 .unwrap();
+            add_age(sleep_time);
 
             // Trigger the purging.
             pool.apply_changes(time_source.as_ref(), Vec::new());
             // sync
-            pool.apply_changes(time_source.as_ref(), Vec::new());
+            pool.backup.as_ref().unwrap().sync_purging();
 
             // The subnet_id folder expired and was deleted.
             assert!(!path.exists());
             assert_eq!(fs::read_dir(&backup_dir).unwrap().count(), 0);
         })
+    }
+
+    #[test]
+    fn test_block_chain_iterator() {
+        ic_test_utilities::artifact_pool_config::with_test_pool_config(|pool_config| {
+            let time_source = FastForwardTimeSource::new();
+            let subnet_id = subnet_test_id(1);
+            let committee = vec![node_test_id(0)];
+            let dkg_interval_length = 5;
+            let subnet_records = vec![(
+                1,
+                SubnetRecordBuilder::from(&committee)
+                    .with_dkg_interval_length(dkg_interval_length)
+                    .build(),
+            )];
+            let registry = setup_registry(subnet_id, subnet_records);
+            let state_manager = FakeStateManager::new();
+            let state_manager = Arc::new(state_manager);
+            let mut pool = TestConsensusPool::new(
+                subnet_id,
+                pool_config,
+                time_source,
+                registry,
+                Arc::new(CryptoReturningOk::default()),
+                state_manager,
+                None,
+            );
+
+            // Only genesis to start with
+            check_iterator(&pool, pool.as_cache().finalized_block(), vec![0]);
+
+            // Two finalized rounds added
+            assert_eq!(pool.advance_round_normal_operation_n(2), Height::from(2));
+            check_iterator(&pool, pool.as_cache().finalized_block(), vec![2, 1, 0]);
+
+            // Two notarized rounds added
+            let block = pool.make_next_block();
+            pool.insert_validated(block.clone());
+            pool.notarize(&block);
+
+            let block = pool.make_next_block();
+            pool.insert_validated(block.clone());
+            pool.notarize(&block);
+            check_iterator(&pool, block.clone().into(), vec![4, 3, 2, 1, 0]);
+
+            pool.finalize(&block);
+            pool.insert_validated(pool.make_next_beacon());
+            pool.insert_validated(pool.make_next_beacon());
+            pool.insert_validated(pool.make_next_tape());
+            pool.insert_validated(pool.make_next_tape());
+            check_iterator(&pool, block.into(), vec![4, 3, 2, 1, 0]);
+
+            // Next summary interval starts(height = 6), iterator should stop at the summary block
+            assert_eq!(pool.advance_round_normal_operation_n(3), Height::from(7));
+            check_iterator(&pool, pool.as_cache().finalized_block(), vec![7, 6]);
+
+            // Start from CUP height
+            check_iterator(
+                &pool,
+                pool.as_cache()
+                    .catch_up_package()
+                    .content
+                    .block
+                    .into_inner(),
+                vec![6],
+            );
+        })
+    }
+
+    // Verifies the iterator output, starting from the given block
+    fn check_iterator(pool: &dyn ConsensusPool, from: Block, expected_heights: Vec<u64>) {
+        let mut blocks = Vec::new();
+        BlockChainIterator::new(pool, from).for_each(|block| blocks.push(block));
+        assert_eq!(blocks.len(), expected_heights.len());
+
+        for (block, expected_height) in blocks.iter().zip(expected_heights.iter()) {
+            assert_eq!(block.height(), Height::from(*expected_height));
+        }
     }
 }

@@ -14,11 +14,13 @@
 //! no possibility to inject purging (or any other deletion) of artifacts
 //! between the pool update and the backup.
 
+use ic_config::artifact_pool::BACKUP_GROUP_SIZE;
 use ic_interfaces::{
     consensus_pool::{ConsensusPool, HeightRange},
     time_source::TimeSource,
 };
-use ic_logger::{error, ReplicaLogger};
+use ic_logger::{error, info, warn, ReplicaLogger};
+use ic_metrics::MetricsRegistry;
 use ic_protobuf::types::v1 as pb;
 use ic_types::{
     consensus::{
@@ -31,38 +33,211 @@ use ic_types::{
 };
 use prometheus::IntCounter;
 use prost::Message;
-use std::io;
-use std::{fs, io::Write, path::PathBuf, sync::RwLock, thread, time::Duration};
+use std::{
+    fs,
+    io::{self, Write},
+    path::{Path, PathBuf},
+    sync::{
+        mpsc::{sync_channel, Receiver, SyncSender},
+        RwLock,
+    },
+    thread::{self, JoinHandle},
+    time::Duration,
+};
 
-#[allow(clippy::large_enum_variant)]
-enum BackupArtifact {
-    Finalization(Finalization),
-    Notarization(Notarization),
-    BlockProposal(BlockProposal),
-    RandomBeacon(RandomBeacon),
-    RandomTape(RandomTape),
-    CatchUpPackage(CatchUpPackage),
+pub enum BackupArtifact {
+    Finalization(Box<Finalization>),
+    Notarization(Box<Notarization>),
+    BlockProposal(Box<BlockProposal>),
+    RandomBeacon(Box<RandomBeacon>),
+    RandomTape(Box<RandomTape>),
+    CatchUpPackage(Box<CatchUpPackage>),
 }
 
+#[derive(Clone, Debug)]
 struct Metrics {
     // Amount of I/O errors. Any number above 0 is critical.
     io_errors: IntCounter,
 }
 
-pub(super) struct Backup {
+impl Metrics {
+    fn new(registry: &MetricsRegistry) -> Self {
+        Self {
+            io_errors: registry.int_counter(
+                "consensus_backup_io_errors",
+                "The number of I/O errors happened during the consensus backup storing or purging.",
+            ),
+        }
+    }
+}
+
+// The number of backup / purging rounds, that can queue up before we start
+// blocking consensus. Currently, we have a full rendevouz, i.e. consensus
+// blocks when the artifacts of the last round have not persisted yet.
+const QUEUE_LENGTH: usize = 0;
+
+enum BackupRequest {
+    Backup(Vec<ConsensusMessage>),
+    Await(SyncSender<()>),
+    Shutdown,
+}
+
+struct BackupThread {
     // Path pointing to <backup_dir>/<subnet_id>/<replica_version>. It contains all artifacts
     // backed up by the current replica version.
     version_path: PathBuf,
+    metrics: Metrics,
+    log: ReplicaLogger,
+}
+
+impl BackupThread {
+    fn new(version_path: PathBuf, metrics: Metrics, log: ReplicaLogger) -> Self {
+        BackupThread {
+            version_path,
+            metrics,
+            log,
+        }
+    }
+
+    fn start(mut self) -> (SyncSender<BackupRequest>, JoinHandle<()>) {
+        let (tx, rx) = sync_channel(QUEUE_LENGTH);
+        let handle = thread::Builder::new()
+            .name("BackupThread".to_string())
+            .spawn(move || self.run(rx))
+            .expect("Failed to spawn BackupThread");
+        (tx, handle)
+    }
+
+    fn run(&mut self, rx: Receiver<BackupRequest>) {
+        loop {
+            match rx.recv() {
+                Ok(BackupRequest::Backup(artifacts)) => {
+                    if let Err(err) = store_artifacts(artifacts, &self.version_path) {
+                        error!(self.log, "Backup storing failed: {:?}", err);
+                        self.metrics.io_errors.inc();
+                    }
+                }
+                Ok(BackupRequest::Await(tx)) => tx.send(()).unwrap(),
+                Ok(BackupRequest::Shutdown) => {
+                    info!(self.log, "Shutting down the backup thread.");
+                    break;
+                }
+                Err(_) => {
+                    error!(self.log, "Orphaned backup thread. This is a bug");
+                    break;
+                }
+            }
+        }
+    }
+}
+
+enum PurgingRequest {
+    Purge,
+    Await(SyncSender<()>),
+    Shutdown,
+}
+
+struct PurgingThread {
     // Path containing all backups of all versions running on the current node.
     backup_path: PathBuf,
-    // The timestamp of the last backup purge.
-    time_of_last_purge: RwLock<Time>,
-    // Thread handle of the thread executing the backup.
-    pending_backup: RwLock<Option<thread::JoinHandle<()>>>,
-    // Thread handle of the thread executing the purging.
-    pending_purging: RwLock<Option<thread::JoinHandle<()>>>,
     // The maximum age backup artifacts can reach before purging.
     age_threshold_secs: Duration,
+    metrics: Metrics,
+    log: ReplicaLogger,
+    age: Box<dyn BackupAge>,
+}
+
+pub enum PurgingError {
+    Transient(String),
+    Permanent(io::Error),
+}
+
+/// Trait defining an interface to determine the age of backup artifacts stored on disk
+pub trait BackupAge: Send {
+    fn get_elapsed_time(&self, path: &Path) -> Result<Duration, PurgingError>;
+}
+
+pub struct FileSystemAge {}
+
+impl BackupAge for FileSystemAge {
+    fn get_elapsed_time(&self, path: &Path) -> Result<Duration, PurgingError> {
+        // return elapsed time since last modification as reported by file system
+        path.metadata()
+            .map_err(PurgingError::Permanent)?
+            .modified()
+            .map_err(PurgingError::Permanent)?
+            .elapsed()
+            .map_err(|err| PurgingError::Transient(err.to_string()))
+    }
+}
+
+impl PurgingThread {
+    fn new(
+        backup_path: PathBuf,
+        age_threshold_secs: Duration,
+        metrics: Metrics,
+        log: ReplicaLogger,
+        age: Box<dyn BackupAge>,
+    ) -> Self {
+        Self {
+            backup_path,
+            age_threshold_secs,
+            metrics,
+            log,
+            age,
+        }
+    }
+
+    fn start(mut self) -> (SyncSender<PurgingRequest>, JoinHandle<()>) {
+        let (tx, rx) = sync_channel(QUEUE_LENGTH);
+        let handle = thread::Builder::new()
+            .name("BackupPurgingThread".to_string())
+            .spawn(move || self.run(rx))
+            .expect("Failed to start BackupPurgingThread");
+        (tx, handle)
+    }
+
+    fn run(&mut self, rx: Receiver<PurgingRequest>) {
+        loop {
+            match rx.recv() {
+                Ok(PurgingRequest::Purge) => {
+                    let start = std::time::Instant::now();
+                    if let Err(err) = purge(
+                        self.age_threshold_secs,
+                        &self.backup_path,
+                        self.log.clone(),
+                        self.age.as_ref(),
+                    ) {
+                        error!(self.log, "Backup purging failed: {:?}", err);
+                        self.metrics.io_errors.inc();
+                    }
+                    info!(self.log, "Backup purging finished in {:?}", start.elapsed());
+                }
+                Ok(PurgingRequest::Await(tx)) => tx.send(()).unwrap(),
+                Ok(PurgingRequest::Shutdown) => {
+                    info!(self.log, "Shutting down the purging thread.");
+                    break;
+                }
+                Err(_) => {
+                    error!(self.log, "Orphaned purging thread. This is a bug");
+                    break;
+                }
+            }
+        }
+    }
+}
+
+pub(super) struct Backup {
+    // The timestamp of the last backup purge.
+    time_of_last_purge: RwLock<Time>,
+    // The queue of the backup thread
+    backup_queue: SyncSender<BackupRequest>,
+    // Thread handle of the thread executing the backup.
+    backup_thread: Option<thread::JoinHandle<()>>,
+    // The queue for the purging thread
+    purging_queue: SyncSender<PurgingRequest>,
+    // Thread handle of the thread executing the purging.
+    purging_thread: Option<thread::JoinHandle<()>>,
     // Time interval between purges.
     purge_interval_secs: Duration,
     metrics: Metrics,
@@ -70,120 +245,152 @@ pub(super) struct Backup {
 }
 
 impl Backup {
-    pub fn new(
+    pub fn new_with_age_func(
         pool: &dyn ConsensusPool,
         backup_path: PathBuf,
         version_path: PathBuf,
         age_threshold_secs: Duration,
         purge_interval_secs: Duration,
-        metrics_registry: ic_metrics::MetricsRegistry,
+        metrics_registry: MetricsRegistry,
         log: ReplicaLogger,
+        age: Box<dyn BackupAge>,
     ) -> Self {
-        let backup = Self {
+        let metrics = Metrics::new(&metrics_registry);
+        let (backup_queue, backup_thread) =
+            BackupThread::new(version_path.clone(), metrics.clone(), log.clone()).start();
+        let (purging_queue, purging_thread) = PurgingThread::new(
             backup_path,
-            version_path: version_path.clone(),
-            time_of_last_purge: RwLock::new(UNIX_EPOCH),
-            pending_purging: Default::default(),
-            pending_backup: Default::default(),
             age_threshold_secs,
+            metrics.clone(),
+            log.clone(),
+            age,
+        )
+        .start();
+        let backup = Self {
+            time_of_last_purge: RwLock::new(UNIX_EPOCH),
+            backup_queue,
+            backup_thread: Some(backup_thread),
+            purging_queue,
+            purging_thread: Some(purging_thread),
             purge_interval_secs,
-            metrics: Metrics {
-                io_errors: metrics_registry
-                    .int_counter("consensus_backup_io_errors", "The number of I/O errors happened during the consensus backup storing or purging."),
-            },
+            metrics,
             log,
         };
 
         // Due to the fact that the backup is synced to the disk completely
         // independently of the consensus pool and always after the consensus pool was
         // mutated, we might run into an inconsistent state between the pool and the
-        // backup data if the replica gets killed by the node manager. To avoid this
+        // backup data if the replica gets killed by the orchestrator. To avoid this
         // situation, on the instantiation of the consensus pool and the backup
         // component, we need to synchronize the backup with the pool in a blocking
         // manner.
         let artifacts = get_all_persisted_artifacts(pool);
-        if let Err(err) = store_artifacts(artifacts, version_path) {
+        if let Err(err) = store_artifacts(artifacts, &version_path) {
             error!(backup.log, "Backup storing failed: {:?}", err);
             backup.metrics.io_errors.inc();
         }
         backup
     }
 
+    pub fn new(
+        pool: &dyn ConsensusPool,
+        backup_path: PathBuf,
+        version_path: PathBuf,
+        age_threshold_secs: Duration,
+        purge_interval_secs: Duration,
+        metrics_registry: MetricsRegistry,
+        log: ReplicaLogger,
+    ) -> Self {
+        Self::new_with_age_func(
+            pool,
+            backup_path,
+            version_path,
+            age_threshold_secs,
+            purge_interval_secs,
+            metrics_registry,
+            log,
+            Box::new(FileSystemAge {}),
+        )
+    }
+
     // Filters the new artifacts and asynchronously writes the relevant artifacts
     // to the disk.
     pub fn store(&self, time_source: &dyn TimeSource, artifacts: Vec<ConsensusMessage>) {
-        // We block until the previous write has finished. This should never happen, as
-        // writing of the artifacts should take less than one consensus round, otherwise
-        // a full backup is infeasible.
-        self.sync_backup();
-        let path = self.version_path.clone();
-        let log = self.log.clone();
-        let io_errors = self.metrics.io_errors.clone();
-        let handle = std::thread::spawn(move || {
-            if let Err(err) = store_artifacts(artifacts, path) {
-                error!(log, "Backup storing failed: {:?}", err);
-                io_errors.inc();
-            }
-        });
-        *self.pending_backup.write().unwrap() = Some(handle);
+        // If the queue is full, we will block here.
+        if self
+            .backup_queue
+            .send(BackupRequest::Backup(artifacts))
+            .is_err()
+        {
+            error!(
+                self.log,
+                "Backup thread exited unexpectedly. This is a bug."
+            );
+            self.metrics.io_errors.inc();
+        }
 
         // If we didn't purge within the last PURGE_INTERVAL, trigger a new purge.
         // This way we avoid a too frequent purging. We also block if the previous
         // purging has not finished yet, which is not expected with sufficiently
         // large PURGE_INTERVAL.
         let time_of_last_purge = *self.time_of_last_purge.read().unwrap();
-        if time_source.get_relative_time() - time_of_last_purge > self.purge_interval_secs {
-            self.sync_purging();
-            // We purge all outdated sub-directories in the backup directory.
-            let path = self.backup_path.clone();
-            let threshold = self.age_threshold_secs;
-            let log = self.log.clone();
-            let io_errors = self.metrics.io_errors.clone();
-            let handle = std::thread::spawn(move || {
-                if let Err(err) = purge(threshold, path) {
-                    error!(log, "Backup purging failed: {:?}", err);
-                    io_errors.inc();
-                }
-            });
-            *self.pending_backup.write().unwrap() = Some(handle);
+        if time_source.get_relative_time() - time_of_last_purge >= self.purge_interval_secs {
+            if self.purging_queue.send(PurgingRequest::Purge).is_err() {
+                error!(
+                    self.log,
+                    "Purging thread exited unexpectedly. This is a bug."
+                );
+                self.metrics.io_errors.inc();
+            }
+
+            // Set the time to current
             *self.time_of_last_purge.write().unwrap() = time_source.get_relative_time();
         }
     }
 
-    // Joins on the backup thread handle and blocks until the thread has finished.
-    fn sync_backup(&self) {
-        if let Some(handle) = self.pending_backup.write().unwrap().take() {
-            if let Err(err) = handle.join() {
-                error!(self.log, "Couldn't finish writing backup files: {:?}", err);
-                self.metrics.io_errors.inc();
-            }
+    /// Blocks the current thread until all artifacts have been written to disk.
+    ///
+    /// Mainly useful for testing.
+    #[allow(dead_code)]
+    pub(crate) fn sync_backup(&self) {
+        let (tx, rx) = sync_channel(0);
+        // NOTE: If we have an error here we will also have one in the next line
+        let _ = self.backup_queue.send(BackupRequest::Await(tx));
+        if rx.recv().is_err() {
+            error!(self.log, "Error while syncing the backup thread");
+            self.metrics.io_errors.inc();
         }
     }
 
-    // Joins on the purging thread handle and blocks until the thread has finished.
-    fn sync_purging(&self) {
-        if let Some(handle) = self.pending_purging.write().unwrap().take() {
-            if let Err(err) = handle.join() {
-                error!(self.log, "Couldn't finish purging backup files: {:?}", err);
-                self.metrics.io_errors.inc();
-            }
+    /// Joins on the purging thread handle and blocks until the thread has
+    /// finished.
+    ///
+    /// Mainly useful for testing.
+    #[allow(dead_code)]
+    pub(crate) fn sync_purging(&self) {
+        let (tx, rx) = sync_channel(0);
+        // NOTE: If we have an error here we will also have one in the next line
+        let _ = self.purging_queue.send(PurgingRequest::Await(tx));
+        if rx.recv().is_err() {
+            error!(self.log, "Error while syncing the purging thread");
+            self.metrics.io_errors.inc();
         }
     }
 }
 
 // Write all backup files to the disk. For the sake of simplicity, we write all
 // artifacts sequentially.
-fn store_artifacts(artifacts: Vec<ConsensusMessage>, path: PathBuf) -> Result<(), io::Error> {
+fn store_artifacts(artifacts: Vec<ConsensusMessage>, path: &Path) -> Result<(), io::Error> {
     use ConsensusMessage::*;
     artifacts
         .into_iter()
         .filter_map(|artifact| match artifact {
-            Finalization(artifact) => Some(BackupArtifact::Finalization(artifact)),
-            Notarization(artifact) => Some(BackupArtifact::Notarization(artifact)),
-            BlockProposal(artifact) => Some(BackupArtifact::BlockProposal(artifact)),
-            RandomTape(artifact) => Some(BackupArtifact::RandomTape(artifact)),
-            RandomBeacon(artifact) => Some(BackupArtifact::RandomBeacon(artifact)),
-            CatchUpPackage(artifact) => Some(BackupArtifact::CatchUpPackage(artifact)),
+            Finalization(artifact) => Some(BackupArtifact::Finalization(Box::new(artifact))),
+            Notarization(artifact) => Some(BackupArtifact::Notarization(Box::new(artifact))),
+            BlockProposal(artifact) => Some(BackupArtifact::BlockProposal(Box::new(artifact))),
+            RandomTape(artifact) => Some(BackupArtifact::RandomTape(Box::new(artifact))),
+            RandomBeacon(artifact) => Some(BackupArtifact::RandomBeacon(Box::new(artifact))),
+            CatchUpPackage(artifact) => Some(BackupArtifact::CatchUpPackage(Box::new(artifact))),
             // Do not replace by a `_` so that we evaluate at this place if we want to
             // backup a new artifact!
             RandomBeaconShare(_)
@@ -192,21 +399,40 @@ fn store_artifacts(artifacts: Vec<ConsensusMessage>, path: PathBuf) -> Result<()
             | RandomTapeShare(_)
             | CatchUpPackageShare(_) => None,
         })
-        .try_for_each(|artifact| artifact.write_to_disk(&path))
+        .try_for_each(|artifact| artifact.write_to_disk(path))
 }
 
-// Traverses the whole backup directory and finds all leaf directories
-// (containing no other directories). Then it purges all leaves older than the
-// specified retention time.
-fn purge(threshold_secs: Duration, path: PathBuf) -> Result<(), io::Error> {
+/// Traverses the whole backup directory and finds all leaf directories
+/// (containing no other directories). Then it purges all leaves older than the
+/// specified retention time. Age of a leave is determined by calling the given
+/// implementation of [`BackupAge`]
+fn purge(
+    threshold_secs: Duration,
+    path: &Path,
+    log: ReplicaLogger,
+    age: &dyn BackupAge,
+) -> Result<(), io::Error> {
     let mut leaves = Vec::new();
-    get_leaves(&path, &mut leaves)?;
+    get_leaves(path, &mut leaves)?;
     for path in leaves {
-        let age = path
-            .metadata()?
-            .modified()?
-            .elapsed()
-            .map_err(|err| io::Error::new(io::ErrorKind::Other, err.to_string()))?;
+        let age = match age.get_elapsed_time(&path) {
+            Ok(time) => time,
+            // According to the documentation of `elapsed` this function may fail as
+            // "the underlying system clock is susceptible to drift and updates". Those
+            // errors are transient and safe to ignore. As they are very rare it's ok to
+            // log a warning.
+            Err(PurgingError::Transient(err)) => {
+                warn!(
+                    log,
+                    "Skipping {:?}, because the modified timestamp couldn't be computed: {:?}",
+                    &path,
+                    err
+                );
+                continue;
+            }
+
+            Err(PurgingError::Permanent(err)) => return Err(err),
+        };
         if age > threshold_secs {
             fs::remove_dir_all(path)?;
         }
@@ -215,7 +441,7 @@ fn purge(threshold_secs: Duration, path: PathBuf) -> Result<(), io::Error> {
 }
 
 // Traverses the given path and returns a list of all leaf directories.
-fn get_leaves(dir: &PathBuf, leaves: &mut Vec<PathBuf>) -> std::io::Result<()> {
+fn get_leaves(dir: &Path, leaves: &mut Vec<PathBuf>) -> std::io::Result<()> {
     if !dir.is_dir() {
         return Ok(());
     }
@@ -232,7 +458,7 @@ fn get_leaves(dir: &PathBuf, leaves: &mut Vec<PathBuf>) -> std::io::Result<()> {
             // We skip the folder lost+found, which is currently present on the backup
             // volume.
             if !path_name.contains("lost+found") {
-                leaves.push(dir.clone());
+                leaves.push(dir.to_path_buf());
             }
         }
     }
@@ -318,52 +544,63 @@ fn get_all_persisted_artifacts(pool: &dyn ConsensusPool) -> Vec<ConsensusMessage
 
 impl Drop for Backup {
     fn drop(&mut self) {
-        self.sync_backup();
-        self.sync_purging();
+        let _ = self.backup_queue.send(BackupRequest::Shutdown);
+        if self.backup_thread.take().unwrap().join().is_err() {
+            error!(self.log, "Backup thread exited prematurely during shutdown");
+        }
+        let _ = self.purging_queue.send(PurgingRequest::Shutdown);
+        if self.purging_thread.take().unwrap().join().is_err() {
+            error!(
+                self.log,
+                "Purging thread exited prematurely during shutdown"
+            );
+        }
     }
 }
 
 impl BackupArtifact {
-    // Writes the protobuf serialization of the artifact into a file in the given
-    // directory.
-    fn write_to_disk(&self, path: &PathBuf) -> Result<(), std::io::Error> {
+    /// Writes the protobuf serialization of the artifact into a file in the given
+    /// directory.
+    pub fn write_to_disk(&self, path: &Path) -> Result<(), std::io::Error> {
         let (file_directory, file_name) = self.file_location(path);
         // Create the path if necessary.
         fs::create_dir_all(&file_directory)?;
         let full_path = file_directory.join(file_name);
         // If the file exists, it will be overwritten (this is required on
         // intializations).
-        let mut file = fs::File::create(&full_path)?;
-        file.write_all(&self.serialize()?)
+        let serialized = self.serialize()?;
+        ic_utils::fs::write_using_tmp_file(full_path, |writer| writer.write_all(&serialized))
     }
 
-    // Serializes the artifact to protobuf.
-    fn serialize(&self) -> Result<Vec<u8>, io::Error> {
+    /// Serializes the artifact to protobuf.
+    pub fn serialize(&self) -> Result<Vec<u8>, io::Error> {
         let mut buf = Vec::new();
         use BackupArtifact::*;
         match self {
-            Finalization(artifact) => pb::Finalization::from(artifact).encode(&mut buf),
-            Notarization(artifact) => pb::Notarization::from(artifact).encode(&mut buf),
-            BlockProposal(artifact) => pb::BlockProposal::from(artifact).encode(&mut buf),
-            RandomTape(artifact) => pb::RandomTape::from(artifact).encode(&mut buf),
-            RandomBeacon(artifact) => pb::RandomBeacon::from(artifact).encode(&mut buf),
-            CatchUpPackage(artifact) => pb::CatchUpPackage::from(artifact).encode(&mut buf),
+            Finalization(artifact) => pb::Finalization::from(artifact.as_ref()).encode(&mut buf),
+            Notarization(artifact) => pb::Notarization::from(artifact.as_ref()).encode(&mut buf),
+            BlockProposal(artifact) => pb::BlockProposal::from(artifact.as_ref()).encode(&mut buf),
+            RandomTape(artifact) => pb::RandomTape::from(artifact.as_ref()).encode(&mut buf),
+            RandomBeacon(artifact) => pb::RandomBeacon::from(artifact.as_ref()).encode(&mut buf),
+            CatchUpPackage(artifact) => {
+                pb::CatchUpPackage::from(artifact.as_ref()).encode(&mut buf)
+            }
         }
         .map_err(|err| io::Error::new(io::ErrorKind::Other, err.to_string()))?;
         Ok(buf)
     }
 
-    // Each artifact will be stored separately used the following path:
-    //
-    // <subnet_id>/<(height / N) * N>/height/<artifact_specific_name>.bin
-    //
-    // Note that the artifact specific name must contain all parameters to be
-    // differentiated not only across other artifacts of the same replica, but also
-    // across artifacts from all replicas. E.g., since we use multi-signatures for
-    // notarizations and finalizations, these artifacts can be created in different
-    // ways on different replicas, so we need to put their hashes into the artifact
-    // name.
-    fn file_location(&self, path: &PathBuf) -> (PathBuf, String) {
+    /// Each artifact will be stored separately used the following path:
+    ///
+    /// <subnet_id>/<replica_version>/<(height / N) * N>/height/<artifact_specific_name>.bin
+    ///
+    /// Note that the artifact specific name must contain all parameters to be
+    /// differentiated not only across other artifacts of the same replica, but also
+    /// across artifacts from all replicas. E.g., since we use multi-signatures for
+    /// notarizations and finalizations, these artifacts can be created in different
+    /// ways on different replicas, so we need to put their hashes into the artifact
+    /// name.
+    pub fn file_location(&self, path: &Path) -> (PathBuf, String) {
         // Create a subdir for the height
         use BackupArtifact::*;
         let (height, file_name) = match self {
@@ -372,7 +609,7 @@ impl BackupArtifact {
                 format!(
                     "finalization_{}_{}.bin",
                     bytes_to_hex_str(&artifact.content.block),
-                    bytes_to_hex_str(&ic_crypto::crypto_hash(artifact)),
+                    bytes_to_hex_str(&ic_types::crypto::crypto_hash(artifact.as_ref())),
                 ),
             ),
             Notarization(artifact) => (
@@ -380,15 +617,15 @@ impl BackupArtifact {
                 format!(
                     "notarization_{}_{}.bin",
                     bytes_to_hex_str(&artifact.content.block),
-                    bytes_to_hex_str(&ic_crypto::crypto_hash(artifact)),
+                    bytes_to_hex_str(&ic_types::crypto::crypto_hash(artifact.as_ref())),
                 ),
             ),
             BlockProposal(artifact) => (
                 artifact.height(),
                 format!(
                     "block_proposal_{}_{}.bin",
-                    bytes_to_hex_str(&artifact.content.get_hash()),
-                    bytes_to_hex_str(&ic_crypto::crypto_hash(artifact)),
+                    bytes_to_hex_str(artifact.content.get_hash()),
+                    bytes_to_hex_str(&ic_types::crypto::crypto_hash(artifact.as_ref())),
                 ),
             ),
             RandomTape(artifact) => (artifact.height(), "random_tape.bin".to_string()),
@@ -397,9 +634,8 @@ impl BackupArtifact {
         };
         // We group heights by directories to avoid running into any kind of unexpected
         // FS inode limitations. Each group directory will contain at most
-        // `group_size` heights.
-        let group_size = 10000;
-        let group_key = (height.get() / group_size) * group_size;
+        // `BACKUP_GROUP_SIZE` heights.
+        let group_key = (height.get() / BACKUP_GROUP_SIZE) * BACKUP_GROUP_SIZE;
         let path_with_height = path.join(group_key.to_string()).join(height.to_string());
         (path_with_height, file_name)
     }
@@ -474,8 +710,8 @@ mod tests {
             Block::new(
                 CryptoHashOf::from(CryptoHash(Vec::new())),
                 Payload::new(
-                    ic_crypto::crypto_hash,
-                    ic_types::consensus::dkg::Summary::fake().into(),
+                    ic_types::crypto::crypto_hash,
+                    (ic_types::consensus::dkg::Summary::fake(), None).into(),
                 ),
                 Height::from(123),
                 Rank(456),

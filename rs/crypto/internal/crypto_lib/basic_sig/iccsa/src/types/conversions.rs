@@ -1,5 +1,5 @@
 use crate::types::{PublicKey, PublicKeyBytes};
-use ic_types::CanisterId;
+use ic_types::{CanisterId, CanisterIdBlobParseError};
 use std::convert::TryFrom;
 
 #[cfg(test)]
@@ -16,7 +16,7 @@ impl TryFrom<&PublicKeyBytes> for PublicKey {
     type Error = PublicKeyFromBytesError;
 
     fn try_from(pubkey_bytes: &PublicKeyBytes) -> Result<Self, Self::Error> {
-        let canister_id_len = match pubkey_bytes.0.get(0) {
+        let canister_id_len = match pubkey_bytes.0.first() {
             Some(length_byte) => usize::from(*length_byte),
             None => return Err(PublicKeyFromBytesError::MissingCanisterIdLengthByte),
         };
@@ -27,7 +27,7 @@ impl TryFrom<&PublicKeyBytes> for PublicKey {
         let seed = &pubkey_bytes.0[canister_id_len + 1..];
 
         let canister_id = CanisterId::try_from(canister_id_raw)
-            .map_err(|_| PublicKeyFromBytesError::InvalidCanisterId)?;
+            .map_err(PublicKeyFromBytesError::InvalidCanisterId)?;
         Ok(PublicKey {
             signing_canister_id: canister_id,
             seed: seed.to_vec(),
@@ -39,5 +39,5 @@ impl TryFrom<&PublicKeyBytes> for PublicKey {
 pub enum PublicKeyFromBytesError {
     Malformed,
     MissingCanisterIdLengthByte,
-    InvalidCanisterId,
+    InvalidCanisterId(CanisterIdBlobParseError),
 }

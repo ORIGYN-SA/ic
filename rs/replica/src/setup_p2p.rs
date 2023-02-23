@@ -1,31 +1,39 @@
+use ic_btc_adapter_client::{setup_bitcoin_adapter_clients, BitcoinAdapterClients};
+use ic_btc_consensus::BitcoinPayloadBuilder;
 use ic_config::{artifact_pool::ArtifactPoolConfig, subnet_config::SubnetConfig, Config};
 use ic_consensus::certification::VerifierImpl;
 use ic_crypto::CryptoComponent;
 use ic_cycles_account_manager::CyclesAccountManager;
-use ic_execution_environment::{setup_execution, IngressHistoryReaderImpl};
-use ic_interfaces::registry::LocalStoreCertifiedTimeReader;
+use ic_execution_environment::ExecutionServices;
 use ic_interfaces::{
-    certified_stream_store::CertifiedStreamStore,
     consensus_pool::ConsensusPoolCache,
-    execution_environment::{ExecutionEnvironment, QueryHandler},
-    p2p::IngressEventHandler,
-    p2p::P2PRunner,
-    registry::RegistryClient,
-    transport::Transport,
+    execution_environment::{
+        AnonymousQueryService, IngressFilterService, QueryExecutionService, QueryHandler,
+    },
 };
-use ic_logger::ReplicaLogger;
-use ic_messaging::{MessageRoutingImpl, XNetPayloadBuilderImpl};
-use ic_messaging::{XNetEndpoint, XNetEndpointConfig};
-use ic_p2p::p2p::{P2PStateSyncClient, P2P};
+use ic_interfaces_certified_stream_store::CertifiedStreamStore;
+use ic_interfaces_p2p::IngressIngestionService;
+use ic_interfaces_registry::{LocalStoreCertifiedTimeReader, RegistryClient};
+use ic_logger::{info, ReplicaLogger};
+use ic_messaging::MessageRoutingImpl;
+use ic_p2p::P2PThreadJoiner;
 use ic_registry_subnet_type::SubnetType;
-use ic_replicated_state::{CanisterState, ReplicatedState};
-use ic_state_manager::StateManagerImpl;
-use ic_types::{consensus::catchup::CUPWithOriginalProtobuf, transport::FlowTag, NodeId, SubnetId};
+use ic_replica_setup_ic_network::{
+    create_networking_stack, init_artifact_pools, P2PStateSyncClient,
+};
+use ic_replicated_state::ReplicatedState;
+use ic_state_manager::{state_sync::StateSync, StateManagerImpl};
+use ic_types::{consensus::catchup::CUPWithOriginalProtobuf, NodeId, SubnetId};
+use ic_xnet_endpoint::{XNetEndpoint, XNetEndpointConfig};
+use ic_xnet_payload_builder::XNetPayloadBuilderImpl;
+
 use std::sync::Arc;
 
 #[allow(clippy::too_many_arguments, clippy::type_complexity)]
-pub fn construct_p2p_stack(
+pub fn construct_ic_stack(
     replica_logger: ReplicaLogger,
+    rt_handle: tokio::runtime::Handle,
+    rt_handle_xnet: tokio::runtime::Handle,
     config: Config,
     subnet_config: SubnetConfig,
     node_id: NodeId,
@@ -34,7 +42,6 @@ pub fn construct_p2p_stack(
     registry: Arc<dyn RegistryClient + Send + Sync>,
     crypto: Arc<CryptoComponent>,
     metrics_registry: ic_metrics::MetricsRegistry,
-    transport: Arc<dyn Transport>,
     catch_up_package: Option<CUPWithOriginalProtobuf>,
     local_store_time_reader: Option<Arc<dyn LocalStoreCertifiedTimeReader>>,
 ) -> std::io::Result<(
@@ -43,40 +50,106 @@ pub fn construct_p2p_stack(
     Arc<CryptoComponent>,
     Arc<StateManagerImpl>,
     Arc<dyn QueryHandler<State = ReplicatedState>>,
-    Box<dyn P2PRunner>,
-    Arc<dyn IngressEventHandler>,
+    QueryExecutionService,
+    AnonymousQueryService,
+    P2PThreadJoiner,
+    IngressIngestionService,
     Arc<dyn ConsensusPoolCache>,
-    Arc<dyn ExecutionEnvironment<State = ReplicatedState, CanisterState = CanisterState>>,
+    IngressFilterService,
     XNetEndpoint,
 )> {
+    let artifact_pool_config = ArtifactPoolConfig::from(config.artifact_pool);
+
+    // Determine the correct catch-up package.
+    let catch_up_package = {
+        use ic_types::consensus::HasHeight;
+        let make_registry_cup = || {
+            CUPWithOriginalProtobuf::from_cup(
+                ic_consensus::dkg::make_registry_cup(&*registry, subnet_id, None)
+                    .expect("Couldn't create a registry CUP"),
+            )
+        };
+        match catch_up_package {
+            // The orchestrator has persisted a CUP for the replica.
+            Some(cup_from_orc) => {
+                let signed = !cup_from_orc
+                    .cup
+                    .signature
+                    .signature
+                    .clone()
+                    .get()
+                    .0
+                    .is_empty();
+                if signed {
+                    // The CUP persisted by the orchestrator is safe to use because it's signed.
+                    info!(
+                        &replica_logger,
+                        "Using the signed CUP with height {}",
+                        cup_from_orc.cup.height()
+                    );
+                } else {
+                    // The CUP persisted by the orchestrator is unsigned and hence it was created
+                    // from the registry CUP contents.
+                    info!(
+                        &replica_logger,
+                        "Using the unsigned CUP with height {} passed from the orchestrator",
+                        cup_from_orc.cup.height()
+                    );
+                }
+                cup_from_orc
+            }
+            // No CUP was persisted by the orchestrator, which is usually the case for fresh nodes.
+            None => {
+                let registry_cup = make_registry_cup();
+                info!(
+                    &replica_logger,
+                    "Using the CUP with height {} generated from the registry",
+                    registry_cup.cup.height()
+                );
+                registry_cup
+            }
+        }
+    };
+
+    let artifact_pools = init_artifact_pools(
+        subnet_id,
+        artifact_pool_config,
+        metrics_registry.clone(),
+        replica_logger.clone(),
+        catch_up_package,
+    );
+
     let cycles_account_manager = Arc::new(CyclesAccountManager::new(
         subnet_config.scheduler_config.max_instructions_per_message,
-        config.hypervisor.max_cycles_per_canister,
         subnet_type,
         subnet_id,
         subnet_config.cycles_account_manager_config,
     ));
-    let (exec_env, ingress_history_writer, http_query_handler) = setup_execution(
-        replica_logger.clone(),
-        &metrics_registry,
-        subnet_id,
-        subnet_type,
-        subnet_config.scheduler_config.scheduler_cores,
-        config.hypervisor.clone(),
-        Arc::clone(&cycles_account_manager),
-    );
-
     let verifier = VerifierImpl::new(crypto.clone());
-    let state_manager = StateManagerImpl::new(
+
+    let state_manager = Arc::new(StateManagerImpl::new(
         Arc::new(verifier),
         subnet_id,
         subnet_type,
         replica_logger.clone(),
         &metrics_registry,
         &config.state_manager,
+        Some(artifact_pools.consensus_pool_cache.starting_height()),
         config.malicious_behaviour.malicious_flags.clone(),
+    ));
+    // Get the file descriptor factory object and pass it down the line to the hypervisor
+    let fd_factory = state_manager.get_fd_factory();
+    let execution_services = ExecutionServices::setup_execution(
+        replica_logger.clone(),
+        &metrics_registry,
+        subnet_id,
+        subnet_type,
+        subnet_config.scheduler_config,
+        config.hypervisor.clone(),
+        Arc::clone(&cycles_account_manager),
+        Arc::clone(&state_manager) as Arc<_>,
+        Arc::clone(&fd_factory),
     );
-    let state_manager = Arc::new(state_manager);
 
     let certified_stream_store: Arc<dyn CertifiedStreamStore> =
         Arc::clone(&state_manager) as Arc<_>;
@@ -89,7 +162,7 @@ pub fn construct_p2p_stack(
         MessageRoutingImpl::new_fake(
             subnet_id,
             Arc::clone(&state_manager) as Arc<_>,
-            ingress_history_writer,
+            execution_services.ingress_history_writer,
             &metrics_registry,
             replica_logger.clone(),
         )
@@ -97,15 +170,15 @@ pub fn construct_p2p_stack(
         MessageRoutingImpl::new(
             Arc::clone(&state_manager) as Arc<_>,
             Arc::clone(&certified_stream_store) as Arc<_>,
-            ingress_history_writer,
-            Arc::clone(&exec_env) as Arc<_>,
+            execution_services.ingress_history_writer,
+            execution_services.scheduler,
+            config.hypervisor,
             Arc::clone(&cycles_account_manager),
-            subnet_config.scheduler_config,
             subnet_id,
-            subnet_type,
             &metrics_registry,
             replica_logger.clone(),
             Arc::clone(&registry) as Arc<_>,
+            config.malicious_behaviour.malicious_flags.clone(),
         )
     };
     let message_router = Arc::new(message_router);
@@ -114,7 +187,7 @@ pub fn construct_p2p_stack(
         XNetEndpointConfig::from(Arc::clone(&registry) as Arc<_>, node_id, &replica_logger);
 
     let xnet_endpoint = XNetEndpoint::new(
-        tokio::runtime::Handle::current(),
+        rt_handle_xnet,
         Arc::clone(&certified_stream_store),
         Arc::clone(&crypto) as Arc<_>,
         Arc::clone(&registry),
@@ -129,7 +202,7 @@ pub fn construct_p2p_stack(
         Arc::clone(&certified_stream_store) as Arc<_>,
         Arc::clone(&crypto) as Arc<_>,
         Arc::clone(&registry) as Arc<_>,
-        tokio::runtime::Handle::current(),
+        rt_handle.clone(),
         node_id,
         subnet_id,
         &metrics_registry,
@@ -137,30 +210,53 @@ pub fn construct_p2p_stack(
     );
     let xnet_payload_builder = Arc::new(xnet_payload_builder);
 
-    let artifact_pool_config = ArtifactPoolConfig::from(config.artifact_pool);
+    let BitcoinAdapterClients {
+        btc_testnet_client,
+        btc_mainnet_client,
+    } = setup_bitcoin_adapter_clients(
+        replica_logger.clone(),
+        &metrics_registry,
+        rt_handle.clone(),
+        config.adapters_config.clone(),
+    );
+    let self_validating_payload_builder = BitcoinPayloadBuilder::new(
+        state_manager.clone(),
+        &metrics_registry,
+        btc_mainnet_client,
+        btc_testnet_client,
+        subnet_id,
+        Arc::clone(&registry),
+        replica_logger.clone(),
+    );
+    let self_validating_payload_builder = Arc::new(self_validating_payload_builder);
 
-    let p2p_flow_tags = config
-        .transport
-        .p2p_flows
-        .iter()
-        .map(|flow_config| FlowTag::from(flow_config.flow_tag))
-        .collect();
+    let canister_http_adapter_client = ic_https_outcalls_adapter_client::setup_canister_http_client(
+        rt_handle.clone(),
+        &metrics_registry,
+        config.adapters_config,
+        execution_services.anonymous_query_handler.clone(),
+        replica_logger.clone(),
+        subnet_type,
+    );
 
-    let catch_up_package = catch_up_package.unwrap_or_else(|| {
-        CUPWithOriginalProtobuf::from_cup(ic_consensus_message::make_genesis(
-            ic_consensus::dkg::make_genesis_summary(&*registry, subnet_id, None),
-        ))
-    });
+    let state_sync = StateSync::new(state_manager.clone(), replica_logger.clone());
 
-    let (p2p_event_handler, p2p_runner, consensus_pool_cache) = P2P::new(
+    let (ingress_ingestion_service, p2p_runner) = create_networking_stack(
+        metrics_registry,
+        replica_logger,
+        rt_handle,
+        config.transport,
+        config.consensus,
         config.malicious_behaviour.malicious_flags,
         node_id,
         subnet_id,
-        transport,
-        p2p_flow_tags,
+        None,
+        Arc::clone(&crypto) as Arc<_>,
         Arc::clone(&state_manager) as Arc<_>,
-        P2PStateSyncClient::Client(Arc::clone(&state_manager) as Arc<_>),
+        Arc::clone(&state_manager) as Arc<_>,
+        P2PStateSyncClient::Client(state_sync),
         xnet_payload_builder as Arc<_>,
+        self_validating_payload_builder as Arc<_>,
         message_router as Arc<_>,
         // TODO(SCL-213)
         Arc::clone(&crypto) as Arc<_>,
@@ -168,27 +264,23 @@ pub fn construct_p2p_stack(
         Arc::clone(&crypto) as Arc<_>,
         Arc::clone(&crypto) as Arc<_>,
         registry,
-        Box::new(IngressHistoryReaderImpl::new(
-            Arc::clone(&state_manager) as Arc<_>
-        )),
-        artifact_pool_config,
-        config.consensus,
-        metrics_registry,
-        replica_logger,
-        catch_up_package,
+        execution_services.ingress_history_reader,
+        &artifact_pools,
         cycles_account_manager,
         local_store_time_reader,
-    )
-    .expect("Failed to construct p2p");
-
+        canister_http_adapter_client,
+        config.nns_registry_replicator.poll_delay_duration_ms,
+    );
     Ok((
         crypto,
         state_manager,
-        Arc::clone(&http_query_handler) as Arc<_>,
-        Box::new(p2p_runner),
-        p2p_event_handler,
-        consensus_pool_cache,
-        exec_env,
+        execution_services.sync_query_handler,
+        execution_services.async_query_handler,
+        execution_services.anonymous_query_handler,
+        p2p_runner,
+        ingress_ingestion_service,
+        artifact_pools.consensus_pool_cache,
+        execution_services.ingress_filter,
         xnet_endpoint,
     ))
 }

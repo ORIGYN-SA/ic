@@ -28,11 +28,8 @@
 //! * Potential signatories are stored in a list.  It is important to preserve
 //!   the order of signatories, especially in the case of distributed key
 //!   generation where multiple keys may be dealt for each signatory.
-//! * Given that signatories may become ineligible the standard form for storing
-//!   signatory information is `<Vec<Option<T>>`, where:
-//!   * the index in the vector corresponds to the signatory index
-//!   * the `Option` is set to `None` for ineligible, discredited or otherwise
-//!     non-participating signatories.
+//! * The standard form for storing signatory information is `Vec<T>`,
+//!   where: the index in the vector corresponds to the signatory index
 //! * The external API methods are equivalent to internal methods but use opaque
 //!   data types. The external API parses requests to the internal types, calls
 //!   the corresponding internal methods and serialises the responses.
@@ -44,13 +41,14 @@ use super::types::{
 use crate::api::threshold_sign_error::ClibThresholdSignError;
 use crate::types::public_coefficients::conversions::pub_key_bytes_from_pub_coeff_bytes;
 use crate::types::PublicKey;
+use ic_crypto_internal_seed::Seed;
+use ic_crypto_internal_threshold_sig_bls12381_der as der;
 use ic_crypto_internal_types::sign::threshold_sig::ni_dkg::ni_dkg_groth20_bls12_381::PublicCoefficientsBytes;
 use ic_crypto_internal_types::sign::threshold_sig::public_key::bls12_381::PublicKeyBytes;
 use ic_types::{
     crypto::{AlgorithmId, CryptoError, CryptoResult},
-    NodeIndex, NumberOfNodes, Randomness,
+    NodeIndex, NumberOfNodes,
 };
-use simple_asn1::{oid, ASN1Block, BigUint, OID};
 use std::convert::{TryFrom, TryInto};
 
 pub mod dkg_errors;
@@ -65,32 +63,25 @@ pub mod threshold_sign_error;
 /// * `seed` is a random input.  It must be treated as a secret.
 /// * `threshold` is the minimum number of signatures that can be combined to
 ///   make a valid threshold signature.
-/// * `signatory_eligibility` is a boolean indicating, for each signatory,
-///   whether they should receive a key.  The `i`th signatory should receive a
-///   key if and only if `signatory_eligibilty[i]==true`.
+/// * `receivers` is the total number of nodes that will receive a share of
+///   the key.
 /// # Returns
 /// * `PublicCoefficients` can be used by the caller to verify signatures.
-/// * `Vec<Option<SecretKeyBytes>>` contains secret keys.  The vector has the
-///   same length as the input `signatory_eligibility` and the i'th entry
-///   contains a secret key if and only if `signatory_eligibility[i]` is `true`.
+/// * `Vec<SecretKeyBytes>` contains secret keys.  The vector is of length
+///   `receivers`
 /// # Panics
 /// This method is not expected to panic.
 /// # Errors
-/// * If `threshold > signatory_eligibility.len()` then it is impossible for the
-///   signatories to create a valid combined signature, so this is treated as an
-///   error.
-#[allow(unused)]
-pub fn keygen(
-    seed: Randomness,
+/// * If `threshold > receivers` then it is impossible for the signatories to
+///   create a valid combined signature, so this is treated as an error.
+pub fn generate_threshold_key(
+    seed: Seed,
     threshold: NumberOfNodes,
-    signatory_eligibilty: &[bool],
-) -> CryptoResult<(PublicCoefficientsBytes, Vec<Option<SecretKeyBytes>>)> {
-    crypto::keygen(seed, threshold, signatory_eligibilty)
+    receivers: NumberOfNodes,
+) -> CryptoResult<(PublicCoefficientsBytes, Vec<SecretKeyBytes>)> {
+    crypto::generate_threshold_key(seed, threshold, receivers)
         .map(|(public_coefficients, shares)| {
-            let shares = shares
-                .iter()
-                .map(|key_maybe| key_maybe.map(SecretKeyBytes::from))
-                .collect();
+            let shares = shares.iter().cloned().map(SecretKeyBytes::from).collect();
             (PublicCoefficientsBytes::from(&public_coefficients), shares)
         })
         .map_err(CryptoError::from)
@@ -110,6 +101,24 @@ pub fn individual_public_key(
     index: NodeIndex,
 ) -> CryptoResult<PublicKeyBytes> {
     let public_coefficients = PublicCoefficients::try_from(public_coefficients)?;
+    let public_key: PublicKey = crypto::individual_public_key(&public_coefficients, index);
+    Ok(PublicKeyBytes::from(public_key))
+}
+
+/// Derives the public key of one signatory from the `public_coefficients`.
+///
+/// Equivalent to `individual_public_key`,
+/// but uses an "unchecked" deserialization for improved efficiency.
+///
+/// # Security Notice
+/// This skips an important security check, and so should
+/// only be used when`public_coefficients` were obtained
+/// from a trusted source.
+pub fn individual_public_key_from_trusted_bytes(
+    public_coefficients: &PublicCoefficientsBytes,
+    index: NodeIndex,
+) -> CryptoResult<PublicKeyBytes> {
+    let public_coefficients = PublicCoefficients::from_trusted_bytes(public_coefficients)?;
     let public_key: PublicKey = crypto::individual_public_key(&public_coefficients, index);
     Ok(PublicKeyBytes::from(public_key))
 }
@@ -206,64 +215,85 @@ pub fn verify_individual_signature(
     signature: IndividualSignatureBytes,
     public_key: PublicKeyBytes,
 ) -> CryptoResult<()> {
-    crypto::verify_individual_sig(
-        message,
-        (&signature).try_into()?,
-        PublicKey::try_from(&public_key)?,
-    )
+    let signature = (&signature).try_into()?;
+    let pk = PublicKey::try_from(&public_key)?;
+    crypto::verify_individual_sig(message, &signature, &pk)
 }
 
 /// Verifies that a combined signature is valid.
 ///
 /// # Arguments
-/// * `message` is the bytes that have been signed.  Note: This may be changed
-///   to a `[u8;32]` and renamed to hash pending discussion.  See TODO: DFN-1430
+/// * `message` is the bytes that have been signed.
 /// * `signature` is the combined signature to be verified.
 /// * `public_key` is the combined public key for the threshold signature.
 /// # Panics
 /// This method is not expected to panic.
 /// # Errors
-/// * If `signature` or `public_key` cannot be parsed, this will return an
+/// * If `signature` or `public_key` cannot be parsed, or if the signature
+///   is not valid for this `public_key` and `message`, this will return an
 ///   error.
 pub fn verify_combined_signature(
     message: &[u8],
     signature: CombinedSignatureBytes,
     public_key: PublicKeyBytes,
 ) -> CryptoResult<()> {
-    crypto::verify_combined_sig(
-        message,
-        (&signature).try_into()?,
-        PublicKey::try_from(&public_key)?,
-    )
+    let signature = (&signature).try_into()?;
+    let pk = PublicKey::try_from(&public_key)?;
+    crypto::verify_combined_sig(message, &signature, &pk)
+}
+
+/// Verifies that a combined signature is valid, making use of a cache
+///
+/// The cache is a global shared signature cache defined in `cache.rs`
+/// that caches a fixed number of signatures with an LRU eviction
+/// policy.  Cache hits are significantly (~1000x) faster than
+/// verifying the BLS signature directly. Using this function can be
+/// beneficial in cases where the same BLS signature is repeatedly verified.
+///
+/// # Arguments
+/// * `message` is the bytes that have been signed.
+/// * `signature` is the combined signature to be verified.
+/// * `public_key` is the combined public key for the threshold signature.
+/// # Panics
+/// This method is not expected to panic.
+/// # Errors
+/// * If `signature` or `public_key` cannot be parsed, or if the signature
+///   is not valid for this `public_key` and `message`, this will return an
+///   error.
+pub fn verify_combined_signature_with_cache(
+    message: &[u8],
+    signature: CombinedSignatureBytes,
+    public_key: PublicKeyBytes,
+) -> CryptoResult<()> {
+    let entry = crate::cache::SignatureCacheEntry::new(&public_key.0, &signature.0, message);
+
+    if crate::cache::SignatureCache::global().contains(&entry) {
+        return Ok(());
+    }
+
+    let result = verify_combined_signature(message, signature, public_key);
+
+    if result.is_ok() {
+        crate::cache::SignatureCache::global().insert(&entry);
+    }
+
+    result
+}
+
+/// Return statistics related to the verify_combined_signature_with_cache cache
+pub fn bls_signature_cache_statistics() -> crate::cache::SignatureCacheStatistics {
+    crate::cache::SignatureCache::global().cache_statistics()
 }
 
 /// Converts public key bytes into its DER-encoded form.
 ///
 /// See [the Interface Spec](https://sdk.dfinity.org/docs/interface-spec/index.html#_certificate) and [RFC 5480](https://tools.ietf.org/html/rfc5480).
 pub fn public_key_to_der(key: PublicKeyBytes) -> CryptoResult<Vec<u8>> {
-    use simple_asn1::to_der;
-    let key = key.0;
-
-    to_der(&ASN1Block::Sequence(
-        2,
-        vec![
-            ASN1Block::Sequence(0, vec![bls_algorithm_id(), bls_curve_id()]),
-            ASN1Block::BitString(0, key.len() * 8, key.to_vec()),
-        ],
-    ))
-    .map_err(|e| CryptoError::MalformedPublicKey {
+    der::public_key_to_der(&key.0).map_err(|e| CryptoError::MalformedPublicKey {
         algorithm: AlgorithmId::ThresBls12_381,
-        key_bytes: Some(key.to_vec()),
-        internal_error: format!("Conversion to DER failed with error {}", e.to_string()),
+        key_bytes: Some(key.0.to_vec()),
+        internal_error: format!("Conversion to DER failed with error {}", e),
     })
-}
-
-fn bls_algorithm_id() -> ASN1Block {
-    ASN1Block::ObjectIdentifier(0, oid!(1, 3, 6, 1, 4, 1, 44668, 5, 3, 1, 2, 1))
-}
-
-fn bls_curve_id() -> ASN1Block {
-    ASN1Block::ObjectIdentifier(0, oid!(1, 3, 6, 1, 4, 1, 44668, 5, 3, 2, 1))
 }
 
 /// Parses a `PublicKeyBytes` from its DER-encoded form.
@@ -275,97 +305,12 @@ fn bls_curve_id() -> ASN1Block {
 /// * `CryptoError::MalformedPublicKey` if the given `bytes` are not valid
 ///   ASN.1, or include unexpected ASN.1 structures..
 pub fn public_key_from_der(bytes: &[u8]) -> CryptoResult<PublicKeyBytes> {
-    use simple_asn1::{
-        from_der,
-        ASN1Block::{BitString, Sequence},
-    };
-
-    let malformed_key_err = |msg| {
-        Err(CryptoError::MalformedPublicKey {
+    match der::public_key_from_der(bytes) {
+        Ok(key_bytes) => Ok(PublicKeyBytes(key_bytes)),
+        Err(internal_error) => Err(CryptoError::MalformedPublicKey {
             algorithm: AlgorithmId::ThresBls12_381,
             key_bytes: Some(bytes.to_vec()),
-            internal_error: msg,
-        })
-    };
-
-    let unexpected_struct_err = |s: &ASN1Block| {
-        malformed_key_err(format!(
-            "unexpected ASN1 structure: {:?}, wanted: seq(seq(OID, OID), bitstring)",
-            s
-        ))
-    };
-
-    let asn1_values = from_der(bytes).map_err(|e| CryptoError::MalformedPublicKey {
-        algorithm: AlgorithmId::ThresBls12_381,
-        key_bytes: Some(bytes.to_vec()),
-        internal_error: format!("failed to deserialize DER blocks: {}", e),
-    })?;
-
-    match asn1_values[..] {
-        [Sequence(_, ref seq)] => match &seq[..] {
-            [Sequence(_, ids), BitString(_, len, key)] => {
-                if ids.len() != 2 {
-                    return unexpected_struct_err(&asn1_values[0]);
-                }
-
-                if *len != PublicKeyBytes::SIZE * 8 {
-                    return malformed_key_err(format!("unexpected key length: {} bits", len));
-                }
-
-                if ids[0] == bls_algorithm_id() && ids[1] == bls_curve_id() {
-                    let mut key_bytes = [0u8; PublicKeyBytes::SIZE];
-                    key_bytes.copy_from_slice(key.as_slice());
-                    Ok(PublicKeyBytes(key_bytes))
-                } else {
-                    malformed_key_err(format!(
-                        "unsupported algorithm ({:?}) and/or curve ({:?}) OIDs",
-                        ids[0], ids[1],
-                    ))
-                }
-            }
-            _ => unexpected_struct_err(&asn1_values[0]),
-        },
-        _ => malformed_key_err(format!(
-            "expected exactly one ASN1 block, got sequence: {:?}",
-            asn1_values
-        )),
+            internal_error,
+        }),
     }
-}
-
-/// Generates new keys for threshold signatories and a signature using the new
-/// keys.
-///
-/// This is only used for testing (cf. CRP-622 and
-/// `ic-crypto-internal-csp::imported_utilities::
-/// combined_threshold_signature_and_public_key`).
-///
-/// # Arguments
-/// * `seed` is a random input.  It must be treated as a secret.
-/// * `message` is the bytes to be signed.
-/// * `group_size` is the number of signatories.
-///
-/// # Panics
-/// * If any one of key generation, signing, signature combination, or
-/// public key combination fails.
-pub fn combined_signature_and_public_key(
-    seed: Randomness,
-    group_size: usize,
-    threshold: NumberOfNodes,
-    message: &[u8],
-) -> (CombinedSignatureBytes, PublicKeyBytes) {
-    let (public_coefficients, secret_keys) =
-        keygen(seed, threshold, &vec![true; group_size]).expect("Failed to deal");
-    let signatures: Vec<Option<IndividualSignatureBytes>> = secret_keys
-        .iter()
-        .map(|secret_key| {
-            Some(
-                sign_message(message, &secret_key.expect("Keygen failed")).expect("Failed to sign"),
-            )
-        })
-        .collect();
-    let signature =
-        combine_signatures(signatures.as_slice(), threshold).expect("Failed to combine signatures");
-    let public_key =
-        combined_public_key(&public_coefficients).expect("Failed to get combined public key");
-    (signature, public_key)
 }

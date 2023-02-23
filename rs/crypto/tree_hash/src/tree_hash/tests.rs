@@ -43,7 +43,7 @@ fn hash_node_with_leaf(label: &Label, leaf_data: &str) -> HashTree {
         digest: leaf_digest(leaf_data),
     };
     HashTree::Node {
-        digest: node_digest(&label, &hash_leaf.digest().0),
+        digest: node_digest(label, &hash_leaf.digest().0),
         label: label.clone(),
         hash_tree: Box::new(hash_leaf),
     }
@@ -52,7 +52,7 @@ fn hash_node_with_leaf(label: &Label, leaf_data: &str) -> HashTree {
 // Returns a HashTree::HashNode that contains a HashLeaf with the given data.
 fn hash_node_with_hash_tree(label: &Label, hash_tree: HashTree) -> HashTree {
     HashTree::Node {
-        digest: node_digest(&label, &hash_tree.digest().0),
+        digest: node_digest(label, &hash_tree.digest().0),
         label: label.clone(),
         hash_tree: Box::new(hash_tree),
     }
@@ -731,6 +731,13 @@ fn mlabeled(label: &Label, t: MixedHashTree) -> MixedHashTree {
     MixedHashTree::Labeled(label.clone(), Box::new(t))
 }
 
+fn gmlabeled(label: impl Into<Label>, t: MixedHashTree) -> MixedHashTree {
+    MixedHashTree::Labeled(label.into(), Box::new(t))
+}
+fn gmpruned(digest: impl Into<Digest>) -> MixedHashTree {
+    MixedHashTree::Pruned(digest.into())
+}
+
 #[test]
 fn witness_for_a_simple_path() {
     // Simple path: label_b -> label_c
@@ -992,25 +999,27 @@ fn check_recompute_digest_works(
 ) {
     let orig_digest = orig_builder.as_hash_tree().unwrap().digest().to_owned();
     let orig_witness_generator = orig_builder.witness_generator().unwrap();
-    let orig_witness = orig_witness_generator.witness(&partial_tree).unwrap();
+    let orig_witness = orig_witness_generator.witness(partial_tree).unwrap();
 
     let modified_digest = modified_builder.as_hash_tree().unwrap().digest().to_owned();
     let modified_witness_generator = modified_builder.witness_generator().unwrap();
-    let modified_witness = modified_witness_generator.witness(&partial_tree).unwrap();
+    let modified_witness = modified_witness_generator.witness(partial_tree).unwrap();
     let mixed_hash_tree = modified_witness_generator
-        .mixed_hash_tree(&partial_tree)
+        .mixed_hash_tree(partial_tree)
         .unwrap();
 
     assert_eq!(orig_witness, modified_witness);
     let witness = &orig_witness;
     assert_ne!(orig_digest, modified_digest);
 
-    let recomputed_digest = recompute_digest(&partial_tree, witness).unwrap();
+    let recomputed_digest = recompute_digest(partial_tree, witness).unwrap();
     assert_eq!(recomputed_digest, modified_digest);
     assert_eq!(recomputed_digest, mixed_hash_tree.digest());
+    let labeled_tree = LabeledTree::<Vec<u8>>::try_from(mixed_hash_tree.clone()).unwrap();
     assert_eq!(
-        partial_tree,
-        &LabeledTree::<Vec<u8>>::try_from(mixed_hash_tree).unwrap()
+        partial_tree, &labeled_tree,
+        "mixed_hash_tree: {:#?}",
+        mixed_hash_tree
     );
 }
 
@@ -1853,7 +1862,7 @@ impl LabeledTreeFixture {
 
     fn witness_for(&self, partial_tree: &LabeledTree<Vec<u8>>) -> Witness {
         let witness_gen = self.builder.witness_generator().unwrap();
-        witness_gen.witness(&partial_tree).unwrap()
+        witness_gen.witness(partial_tree).unwrap()
     }
 }
 
@@ -2134,4 +2143,256 @@ fn labeled_tree_lookup() {
     assert!(lookup_path(&t, &[&b"sig"[..], &b"d"[..]]).is_none());
     assert!(lookup_path(&t, &[&b"sieg"[..]]).is_none());
     assert!(lookup_path(&t, &[&b"sig"[..], &b"a"[..], &b"d"[..]]).is_none());
+}
+
+#[test]
+fn mixed_hash_tree_lookup() {
+    use LookupStatus::{Absent, Found, Unknown};
+    use MixedHashTree::{Empty, Leaf};
+
+    let t = mfork(
+        mlabeled(&Label::from("1"), mleaf("test1")),
+        mlabeled(&Label::from("3"), mleaf("test3")),
+    );
+    assert_eq!(t.lookup(&[b"0"]), Absent);
+    assert_eq!(t.lookup(&[b"1"]), Found(&mleaf("test1")));
+    assert_eq!(t.lookup(&[b"2"]), Absent);
+    assert_eq!(t.lookup(&[b"3"]), Found(&mleaf("test3")));
+    assert_eq!(t.lookup(&[b"4"]), Absent);
+    assert_eq!(t.lookup(&[&b"3"[..], &b"nope"[..]]), Absent);
+
+    let t = mfork(
+        mpruned(&Digest([0u8; 32])),
+        mlabeled(&Label::from("3"), mleaf("test3")),
+    );
+    assert_eq!(t.lookup(&[b"2"]), Unknown);
+    assert_eq!(t.lookup(&[b"3"]), Found(&mleaf("test3")));
+    assert_eq!(t.lookup(&[b"4"]), Absent);
+
+    let t = mfork(
+        mlabeled(&Label::from("3"), mleaf("test3")),
+        mpruned(&Digest([0u8; 32])),
+    );
+    assert_eq!(t.lookup(&[b"2"]), Absent);
+    assert_eq!(t.lookup(&[b"3"]), Found(&mleaf("test3")));
+    assert_eq!(t.lookup(&[b"4"]), Unknown);
+
+    assert_eq!(Empty.lookup::<&[u8]>(&[]), Found(&Empty));
+    assert_eq!(Empty.lookup(&[b"1"]), Absent);
+    assert_eq!(Empty.lookup(&[b"1", b"2"]), Absent);
+
+    let tree = mfork(
+        mlabeled(&Label::from("1"), Empty),
+        mfork(
+            mpruned(&Digest([1; 32])),
+            mfork(
+                mlabeled(&Label::from("3"), Leaf(vec![1, 2, 3, 4, 5, 6])),
+                mlabeled(&Label::from("5"), Empty),
+            ),
+        ),
+    );
+
+    assert_eq!(tree.lookup(&[b"0"]), Absent);
+    assert_eq!(tree.lookup(&[b"1"]), Found(&Empty));
+    assert_eq!(tree.lookup(&[b"2"]), Unknown);
+    assert_eq!(tree.lookup(&[b"3"]), Found(&Leaf(vec![1, 2, 3, 4, 5, 6])));
+    assert_eq!(tree.lookup(&[b"4"]), Absent);
+    assert_eq!(tree.lookup(&[b"5"]), Found(&Empty));
+    assert_eq!(tree.lookup(&[b"6"]), Absent);
+
+    let tree = mfork(
+        mlabeled(&Label::from("1"), Empty),
+        mfork(
+            mfork(
+                mlabeled(&Label::from("3"), Leaf(vec![1, 2, 3, 4, 5, 6])),
+                mlabeled(&Label::from("5"), Empty),
+            ),
+            mpruned(&Digest([1; 32])),
+        ),
+    );
+
+    assert_eq!(tree.lookup(&[b"0"]), Absent);
+    assert_eq!(tree.lookup(&[b"1"]), Found(&Empty));
+    assert_eq!(tree.lookup(&[b"2"]), Absent);
+    assert_eq!(tree.lookup(&[b"3"]), Found(&Leaf(vec![1, 2, 3, 4, 5, 6])));
+    assert_eq!(tree.lookup(&[b"4"]), Absent);
+    assert_eq!(tree.lookup(&[b"5"]), Found(&Empty));
+    assert_eq!(tree.lookup(&[b"6"]), Unknown);
+
+    let tree = mfork(
+        mpruned(&Digest([0; 32])),
+        mfork(
+            mpruned(&Digest([1; 32])),
+            mfork(
+                mlabeled(&Label::from("3"), Leaf(vec![1, 2, 3, 4, 5, 6])),
+                mlabeled(&Label::from("5"), Empty),
+            ),
+        ),
+    );
+
+    assert_eq!(tree.lookup(&[b"2"]), Unknown);
+    assert_eq!(tree.lookup(&[b"3"]), Found(&Leaf(vec![1, 2, 3, 4, 5, 6])));
+    assert_eq!(tree.lookup(&[b"4"]), Absent);
+    assert_eq!(tree.lookup(&[b"5"]), Found(&Empty));
+    assert_eq!(tree.lookup(&[b"6"]), Absent);
+
+    let tree = mfork(
+        mpruned(&Digest([0; 32])),
+        mfork(
+            mfork(
+                mlabeled(&Label::from("3"), Leaf(vec![1, 2, 3, 4, 5, 6])),
+                mlabeled(&Label::from("5"), Empty),
+            ),
+            mpruned(&Digest([1; 32])),
+        ),
+    );
+
+    assert_eq!(tree.lookup(&[b"2"]), Unknown);
+    assert_eq!(tree.lookup(&[b"3"]), Found(&Leaf(vec![1, 2, 3, 4, 5, 6])));
+    assert_eq!(tree.lookup(&[b"4"]), Absent);
+    assert_eq!(tree.lookup(&[b"5"]), Found(&Empty));
+    assert_eq!(tree.lookup(&[b"6"]), Unknown);
+
+    let tree = mfork(
+        mfork(
+            mpruned(&Digest([1; 32])),
+            mfork(
+                mlabeled(&Label::from("3"), Leaf(vec![1, 2, 3, 4, 5, 6])),
+                mlabeled(&Label::from("5"), Empty),
+            ),
+        ),
+        mlabeled(&Label::from("7"), Empty),
+    );
+
+    assert_eq!(tree.lookup(&[b"2"]), Unknown);
+    assert_eq!(tree.lookup(&[b"3"]), Found(&Leaf(vec![1, 2, 3, 4, 5, 6])));
+    assert_eq!(tree.lookup(&[b"4"]), Absent);
+    assert_eq!(tree.lookup(&[b"5"]), Found(&Empty));
+    assert_eq!(tree.lookup(&[b"6"]), Absent);
+    assert_eq!(tree.lookup(&[b"7"]), Found(&Empty));
+    assert_eq!(tree.lookup(&[b"8"]), Absent);
+
+    let tree = mfork(
+        mfork(
+            mfork(
+                mlabeled(&Label::from("3"), Leaf(vec![1, 2, 3, 4, 5, 6])),
+                mlabeled(&Label::from("5"), Empty),
+            ),
+            mpruned(&Digest([1; 32])),
+        ),
+        mlabeled(&Label::from("7"), Empty),
+    );
+
+    assert_eq!(tree.lookup(&[b"2"]), Absent);
+    assert_eq!(tree.lookup(&[b"3"]), Found(&Leaf(vec![1, 2, 3, 4, 5, 6])));
+    assert_eq!(tree.lookup(&[b"4"]), Absent);
+    assert_eq!(tree.lookup(&[b"5"]), Found(&Empty));
+    assert_eq!(tree.lookup(&[b"6"]), Unknown);
+    assert_eq!(tree.lookup(&[b"7"]), Found(&Empty));
+    assert_eq!(tree.lookup(&[b"8"]), Absent);
+
+    let tree = mfork(
+        mfork(
+            mpruned(&Digest([1; 32])),
+            mfork(
+                mlabeled(&Label::from("3"), Leaf(vec![1, 2, 3, 4, 5, 6])),
+                mlabeled(&Label::from("5"), Empty),
+            ),
+        ),
+        mpruned(&Digest([0; 32])),
+    );
+
+    assert_eq!(tree.lookup(&[b"2"]), Unknown);
+    assert_eq!(tree.lookup(&[b"3"]), Found(&Leaf(vec![1, 2, 3, 4, 5, 6])));
+    assert_eq!(tree.lookup(&[b"4"]), Absent);
+    assert_eq!(tree.lookup(&[b"5"]), Found(&Empty));
+    assert_eq!(tree.lookup(&[b"6"]), Unknown);
+
+    let tree = mfork(
+        mfork(
+            mfork(
+                mlabeled(&Label::from("3"), Leaf(vec![1, 2, 3, 4, 5, 6])),
+                mlabeled(&Label::from("5"), Empty),
+            ),
+            mpruned(&Digest([1; 32])),
+        ),
+        mpruned(&Digest([0; 32])),
+    );
+
+    assert_eq!(tree.lookup(&[b"2"]), Absent);
+    assert_eq!(tree.lookup(&[b"3"]), Found(&Leaf(vec![1, 2, 3, 4, 5, 6])));
+    assert_eq!(tree.lookup(&[b"4"]), Absent);
+    assert_eq!(tree.lookup(&[b"5"]), Found(&Empty));
+    assert_eq!(tree.lookup(&[b"6"]), Unknown);
+}
+
+#[test]
+fn labeled_tree_conversion() {
+    use MixedHashTreeConversionError::Pruned;
+    type R = Result<LabeledTree<Vec<u8>>, MixedHashTreeConversionError>;
+
+    assert_eq!(gmpruned([0; 32]).try_into() as R, Err(Pruned));
+    assert_eq!(
+        mfork(gmpruned([0; 32]), gmpruned([0; 32])).try_into() as R,
+        Err(Pruned)
+    );
+
+    assert_eq!(
+        gmlabeled("a", gmpruned([0; 32])).try_into() as R,
+        Ok(LabeledTree::SubTree(flatmap! {}))
+    );
+
+    assert_eq!(
+        mfork(
+            gmlabeled("a", gmpruned([0; 32])),
+            gmlabeled("b", gmpruned([0; 32])),
+        )
+        .try_into() as R,
+        Ok(LabeledTree::SubTree(flatmap! {}))
+    );
+
+    assert_eq!(
+        mfork(
+            gmlabeled("a", gmpruned([0; 32])),
+            gmlabeled("b", gmpruned([0; 32])),
+        )
+        .try_into() as R,
+        Ok(LabeledTree::SubTree(flatmap! {}))
+    );
+
+    assert_eq!(
+        mfork(
+            gmlabeled("a", mleaf("abcd")),
+            gmlabeled("b", gmpruned([0; 32]))
+        )
+        .try_into() as R,
+        Ok(LabeledTree::SubTree(
+            flatmap! { Label::from("a") => LabeledTree::Leaf(b"abcd".to_vec()) }
+        ))
+    );
+
+    assert_eq!(
+        mfork(
+            gmlabeled("a", gmpruned([0; 32])),
+            gmlabeled("b", mleaf("abcd")),
+        )
+        .try_into() as R,
+        Ok(LabeledTree::SubTree(
+            flatmap! { Label::from("b") => LabeledTree::Leaf(b"abcd".to_vec()) }
+        ))
+    );
+
+    assert_eq!(
+        mfork(gmlabeled("a", mleaf("abcd")), gmpruned([0; 32])).try_into() as R,
+        Ok(LabeledTree::SubTree(
+            flatmap! { Label::from("a") => LabeledTree::Leaf(b"abcd".to_vec()) }
+        ))
+    );
+
+    assert_eq!(
+        mfork(gmpruned([0; 32]), gmlabeled("b", mleaf("abcd")),).try_into() as R,
+        Ok(LabeledTree::SubTree(
+            flatmap! { Label::from("b") => LabeledTree::Leaf(b"abcd".to_vec()) }
+        ))
+    );
 }

@@ -18,46 +18,46 @@ proptest! {
 
     #[test]
     fn secret_key_serde(key in arbitrary::secret_key()) {
-        let bytes: SecretKeyBytes = key.into();
+        let bytes: SecretKeyBytes = key.clone().into();
         assert_eq!(key, bytes.into());
     }
     #[test]
     fn public_key_serde(key in arbitrary::public_key()) {
-        let bytes: PublicKeyBytes = key.into();
+        let bytes: PublicKeyBytes = key.clone().into();
         assert_eq!(Ok(key), bytes.try_into());
     }
     #[test]
     fn individual_signature_serde(signature in arbitrary::individual_signature()) {
-        let bytes: IndividualSignatureBytes = signature.into();
+        let bytes: IndividualSignatureBytes = signature.clone().into();
         assert_eq!(Ok(signature), bytes.try_into());
     }
     #[test]
     fn pop_serde(pop in arbitrary::pop()) {
-        let bytes: PopBytes = pop.into();
+        let bytes: PopBytes = pop.clone().into();
         assert_eq!(Ok(pop), bytes.try_into());
     }
     #[test]
     fn combined_signature_serde(signature in arbitrary::combined_signature()) {
-        let bytes: CombinedSignatureBytes = signature.into();
+        let bytes: CombinedSignatureBytes = signature.clone().into();
         assert_eq!(Ok(signature), bytes.try_into());
     }
     #[test]
     fn signature_bulk_conversion(signatures in proptest::collection::vec(arbitrary::individual_signature(), 0..10)) {
-        let bytes: Vec<IndividualSignatureBytes> = signatures.iter().cloned().map(|signature| signature.into()).collect();
-        let reconstructed_signatures: Result<Vec<IndividualSignature>, CryptoError> = bytes.into_iter().map(|bytes| bytes.try_into()).collect();
+        let bytes = signatures.iter().cloned().map(IndividualSignatureBytes::from);
+        let reconstructed_signatures: Result<Vec<IndividualSignature>, CryptoError> = bytes.map(|bytes| bytes.try_into()).collect();
         assert_eq!(Ok(signatures), reconstructed_signatures);
     }
     #[test]
     fn pop_bulk_conversion(pops in proptest::collection::vec(arbitrary::pop(), 0..10)) {
-        let bytes: Vec<PopBytes> = pops.iter().cloned().map(|pop| pop.into()).collect();
-        let reconstructed_pops: Result<Vec<Pop>, CryptoError> = bytes.into_iter().map(|bytes| bytes.try_into()).collect();
+        let bytes = pops.iter().cloned().map(PopBytes::from);
+        let reconstructed_pops: Result<Vec<Pop>, CryptoError> = bytes.map(|bytes| bytes.try_into()).collect();
         assert_eq!(Ok(pops), reconstructed_pops);
     }
 
     #[test]
     fn secret_key_base64_serde(key in arbitrary::secret_key()) {
         let bytes = SecretKeyBytes::from(key);
-        let base64: String = bytes.into();
+        let base64: String = bytes.clone().into();
         assert_eq!(Ok(bytes), SecretKeyBytes::try_from(&base64));
     }
     #[test]

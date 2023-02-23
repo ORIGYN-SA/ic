@@ -3,13 +3,6 @@ use ic_types::crypto::{AlgorithmId, CryptoError};
 use std::convert::{From, TryFrom};
 
 // From vector of bytes.
-impl From<Vec<u8>> for SecretKeyBytes {
-    fn from(key: Vec<u8>) -> Self {
-        SecretKeyBytes(key)
-    }
-}
-
-// From vector of bytes.
 impl From<Vec<u8>> for PublicKeyBytes {
     fn from(key: Vec<u8>) -> Self {
         PublicKeyBytes(key)
@@ -55,7 +48,9 @@ mod tests {
         let bytes = vec![0; SignatureBytes::SIZE + 1];
         let result = SignatureBytes::try_from(bytes);
         assert!(result.is_err());
-        assert!(result.unwrap_err().is_malformed_signature());
+        assert!(result
+            .expect_err("Unexpected success.")
+            .is_malformed_signature());
     }
 
     #[test]
@@ -63,6 +58,8 @@ mod tests {
         let bytes = vec![0; SignatureBytes::SIZE - 1];
         let result = SignatureBytes::try_from(bytes);
         assert!(result.is_err());
-        assert!(result.unwrap_err().is_malformed_signature());
+        assert!(result
+            .expect_err("Unexpected success.")
+            .is_malformed_signature());
     }
 }

@@ -1,5 +1,18 @@
 //! Defines crypto component types.
-pub mod dkg;
+pub mod canister_threshold_sig;
+
+mod hash;
+
+pub use hash::crypto_hash;
+pub use hash::CryptoHashDomain;
+pub use hash::CryptoHashable;
+pub use hash::CryptoHashableTestDummy;
+pub use hash::DOMAIN_IC_REQUEST;
+
+mod sign;
+
+pub use sign::{Signable, SignableMock};
+
 pub mod error;
 pub mod threshold_sig;
 
@@ -10,43 +23,17 @@ use core::fmt::Formatter;
 use ic_crypto_internal_types::sign::threshold_sig::public_coefficients::CspPublicCoefficients;
 use ic_crypto_internal_types::sign::threshold_sig::public_key::bls12_381::ThresholdSigPublicKeyBytesConversionError;
 use ic_crypto_internal_types::sign::threshold_sig::public_key::CspThresholdSigPublicKey;
+use ic_protobuf::crypto::v1::NodePublicKeys;
+use ic_protobuf::registry::crypto::v1::{PublicKey, X509PublicKeyCert};
 use phantom_newtype::Id;
 #[cfg(all(test, not(target_arch = "wasm32")))]
 use proptest_derive::Arbitrary;
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeSet;
-use std::fmt;
-use strum_macros::EnumIter;
-
-/// An id of a key. These ids are used to refer to entries in the crypto secret
-/// key store.
-#[derive(Copy, Clone, PartialEq, Eq, Hash, Ord, PartialOrd)]
-pub struct KeyId(pub [u8; 32]);
-ic_crypto_internal_types::derive_serde!(KeyId, 32);
+use std::{collections::BTreeSet, fmt, str::FromStr};
+use strum_macros::{Display, EnumIter};
 
 #[cfg(test)]
 mod tests;
-
-impl KeyId {
-    pub fn get(&self) -> [u8; 32] {
-        self.0
-    }
-}
-impl fmt::Debug for KeyId {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "KeyId(0x{})", hex::encode(self.0))
-    }
-}
-impl From<[u8; 32]> for KeyId {
-    fn from(bytes: [u8; 32]) -> Self {
-        KeyId(bytes)
-    }
-}
-impl fmt::Display for KeyId {
-    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
-        write!(f, "KeyId(0x{})", hex::encode(self.0))
-    }
-}
 
 /// A cryptographic hash.
 #[derive(Clone, PartialEq, Eq, Hash, Serialize, Deserialize, PartialOrd, Ord)]
@@ -100,15 +87,44 @@ pub enum KeyPurpose {
     QueryResponseSigning = 2,
     DkgDealingEncryption = 3,
     CommitteeSigning = 4,
+    IDkgMEGaEncryption = 5,
+}
+
+// FromStr implementation for the the registry admin tool.
+impl FromStr for KeyPurpose {
+    type Err = String;
+
+    fn from_str(string: &str) -> Result<Self, <Self as FromStr>::Err> {
+        match string {
+            "node_signing" => Ok(KeyPurpose::NodeSigning),
+            "query_response_signing" => Ok(KeyPurpose::QueryResponseSigning),
+            "dkg_dealing_encryption" => Ok(KeyPurpose::DkgDealingEncryption),
+            "committee_signing" => Ok(KeyPurpose::CommitteeSigning),
+            "idkg_mega_encryption" => Ok(KeyPurpose::IDkgMEGaEncryption),
+            _ => Err(format!("Invalid key purpose: {:?}", string)),
+        }
+    }
 }
 
 /// An algorithm ID. This is used to specify the signature algorithm associated
 /// with a public key.
 #[derive(
-    Clone, Copy, Debug, Deserialize, EnumIter, Eq, Hash, PartialEq, PartialOrd, Ord, Serialize,
+    Clone,
+    Copy,
+    Debug,
+    Deserialize,
+    Display,
+    EnumIter,
+    Eq,
+    Hash,
+    PartialEq,
+    PartialOrd,
+    Ord,
+    Serialize,
 )]
 #[cfg_attr(all(test, not(target_arch = "wasm32")), derive(Arbitrary))]
 #[allow(non_camel_case_types)]
+#[strum(serialize_all = "snake_case")]
 pub enum AlgorithmId {
     Placeholder = 0,
     MultiBls12_381 = 1,
@@ -124,6 +140,15 @@ pub enum AlgorithmId {
     EcdsaP256 = 11,
     EcdsaSecp256k1 = 12,
     IcCanisterSignature = 13,
+    RsaSha256 = 14,
+    ThresholdEcdsaSecp256k1 = 15,
+    MegaSecp256k1 = 16,
+}
+
+impl AlgorithmId {
+    pub fn as_u8(&self) -> u8 {
+        u8::try_from(*self as isize).expect("could not convert AlgorithmId to u8")
+    }
 }
 
 impl From<CspThresholdSigPublicKey> for AlgorithmId {
@@ -149,6 +174,7 @@ impl From<usize> for KeyPurpose {
             2 => KeyPurpose::QueryResponseSigning,
             3 => KeyPurpose::DkgDealingEncryption,
             4 => KeyPurpose::CommitteeSigning,
+            5 => KeyPurpose::IDkgMEGaEncryption,
             _ => KeyPurpose::Placeholder,
         }
     }
@@ -170,39 +196,10 @@ impl From<i32> for AlgorithmId {
             11 => AlgorithmId::EcdsaP256,
             12 => AlgorithmId::EcdsaSecp256k1,
             13 => AlgorithmId::IcCanisterSignature,
+            14 => AlgorithmId::RsaSha256,
+            15 => AlgorithmId::ThresholdEcdsaSecp256k1,
+            16 => AlgorithmId::MegaSecp256k1,
             _ => AlgorithmId::Placeholder,
-        }
-    }
-}
-
-impl From<KeyPurpose> for AlgorithmId {
-    fn from(key_purpose: KeyPurpose) -> Self {
-        match key_purpose {
-            KeyPurpose::QueryResponseSigning => AlgorithmId::Ed25519,
-            KeyPurpose::NodeSigning => AlgorithmId::Ed25519,
-            KeyPurpose::DkgDealingEncryption => AlgorithmId::StaticDhSecp256k1,
-            KeyPurpose::CommitteeSigning => AlgorithmId::MultiBls12_381,
-            KeyPurpose::Placeholder => AlgorithmId::Placeholder,
-        }
-    }
-}
-
-/// A public key.
-#[derive(Debug)]
-pub enum PublicKey {
-    UserPublicKey(UserPublicKey),
-    NodePublicKey(NodePublicKey),
-    IcpPublicKey(IcpPublicKey),
-    CommitteeMemberPublicKey(CommitteeMemberPublicKey),
-}
-
-impl CountBytes for PublicKey {
-    fn count_bytes(&self) -> usize {
-        match self {
-            PublicKey::UserPublicKey(key) => key.count_bytes(),
-            PublicKey::NodePublicKey(key) => key.count_bytes(),
-            PublicKey::IcpPublicKey(key) => key.count_bytes(),
-            PublicKey::CommitteeMemberPublicKey(key) => key.count_bytes(),
         }
     }
 }
@@ -232,46 +229,6 @@ impl CountBytes for UserPublicKey {
     }
 }
 
-/// A public key of an IC node.
-#[derive(Debug)]
-pub struct NodePublicKey {
-    pub key: Vec<u8>,
-    pub proof_of_possession: Vec<u8>,
-}
-
-impl CountBytes for NodePublicKey {
-    fn count_bytes(&self) -> usize {
-        self.key.len() + self.proof_of_possession.len()
-    }
-}
-
-/// An ICP public key.
-#[derive(Debug)]
-pub struct IcpPublicKey {
-    pub key: Vec<u8>,
-}
-
-impl CountBytes for IcpPublicKey {
-    fn count_bytes(&self) -> usize {
-        self.key.len()
-    }
-}
-
-/// A public key of a committee member.
-#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub struct CommitteeMemberPublicKey {
-    #[serde(with = "serde_bytes")]
-    pub key: Vec<u8>,
-    #[serde(with = "serde_bytes")]
-    pub proof_of_possession: Vec<u8>,
-}
-
-impl CountBytes for CommitteeMemberPublicKey {
-    fn count_bytes(&self) -> usize {
-        self.key.len() + self.proof_of_possession.len()
-    }
-}
-
 /// An error returned by the crypto component.
 #[derive(Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum CryptoError {
@@ -295,7 +252,7 @@ pub enum CryptoError {
     /// Secret key not found in SecretKeyStore.
     SecretKeyNotFound {
         algorithm: AlgorithmId,
-        key_id: KeyId,
+        key_id: String,
     },
     /// TLS secret key not found in SecretKeyStore.
     TlsSecretKeyNotFound { certificate_der: Vec<u8> },
@@ -359,6 +316,12 @@ pub enum CryptoError {
     },
     /// Root subnet public key not found at given registry version.
     RootSubnetPublicKeyNotFound { registry_version: RegistryVersion },
+    /// Invalid not-after date specified in certificate generation request.
+    InvalidNotAfterDate { message: String, not_after: String },
+    /// Internal error.
+    InternalError { internal_error: String },
+    /// Transient internal error; retrying may cause the operation to succeed.
+    TransientInternalError { internal_error: String },
 }
 
 impl From<ThresholdSigPublicKeyBytesConversionError> for CryptoError {
@@ -378,87 +341,55 @@ impl From<ThresholdSigPublicKeyBytesConversionError> for CryptoError {
 
 impl CryptoError {
     pub fn is_public_key_not_found(&self) -> bool {
-        match self {
-            CryptoError::PublicKeyNotFound { .. } => true,
-            _ => false,
-        }
+        matches!(self, CryptoError::PublicKeyNotFound { .. })
     }
 
     pub fn is_secret_key_not_found(&self) -> bool {
-        match self {
-            CryptoError::SecretKeyNotFound { .. } => true,
-            _ => false,
-        }
+        matches!(self, CryptoError::SecretKeyNotFound { .. })
     }
 
     pub fn is_malformed_secret_key(&self) -> bool {
-        match self {
-            CryptoError::MalformedSecretKey { .. } => true,
-            _ => false,
-        }
+        matches!(self, CryptoError::MalformedSecretKey { .. })
     }
 
     pub fn is_malformed_public_key(&self) -> bool {
-        match self {
-            CryptoError::MalformedPublicKey { .. } => true,
-            _ => false,
-        }
+        matches!(self, CryptoError::MalformedPublicKey { .. })
     }
 
     pub fn is_malformed_signature(&self) -> bool {
-        match self {
-            CryptoError::MalformedSignature { .. } => true,
-            _ => false,
-        }
+        matches!(self, CryptoError::MalformedSignature { .. })
     }
 
     pub fn is_signature_verification_error(&self) -> bool {
-        match self {
-            CryptoError::SignatureVerification { .. } => true,
-            _ => false,
-        }
+        matches!(self, CryptoError::SignatureVerification { .. })
     }
 
     pub fn is_pop_verification_error(&self) -> bool {
-        match self {
-            CryptoError::PopVerification { .. } => true,
-            _ => false,
-        }
+        matches!(self, CryptoError::PopVerification { .. })
     }
 
     pub fn is_inconsistent_algorithms(&self) -> bool {
-        match self {
-            CryptoError::InconsistentAlgorithms { .. } => true,
-            _ => false,
-        }
+        matches!(self, CryptoError::InconsistentAlgorithms { .. })
     }
 
     pub fn is_algorithm_not_supported(&self) -> bool {
-        match self {
-            CryptoError::AlgorithmNotSupported { .. } => true,
-            _ => false,
-        }
+        matches!(self, CryptoError::AlgorithmNotSupported { .. })
     }
 
     pub fn is_registry_client_error(&self) -> bool {
-        match self {
-            CryptoError::RegistryClient(_) => true,
-            _ => false,
-        }
+        matches!(self, CryptoError::RegistryClient(_))
     }
 
     pub fn is_threshold_sig_data_not_found(&self) -> bool {
-        match self {
-            CryptoError::ThresholdSigDataNotFound { .. } => true,
-            _ => false,
-        }
+        matches!(self, CryptoError::ThresholdSigDataNotFound { .. })
     }
 
     pub fn is_dkg_transcript_not_found(&self) -> bool {
-        match self {
-            CryptoError::DkgTranscriptNotFound { .. } => true,
-            _ => false,
-        }
+        matches!(self, CryptoError::DkgTranscriptNotFound { .. })
+    }
+
+    pub fn is_invalid_argument(&self) -> bool {
+        matches!(self, CryptoError::InvalidArgument { .. })
     }
 }
 
@@ -509,7 +440,7 @@ impl fmt::Debug for CryptoError {
             CryptoError::TlsSecretKeyNotFound { certificate_der } => write!(
                 f,
                 "Cannot find TLS secret key for certificate (DER encoding) 0x{}",
-                hex::encode(&certificate_der)
+                hex::encode(certificate_der)
             ),
 
             CryptoError::MalformedSecretKey { algorithm, .. } => {
@@ -524,7 +455,7 @@ impl fmt::Debug for CryptoError {
                 f,
                 "Malformed {:?} public key: {}, error: {}",
                 algorithm,
-                hex::encode(&key_bytes),
+                hex::encode(key_bytes),
                 internal_error,
             ),
             CryptoError::MalformedPublicKey {
@@ -545,7 +476,7 @@ impl fmt::Debug for CryptoError {
                 f,
                 "Malformed {:?} signature: [{}] error: '{}'",
                 algorithm,
-                hex::encode(&sig_bytes),
+                hex::encode(sig_bytes),
                 internal_error
             ),
             CryptoError::MalformedPop {
@@ -556,7 +487,7 @@ impl fmt::Debug for CryptoError {
                 f,
                 "Malformed {:?} PoP: [{}] error: '{}'",
                 algorithm,
-                hex::encode(&pop_bytes),
+                hex::encode(pop_bytes),
                 internal_error
             ),
 
@@ -569,8 +500,8 @@ impl fmt::Debug for CryptoError {
                 f,
                 "{:?} signature could not be verified: public key {}, signature {}, error: {}",
                 algorithm,
-                hex::encode(&public_key_bytes),
-                hex::encode(&sig_bytes),
+                hex::encode(public_key_bytes),
+                hex::encode(sig_bytes),
                 internal_error,
             ),
             CryptoError::PopVerification {
@@ -582,8 +513,8 @@ impl fmt::Debug for CryptoError {
                 f,
                 "{:?} PoP could not be verified: public key {}, pop {}, error: {}",
                 algorithm,
-                hex::encode(&public_key_bytes),
-                hex::encode(&pop_bytes),
+                hex::encode(public_key_bytes),
+                hex::encode(pop_bytes),
                 internal_error,
             ),
 
@@ -622,7 +553,16 @@ impl fmt::Debug for CryptoError {
                 f,
                 "Cannot find root subnet public key at registry version {:?}",
                 registry_version
-            )
+            ),
+            CryptoError::InvalidNotAfterDate { message , not_after } => write!(
+                f,
+                "Invalid not_after date specified ({:?}: {:?})",
+                message, not_after
+            ),
+            CryptoError::InternalError { internal_error } =>
+                write!(f, "Internal error: {}", internal_error),
+            CryptoError::TransientInternalError { internal_error: transient_internal_error } =>
+                write!(f, "Transient internal error: {}", transient_internal_error),
         }
     }
 }
@@ -637,8 +577,21 @@ impl fmt::Display for CryptoError {
 pub type CryptoResult<T> = std::result::Result<T, CryptoError>;
 
 /// A basic signature.
-#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Hash, Serialize, Deserialize, Ord, PartialOrd)]
 pub struct BasicSig(#[serde(with = "serde_bytes")] pub Vec<u8>);
+
+impl fmt::Display for BasicSig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{:?}", self)
+    }
+}
+
+impl fmt::Debug for BasicSig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "BasicSig: 0x{}", hex::encode(&self.0))
+    }
+}
+
 /// A basic signature for content of type `T`
 pub type BasicSigOf<T> = Id<T, BasicSig>; // Use newtype instead? E.g., `pub struct BasicSigOf<T>(Id<T, BasicSig>);`
 
@@ -655,7 +608,7 @@ impl<T: CountBytes> CountBytes for BasicSigOf<T> {
 }
 
 /// An individual multi-signature.
-#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Hash, Serialize, Deserialize, PartialOrd, Ord)]
 pub struct IndividualMultiSig(#[serde(with = "serde_bytes")] pub Vec<u8>);
 /// An individual multi-signature for content of type `T`
 pub type IndividualMultiSigOf<T> = Id<T, IndividualMultiSig>; // Use newtype instead?
@@ -672,8 +625,20 @@ impl<T: CountBytes> CountBytes for IndividualMultiSigOf<T> {
     }
 }
 
+impl fmt::Display for IndividualMultiSig {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        write!(f, "{:?}", self)
+    }
+}
+
+impl fmt::Debug for IndividualMultiSig {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        write!(f, "IndividualMultiSig: 0x{}", hex::encode(&self.0))
+    }
+}
+
 /// A combined multi-signature.
-#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Hash, Serialize, Deserialize, PartialOrd, Ord)]
 pub struct CombinedMultiSig(#[serde(with = "serde_bytes")] pub Vec<u8>);
 /// A combined multi-signature for content of type `T`
 pub type CombinedMultiSigOf<T> = Id<T, CombinedMultiSig>; // Use newtype instead?
@@ -690,20 +655,114 @@ impl<T: CountBytes> CountBytes for CombinedMultiSigOf<T> {
     }
 }
 
+impl fmt::Display for CombinedMultiSig {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        write!(f, "{:?}", self)
+    }
+}
+
+impl fmt::Debug for CombinedMultiSig {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        write!(f, "CombinedMultiSig: 0x{}", hex::encode(&self.0))
+    }
+}
+
 /// A threshold signature share.
-#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Hash, Serialize, Deserialize, PartialOrd, Ord)]
 pub struct ThresholdSigShare(#[serde(with = "serde_bytes")] pub Vec<u8>);
 /// A threshold signature share for content of type `T`
 pub type ThresholdSigShareOf<T> = Id<T, ThresholdSigShare>; // Use newtype instead?
 
+impl fmt::Display for ThresholdSigShare {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        write!(f, "{:?}", self)
+    }
+}
+
+impl fmt::Debug for ThresholdSigShare {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        write!(f, "ThresholdSigShare: 0x{}", hex::encode(&self.0))
+    }
+}
+
 /// A combined threshold signature.
-#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct CombinedThresholdSig(#[serde(with = "serde_bytes")] pub Vec<u8>);
 /// A combined threshold signature for content of type `T`
 pub type CombinedThresholdSigOf<T> = Id<T, CombinedThresholdSig>; // Use newtype instead?
 
+impl fmt::Display for CombinedThresholdSig {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        write!(f, "{:?}", self)
+    }
+}
+
+impl fmt::Debug for CombinedThresholdSig {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        write!(f, "CombinedThresholdSig: 0x{}", hex::encode(&self.0))
+    }
+}
+
 /// A canister signature (ICCSA).
-#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct CanisterSig(#[serde(with = "serde_bytes")] pub Vec<u8>);
 /// A canister signature for content of type `T`
 pub type CanisterSigOf<T> = Id<T, CanisterSig>;
+
+impl fmt::Display for CanisterSig {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        write!(f, "{:?}", self)
+    }
+}
+
+impl fmt::Debug for CanisterSig {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        write!(f, "CanisterSig: 0x{}", hex::encode(&self.0))
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct CurrentNodePublicKeys {
+    pub node_signing_public_key: Option<PublicKey>,
+    pub committee_signing_public_key: Option<PublicKey>,
+    pub tls_certificate: Option<X509PublicKeyCert>,
+    pub dkg_dealing_encryption_public_key: Option<PublicKey>,
+    pub idkg_dealing_encryption_public_key: Option<PublicKey>,
+}
+
+impl CurrentNodePublicKeys {
+    pub fn get_pub_keys_and_cert_count(&self) -> u8 {
+        let mut count: u8 = 0;
+        if self.node_signing_public_key.is_some() {
+            count += 1;
+        }
+        if self.committee_signing_public_key.is_some() {
+            count += 1;
+        }
+        if self.tls_certificate.is_some() {
+            count += 1;
+        }
+        if self.dkg_dealing_encryption_public_key.is_some() {
+            count += 1;
+        }
+        if self.idkg_dealing_encryption_public_key.is_some() {
+            count += 1;
+        }
+        count
+    }
+}
+
+impl From<CurrentNodePublicKeys> for NodePublicKeys {
+    fn from(current_node_public_keys: CurrentNodePublicKeys) -> Self {
+        NodePublicKeys {
+            version: 1,
+            node_signing_pk: current_node_public_keys.node_signing_public_key,
+            committee_signing_pk: current_node_public_keys.committee_signing_public_key,
+            tls_certificate: current_node_public_keys.tls_certificate,
+            dkg_dealing_encryption_pk: current_node_public_keys.dkg_dealing_encryption_public_key,
+            idkg_dealing_encryption_pks: current_node_public_keys
+                .idkg_dealing_encryption_public_key
+                .map_or(vec![], |public_key| vec![public_key]),
+        }
+    }
+}

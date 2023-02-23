@@ -1,23 +1,29 @@
 #![deny(missing_docs)]
 use crate::{
     consensus::{
-        membership::Membership, metrics::BlockMakerMetrics, payload_builder::PayloadBuilder,
-        pool_reader::PoolReader, prelude::*, utils::*, ConsensusCrypto,
+        membership::Membership,
+        metrics::{BlockMakerMetrics, EcdsaPayloadMetrics},
+        payload_builder::PayloadBuilder,
+        pool_reader::PoolReader,
+        prelude::*,
+        utils::*,
+        ConsensusCrypto,
     },
-    dkg::create_payload,
+    dkg::create_payload as create_dkg_payload,
+    ecdsa,
 };
-use ic_interfaces::{
-    dkg::DkgPool, ingress_pool::IngressPoolSelect, messaging::XNetPayloadError,
-    registry::RegistryClient, state_manager::StateManager, time_source::TimeSource,
-};
+use ic_interfaces::{dkg::DkgPool, ecdsa::EcdsaPool, time_source::TimeSource};
+use ic_interfaces_registry::RegistryClient;
+use ic_interfaces_state_manager::StateManager;
 use ic_logger::{debug, error, trace, warn, ReplicaLogger};
 use ic_metrics::MetricsRegistry;
-use ic_registry_client::helper::subnet::SubnetRegistry;
+use ic_protobuf::registry::subnet::v1::SubnetRecord;
 use ic_replicated_state::ReplicatedState;
-use ic_types::{consensus::dkg, replica_config::ReplicaConfig, ReplicaVersion};
-use std::cmp::Ordering;
-use std::sync::Arc;
-use std::sync::{Mutex, RwLock};
+use ic_types::{consensus::dkg, replica_config::ReplicaConfig, time::current_time};
+use std::{
+    sync::{Arc, RwLock},
+    time::Duration,
+};
 
 // Wait for VALIDATED_DEALING_AGE_THRESHOLD_MSECS (from the time an entry was
 // added to the validated pool) before selecting it for inclusion in a block.
@@ -25,6 +31,44 @@ use std::sync::{Mutex, RwLock};
 // gossiped/validated/included in the DKG pools of the peers. And so that
 // the block validation path can skip the expensive crypto validation.
 const VALIDATED_DEALING_AGE_THRESHOLD_MSECS: u64 = 10;
+
+/// A collection of subnet records, that are relevant for constructing a block
+pub struct SubnetRecords {
+    /// The membership [`SubnetRecord`], that is available to this node
+    pub(crate) membership_version: SubnetRecord,
+
+    /// The stable [`SubnetRecord`], that might be older than latest
+    /// but is very likely available to all nodes on the subnet.
+    ///
+    /// This is the [`SubnetRecord`] that corresponds to the
+    /// [`ValidationContext`].
+    pub(crate) context_version: SubnetRecord,
+}
+
+impl SubnetRecords {
+    fn new(
+        block_maker: &BlockMaker,
+        membership_record: RegistryVersion,
+        context_record: RegistryVersion,
+    ) -> Option<Self> {
+        Some(Self {
+            membership_version: get_subnet_record(
+                block_maker.registry_client.as_ref(),
+                block_maker.replica_config.subnet_id,
+                membership_record,
+                &block_maker.log,
+            )
+            .ok()?,
+            context_version: get_subnet_record(
+                block_maker.registry_client.as_ref(),
+                block_maker.replica_config.subnet_id,
+                context_record,
+                &block_maker.log,
+            )
+            .ok()?,
+        })
+    }
+}
 
 /// A consensus subcomponent that is responsible for creating block proposals.
 pub struct BlockMaker {
@@ -35,10 +79,15 @@ pub struct BlockMaker {
     crypto: Arc<dyn ConsensusCrypto>,
     payload_builder: Arc<dyn PayloadBuilder>,
     dkg_pool: Arc<RwLock<dyn DkgPool>>,
+    ecdsa_pool: Arc<RwLock<dyn EcdsaPool>>,
     state_manager: Arc<dyn StateManager<State = ReplicatedState>>,
     metrics: BlockMakerMetrics,
+    ecdsa_payload_metrics: EcdsaPayloadMetrics,
     log: ReplicaLogger,
-    payload_context_cache: Mutex<Option<(CryptoHashOf<Block>, ValidationContext)>>,
+    // The minimal age of the registry version we want to use for the validation context of a new
+    // block. The older is the version, the higher is the probability, that it's universally
+    // available across the subnet.
+    stable_registry_version_age: Duration,
 }
 
 impl BlockMaker {
@@ -52,7 +101,9 @@ impl BlockMaker {
         crypto: Arc<dyn ConsensusCrypto>,
         payload_builder: Arc<dyn PayloadBuilder>,
         dkg_pool: Arc<RwLock<dyn DkgPool>>,
+        ecdsa_pool: Arc<RwLock<dyn EcdsaPool>>,
         state_manager: Arc<dyn StateManager<State = ReplicatedState>>,
+        stable_registry_version_age: Duration,
         metrics_registry: MetricsRegistry,
         log: ReplicaLogger,
     ) -> Self {
@@ -64,22 +115,20 @@ impl BlockMaker {
             crypto,
             payload_builder,
             dkg_pool,
+            ecdsa_pool,
             state_manager,
             log,
-            metrics: BlockMakerMetrics::new(metrics_registry),
-            payload_context_cache: Mutex::new(None),
+            metrics: BlockMakerMetrics::new(metrics_registry.clone()),
+            ecdsa_payload_metrics: EcdsaPayloadMetrics::new(metrics_registry),
+            stable_registry_version_age,
         }
     }
 
     /// If a block should be proposed, propose it.
-    pub fn on_state_change(
-        &self,
-        pool: &PoolReader<'_>,
-        ingress_pool: &dyn IngressPoolSelect,
-    ) -> Option<BlockProposal> {
+    pub fn on_state_change(&self, pool: &PoolReader<'_>) -> Option<BlockProposal> {
         trace!(self.log, "on_state_change");
         let my_node_id = self.replica_config.node_id;
-        let (beacon, parent) = get_dependencies(&pool)?;
+        let (beacon, parent) = get_dependencies(pool)?;
         let height = beacon.content.height.increment();
         match self
             .membership
@@ -98,18 +147,17 @@ impl BlockMaker {
                         self.time_source.as_ref(),
                     )
                 {
-                    self.propose_block(pool, ingress_pool, rank, parent)
-                        .map(|proposal| {
-                            debug!(
-                                self.log,
-                                "Make proposal {:?} {:?} {:?}",
-                                proposal.content.get_hash(),
-                                proposal.as_ref().payload.get_hash(),
-                                proposal.as_ref().payload.as_ref()
-                            );
-                            self.log_block(proposal.as_ref());
-                            proposal
-                        })
+                    self.propose_block(pool, rank, parent).map(|proposal| {
+                        debug!(
+                            self.log,
+                            "Make proposal {:?} {:?} {:?}",
+                            proposal.content.get_hash(),
+                            proposal.as_ref().payload.get_hash(),
+                            proposal.as_ref().payload.as_ref()
+                        );
+                        self.log_block(proposal.as_ref());
+                        proposal
+                    })
                 } else {
                     None
                 }
@@ -146,106 +194,59 @@ impl BlockMaker {
     fn propose_block(
         &self,
         pool: &PoolReader<'_>,
-        ingress_pool: &dyn IngressPoolSelect,
         rank: Rank,
         parent: Block,
     ) -> Option<BlockProposal> {
-        let parent_hash = ic_crypto::crypto_hash(&parent);
+        let parent_hash = ic_types::crypto::crypto_hash(&parent);
         let height = parent.height.increment();
         let certified_height = self.state_manager.latest_certified_height();
 
         // Note that we will skip blockmaking if registry versions or replica_versions
         // are missing or temporarily not retrievable.
-        let registry_version = pool.registry_version(height)?;
-        let replica_version = lookup_replica_version(
-            self.registry_client.as_ref(),
-            self.replica_config.subnet_id,
-            &self.log,
-            registry_version,
-        )?;
+        let registry_version = pool.registry_version(height).or_else(|| {
+            warn!(
+                self.log,
+                "Couldn't determine the registry version for height {:?}.", height
+            );
+            None
+        })?;
+
+        // Get the subnet records that are relevant to making a block
+        let stable_registry_version = self.get_stable_registry_version(&parent)?;
+        let subnet_records = SubnetRecords::new(self, registry_version, stable_registry_version)?;
 
         // If we have previously tried to make a payload but got an error at the given
         // height, We should try again with the same context. Otherwise create a
         // new context.
-        let context = match self.payload_context_cache.lock().unwrap().take() {
-            Some((hash, context)) if hash == parent_hash => context,
-            _ => ValidationContext {
-                certified_height,
-                registry_version: self.registry_client.get_latest_version(),
-                // Below we skip proposing the block if this context is behind the parent's context.
-                // We set the time so that block making is not skipped due to local time being
-                // behind the network time.
-                time: std::cmp::max(self.time_source.get_relative_time(), parent.context.time),
-            },
+        let context = ValidationContext {
+            certified_height,
+            // To ensure that other replicas can validate our block proposal, we need to use a
+            // registry version that is present on most replicas. But since every registry
+            // version can become available to different replicas at different times, we should
+            // not use the latest one. Instead, we pick an older version we consider "stable",
+            // the one which has reached most replicas by now.
+            registry_version: stable_registry_version,
+            // Below we skip proposing the block if this context is behind the parent's context.
+            // We set the time so that block making is not skipped due to local time being
+            // behind the network time.
+            time: std::cmp::max(self.time_source.get_relative_time(), parent.context.time),
         };
 
-        match context.partial_cmp(&parent.context) {
-            None | Some(Ordering::Less) => {
-                // the values in our validation context are not monotonically increasing the
-                // values included in the parent block. To avoid proposing an
-                // invalid block, we simply do not propose a block now.
-                warn!(
-                    self.log,
-                    "Cannot propose block as the locally available validation context is smaller than the parent validation context (locally available={:?}, parent context={:?})",
-                    context,
-                    &parent.context
-                );
-                return None;
-            }
-            _ => {}
+        if !context.greater_or_equal(&parent.context) {
+            // The values in our validation context are not monotonically increasing the
+            // values included in the parent block. To avoid proposing an invalid block, we
+            // simply do not propose a block now.
+            warn!(
+                every_n_seconds => 5,
+                self.log,
+                "Cannot propose block as the locally available validation context is \
+                        smaller than the parent validation context \
+                        (locally available={:?}, parent context={:?})",
+                context,
+                &parent.context
+            );
+            return None;
         }
-
-        let batch_payload = {
-            // Use empty payload if the (agreed) replica_version is not supported.
-            if replica_version != ReplicaVersion::default() {
-                // if latest finalized CUP block has a version that is different,
-                // we should stop making blocks.
-                let finalized_replica_version = pool
-                    .get_replica_version_from_highest_catch_up_package(
-                        self.registry_client.as_ref(),
-                        &self.replica_config,
-                        &self.log,
-                    )?;
-                if finalized_replica_version != ReplicaVersion::default() {
-                    debug!(
-                        self.log,
-                        "Skip making blocks after the upgrade catch-up package has finalized."
-                    );
-                    return None;
-                }
-                BatchPayload::default()
-            } else {
-                let past_payloads =
-                    pool.get_payloads_from_height(certified_height.increment(), parent.clone());
-                match self.payload_builder.get_payload(
-                    height,
-                    ingress_pool,
-                    &past_payloads,
-                    &context,
-                ) {
-                    Ok(payload) => {
-                        self.metrics
-                            .get_payload_calls
-                            .with_label_values(&["success"])
-                            .inc();
-                        payload
-                    }
-                    Err(XNetPayloadError::Pending) => {
-                        // In case xnet payload builder has yet to finish preparing a payload, we
-                        // will try again later.
-                        //
-                        // The necessary context is remembered in a local cache so that we can use
-                        // the same context when trying again.
-                        *self.payload_context_cache.lock().unwrap() = Some((parent_hash, context));
-                        self.metrics
-                            .get_payload_calls
-                            .with_label_values(&["pending"])
-                            .inc();
-                        return None;
-                    }
-                }
-            }
-        };
 
         self.construct_block_proposal(
             pool,
@@ -253,10 +254,10 @@ impl BlockMaker {
             parent,
             parent_hash,
             height,
+            certified_height,
             rank,
-            replica_version,
             registry_version,
-            batch_payload,
+            &subnet_records,
         )
     }
 
@@ -271,26 +272,21 @@ impl BlockMaker {
         parent: Block,
         parent_hash: CryptoHashOf<Block>,
         height: Height,
+        certified_height: Height,
         rank: Rank,
-        replica_version: ReplicaVersion,
         registry_version: RegistryVersion,
-        batch_payload: BatchPayload,
+        subnet_records: &SubnetRecords,
     ) -> Option<BlockProposal> {
-        let max_dealings_per_block = dkg_dealings_per_block(
-            &*self.registry_client,
-            registry_version,
-            self.replica_config.subnet_id,
-        )
-        .map_err(|err| warn!(self.log, "{:?}", err))
-        .ok()?;
+        let max_dealings_per_block =
+            subnet_records.membership_version.dkg_dealings_per_block as usize;
 
-        let dkg_payload = create_payload(
+        let dkg_payload = create_dkg_payload(
             self.replica_config.subnet_id,
             &*self.registry_client,
             &*self.crypto,
-            &pool,
+            pool,
             Arc::clone(&self.dkg_pool),
-            parent,
+            &parent,
             &*self.state_manager,
             &context,
             self.log.clone(),
@@ -301,25 +297,80 @@ impl BlockMaker {
         .ok()?;
 
         let payload = Payload::new(
-            ic_crypto::crypto_hash,
+            ic_types::crypto::crypto_hash,
             match dkg_payload {
-                dkg::Payload::Summary(summary) => summary.into(),
+                dkg::Payload::Summary(summary) => {
+                    // Summary block does not have batch payload.
+                    self.metrics.report_byte_estimate_metrics(0, 0);
+                    let ecdsa_summary = ecdsa::create_summary_payload(
+                        self.replica_config.subnet_id,
+                        &*self.registry_client,
+                        pool,
+                        &context,
+                        &parent,
+                        Some(&self.ecdsa_payload_metrics),
+                        self.log.clone(),
+                    )
+                    .map_err(|err| warn!(self.log, "Payload construction has failed: {:?}", err))
+                    .ok()
+                    .flatten();
+                    (summary, ecdsa_summary).into()
+                }
                 dkg::Payload::Dealings(dealings) => {
-                    if replica_version != ReplicaVersion::default() {
-                        // Use empty DKG dealings if the (agreed) replica_version is not supported.
-                        (
-                            batch_payload,
-                            dkg::Dealings::new_empty(dealings.start_height),
-                        )
-                            .into()
+                    let batch_payload = match self.build_batch_payload(
+                        pool,
+                        height,
+                        certified_height,
+                        &context,
+                        &parent,
+                        subnet_records,
+                    ) {
+                        None => return None,
+                        Some(payload) => payload,
+                    };
+                    if is_upgrade_pending(
+                        height,
+                        self.registry_client.as_ref(),
+                        &self.replica_config,
+                        &self.log,
+                        pool,
+                    )? {
+                        // Use empty DKG dealings if a replica upgrade is pending.
+                        let new_dealings = dkg::Dealings::new_empty(dealings.start_height);
+                        self.metrics.report_byte_estimate_metrics(
+                            batch_payload.xnet.size_bytes(),
+                            batch_payload.ingress.count_bytes(),
+                        );
+                        (batch_payload, new_dealings, None).into()
                     } else {
-                        (batch_payload, dealings).into()
+                        let ecdsa_data = ecdsa::create_data_payload(
+                            self.replica_config.subnet_id,
+                            &*self.registry_client,
+                            &*self.crypto,
+                            pool,
+                            self.ecdsa_pool.clone(),
+                            &*self.state_manager,
+                            &context,
+                            &parent,
+                            &self.ecdsa_payload_metrics,
+                            self.log.clone(),
+                        )
+                        .map_err(|err| {
+                            warn!(self.log, "Payload construction has failed: {:?}", err)
+                        })
+                        .ok()
+                        .flatten();
+                        self.metrics.report_byte_estimate_metrics(
+                            batch_payload.xnet.size_bytes(),
+                            batch_payload.ingress.count_bytes(),
+                        );
+                        (batch_payload, dealings, ecdsa_data).into()
                     }
                 }
             },
         );
         let block = Block::new(parent_hash, payload, height, rank, context);
-        let hashed_block = hashed::Hashed::new(ic_crypto::crypto_hash, block);
+        let hashed_block = hashed::Hashed::new(ic_types::crypto::crypto_hash, block);
         match self
             .crypto
             .sign(&hashed_block, self.replica_config.node_id, registry_version)
@@ -332,6 +383,58 @@ impl BlockMaker {
                 error!(self.log, "Couldn't create a signature: {:?}", err);
                 None
             }
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn build_batch_payload(
+        &self,
+        pool: &PoolReader<'_>,
+        height: Height,
+        certified_height: Height,
+        context: &ValidationContext,
+        parent: &Block,
+        subnet_records: &SubnetRecords,
+    ) -> Option<BatchPayload> {
+        // Use empty payload if the (agreed) replica_version is not supported.
+        let upgrade_pending = is_upgrade_pending(
+            parent.height.increment(),
+            self.registry_client.as_ref(),
+            &self.replica_config,
+            &self.log,
+            pool,
+        );
+        if upgrade_pending.is_none() {
+            warn!(self.log, "Failed to check if upgrade is pending!");
+        }
+        if upgrade_pending? {
+            let upgrade_finalized = is_upgrade_finalized(
+                self.registry_client.as_ref(),
+                &self.replica_config,
+                &self.log,
+                pool,
+            );
+            if upgrade_finalized.is_none() {
+                warn!(self.log, "Failed to check if upgrade is finalized!");
+            }
+            if upgrade_finalized.unwrap_or(false) {
+                None
+            } else {
+                Some(BatchPayload::default())
+            }
+        } else {
+            let past_payloads =
+                pool.get_payloads_from_height(certified_height.increment(), parent.clone());
+            let payload =
+                self.payload_builder
+                    .get_payload(height, &past_payloads, context, subnet_records);
+
+            self.metrics
+                .get_payload_calls
+                .with_label_values(&["success"])
+                .inc();
+
+            Some(payload)
         }
     }
 
@@ -348,7 +451,7 @@ impl BlockMaker {
         let batch = if block.payload.is_summary() {
             &empty_batch
         } else {
-            block.payload.as_ref().as_batch_payload()
+            &block.payload.as_ref().as_data().batch
         };
 
         for message_id in batch.ingress.message_ids() {
@@ -361,6 +464,27 @@ impl BlockMaker {
         }
     }
 
+    // Returns the registry version received from the NNS some specified amount of
+    // time ago. If the parent's context references higher version which is already
+    // available localy, we use that version.
+    fn get_stable_registry_version(&self, parent: &Block) -> Option<RegistryVersion> {
+        let parents_version = parent.context.registry_version;
+        let latest_version = self.registry_client.get_latest_version();
+        // Check if there is a stable version that we can bump up to.
+        for v in (parents_version.get()..=latest_version.get()).rev() {
+            let version = RegistryVersion::from(v);
+            let version_timestamp = self.registry_client.get_version_timestamp(version)?;
+            if version_timestamp + self.stable_registry_version_age <= current_time() {
+                return Some(version);
+            }
+        }
+        // If parent's version is locally available, return that.
+        if parents_version <= latest_version {
+            return Some(parents_version);
+        }
+        None
+    }
+
     /// Maliciously propose blocks irrespective of the rank, based on the flags
     /// received. If maliciously_propose_empty_blocks is set, propose only empty
     /// blocks. If maliciously_equivocation_blockmaker is set, propose
@@ -369,19 +493,17 @@ impl BlockMaker {
     pub(crate) fn maliciously_propose_blocks(
         &self,
         pool: &PoolReader<'_>,
-        ingress_pool: &dyn IngressPoolSelect,
         maliciously_propose_empty_blocks: bool,
         maliciously_equivocation_blockmaker: bool,
     ) -> Vec<BlockProposal> {
         use ic_protobuf::log::malicious_behaviour_log_entry::v1::{
             MaliciousBehaviour, MaliciousBehaviourLogEntry,
         };
-        use std::time::Duration;
         trace!(self.log, "maliciously_propose_blocks");
         let number_of_proposals = 5;
 
         let my_node_id = self.replica_config.node_id;
-        let (beacon, parent) = match get_dependencies(&pool) {
+        let (beacon, parent) = match get_dependencies(pool) {
             Some((b, p)) => (b, p),
             None => {
                 return Vec::new();
@@ -411,7 +533,7 @@ impl BlockMaker {
                 // If maliciously_propose_empty_blocks is set, propose only empty blocks.
                 let maybe_proposal = match maliciously_propose_empty_blocks {
                     true => self.maliciously_propose_empty_block(pool, rank, parent),
-                    false => self.propose_block(pool, ingress_pool, rank, parent),
+                    false => self.propose_block(pool, rank, parent),
                 };
 
                 if let Some(proposal) = maybe_proposal {
@@ -428,7 +550,7 @@ impl BlockMaker {
                                 let mut new_block = original_block.clone();
                                 new_block.context.time += Duration::from_nanos(i);
                                 let hashed_block =
-                                    hashed::Hashed::new(ic_crypto::crypto_hash, new_block);
+                                    hashed::Hashed::new(ic_types::crypto::crypto_hash, new_block);
                                 if let Ok(signature) = self.crypto.sign(
                                     &hashed_block,
                                     self.replica_config.node_id,
@@ -476,19 +598,18 @@ impl BlockMaker {
         rank: Rank,
         parent: Block,
     ) -> Option<BlockProposal> {
-        let parent_hash = ic_crypto::crypto_hash(&parent);
+        let parent_hash = ic_types::crypto::crypto_hash(&parent);
         let height = parent.height.increment();
+        let certified_height = self.state_manager.latest_certified_height();
         let context = parent.context.clone();
 
         // Note that we will skip blockmaking if registry versions or replica_versions
         // are missing or temporarily not retrievable.
         let registry_version = pool.registry_version(height)?;
-        let replica_version = lookup_replica_version(
-            self.registry_client.as_ref(),
-            self.replica_config.subnet_id,
-            &self.log,
-            registry_version,
-        )?;
+
+        // Get the subnet records that are relevant to making a block
+        let stable_registry_version = self.get_stable_registry_version(&parent)?;
+        let subnet_records = SubnetRecords::new(self, registry_version, stable_registry_version)?;
 
         self.construct_block_proposal(
             pool,
@@ -496,10 +617,10 @@ impl BlockMaker {
             parent,
             parent_hash,
             height,
+            certified_height,
             rank,
-            replica_version,
             registry_version,
-            BatchPayload::default(),
+            &subnet_records,
         )
     }
 }
@@ -525,24 +646,6 @@ fn already_proposed(pool: &PoolReader<'_>, h: Height, this_node: NodeId) -> bool
         .any(|p| p.signature.signer == this_node)
 }
 
-/// Determine how many DKG dealings are allowed in a single block by obtaining
-/// this value from the registry.
-fn dkg_dealings_per_block(
-    registry_client: &dyn RegistryClient,
-    version: RegistryVersion,
-    subnet_id: SubnetId,
-) -> Result<usize, String> {
-    registry_client
-        .get_dkg_dealings_per_block(subnet_id, version)
-        .map_err(|err| format!("Registry error: {:?}", err))?
-        .ok_or_else(|| {
-            panic!(
-                "No subnet record found for registry version={:?} and subnet_id={:?}",
-                version, subnet_id,
-            )
-        })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -552,14 +655,12 @@ mod tests {
     use ic_interfaces::consensus_pool::ConsensusPool;
     use ic_logger::replica_logger::no_op_logger;
     use ic_metrics::MetricsRegistry;
-    use ic_test_artifact_pool::ingress_pool::TestIngressPool;
-    use ic_test_utilities::{
-        registry::SubnetRecordBuilder,
-        types::ids::{node_test_id, subnet_test_id},
-    };
+    use ic_test_utilities::types::ids::{node_test_id, subnet_test_id};
+    use ic_test_utilities_registry::{add_subnet_record, SubnetRecordBuilder};
     use ic_types::*;
     use ic_types::{batch::*, consensus::dkg};
     use std::sync::{Arc, RwLock};
+
     #[test]
     fn test_block_maker() {
         let subnet_id = subnet_test_id(0);
@@ -579,9 +680,11 @@ mod tests {
                 time_source,
                 replica_config,
                 state_manager,
+                dkg_pool,
+                ecdsa_pool,
                 ..
             } = dependencies_with_subnet_params(
-                pool_config.clone(),
+                pool_config,
                 subnet_id,
                 vec![
                     (
@@ -598,12 +701,10 @@ mod tests {
                     ),
                 ],
             );
+
             pool.advance_round_normal_operation_n(4);
 
             let payload_builder = MockPayloadBuilder::new();
-            let dkg_pool = Arc::new(RwLock::new(ic_artifact_pool::dkg_pool::DkgPoolImpl::new(
-                MetricsRegistry::new(),
-            )));
             let certified_height = Height::from(1);
             state_manager
                 .get_mut()
@@ -618,16 +719,17 @@ mod tests {
                 crypto.clone(),
                 Arc::new(payload_builder),
                 dkg_pool.clone(),
+                ecdsa_pool.clone(),
                 state_manager.clone(),
+                Duration::from_millis(0),
                 MetricsRegistry::new(),
                 no_op_logger(),
             );
-            let ingress_pool = TestIngressPool::new(pool_config);
 
             // Check first block is created immediately because rank 1 has to wait.
             let run_block_maker = || {
                 let reader = PoolReader::new(&pool);
-                block_maker.on_state_change(&reader, &ingress_pool)
+                block_maker.on_state_change(&reader)
             };
             assert!(run_block_maker().is_none());
 
@@ -659,7 +761,7 @@ mod tests {
             };
             let expected_block = Block::new(
                 start_hash.clone(),
-                Payload::new(ic_crypto::crypto_hash, returned_payload.into()),
+                Payload::new(ic_types::crypto::crypto_hash, returned_payload.into()),
                 next_height,
                 Rank(1),
                 expected_context.clone(),
@@ -667,10 +769,10 @@ mod tests {
 
             payload_builder
                 .expect_get_payload()
-                .withf(move |_, _, payloads, context| {
+                .withf(move |_, payloads, context, _| {
                     matches_expected_payloads(payloads) && context == &expected_context
                 })
-                .return_const(Ok(BatchPayload::default()));
+                .return_const(BatchPayload::default());
 
             let pool_reader = PoolReader::new(&pool);
             let replica_config = ReplicaConfig {
@@ -694,13 +796,15 @@ mod tests {
                 Arc::clone(&crypto) as Arc<_>,
                 Arc::new(payload_builder),
                 dkg_pool,
+                ecdsa_pool,
                 state_manager,
+                Duration::from_millis(0),
                 MetricsRegistry::new(),
                 no_op_logger(),
             );
             let run_block_maker = || {
                 let reader = PoolReader::new(&pool);
-                block_maker.on_state_change(&reader, &ingress_pool)
+                block_maker.on_state_change(&reader)
             };
 
             // kick start another round
@@ -733,7 +837,7 @@ mod tests {
 
             let run_block_maker = || {
                 let reader = PoolReader::new(&pool);
-                block_maker.on_state_change(&reader, &ingress_pool)
+                block_maker.on_state_change(&reader)
             };
 
             // check that the block maker does not create a block, as a lower ranked block
@@ -776,12 +880,21 @@ mod tests {
                     ),
                 ],
             );
-            let ingress_pool = TestIngressPool::new(pool_config);
+            let dkg_pool = Arc::new(RwLock::new(ic_artifact_pool::dkg_pool::DkgPoolImpl::new(
+                MetricsRegistry::new(),
+            )));
+            let ecdsa_pool = Arc::new(RwLock::new(
+                ic_artifact_pool::ecdsa_pool::EcdsaPoolImpl::new(
+                    pool_config,
+                    no_op_logger(),
+                    MetricsRegistry::new(),
+                ),
+            ));
 
             state_manager
                 .get_mut()
                 .expect_get_state_hash_at()
-                .return_const(Ok(Some(CryptoHashOfState::from(CryptoHash(Vec::new())))));
+                .return_const(Ok(CryptoHashOfState::from(CryptoHash(Vec::new()))));
             let certified_height = Height::from(1);
             state_manager
                 .get_mut()
@@ -790,7 +903,7 @@ mod tests {
             state_manager
                 .get_mut()
                 .expect_get_state_at()
-                .return_const(Ok(ic_interfaces::state_manager::Labeled::new(
+                .return_const(Ok(ic_interfaces_state_manager::Labeled::new(
                     Height::new(0),
                     Arc::new(ic_test_utilities::state::get_initial_state(0, 0)),
                 )));
@@ -798,7 +911,7 @@ mod tests {
             let mut payload_builder = MockPayloadBuilder::new();
             payload_builder
                 .expect_get_payload()
-                .return_const(Ok(BatchPayload::default()));
+                .return_const(BatchPayload::default());
             let membership =
                 Membership::new(pool.get_cache(), registry.clone(), replica_config.subnet_id);
             let membership = Arc::new(membership);
@@ -810,10 +923,10 @@ mod tests {
                 membership.clone(),
                 crypto.clone(),
                 Arc::new(payload_builder),
-                Arc::new(RwLock::new(ic_artifact_pool::dkg_pool::DkgPoolImpl::new(
-                    MetricsRegistry::new(),
-                ))),
+                dkg_pool.clone(),
+                ecdsa_pool.clone(),
                 state_manager.clone(),
+                Duration::from_millis(0),
                 MetricsRegistry::new(),
                 no_op_logger(),
             );
@@ -821,7 +934,7 @@ mod tests {
             // Skip the first DKG interval
             pool.advance_round_normal_operation_n(dkg_interval_length);
 
-            let proposal = block_maker.on_state_change(&PoolReader::new(&pool), &ingress_pool);
+            let proposal = block_maker.on_state_change(&PoolReader::new(&pool));
             assert!(proposal.is_some());
             let mut proposal = proposal.unwrap();
             let block = proposal.content.as_mut();
@@ -843,7 +956,7 @@ mod tests {
             let mut payload_builder = MockPayloadBuilder::new();
             payload_builder
                 .expect_get_payload()
-                .return_const(Ok(BatchPayload::default()));
+                .return_const(BatchPayload::default());
 
             let block_maker = BlockMaker::new(
                 Arc::clone(&time_source) as Arc<_>,
@@ -852,19 +965,18 @@ mod tests {
                 membership,
                 crypto,
                 Arc::new(payload_builder),
-                Arc::new(RwLock::new(ic_artifact_pool::dkg_pool::DkgPoolImpl::new(
-                    MetricsRegistry::new(),
-                ))),
+                dkg_pool,
+                ecdsa_pool,
                 state_manager,
+                Duration::from_millis(0),
                 MetricsRegistry::new(),
                 no_op_logger(),
             );
 
             // Check CUP block is made.
-            let proposal = block_maker.on_state_change(&PoolReader::new(&pool), &ingress_pool);
+            let proposal = block_maker.on_state_change(&PoolReader::new(&pool));
             assert!(proposal.is_some());
             let cup_proposal = proposal.unwrap();
-            let cup_height = cup_proposal.height();
             let block = cup_proposal.content.as_ref();
             assert!(block.payload.is_summary());
             assert_eq!(block.context.registry_version, RegistryVersion::from(10));
@@ -875,7 +987,7 @@ mod tests {
             pool.notarize(&cup_proposal);
 
             // 3. Make one more block, payload builder should not have been called.
-            let proposal = block_maker.on_state_change(&PoolReader::new(&pool), &ingress_pool);
+            let proposal = block_maker.on_state_change(&PoolReader::new(&pool));
             assert!(proposal.is_some());
             let proposal = proposal.unwrap();
             let block = proposal.content.as_ref();
@@ -886,13 +998,97 @@ mod tests {
                 PoolReader::new(&pool).registry_version(proposal.height()),
                 Some(RegistryVersion::from(10))
             );
+        })
+    }
 
-            // 4. finalize and try making another block, should not be able to.
-            pool.finalize(&cup_proposal);
-            let catch_up_package = pool.make_catch_up_package(cup_height);
-            pool.insert_validated(catch_up_package);
-            let proposal = block_maker.on_state_change(&PoolReader::new(&pool), &ingress_pool);
-            assert!(proposal.is_none());
+    #[test]
+    fn test_stable_registry_version() {
+        ic_test_utilities::artifact_pool_config::with_test_pool_config(|pool_config| {
+            let dkg_interval_length = 3;
+            let node_ids = [node_test_id(0)];
+            let record = SubnetRecordBuilder::from(&node_ids)
+                .with_dkg_interval_length(dkg_interval_length)
+                .build();
+            let subnet_id = subnet_test_id(0);
+            let Dependencies {
+                registry,
+                crypto,
+                pool,
+                time_source,
+                replica_config,
+                state_manager,
+                registry_data_provider,
+                dkg_pool,
+                ecdsa_pool,
+                ..
+            } = dependencies_with_subnet_params(pool_config, subnet_id, vec![(1, record.clone())]);
+
+            let mut payload_builder = MockPayloadBuilder::new();
+            payload_builder
+                .expect_get_payload()
+                .return_const(BatchPayload::default());
+            let membership = Arc::new(Membership::new(
+                pool.get_cache(),
+                registry.clone(),
+                replica_config.subnet_id,
+            ));
+
+            let mut block_maker = BlockMaker::new(
+                Arc::clone(&time_source) as Arc<_>,
+                replica_config,
+                Arc::clone(&registry) as Arc<dyn RegistryClient>,
+                membership,
+                crypto,
+                Arc::new(payload_builder),
+                dkg_pool,
+                ecdsa_pool,
+                state_manager,
+                Duration::from_millis(0),
+                MetricsRegistry::new(),
+                no_op_logger(),
+            );
+
+            let delay = Duration::from_millis(1000);
+
+            // We add a new version every `delay` ms.
+            std::thread::sleep(delay);
+            add_subnet_record(&registry_data_provider, 2, subnet_id, record.clone());
+            registry.update_to_latest_version();
+            std::thread::sleep(delay);
+            add_subnet_record(&registry_data_provider, 3, subnet_id, record.clone());
+            registry.update_to_latest_version();
+            std::thread::sleep(delay);
+            add_subnet_record(&registry_data_provider, 4, subnet_id, record);
+            registry.update_to_latest_version();
+
+            // Make sure the latest version is the highest we added.
+            assert_eq!(registry.get_latest_version(), RegistryVersion::from(4));
+
+            // Now we just request versions at every interval of the previously added
+            // version. To avoid hitting the boundaries, we use a little offset.
+            let offset = delay / 10 * 3;
+            let mut parent = pool.get_cache().finalized_block();
+            block_maker.stable_registry_version_age = offset;
+            assert_eq!(
+                block_maker.get_stable_registry_version(&parent).unwrap(),
+                RegistryVersion::from(3)
+            );
+            block_maker.stable_registry_version_age = offset + delay;
+            assert_eq!(
+                block_maker.get_stable_registry_version(&parent).unwrap(),
+                RegistryVersion::from(2)
+            );
+            block_maker.stable_registry_version_age = offset + delay * 2;
+            assert_eq!(
+                block_maker.get_stable_registry_version(&parent).unwrap(),
+                RegistryVersion::from(1)
+            );
+            // Now let's test if parent's version is used
+            parent.context.registry_version = RegistryVersion::from(2);
+            assert_eq!(
+                block_maker.get_stable_registry_version(&parent).unwrap(),
+                RegistryVersion::from(2)
+            );
         })
     }
 }

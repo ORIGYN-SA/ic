@@ -4,18 +4,103 @@ mod test_create_dealing;
 mod test_retention;
 
 use super::*;
+use crate::key_id::KeyId;
 use crate::threshold::tests::util::test_threshold_signatures;
 use crate::types as csp_types;
+use crate::vault::test_utils::sks::secret_key_store_with_duplicated_key_id_error_on_insert;
 use crate::Csp;
+use assert_matches::assert_matches;
 use fixtures::*;
+use ic_crypto_internal_seed::Seed;
 use ic_crypto_internal_types::sign::threshold_sig::ni_dkg as internal_types;
 use ic_crypto_internal_types::sign::threshold_sig::ni_dkg::ni_dkg_groth20_bls12_381::PublicCoefficientsBytes;
-use ic_types::crypto::KeyId;
-use ic_types::Randomness;
+use ic_types_test_utils::ids::NODE_1;
 use proptest::prelude::*;
-use rand::Rng;
 use rand::SeedableRng;
+use rand::{CryptoRng, Rng};
 use rand_chacha::ChaCha20Rng;
+
+mod gen_dealing_encryption_key_pair_tests {
+    use super::*;
+    use crate::keygen::utils::dkg_dealing_encryption_pk_to_proto;
+    use crate::{CspSecretKeyStoreChecker, LocalCspVault};
+    use ic_crypto_internal_test_vectors::unhex::hex_to_32_bytes;
+    use ic_crypto_internal_threshold_sig_bls12381::api::ni_dkg_errors::{
+        CspDkgCreateFsKeyError, InternalError,
+    };
+
+    #[test]
+    fn should_correctly_generate_dealing_encryption_key_pair() {
+        let csp = Csp::builder()
+            .with_vault(LocalCspVault::builder().with_rng(rng()).build())
+            .build();
+        let (public_key, pop) = csp
+            .gen_dealing_encryption_key_pair(NODE_1)
+            .expect("error generating NI-DKG encryption dealing key pair");
+        let key_id = KeyId::from(&public_key);
+
+        assert_eq!(
+            key_id,
+            KeyId::from(hex_to_32_bytes(
+                "9887c340bb30d8436bc3d06e162bce60e0493d4e77ca8ad4d10c28016371fe90"
+            )),
+        );
+
+        assert_eq!(
+            csp.current_node_public_keys()
+                .expect("Failed to retrieve node public keys")
+                .dkg_dealing_encryption_public_key
+                .expect("missing key"),
+            dkg_dealing_encryption_pk_to_proto(public_key, pop)
+        );
+        assert!(csp.sks_contains(&key_id).is_ok());
+    }
+
+    #[test]
+    fn should_fail_with_internal_error_if_dealing_encryption_pubkey_already_set() {
+        let csp = Csp::builder().build();
+        let node_id = NODE_1;
+
+        assert!(csp.gen_dealing_encryption_key_pair(node_id).is_ok());
+        let result = csp.gen_dealing_encryption_key_pair(node_id);
+
+        assert_matches!(result,
+            Err(CspDkgCreateFsKeyError::InternalError(InternalError { internal_error }))
+            if internal_error.contains("ni-dkg dealing encryption public key already set")
+        );
+
+        assert_matches!(csp.gen_dealing_encryption_key_pair(node_id),
+            Err(CspDkgCreateFsKeyError::InternalError(InternalError { internal_error }))
+            if internal_error.contains("ni-dkg dealing encryption public key already set")
+        );
+    }
+
+    #[test]
+    fn should_fail_with_internal_error_on_duplicate_secret_key() {
+        let duplicated_key_id = KeyId::from([42; 32]);
+        let csp = Csp::builder()
+            .with_vault(
+                LocalCspVault::builder()
+                    .with_mock_stores()
+                    .with_node_secret_key_store(
+                        secret_key_store_with_duplicated_key_id_error_on_insert(duplicated_key_id),
+                    )
+                    .build(),
+            )
+            .build();
+
+        let result = csp.gen_dealing_encryption_key_pair(NODE_1);
+
+        assert_matches!(result,
+            Err(CspDkgCreateFsKeyError::DuplicateKeyId(error))
+            if error.contains("duplicate ni-dkg dealing encryption secret key id: KeyId(0x2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a)")
+        );
+    }
+
+    fn rng() -> impl CryptoRng + Rng {
+        ChaCha20Rng::seed_from_u64(42)
+    }
+}
 
 proptest! {
     #![proptest_config(ProptestConfig {
@@ -65,7 +150,7 @@ fn state_with_transcript(config: &MockDkgConfig, network: MockNetwork) -> StateW
     };
     let state = StateWithDealings::from_state_with_config(state).expect("Dealing failed");
     let state = StateWithVerifiedDealings::from_state_with_dealings(state);
-    let mut state = StateWithTranscript::from_state_with_verified_dealings(state);
+    let state = StateWithTranscript::from_state_with_verified_dealings(state);
     state.load_keys();
     state
 }
@@ -88,8 +173,8 @@ fn threshold_signatures_should_work(
         coefficients: transcript.public_coefficients.coefficients.clone(),
     };
     let public_coefficients = csp_types::CspPublicCoefficients::Bls12_381(public_coefficients);
-    let signatories: Vec<(&Csp<_, _>, KeyId)> = {
-        let key_id = key_id_from_csp_pub_coeffs(&public_coefficients);
+    let signatories: Vec<(&Csp, KeyId)> = {
+        let key_id = KeyId::from(&public_coefficients);
         config
             .receivers
             .get()
@@ -104,7 +189,7 @@ fn threshold_signatures_should_work(
             })
             .collect()
     };
-    let seed = Randomness::from(rng.gen::<[u8; 32]>());
+    let seed = Seed::from_rng(rng);
     let message = b"Tinker tailor soldier spy";
     test_threshold_signatures(&public_coefficients, &signatories[..], seed, &message[..]);
 }

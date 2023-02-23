@@ -1,19 +1,21 @@
-/// This file contains the helper functions required to setup testing framework.
-use ic_interfaces::{p2p::P2PRunner, registry::RegistryClient};
+use ic_config::transport::TransportConfig;
+use ic_interfaces_registry::RegistryClient;
 use ic_logger::*;
 use ic_metrics::MetricsRegistry;
 use ic_protobuf::registry::{
     node::{ConnectionEndpoint, NodeRecord},
     subnet::{SubnetListRecord, SubnetRecord},
 };
-use ic_registry_common::{
-    keys::{make_node_record_key, make_subnet_record_key, SUBNET_LIST_KEY},
+use ic_registry_nns_data_provider::{
+    keys::{make_node_record_key, make_subnet_list_record_key, make_subnet_record_key},
     proto_registry_data_provider::ProtoRegistryDataProvider,
 };
+/// This file contains the helper functions required to setup testing framework.
+use ic_replica_setup_networking_stack::P2PThreadJoiner;
 use ic_test_utilities::types::ids::node_test_id;
 use ic_types::{
     replica_config::ReplicaConfig,
-    transport::{TransportConfig, TransportMessageType, TransportTomlConfig},
+    transport::{TransportMessageType, TransportTomlConfig},
     NodeId, RegistryVersion, SubnetId,
 };
 
@@ -67,7 +69,7 @@ pub struct P2PTestContext {
     pub subnet_id: SubnetId,                    // Dummy test subnet ID
     pub metrics_registry: MetricsRegistry,      // monitor metrics from various ICP layers
     pub test_synchronizer: P2PTestSynchronizer, // Provide basic inter-test synchronization
-    pub p2p: Box<dyn P2PRunner>,                // p2p object to drive the ICP stack
+    pub _p2p_thread_joiner: P2PThreadJoiner,    // p2p object to drive the ICP stack
 }
 
 impl P2PTestContext {
@@ -76,14 +78,14 @@ impl P2PTestContext {
         subnet_id: SubnetId,
         metrics_registry: MetricsRegistry,
         test_synchronizer: P2PTestSynchronizer,
-        p2p: Box<dyn P2PRunner>,
+        p2p_thread_joiner: P2PThreadJoiner,
     ) -> Self {
         P2PTestContext {
             node_id,
             subnet_id,
             metrics_registry,
             test_synchronizer,
-            p2p,
+            p2p_thread_joiner,
         }
     }
 }
@@ -233,7 +235,7 @@ pub(crate) fn test_group_set_registry(
     // set subnet list
     data_provider
         .add(
-            SUBNET_LIST_KEY,
+            make_subnet_list_record_key.as_str(),
             version,
             Some(SubnetListRecord {
                 subnets: vec![subnet_id.get()],

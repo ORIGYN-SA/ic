@@ -4,15 +4,16 @@ pub mod pb;
 use crate::pb::v1::{AccountState, Gtc, TransferredNeuron};
 use dfn_candid::candid;
 use dfn_core::api::{call, now};
+use dfn_core::println;
 use ic_base_types::PrincipalId;
 use ic_nns_common::pb::v1::NeuronId;
 use ic_nns_constants::GOVERNANCE_CANISTER_ID;
 use ic_nns_governance::pb::v1::GovernanceError;
-use num_bigint::BigUint;
-use secp256k1::{PublicKey, PublicKeyFormat};
+use libsecp256k1::{PublicKey, PublicKeyFormat};
 use sha3::{Digest, Keccak256};
 use simple_asn1::ASN1Block::{BitString, ObjectIdentifier, Sequence};
-use simple_asn1::{oid, to_der, OID};
+use simple_asn1::{oid, to_der};
+use std::collections::HashSet;
 use std::time::SystemTime;
 
 pub const LOG_PREFIX: &str = "[GTC] ";
@@ -22,10 +23,10 @@ pub const LOG_PREFIX: &str = "[GTC] ";
 pub const SECONDS_UNTIL_CLAIM_NEURONS_CAN_BE_CALLED: u64 = 3 * 86400; // 3 days
 
 /// The amount of time after the genesis of the IC that any user can call
-/// `forward_all_unclaimed_accounts`. This allows the reclaiming of GTC neurons
-/// that have not been claimed, so that these neurons don't exist in an
+/// `forward_whitelisted_unclaimed_accounts`. This allows the reclaiming of GTC
+/// neurons that have not been claimed, so that these neurons don't exist in an
 /// unclaimed state indefinitely.
-pub const SECONDS_UNTIL_FORWARD_ALL_UNCLAIMED_ACCOUNTS_CAN_BE_CALLED: u64 = 180 * 86400; // 180 days
+pub const SECONDS_UNTIL_FORWARD_WHITELISTED_UNCLAIMED_ACCOUNTS_CAN_BE_CALLED: u64 = 188 * 86400; // 188 days
 
 /// Return the current UNIX timestamp (in seconds) as a `u64`
 fn now_secs() -> u64 {
@@ -93,24 +94,40 @@ impl Gtc {
         Ok(())
     }
 
-    /// Forwards the stake of all GTC neurons that have not been claimed (or
-    /// donated) to the Neuron given by
-    /// `self.forward_all_unclaimed_accounts_recipient_neuron_id`.
+    /// Forwards the stake of whitelisted GTC neurons that have not been claimed
+    /// (or donated) to the Neuron given by
+    /// `self.forward_whitelisted_unclaimed_accounts_recipient_neuron_id`.
     ///
     /// This method will be allowed to be called by anyone after
-    /// `SECONDS_UNTIL_FORWARD_ALL_UNCLAIMED_ACCOUNTS_CAN_BE_CALLED` has
+    /// `SECONDS_UNTIL_FORWARD_WHITELISTED_UNCLAIMED_ACCOUNTS_CAN_BE_CALLED` has
     /// elapsed.
-    pub async fn forward_all_unclaimed_accounts(&mut self) -> Result<(), String> {
-        self.assert_forward_all_unclaimed_accounts_can_be_called()?;
+    pub async fn forward_whitelisted_unclaimed_accounts(&mut self) -> Result<(), String> {
+        self.assert_forward_whitelisted_unclaimed_accounts_can_be_called()?;
+        let mut forward_whitelist = HashSet::new();
+
+        for gtc_address in &self.whitelisted_accounts_to_forward {
+            forward_whitelist.insert(gtc_address.to_string());
+        }
 
         let custodian_neuron_id = self
-            .forward_all_unclaimed_accounts_recipient_neuron_id
+            .forward_whitelisted_unclaimed_accounts_recipient_neuron_id
             .clone();
 
-        for (_, account) in self.accounts.iter_mut() {
-            if !account.has_claimed && !account.has_donated && !account.has_forwarded {
-                let _ = account.transfer(custodian_neuron_id.clone()).await;
-                account.has_forwarded = true;
+        for (gtc_address, account) in self.accounts.iter_mut() {
+            if !account.has_claimed
+                && !account.has_donated
+                && !account.has_forwarded
+                && forward_whitelist.contains(gtc_address)
+            {
+                match account.transfer(custodian_neuron_id.clone()).await {
+                    Ok(_) => account.has_forwarded = true,
+                    Err(error) => {
+                        println!(
+                            "Error forwarding gtc account: {}. Error: {}",
+                            gtc_address, error
+                        );
+                    }
+                }
             }
         }
 
@@ -144,9 +161,9 @@ impl Gtc {
 
     /// Return an error if `forward_all_unclaimed_accounts` can't be called,
     /// else return `Ok`
-    fn assert_forward_all_unclaimed_accounts_can_be_called(&self) -> Result<(), String> {
+    fn assert_forward_whitelisted_unclaimed_accounts_can_be_called(&self) -> Result<(), String> {
         if now_secs() - self.genesis_timestamp_seconds
-            < SECONDS_UNTIL_FORWARD_ALL_UNCLAIMED_ACCOUNTS_CAN_BE_CALLED
+            < SECONDS_UNTIL_FORWARD_WHITELISTED_UNCLAIMED_ACCOUNTS_CAN_BE_CALLED
         {
             Err("forward_all_unclaimed_accounts cannot be called yet".to_string())
         } else {
@@ -313,9 +330,9 @@ pub fn der_encode(public_key: &PublicKey) -> Vec<u8> {
 pub mod test_constants {
     use super::{decode_hex_public_key, public_key_to_gtc_address, public_key_to_principal};
     use ic_base_types::PrincipalId;
-    use ic_crypto_sha256::Sha256;
-    use secp256k1::{sign, Message};
-    use secp256k1::{PublicKey, PublicKeyFormat, SecretKey};
+    use ic_crypto_sha::Sha256;
+    use libsecp256k1::{sign, Message};
+    use libsecp256k1::{PublicKey, PublicKeyFormat, SecretKey};
     use std::str::FromStr;
 
     /// An identity used to make calls to the GTC canister in tests

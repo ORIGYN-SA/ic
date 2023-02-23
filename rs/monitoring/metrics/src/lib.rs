@@ -1,4 +1,8 @@
+mod adapter_metrics_registry;
 pub mod buckets;
+pub mod histogram_vec_timer;
+#[cfg(target_os = "linux")]
+pub mod process_collector;
 pub mod registry;
 
 pub use registry::MetricsRegistry;

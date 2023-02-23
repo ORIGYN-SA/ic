@@ -8,39 +8,48 @@ mod query;
 mod read_state;
 mod webauthn;
 
-use crate::{user_id_into_protobuf, user_id_try_from_protobuf, Funds, NumBytes, UserId};
-pub use blob::Blob;
-pub use http::{
-    Authentication, Certificate, CertificateDelegation, Delegation, HasCanisterId,
-    HttpCanisterUpdate, HttpQueryResponse, HttpQueryResponseReply, HttpReadContent, HttpReadState,
-    HttpReadStateResponse, HttpReply, HttpRequest, HttpRequestContent, HttpRequestEnvelope,
-    HttpResponseStatus, HttpStatusResponse, HttpSubmitContent, HttpUserQuery, RawHttpRequestVal,
-    ReadContent, SignedDelegation,
+pub use self::http::{
+    Authentication, Certificate, CertificateDelegation, Delegation, HasCanisterId, HttpCallContent,
+    HttpCanisterUpdate, HttpQueryContent, HttpQueryResponse, HttpQueryResponseReply, HttpReadState,
+    HttpReadStateContent, HttpReadStateResponse, HttpReply, HttpRequest, HttpRequestContent,
+    HttpRequestEnvelope, HttpRequestError, HttpStatusResponse, HttpUserQuery, RawHttpRequestVal,
+    ReplicaHealthStatus, SignedDelegation,
 };
-pub use ic_base_types::CanisterInstallMode;
-use ic_base_types::{CanisterId, CanisterIdError, PrincipalId};
+use crate::{user_id_into_protobuf, user_id_try_from_protobuf, Cycles, Funds, NumBytes, UserId};
+pub use blob::Blob;
+use ic_base_types::{CanisterId, PrincipalId};
 use ic_protobuf::proxy::{try_from_option_field, ProxyDecodeError};
 use ic_protobuf::state::canister_state_bits::v1 as pb;
 use ic_protobuf::types::v1 as pb_types;
-pub use ingress_messages::{is_subnet_message, Ingress, SignedIngress, SignedIngressContent};
+pub use ingress_messages::{
+    extract_effective_canister_id, Ingress, ParseIngressError, SignedIngress, SignedIngressContent,
+};
 pub use inter_canister::{
     CallContextId, CallbackId, Payload, RejectContext, Request, RequestOrResponse, Response,
 };
 pub use message_id::{MessageId, MessageIdError, EXPECTED_MESSAGE_ID_LENGTH};
-pub use query::UserQuery;
+pub use query::{AnonymousQuery, AnonymousQueryResponse, AnonymousQueryResponseReply, UserQuery};
 pub use read_state::ReadState;
 use serde::{Deserialize, Serialize};
-use std::{convert::TryFrom, error::Error, fmt};
+use std::convert::TryFrom;
+use std::mem::size_of;
 pub use webauthn::{WebAuthnEnvelope, WebAuthnSignature};
 
-/// This sets the upper bound on how big a single inter-canister request or
-/// response can be.  We know that allowing messages larger than around 2MB has
+/// Same as [MAX_INTER_CANISTER_PAYLOAD_IN_BYTES], but of a primitive type
+/// that can be used for computation in const context.
+pub const MAX_INTER_CANISTER_PAYLOAD_IN_BYTES_U64: u64 = 2 * 1024 * 1024; // 2 MiB
+
+/// This sets the upper bound on how large a single inter-canister request or
+/// response (as returned by `RequestOrResponse::payload_size_bytes()`) can be.
+///
+/// We know that allowing messages larger than around 2MB has
 /// various security and performance impacts on the network.  More specifically,
 /// large messages can allow dishonest block makers to always manage to get
 /// their blocks notarized; and when the consensus protocol is configured for
 /// smaller messages, a large message in the network can cause the finalization
 /// rate to drop.
-pub const MAX_INTER_CANISTER_PAYLOAD_IN_BYTES: NumBytes = NumBytes::new(2 * 1024 * 1024); // 2 MiB
+pub const MAX_INTER_CANISTER_PAYLOAD_IN_BYTES: NumBytes =
+    NumBytes::new(MAX_INTER_CANISTER_PAYLOAD_IN_BYTES_U64); // 2 MiB
 
 /// The maximum size of an inter-canister request or response that the IC can
 /// support.
@@ -51,7 +60,12 @@ pub const MAX_INTER_CANISTER_PAYLOAD_IN_BYTES: NumBytes = NumBytes::new(2 * 1024
 /// fields (e.g. sender: CanisterId), so it is not possible to statically
 /// compute an upper bound on their sizes.  Hopefully the additional space we
 /// have allocated here is sufficient.
-pub const MAX_XNET_PAYLOAD_IN_BYTES: NumBytes = NumBytes::new(2202009); // 2.1 MiB
+pub const MAX_XNET_PAYLOAD_IN_BYTES: NumBytes =
+    NumBytes::new(MAX_INTER_CANISTER_PAYLOAD_IN_BYTES_U64 * 21 / 20); // 2.1 MiB
+
+/// Maximum byte size of a valid inter-canister `Response`.
+pub const MAX_RESPONSE_COUNT_BYTES: usize =
+    size_of::<RequestOrResponse>() + MAX_INTER_CANISTER_PAYLOAD_IN_BYTES_U64 as usize;
 
 /// An end user's signature.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -68,7 +82,7 @@ pub struct UserSignature {
 
 /// Stores info needed for processing and tracking requests to
 /// stop canisters.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum StopCanisterContext {
     Ingress {
         sender: UserId,
@@ -77,10 +91,10 @@ pub enum StopCanisterContext {
     Canister {
         sender: CanisterId,
         reply_callback: CallbackId,
-        /// The funds that the request to stop the canister contained.  Stored
+        /// The cycles that the request to stop the canister contained.  Stored
         /// here so that they can be returned to the caller in the eventual
         /// reply.
-        funds: Funds,
+        cycles: Cycles,
     },
 }
 
@@ -92,10 +106,10 @@ impl StopCanisterContext {
         }
     }
 
-    pub fn take_funds(&mut self) -> Funds {
+    pub fn take_cycles(&mut self) -> Cycles {
         match self {
-            StopCanisterContext::Ingress { .. } => Funds::zero(),
-            StopCanisterContext::Canister { funds, .. } => funds.take(),
+            StopCanisterContext::Ingress { .. } => Cycles::zero(),
+            StopCanisterContext::Canister { cycles, .. } => cycles.take(),
         }
     }
 }
@@ -114,13 +128,14 @@ impl From<&StopCanisterContext> for pb::StopCanisterContext {
             StopCanisterContext::Canister {
                 sender,
                 reply_callback,
-                funds,
+                cycles,
             } => Self {
                 context: Some(pb::stop_canister_context::Context::Canister(
                     pb::stop_canister_context::Canister {
                         sender: Some(pb_types::CanisterId::from(*sender)),
                         reply_callback: reply_callback.get(),
-                        funds: Some(funds.into()),
+                        funds: Some((&Funds::new(*cycles)).into()),
+                        cycles: Some((*cycles).into()),
                     },
                 )),
             },
@@ -147,54 +162,36 @@ impl TryFrom<pb::StopCanisterContext> for StopCanisterContext {
                         sender,
                         reply_callback,
                         funds,
+                        cycles,
                     },
-                ) => StopCanisterContext::Canister {
-                    sender: try_from_option_field(sender, "StopCanisterContext::Canister::sender")?,
-                    reply_callback: CallbackId::from(reply_callback),
-                    funds: try_from_option_field(funds, "StopCanisterContext::Canister::funds")?,
-                },
+                ) => {
+                    // To maintain backwards compatibility we fall back to reading from `funds` if
+                    // `cycles` is not set.
+                    let cycles = match try_from_option_field(
+                        cycles,
+                        "StopCanisterContext::Canister::cycles",
+                    ) {
+                        Ok(cycles) => cycles,
+                        Err(_) => {
+                            let mut funds: Funds = try_from_option_field(
+                                funds,
+                                "StopCanisterContext::Canister::funds",
+                            )?;
+                            funds.take_cycles()
+                        }
+                    };
+
+                    StopCanisterContext::Canister {
+                        sender: try_from_option_field(
+                            sender,
+                            "StopCanisterContext::Canister::sender",
+                        )?,
+                        reply_callback: CallbackId::from(reply_callback),
+                        cycles,
+                    }
+                }
             };
         Ok(stop_canister_context)
-    }
-}
-
-/// Errors returned by `HttpHandler` when processing ingress messages.
-#[derive(Debug, Clone, Serialize)]
-pub enum HttpHandlerError {
-    InvalidMessageId(String),
-    InvalidIngressExpiry(String),
-    InvalidDelegationExpiry(String),
-    InvalidPrincipalId(String),
-    MissingPubkeyOrSignature(String),
-    InvalidEncoding(String),
-}
-
-impl From<serde_cbor::Error> for HttpHandlerError {
-    fn from(err: serde_cbor::Error) -> Self {
-        HttpHandlerError::InvalidEncoding(format!("{}", err))
-    }
-}
-
-impl fmt::Display for HttpHandlerError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            HttpHandlerError::InvalidMessageId(msg) => write!(f, "invalid message ID: {}", msg),
-            HttpHandlerError::InvalidIngressExpiry(msg) => write!(f, "{}", msg),
-            HttpHandlerError::InvalidDelegationExpiry(msg) => write!(f, "{}", msg),
-            HttpHandlerError::InvalidPrincipalId(msg) => write!(f, "invalid princial id: {}", msg),
-            HttpHandlerError::MissingPubkeyOrSignature(msg) => {
-                write!(f, "missing pubkey or signature: {}", msg)
-            }
-            HttpHandlerError::InvalidEncoding(err) => write!(f, "Invalid CBOR encoding: {}", err),
-        }
-    }
-}
-
-impl Error for HttpHandlerError {}
-
-impl From<CanisterIdError> for HttpHandlerError {
-    fn from(err: CanisterIdError) -> Self {
-        Self::InvalidPrincipalId(format!("Converting to canister id failed with {}", err))
     }
 }
 
@@ -262,7 +259,6 @@ mod tests {
     use super::*;
     use crate::time::current_time_and_expiry_time;
     use maplit::btreemap;
-    use proptest::prelude::*;
     use serde_cbor::Value;
     use std::{convert::TryFrom, io::Cursor};
 
@@ -277,7 +273,7 @@ mod tests {
         assert_eq!(debug_blob(vec![255, 0]), "Blob{ff00}");
         assert_eq!(debug_blob(vec![1, 2, 3]), "Blob{010203}");
         assert_eq!(debug_blob(vec![0, 1, 15, 255]), "Blob{4 bytes;00010fff}");
-        let long_vec: Vec<u8> = (0 as u8..100 as u8).collect();
+        let long_vec: Vec<u8> = (0_u8..100_u8).collect();
         let long_debug = debug_blob(long_vec);
         assert_eq!(
             long_debug.len(),
@@ -302,7 +298,7 @@ mod tests {
         assert_eq!(format_blob(vec![255, 0]), "Blob{ff00}");
         assert_eq!(format_blob(vec![1, 2, 3]), "Blob{010203}");
         assert_eq!(format_blob(vec![0, 1, 15, 255]), "Blob{4 bytes;00010fff}");
-        let long_vec: Vec<u8> = (0 as u8..100 as u8).collect();
+        let long_vec: Vec<u8> = (0_u8..100_u8).collect();
         let long_str = format_blob(long_vec);
         assert_eq!(
             long_str.len(),
@@ -340,25 +336,12 @@ mod tests {
         Value::Integer(val as i128)
     }
 
-    proptest! {
-        #[ignore]
-        #[test]
-        // The conversion from Submit to HttpRequest is not total so we proptest
-        // the hell out of it to make sure no enum constructors are added which are
-        // not handled by the conversion.
-        fn request_id_conversion_does_not_panic(
-            submit: HttpRequestEnvelope::<HttpSubmitContent>)
-        {
-            let _ = HttpRequest::try_from(submit).unwrap();
-        }
-    }
-
     #[test]
     fn decoding_submit_call() {
         let (_, expiry_time) = current_time_and_expiry_time();
         assert_cbor_de_equal(
-            &HttpRequestEnvelope::<HttpSubmitContent> {
-                content: HttpSubmitContent::Call {
+            &HttpRequestEnvelope::<HttpCallContent> {
+                content: HttpCallContent::Call {
                     update: HttpCanisterUpdate {
                         canister_id: Blob(vec![42; 8]),
                         method_name: "some_method".to_string(),
@@ -391,8 +374,8 @@ mod tests {
     fn decoding_submit_call_arg() {
         let (_, expiry_time) = current_time_and_expiry_time();
         assert_cbor_de_equal(
-            &HttpRequestEnvelope::<HttpSubmitContent> {
-                content: HttpSubmitContent::Call {
+            &HttpRequestEnvelope::<HttpCallContent> {
+                content: HttpCallContent::Call {
                     update: HttpCanisterUpdate {
                         canister_id: Blob(vec![42; 8]),
                         method_name: "some_method".to_string(),
@@ -425,8 +408,8 @@ mod tests {
     fn decoding_submit_call_with_nonce() {
         let (_, expiry_time) = current_time_and_expiry_time();
         assert_cbor_de_equal(
-            &HttpRequestEnvelope::<HttpSubmitContent> {
-                content: HttpSubmitContent::Call {
+            &HttpRequestEnvelope::<HttpCallContent> {
+                content: HttpCallContent::Call {
                     update: HttpCanisterUpdate {
                         canister_id: Blob(vec![42; 8]),
                         method_name: "some_method".to_string(),
@@ -459,8 +442,8 @@ mod tests {
     #[test]
     fn serialize_via_bincode() {
         let expiry_time = current_time_and_expiry_time().1;
-        let update = HttpRequestEnvelope::<HttpSubmitContent> {
-            content: HttpSubmitContent::Call {
+        let update = HttpRequestEnvelope::<HttpCallContent> {
+            content: HttpCallContent::Call {
                 update: HttpCanisterUpdate {
                     canister_id: Blob(vec![42; 8]),
                     method_name: "some_method".to_string(),
@@ -481,10 +464,14 @@ mod tests {
     }
 
     #[test]
+    /// Allowing bincode::deserialize_from here since
+    /// 1. It's only being used in a test
+    /// 2. The deserialized_from is used on data that has just been serialized before the method.
+    #[allow(clippy::disallowed_methods)]
     fn serialize_via_bincode_without_signature() {
         let expiry_time = current_time_and_expiry_time().1;
-        let update = HttpRequestEnvelope::<HttpSubmitContent> {
-            content: HttpSubmitContent::Call {
+        let update = HttpRequestEnvelope::<HttpCallContent> {
+            content: HttpCallContent::Call {
                 update: HttpCanisterUpdate {
                     canister_id: Blob(vec![42; 8]),
                     method_name: "some_method".to_string(),

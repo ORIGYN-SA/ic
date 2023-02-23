@@ -1,15 +1,14 @@
-use clap::{App, Arg, SubCommand};
+use clap::{arg, Arg, Command};
 use ic_artifact_pool::{
     certification_pool::CertificationPoolImpl,
     consensus_pool::{PoolSectionOps, UncachedConsensusPoolImpl},
 };
 use ic_config::artifact_pool::ArtifactPoolConfig;
-use ic_consensus_message::ConsensusMessageHashable;
 use ic_interfaces::consensus_pool::*;
 use ic_logger::{LoggerImpl, ReplicaLogger};
 use ic_metrics::MetricsRegistry;
 use ic_types::{
-    consensus::{certification::CertificationMessage, CatchUpPackage},
+    consensus::{certification::CertificationMessage, CatchUpPackage, ConsensusMessageHashable},
     time::current_time,
 };
 use prost::Message;
@@ -22,29 +21,28 @@ use std::io::Write;
 use std::path::PathBuf;
 
 fn main() {
-    let app = App::new("ic-consensus-pool-util")
+    let mut app = Command::new("ic-consensus-pool-util")
         .version("0.1")
         .about("IC Consensus Pool Unitity")
         .subcommand(
-            SubCommand::with_name("export")
-                .about("Export data to stdout")
-                .arg(
-                    Arg::with_name("artifact")
-                        .short("a")
-                        .long("artifact")
-                        .value_name("NAME")
-                        .help("Artifact name")
-                        .multiple(true)
-                        .takes_value(true),
-                ),
+            Command::new("export").about("Export data to stdout").arg(
+                Arg::new("artifact")
+                    .short('a')
+                    .long("artifact")
+                    .value_name("NAME")
+                    .help("Artifact name")
+                    .multiple_occurrences(true)
+                    .multiple_values(true)
+                    .takes_value(true),
+            ),
         )
-        .subcommand(SubCommand::with_name("import").about("Import data from stdin"))
+        .subcommand(Command::new("import").about("Import data from stdin"))
         .subcommand(
-            SubCommand::with_name("export-cup-proto")
+            Command::new("export-cup-proto")
                 .about("Export the highest CatchUpPackage protobuf (binary) data")
                 .arg(
-                    Arg::with_name("output")
-                        .short("o")
+                    Arg::new("output")
+                        .short('o')
                         .long("output")
                         .value_name("FILE")
                         .help("Output filename")
@@ -52,7 +50,7 @@ fn main() {
                         .takes_value(true),
                 ),
         )
-        .args_from_usage("<PATH>       'PATH to the consensus pool directory'");
+        .arg(arg!(<PATH>       "PATH to the consensus pool directory"));
     let mut help = Vec::new();
     app.write_help(&mut help)
         .expect("Unable to output help message");
@@ -92,10 +90,9 @@ const ALL_ARTIFACT_NAMES: [&str; 13] = [
 
 fn parse_artifact_names<'a, 'b>(names: &'a [&'b str]) -> Vec<&'static str> {
     for name in names {
-        if ALL_ARTIFACT_NAMES
+        if !ALL_ARTIFACT_NAMES
             .iter()
-            .find(|x| x.eq_ignore_ascii_case(name))
-            .is_none()
+            .any(|x| x.eq_ignore_ascii_case(name))
         {
             panic!("Unknown artifact name '{}'", name)
         }
@@ -154,52 +151,52 @@ fn export(path: &str, matches: &clap::ArgMatches) {
         match artifact {
             "RandomBeacon" => {
                 for x in consensus_pool.validated().random_beacon().get_all() {
-                    println!("{}", to_string(&x.to_message()));
+                    println!("{}", to_string(&x.into_message()));
                 }
             }
             "Finalization" => {
                 for x in consensus_pool.validated().finalization().get_all() {
-                    println!("{}", to_string(&x.to_message()));
+                    println!("{}", to_string(&x.into_message()));
                 }
             }
             "Notarization" => {
                 for x in consensus_pool.validated().notarization().get_all() {
-                    println!("{}", to_string(&x.to_message()));
+                    println!("{}", to_string(&x.into_message()));
                 }
             }
             "BlockProposal" => {
                 for x in consensus_pool.validated().block_proposal().get_all() {
-                    println!("{}", to_string(&x.to_message()));
+                    println!("{}", to_string(&x.into_message()));
                 }
             }
             "RandomBeaconShare" => {
                 for x in consensus_pool.validated().random_beacon_share().get_all() {
-                    println!("{}", to_string(&x.to_message()));
+                    println!("{}", to_string(&x.into_message()));
                 }
             }
             "NotarizationShare" => {
                 for x in consensus_pool.validated().notarization_share().get_all() {
-                    println!("{}", to_string(&x.to_message()));
+                    println!("{}", to_string(&x.into_message()));
                 }
             }
             "FinalizationShare" => {
                 for x in consensus_pool.validated().finalization_share().get_all() {
-                    println!("{}", to_string(&x.to_message()));
+                    println!("{}", to_string(&x.into_message()));
                 }
             }
             "RandomTape" => {
                 for x in consensus_pool.validated().random_tape().get_all() {
-                    println!("{}", to_string(&x.to_message()));
+                    println!("{}", to_string(&x.into_message()));
                 }
             }
             "RandomTapeShare" => {
                 for x in consensus_pool.validated().random_tape_share().get_all() {
-                    println!("{}", to_string(&x.to_message()));
+                    println!("{}", to_string(&x.into_message()));
                 }
             }
             "CatchUpPackage" => {
                 for x in consensus_pool.validated().catch_up_package().get_all() {
-                    println!("{}", to_string(&x.to_message()));
+                    println!("{}", to_string(&x.into_message()));
                 }
             }
             "CatchUpPackageShare" => {
@@ -208,7 +205,7 @@ fn export(path: &str, matches: &clap::ArgMatches) {
                     .catch_up_package_share()
                     .get_all()
                 {
-                    println!("{}", to_string(&x.to_message()));
+                    println!("{}", to_string(&x.into_message()));
                 }
             }
             "Certification" => {

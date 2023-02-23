@@ -18,13 +18,7 @@ pub struct Config {
     #[serde(default = "slot_default")]
     pub pkcs11_keycard_slot: String,
 
-    /// During registration, this file is created the first time the node is
-    /// registered with the NNS. It signals the host VM that the HSM can safely
-    /// be ejected, if necessary.
-    #[serde(default = "eject_keycard_signal_file")]
-    pub eject_keycard_signal_file: PathBuf,
-
-    /// When the node manager runs the first time, it will attempt to contact
+    /// When the orchestrator runs the first time, it will attempt to contact
     /// the NNS via those URLs to initialize the registry's local store.
     /// URLs should be provided coma-separated.
     pub nns_url: Option<String>,
@@ -33,6 +27,13 @@ pub struct Config {
     /// up the initial state of the registry's local store.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub nns_pub_key_pem: Option<PathBuf>,
+
+    /// When the orchestrator runs the first time, it checks if it is given
+    /// a pem file to register with for testing purposes.
+    pub test_key_pem: Option<PathBuf>,
+
+    /// If this Sec256k1 PEM is available, use it instead of the HSM.
+    pub node_operator_pem: Option<PathBuf>,
 }
 
 // We allow for the operator to only specify some of the fields while the others
@@ -50,10 +51,6 @@ fn slot_default() -> String {
     Config::default().pkcs11_keycard_slot
 }
 
-fn eject_keycard_signal_file() -> PathBuf {
-    Config::default().eject_keycard_signal_file
-}
-
 /// These are pre-agreed default values.
 impl Default for Config {
     fn default() -> Self {
@@ -61,9 +58,10 @@ impl Default for Config {
             pkcs11_keycard_transport_pin: "358138".to_string(),
             pkcs11_keycard_key_id: "01".to_string(),
             pkcs11_keycard_slot: "0".to_string(),
-            eject_keycard_signal_file: PathBuf::from("/var/lib/dfinity-node/eject-hsm"),
             nns_url: None,
             nns_pub_key_pem: None,
+            test_key_pem: None,
+            node_operator_pem: None,
         }
     }
 }

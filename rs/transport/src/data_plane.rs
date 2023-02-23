@@ -17,23 +17,29 @@
 //! The data plane module implements data plane functionality for
 //! [`TransportImpl`](../types/struct.TransportImpl.html).
 
-use crate::metrics::DataPlaneMetrics;
-use crate::types::{
-    SendQueueReader, TransportHeader, TransportImpl, TRANSPORT_FLAGS_IS_HEARTBEAT,
-    TRANSPORT_FLAGS_SENDER_ERROR, TRANSPORT_HEADER_SIZE,
+use crate::{
+    metrics::{DataPlaneMetrics, IntGaugeResource},
+    types::{
+        Connected, ConnectionRole, H2Reader, H2Writer, SendQueueReader, StreamReadError,
+        StreamState, TransportHeader, TransportImpl, H2_FRAME_SIZE, H2_WINDOW_SIZE,
+        TRANSPORT_FLAGS_IS_HEARTBEAT, TRANSPORT_HEADER_SIZE,
+    },
+    utils::get_peer_label,
 };
-use ic_crypto_tls_interfaces::{TlsReadHalf, TlsWriteHalf};
-use ic_interfaces::transport::AsyncTransportEventHandler;
-use ic_logger::warn;
-use ic_types::transport::{
-    FlowId, TransportErrorCode, TransportFlowInfo, TransportPayload, TransportStateChange,
+use ic_base_types::NodeId;
+use ic_crypto_tls_interfaces::TlsStream;
+use ic_interfaces_transport::{
+    TransportChannelId, TransportEvent, TransportEventHandler, TransportMessage, TransportPayload,
 };
-
-use futures::future::{AbortHandle, Abortable, Aborted};
+use ic_logger::{info, warn};
 use std::convert::TryInto;
-use std::sync::{Arc, Weak};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use std::net::SocketAddr;
+use std::sync::Weak;
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::task::JoinHandle;
 use tokio::time::{Duration, Instant};
+use tokio_util::io::StreamReader;
+use tower::{BoxError, Service};
 
 // DEQUEUE_BYTES is the number of bytes which we will attempt to dequeue and
 // aggregate before sending to the network via write_all(). Tokio currently
@@ -59,86 +65,72 @@ const TRANSPORT_HEARTBEAT_SEND_INTERVAL_MS: u64 = 200;
 /// Heartbeat wait interval (timeout on receiver side)
 const TRANSPORT_HEARTBEAT_WAIT_INTERVAL_MS: u64 = 5000;
 
-/// Error type for read errors
-#[derive(Debug)]
-enum ReadError {
-    SocketReadFailed(std::io::Error),
-    SocketReadTimeOut,
+const READ_RESULT_ERROR: &str = "error";
+const READ_RESULT_HEARTBEAT: &str = "heartbeat";
+const READ_RESULT_MESSAGE: &str = "message";
+
+/// Create header bytes to send with payload.
+fn pack_header(payload: Option<&TransportPayload>, heartbeat: bool) -> Vec<u8> {
+    let mut result = Vec::<u8>::new();
+    let mut header = TransportHeader {
+        version: 0,
+        flags: 0,
+        reserved: 0,
+        payload_length: match payload {
+            Some(data) => data.0.len() as u32,
+            None => 0,
+        },
+    };
+    if heartbeat {
+        header.flags |= TRANSPORT_FLAGS_IS_HEARTBEAT;
+    }
+    result.append(&mut header.version.to_le_bytes().to_vec());
+    result.append(&mut header.flags.to_le_bytes().to_vec());
+    result.append(&mut header.reserved.to_le_bytes().to_vec());
+    result.append(&mut header.payload_length.to_le_bytes().to_vec());
+
+    assert_eq!(result.len(), TRANSPORT_HEADER_SIZE);
+
+    result
 }
 
-/// Implementation for the transport data plane
-impl TransportImpl {
-    /// Create header bytes to send with payload.
-    fn pack_header(
-        payload: Option<&TransportPayload>,
-        sender_err: bool,
-        heartbeat: bool,
-    ) -> Vec<u8> {
-        let mut result = Vec::<u8>::new();
-        let mut header = TransportHeader {
-            version: 0,
-            flags: 0,
-            reserved: 0,
-            payload_length: match payload {
-                Some(data) => data.0.len() as u32,
-                None => 0,
-            },
-        };
-        if sender_err {
-            header.flags = TRANSPORT_FLAGS_SENDER_ERROR;
-        }
-        if heartbeat {
-            header.flags |= TRANSPORT_FLAGS_IS_HEARTBEAT;
-        }
-        result.append(&mut header.version.to_le_bytes().to_vec());
-        result.append(&mut header.flags.to_le_bytes().to_vec());
-        result.append(&mut header.reserved.to_le_bytes().to_vec());
-        result.append(&mut header.payload_length.to_le_bytes().to_vec());
+/// Read header bytes received in payload.
+fn unpack_header(data: Vec<u8>) -> TransportHeader {
+    let mut header = TransportHeader {
+        version: 0,
+        flags: 0,
+        reserved: 0,
+        payload_length: 0,
+    };
+    let (version_byte, rest) = data.split_at(std::mem::size_of::<u8>());
+    header.version = u8::from_le_bytes(version_byte.try_into().unwrap());
+    let (flags_byte, rest) = rest.split_at(std::mem::size_of::<u8>());
+    header.flags = u8::from_le_bytes(flags_byte.try_into().unwrap());
+    let (reserved_bytes, rest) = rest.split_at(std::mem::size_of::<u16>());
+    header.reserved = u16::from_le_bytes(reserved_bytes.try_into().unwrap());
+    let (payload_length_bytes, _rest) = rest.split_at(std::mem::size_of::<u32>());
+    header.payload_length = u32::from_le_bytes(payload_length_bytes.try_into().unwrap());
 
-        assert_eq!(result.len(), TRANSPORT_HEADER_SIZE);
+    header
+}
 
-        result
-    }
-
-    /// Read header bytes received in payload.
-    fn unpack_header(data: Vec<u8>) -> TransportHeader {
-        let mut header = TransportHeader {
-            version: 0,
-            flags: 0,
-            reserved: 0,
-            payload_length: 0,
-        };
-        let (version_byte, rest) = data.split_at(std::mem::size_of::<u8>());
-        header.version = u8::from_le_bytes(version_byte.try_into().unwrap());
-        let (flags_byte, rest) = rest.split_at(std::mem::size_of::<u8>());
-        header.flags = u8::from_le_bytes(flags_byte.try_into().unwrap());
-        let (reserved_bytes, rest) = rest.split_at(std::mem::size_of::<u16>());
-        header.reserved = u16::from_le_bytes(reserved_bytes.try_into().unwrap());
-        let (payload_length_bytes, _rest) = rest.split_at(std::mem::size_of::<u32>());
-        header.payload_length = u32::from_le_bytes(payload_length_bytes.try_into().unwrap());
-
-        header
-    }
-
-    /// Per-flow send task. Reads the requests from the send queue and writes to
-    /// the socket.
-    async fn flow_write_task(
-        flow_id: FlowId,
-        flow_label: String,
-        mut send_queue_reader: Box<dyn SendQueueReader + Send + Sync>,
-        mut writer: Box<TlsWriteHalf>,
-        metrics: DataPlaneMetrics,
-        state: Weak<TransportImpl>,
-    ) {
-        let _updater = MetricsUpdater::new(metrics.clone(), true);
-        let flow_tag = flow_id.flow_tag.to_string();
-        loop {
-            let loop_start_time = Instant::now();
-            // If the TransportImpl has been deleted, abort.
-            let state = match state.upgrade() {
-                Some(transport) => transport,
-                _ => return,
-            };
+/// Per-flow send task. Reads the requests from the send queue and writes to
+/// the socket.
+fn spawn_write_task<W: AsyncWrite + Unpin + Send + 'static>(
+    peer_id: NodeId,
+    channel_id: TransportChannelId,
+    mut send_queue_reader: Box<dyn SendQueueReader + Send + Sync>,
+    mut writer: W,
+    data_plane_metrics: DataPlaneMetrics,
+    weak_self: Weak<TransportImpl>,
+    rt_handle: tokio::runtime::Handle,
+) -> JoinHandle<()> {
+    let channel_id_str = channel_id.to_string();
+    rt_handle.spawn(async move  {
+        let _ = &data_plane_metrics;
+        let _raii_gauge = IntGaugeResource::new(data_plane_metrics.write_tasks.clone());
+        // If the TransportImpl has been deleted, exist the loop and exist the task.
+        while let Some(arc_self) = weak_self.upgrade() {
             // Wait for the send requests
             let dequeued = send_queue_reader
                 .dequeue(
@@ -147,354 +139,415 @@ impl TransportImpl {
                 )
                 .await;
 
-            let mut to_send = Vec::<u8>::new();
+            let mut bytes_to_send = Vec::<u8>::new();
             if dequeued.is_empty() {
                 // There is nothing to send, so issue a heartbeat message
-                to_send.append(&mut Self::pack_header(None, false, true));
-                state
+                bytes_to_send.append(&mut pack_header(None, true));
+
+                arc_self
                     .data_plane_metrics
                     .heart_beats_sent
-                    .with_label_values(&[&flow_label, &flow_tag])
+                    .with_label_values(&[&channel_id_str])
                     .inc();
             } else {
-                for mut msg in dequeued {
-                    to_send.append(&mut Self::pack_header(
-                        Some(&msg.payload),
-                        msg.sender_error,
+                for mut payload in dequeued {
+                    bytes_to_send.append(&mut pack_header(
+                        Some(&payload),
                         false,
                     ));
-                    to_send.append(&mut msg.payload.0);
+                    bytes_to_send.append(&mut payload.0);
                 }
             }
-            state
-                .data_plane_metrics
-                .write_task_overhead_time_msec
-                .with_label_values(&[&flow_label, &flow_tag])
-                .observe(loop_start_time.elapsed().as_millis() as f64);
-
             // Send the payload
             let start_time = Instant::now();
-            if let Err(e) = writer.write_all(&to_send).await {
+            let message_len = bytes_to_send.len();
+            if let Err(err) = write_one_message(&mut writer, bytes_to_send).await {
                 warn!(
-                    state.log,
-                    "DataPlane::flow_write_task(): failed to write payload: flow: {:?}, {:?}",
-                    flow_id,
-                    e,
+                    arc_self.log,
+                    "DataPlane::spawn_write_task(): failed to write payload: peer_id = {:?}, channel_id = {:?}, error ={:?}",
+                    peer_id,
+                    channel_id,
+                    err,
                 );
-                state.on_disconnect(flow_id).await;
+                arc_self.on_disconnect(peer_id, channel_id).await;
                 return;
             }
-            state
+            arc_self
                 .data_plane_metrics
-                .socket_write_time_msec
-                .with_label_values(&[&flow_label, &flow_tag])
-                .observe(start_time.elapsed().as_millis() as f64);
-            state
+                .send_message_duration
+                .with_label_values(&[&channel_id_str])
+                .observe(start_time.elapsed().as_secs_f64());
+            arc_self
                 .data_plane_metrics
-                .socket_write_bytes
-                .with_label_values(&[&flow_label, &flow_tag])
-                .inc_by(to_send.len() as i64);
-            state
-                .data_plane_metrics
-                .socket_write_size
-                .with_label_values(&[&flow_label, &flow_tag])
-                .observe(to_send.len() as f64);
+                .write_bytes_total
+                .with_label_values(&[&channel_id_str])
+                .inc_by(message_len as u64);
         }
-    }
+    })
+}
 
-    /// Per-flow receive task. Reads the messages from the socket and passes to
-    /// the client.
-    async fn flow_read_task(
-        flow_id: FlowId,
-        flow_label: String,
-        event_handler: Arc<dyn AsyncTransportEventHandler>,
-        mut reader: Box<TlsReadHalf>,
-        metrics: DataPlaneMetrics,
-        state: Weak<TransportImpl>,
-    ) {
+async fn write_one_message<W: AsyncWrite + Unpin>(
+    writer: &mut W,
+    bytes_to_send: Vec<u8>,
+) -> Result<(), std::io::Error> {
+    writer.write_all(&bytes_to_send).await?;
+    writer.flush().await
+}
+
+/// Per-flow receive task. Reads the messages from the socket and passes to
+/// the client.
+fn spawn_read_task<R: AsyncRead + Unpin + Send + 'static>(
+    peer_id: NodeId,
+    channel_id: TransportChannelId,
+    mut event_handler: TransportEventHandler,
+    mut reader: R,
+    data_plane_metrics: DataPlaneMetrics,
+    weak_self: Weak<TransportImpl>,
+    rt_handle: tokio::runtime::Handle,
+) -> JoinHandle<()> {
+    rt_handle.spawn(async move {
+        let _ = &data_plane_metrics;
+        let _raii_gauge = IntGaugeResource::new(data_plane_metrics.read_tasks.clone());
         let heartbeat_timeout = Duration::from_millis(TRANSPORT_HEARTBEAT_WAIT_INTERVAL_MS);
-        let _updater = MetricsUpdater::new(metrics.clone(), false);
-        let flow_tag = flow_id.flow_tag.to_string();
-        loop {
-            // If the TransportImpl has been deleted, abort.
-            let state = match state.upgrade() {
-                Some(transport) => transport,
-                _ => return,
-            };
-
+        let channel_id_str = channel_id.to_string();
+        // If the TransportImpl has been deleted, exist the loop and exist the task.
+        while let Some(arc_self) = weak_self.upgrade() {
             // Read the next message from the socket
-            let ret = Self::read_one_message(&mut reader, heartbeat_timeout).await;
-            if ret.is_err() {
-                warn!(
-                    state.log,
-                    "DataPlane::flow_read_task(): failed to receive message: flow: {:?}, {:?}",
-                    flow_id,
-                    ret.as_ref().err(),
-                );
+            let read_message_start = Instant::now();
+            let read_one_msg_result = read_one_message(&mut reader,heartbeat_timeout).await;
 
-                if let Err(ReadError::SocketReadTimeOut) = ret {
-                    let _ = event_handler.error(flow_id, TransportErrorCode::TimeoutExpired);
-                    metrics
-                        .socket_heart_beat_timeouts
-                        .with_label_values(&[&flow_label, &flow_tag])
+            match read_one_msg_result {
+                Err(err) => {
+                    info!(
+                        arc_self.log,
+                        "DataPlane::spawn_read_task(): failed to receive a single message: peer_id = {:?}, channel_id = {:?}, error = {:?}",
+                        peer_id,
+                        channel_id,
+                        err,
+                    );
+                    arc_self.data_plane_metrics
+                        .read_message_duration
+                        .with_label_values(&[&channel_id_str, READ_RESULT_ERROR])
+                        .observe(read_message_start.elapsed().as_secs_f64());
+
+                    arc_self.data_plane_metrics
+                        .message_read_errors_total
+                        .with_label_values(&[&channel_id_str, err.into()])
                         .inc();
+                    arc_self.on_disconnect(peer_id, channel_id).await;
+                    return;
+                },
+                Ok((header, payload)) => {
+                    if header.flags & TRANSPORT_FLAGS_IS_HEARTBEAT != 0 {
+                        // It's an empty heartbeat message -- do nothing
+                        arc_self.data_plane_metrics
+                            .heart_beats_received
+                            .with_label_values(&[&channel_id_str])
+                            .inc();
+                        arc_self.data_plane_metrics
+                            .read_message_duration
+                            .with_label_values(&[&channel_id_str, READ_RESULT_HEARTBEAT])
+                            .observe(read_message_start.elapsed().as_secs_f64());
+                        continue;
+                    }
+                    arc_self.data_plane_metrics
+                        .read_message_duration
+                        .with_label_values(&[&channel_id_str, READ_RESULT_MESSAGE])
+                        .observe(read_message_start.elapsed().as_secs_f64());
+
+                    // Pass up the received message.
+                    // Errors out for unsolicited messages, decoding errors and p2p
+                    // shutdowns.
+                    arc_self.data_plane_metrics
+                        .read_bytes_total
+                        .with_label_values(&[&channel_id_str])
+                        .inc_by(payload.0.len() as u64);
+                    let _callback_start_time = arc_self.data_plane_metrics
+                        .event_handler_message_duration
+                        .with_label_values(&[&channel_id_str]).start_timer();
+                    event_handler
+                        .call(TransportEvent::Message(TransportMessage {
+                            peer_id,
+                            payload,
+                        }))
+                        .await
+                        .expect("Can't panic on infallible");
                 }
-                state.on_disconnect(flow_id).await;
-                return;
             }
-
-            // Process the received message
-            let (header, payload) = ret.unwrap();
-            if header.flags & TRANSPORT_FLAGS_IS_HEARTBEAT != 0 {
-                // It's an empty heartbeat message -- do nothing
-                metrics
-                    .heart_beats_received
-                    .with_label_values(&[&flow_label, &flow_tag])
-                    .inc();
-                continue;
-            }
-
-            // Pass up sender indicated error
-            if header.flags & TRANSPORT_FLAGS_SENDER_ERROR != 0 {
-                event_handler
-                    .error(flow_id, TransportErrorCode::SenderErrorIndicated)
-                    .await;
-                metrics
-                    .send_errors_received
-                    .with_label_values(&[&flow_label, &flow_tag])
-                    .inc();
-            }
-
-            // Pass up the received message
-            // Errors out for unsolicited messages, decoding errors and p2p
-            // shutdowns.
-            let payload = payload.unwrap();
-            metrics
-                .socket_read_bytes
-                .with_label_values(&[&flow_label, &flow_tag])
-                .inc_by(payload.0.len() as i64);
-            let start_time = Instant::now();
-            let _ = event_handler.send_message(flow_id, payload).await;
-            metrics
-                .client_send_time_msec
-                .with_label_values(&[&flow_label, &flow_tag])
-                .observe(start_time.elapsed().as_millis() as f64);
         }
+    })
+}
+
+/// Reads and returns the next <message hdr, message payload> from the
+/// socket. The timeout is for each socket read (header, payload chunks)
+/// and not the full message.
+async fn read_one_message<T: AsyncRead + Unpin>(
+    reader: &mut T,
+    timeout: Duration,
+) -> Result<(TransportHeader, TransportPayload), StreamReadError> {
+    // Read the hdr
+    let mut header_buffer = vec![0u8; TRANSPORT_HEADER_SIZE];
+    read_into_buffer(reader, &mut header_buffer, timeout).await?;
+    let header = unpack_header(header_buffer);
+    if header.flags & TRANSPORT_FLAGS_IS_HEARTBEAT != 0 {
+        return Ok((header, TransportPayload::default()));
     }
 
-    /// Reads and returns the next <message hdr, message payload> from the
-    /// socket. The timeout is for each socket read (header, payload chunks)
-    /// and not the full message.
-    async fn read_one_message(
-        reader: &mut Box<TlsReadHalf>,
-        timeout: Duration,
-    ) -> Result<(TransportHeader, Option<TransportPayload>), ReadError> {
-        // Read the hdr
-        let mut header_buffer = vec![0u8; TRANSPORT_HEADER_SIZE];
-        Self::read_from_socket(reader, &mut header_buffer, timeout).await?;
+    // Read the payload in chunks
+    let mut payload_buffer = vec![0u8; header.payload_length as usize];
+    let mut remaining = header.payload_length as usize;
+    let mut cur_offset = 0;
+    while remaining > 0 {
+        let cur_chunk_size = std::cmp::min(remaining, SOCKET_READ_CHUNK_SIZE);
+        assert!(cur_chunk_size <= remaining);
+        read_into_buffer(
+            reader,
+            &mut payload_buffer[cur_offset..(cur_offset + cur_chunk_size)],
+            timeout,
+        )
+        .await?;
 
-        let header = Self::unpack_header(header_buffer);
-        if header.flags & TRANSPORT_FLAGS_IS_HEARTBEAT != 0 {
-            return Ok((header, None));
-        }
-
-        // Read the payload in chunks
-        let mut payload_buffer = vec![0u8; header.payload_length as usize];
-        let mut remaining = header.payload_length as usize;
-        let mut cur_offset = 0;
-        while remaining > 0 {
-            let cur_chunk_size = std::cmp::min(remaining, SOCKET_READ_CHUNK_SIZE);
-            assert!(cur_chunk_size <= remaining);
-            Self::read_from_socket(
-                reader,
-                &mut payload_buffer[cur_offset..(cur_offset + cur_chunk_size)],
-                timeout,
-            )
-            .await?;
-
-            remaining -= cur_chunk_size;
-            cur_offset += cur_chunk_size;
-        }
-
-        let payload = TransportPayload(payload_buffer);
-        Ok((header, Some(payload)))
+        remaining -= cur_chunk_size;
+        cur_offset += cur_chunk_size;
     }
 
-    /// Reads the requested bytes from the socket with a timeout
-    async fn read_from_socket(
-        reader: &mut Box<TlsReadHalf>,
-        buf: &mut [u8],
-        timeout: Duration,
-    ) -> Result<(), ReadError> {
-        let read_future = reader.read_exact(buf);
-        let ret = tokio::time::timeout(timeout, read_future).await;
-        if ret.is_err() {
-            return Err(ReadError::SocketReadTimeOut);
-        }
+    let payload = TransportPayload(payload_buffer);
+    Ok((header, payload))
+}
 
-        match ret.unwrap() {
-            Ok(_) => Ok(()),
-            Err(e) => Err(ReadError::SocketReadFailed(e)),
-        }
+/// Reads the requested bytes from the socket with a timeout
+async fn read_into_buffer<T: AsyncRead + Unpin>(
+    reader: &mut T,
+    buf: &mut [u8],
+    timeout: Duration,
+) -> Result<(), StreamReadError> {
+    let read_future = reader.read_exact(buf);
+    match tokio::time::timeout(timeout, read_future).await {
+        Err(_) => Err(StreamReadError::TimeOut),
+        Ok(Ok(_)) => Ok(()),
+        Ok(Err(e)) => Err(StreamReadError::Failed(e)),
     }
+}
 
-    /// Handle peer disconnect.
-    pub async fn on_disconnect(&self, flow_id: FlowId) {
-        if let Err(e) = self.retry_connection(&flow_id) {
-            warn!(
-                self.log,
-                "DataPlane::on_disconnect(): retry_connection error {:?}: flow: {:?}", flow_id, e
-            );
-        }
-        let event_handler = {
-            let mut cl_map = self.client_map.write().unwrap();
-            let client_state = match cl_map.get_mut(&flow_id.client_type) {
-                Some(client_state) => client_state,
-                _ => return,
-            };
-            client_state.event_handler.clone()
-        };
-        event_handler
-            .state_changed(TransportStateChange::PeerFlowDown(TransportFlowInfo {
-                peer_id: flow_id.peer_id,
-                flow_tag: flow_id.flow_tag,
-            }))
-            .await;
-    }
-
-    /// Handle connection setup. Starts flow read and write tasks.
-    fn on_connect_setup(
-        &self,
-        flow_id: FlowId,
-        reader: Box<TlsReadHalf>,
-        writer: Box<TlsWriteHalf>,
-    ) -> Result<Arc<dyn AsyncTransportEventHandler>, TransportErrorCode> {
-        let mut client_map = self.client_map.write().unwrap();
-        let client_state = match client_map.get_mut(&flow_id.client_type) {
-            Some(client_state) => client_state,
-            None => return Err(TransportErrorCode::TransportClientNotFound),
-        };
-        let event_handler = client_state.event_handler.clone();
-
-        let peer_state = match client_state.peer_map.get_mut(&flow_id.peer_id) {
-            Some(client_state) => client_state,
-            None => return Err(TransportErrorCode::TransportClientNotFound),
-        };
-        let flow_state = match peer_state.flow_map.get_mut(&flow_id.flow_tag) {
-            Some(flow_state) => flow_state,
-            None => return Err(TransportErrorCode::FlowNotFound),
-        };
-
+/// Handle connection setup. Starts flow read and write tasks.
+pub(crate) async fn create_connected_state(
+    peer_id: NodeId,
+    channel_id: TransportChannelId,
+    send_queue_reader: Box<dyn SendQueueReader + Send + Sync>,
+    role: ConnectionRole,
+    peer_addr: SocketAddr,
+    tls_stream: Box<dyn TlsStream>,
+    event_handler: TransportEventHandler,
+    data_plane_metrics: DataPlaneMetrics,
+    weak_self: Weak<TransportImpl>,
+    rt_handle: tokio::runtime::Handle,
+    use_h2: bool,
+) -> Result<Connected, Box<dyn std::error::Error + Send + Sync>> {
+    if !use_h2 {
+        let (tls_reader, tls_writer) = tokio::io::split(tls_stream);
         // Spawn write task
-        let flow_id_cl = flow_state.flow_id;
-        let flow_label_cl = flow_state.flow_label.clone();
-        let send_queue_reader = flow_state.send_queue.get_reader();
-        let metrics_cl = self.data_plane_metrics.clone();
-        let weak_self = self.weak_self.read().unwrap().clone();
-        let send_task = async move {
-            Self::flow_write_task(
-                flow_id_cl,
-                flow_label_cl,
-                send_queue_reader,
-                writer,
-                metrics_cl,
-                weak_self,
-            )
-            .await;
-        };
+        let write_task = spawn_write_task(
+            peer_id,
+            channel_id,
+            send_queue_reader,
+            tls_writer,
+            data_plane_metrics.clone(),
+            weak_self.clone(),
+            rt_handle.clone(),
+        );
+        //
+        let read_task = spawn_read_task(
+            peer_id,
+            channel_id,
+            event_handler,
+            tls_reader,
+            data_plane_metrics,
+            weak_self,
+            rt_handle,
+        );
 
-        let flow_id_cl = flow_id;
-        let flow_label_cl = flow_state.flow_label.clone();
-        let event_handler_cl = event_handler.clone();
-        let metrics_cl = self.data_plane_metrics.clone();
-        let weak_self = self.weak_self.read().unwrap().clone();
-        let receive_task = async move {
-            Self::flow_read_task(
-                flow_id_cl,
-                flow_label_cl,
-                event_handler_cl,
-                reader,
-                metrics_cl,
-                weak_self,
-            )
-            .await;
-        };
-
-        // Spawn the tasks with abort handles so tasks can be aborted if needed.
-        let (send_abort_handle, abort_registration) = AbortHandle::new_pair();
-        let log_cl = self.log.clone();
-        let flow_id_cl = flow_id;
-        self.tokio_runtime.spawn(async move {
-            if let Err(Aborted) = Abortable::new(send_task, abort_registration).await {
-                warn!(
-                    log_cl,
-                    "DataPlane:: Send task aborted: flow = {:?}", flow_id_cl
-                );
+        Ok(Connected {
+            peer_addr,
+            stream_state: StreamState {
+                read_task,
+                write_task,
+            },
+            h2_conn: None,
+            role,
+        })
+    } else {
+        // TODO figure out if we need a timeout for the two functions below
+        match role {
+            ConnectionRole::Client => {
+                create_connected_state_for_h2_client(
+                    peer_id,
+                    channel_id,
+                    send_queue_reader,
+                    peer_addr,
+                    tls_stream,
+                    event_handler,
+                    data_plane_metrics,
+                    weak_self,
+                    rt_handle,
+                )
+                .await
             }
-        });
-
-        let (receive_abort_handle, abort_registration) = AbortHandle::new_pair();
-        let log_cl = self.log.clone();
-        let flow_id_cl = flow_id;
-        self.tokio_runtime.spawn(async move {
-            if let Err(Aborted) = Abortable::new(receive_task, abort_registration).await {
-                warn!(
-                    log_cl,
-                    "DataPlane:: Receive task aborted: flow = {:?}", flow_id_cl
-                );
+            ConnectionRole::Server => {
+                create_connected_state_for_h2_server(
+                    peer_id,
+                    channel_id,
+                    send_queue_reader,
+                    peer_addr,
+                    tls_stream,
+                    event_handler,
+                    data_plane_metrics,
+                    weak_self,
+                    rt_handle,
+                )
+                .await
             }
-        });
-
-        flow_state.abort_handles = Some((send_abort_handle, receive_abort_handle));
-        Ok(event_handler)
-    }
-
-    /// Handle peer connection
-    pub(crate) async fn on_connect(
-        &self,
-        flow_id: FlowId,
-        reader: Box<TlsReadHalf>,
-        writer: Box<TlsWriteHalf>,
-    ) -> Result<(), TransportErrorCode> {
-        self.on_connect_setup(flow_id, reader, writer)?
-            // Notify the client that peer flow is up.
-            .state_changed(TransportStateChange::PeerFlowUp(TransportFlowInfo {
-                peer_id: flow_id.peer_id,
-                flow_tag: flow_id.flow_tag,
-            }))
-            .await;
-        Ok(())
-    }
-}
-
-/// Wrapper to update the metrics on destruction. This is needed as the async
-/// tasks can get cancelled, and the metrics may not be updated on exit
-struct MetricsUpdater {
-    metrics: DataPlaneMetrics,
-    write_task: bool,
-}
-
-impl MetricsUpdater {
-    fn new(metrics: DataPlaneMetrics, write_task: bool) -> Self {
-        if write_task {
-            metrics.write_tasks.inc();
-        } else {
-            metrics.read_tasks.inc();
         }
+    }
+}
 
-        Self {
-            metrics,
+pub(crate) async fn create_connected_state_for_h2_client(
+    peer_id: NodeId,
+    channel_id: TransportChannelId,
+    send_queue_reader: Box<dyn SendQueueReader + Send + Sync>,
+    peer_addr: SocketAddr,
+    tls_stream: Box<dyn TlsStream>,
+    event_handler: TransportEventHandler,
+    data_plane_metrics: DataPlaneMetrics,
+    weak_self: Weak<TransportImpl>,
+    rt_handle: tokio::runtime::Handle,
+) -> Result<Connected, BoxError> {
+    let (h2, connection) = h2::client::Builder::new()
+        .initial_window_size(H2_WINDOW_SIZE)
+        .initial_connection_window_size(H2_WINDOW_SIZE)
+        .max_frame_size(H2_FRAME_SIZE)
+        .handshake(tls_stream)
+        .await?;
+
+    let h2_conn = rt_handle.spawn(async move {
+        let _ = connection.await;
+    });
+    let mut h2 = h2.ready().await?;
+    // to support multiple channels the code below needs to be wrapped in a loop and we should have static number
+    // of channels
+    let request = http::Request::new(());
+    let (response_fut, send_stream) = h2.send_request(request, false)?;
+    let recv_stream = response_fut.await?.into_body();
+
+    let peer_label = get_peer_label(&peer_addr.ip().to_string(), &peer_id);
+    let write_task = spawn_write_task(
+        peer_id,
+        channel_id,
+        send_queue_reader,
+        H2Writer::new(
+            send_stream,
+            channel_id,
+            peer_label.clone(),
+            data_plane_metrics.clone(),
+        ),
+        data_plane_metrics.clone(),
+        weak_self.clone(),
+        rt_handle.clone(),
+    );
+
+    let read_task = spawn_read_task(
+        peer_id,
+        channel_id,
+        event_handler,
+        StreamReader::new(H2Reader::new(
+            recv_stream,
+            channel_id,
+            peer_label,
+            data_plane_metrics.clone(),
+        )),
+        data_plane_metrics,
+        weak_self,
+        rt_handle.clone(),
+    );
+
+    Ok(Connected {
+        peer_addr,
+        stream_state: StreamState {
+            read_task,
             write_task,
-        }
-    }
+        },
+        h2_conn: Some(h2_conn),
+        role: ConnectionRole::Client,
+    })
 }
 
-impl Drop for MetricsUpdater {
-    fn drop(&mut self) {
-        if self.write_task {
-            self.metrics.write_tasks.dec();
-        } else {
-            self.metrics.read_tasks.dec();
-        }
-    }
+pub(crate) async fn create_connected_state_for_h2_server(
+    peer_id: NodeId,
+    channel_id: TransportChannelId,
+    send_queue_reader: Box<dyn SendQueueReader + Send + Sync>,
+    peer_addr: SocketAddr,
+    tls_stream: Box<dyn TlsStream>,
+    event_handler: TransportEventHandler,
+    data_plane_metrics: DataPlaneMetrics,
+    weak_self: Weak<TransportImpl>,
+    rt_handle: tokio::runtime::Handle,
+) -> Result<Connected, BoxError> {
+    let mut h2 = h2::server::Builder::new()
+        .initial_window_size(H2_WINDOW_SIZE)
+        .initial_connection_window_size(H2_WINDOW_SIZE)
+        .max_frame_size(H2_FRAME_SIZE)
+        .handshake(tls_stream)
+        .await?;
+
+    // accept the first request
+    let (request, mut respond) = h2
+        .accept()
+        .await
+        .ok_or_else(|| BoxError::from("no incoming"))??;
+    let response = http::Response::new(());
+    let send_stream = respond.send_response(response, false)?;
+    let recv_stream = request.into_body();
+
+    // Once we have multiple streams we would accepts more streams.
+    let h2_conn = rt_handle.spawn(async move { while let Some(Ok(_)) = h2.accept().await {} });
+
+    let peer_label = get_peer_label(&peer_addr.ip().to_string(), &peer_id);
+    let write_task = spawn_write_task(
+        peer_id,
+        channel_id,
+        send_queue_reader,
+        H2Writer::new(
+            send_stream,
+            channel_id,
+            peer_label.clone(),
+            data_plane_metrics.clone(),
+        ),
+        data_plane_metrics.clone(),
+        weak_self.clone(),
+        rt_handle.clone(),
+    );
+
+    let read_task = spawn_read_task(
+        peer_id,
+        channel_id,
+        event_handler,
+        StreamReader::new(H2Reader::new(
+            recv_stream,
+            channel_id,
+            peer_label,
+            data_plane_metrics.clone(),
+        )),
+        data_plane_metrics,
+        weak_self,
+        rt_handle,
+    );
+
+    Ok(Connected {
+        peer_addr,
+        stream_state: StreamState {
+            read_task,
+            write_task,
+        },
+        h2_conn: Some(h2_conn),
+        role: ConnectionRole::Server,
+    })
 }

@@ -1,0 +1,55 @@
+[package]
+name = "ic-state-machine-tests"
+version = "0.8.0"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+candid = "0.8.1"
+ciborium = "0.2"
+clap = { version = "3.1.6", features = ["derive"] }
+hex = "0.4.2"
+ic-config = { path = "../config" }
+ic-constants = { path = "../constants" }
+ic-crypto = { path = "../crypto" }
+ic-crypto-internal-seed = { path= "../crypto/internal/crypto_lib/seed" }
+ic-crypto-internal-threshold-sig-bls12381 = { path= "../crypto/internal/crypto_lib/threshold_sig/bls12_381" }
+ic-crypto-internal-types = { path= "../crypto/internal/crypto_lib/types" }
+ic-crypto-tree-hash = { path= "../crypto/tree_hash" }
+ic-cycles-account-manager = { path = "../cycles_account_manager" }
+ic-error-types = { path = "../types/error_types" }
+ic-execution-environment = { path = "../execution_environment/" }
+ic-ic00-types = { path = "../types/ic00_types" }
+ic-interfaces = { path = "../interfaces" }
+ic-interfaces-registry = { path = "../interfaces/registry" }
+ic-interfaces-state-manager = { path = "../interfaces/state_manager" }
+ic-interfaces-certified-stream-store = { path = "../interfaces/certified_stream_store" }
+ic-logger = { path = "../monitoring/logger" }
+ic-messaging = { path = "../messaging" }
+ic-metrics = { path = "../monitoring/metrics" }
+ic-protobuf = { path = "../protobuf" }
+ic-registry-client-fake = { path = "../registry/fake" }
+ic-registry-client-helpers = { path = "../registry/helpers" }
+ic-registry-keys = { path = "../registry/keys" }
+ic-registry-proto-data-provider = { path = "../registry/proto_data_provider" }
+ic-registry-provisional-whitelist = { path = "../registry/provisional_whitelist" }
+ic-registry-routing-table = { path = "../registry/routing_table" }
+ic-registry-subnet-features = { path = "../registry/subnet_features" }
+ic-registry-subnet-type = { path = "../registry/subnet_type" }
+ic-replicated-state = { path = "../replicated_state" }
+ic-state-layout = { path = "../state_layout" }
+ic-state-manager = { path = "../state_manager" }
+ic-test-utilities-metrics = { path = "../test_utilities/metrics" }
+ic-test-utilities-registry = { path = "../test_utilities/registry" }
+ic-test-state-machine-client = "1"
+ic-types = { path = "../types/types" }
+serde = { version = "1.0.99", features = [ "derive" ] }
+serde_bytes = "0.11"
+serde_cbor = "0.11.1"
+slog = { version = "2.5.2", features = ["nested-values", "max_level_trace", "release_max_level_debug"] }
+slog-term = "2.6.0"
+tempfile = "3.1.0"
+tokio = { version = "1.15.0", features = ["full"] }
+wat = "1.0.52"
+maplit = "1.0.2"

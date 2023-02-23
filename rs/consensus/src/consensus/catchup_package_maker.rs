@@ -17,7 +17,9 @@ use crate::consensus::{
     utils::active_high_threshold_transcript, ConsensusCrypto,
 };
 use ic_interfaces::messaging::MessageRouting;
-use ic_interfaces::state_manager::{StateManager, StateManagerError};
+use ic_interfaces_state_manager::{
+    PermanentStateHashError::*, StateHashError, StateManager, TransientStateHashError::*,
+};
 use ic_logger::{debug, error, trace, ReplicaLogger};
 use ic_replicated_state::ReplicatedState;
 use ic_types::replica_config::ReplicaConfig;
@@ -33,7 +35,7 @@ pub struct CatchUpPackageMaker {
     log: ReplicaLogger,
 }
 
-impl<'a> CatchUpPackageMaker {
+impl CatchUpPackageMaker {
     /// Instantiate a new CatchUpPackage maker and save a copy of the config.
     pub fn new(
         replica_config: ReplicaConfig,
@@ -63,8 +65,21 @@ impl<'a> CatchUpPackageMaker {
             // if message routing expects a batch for a height smaller than the
             // height of the latest CUP, we will need to invoke state sync, as
             // the artifacts lower than the CUP height are purged
-            self.state_manager
-                .fetch_state(catch_up_height, catch_up_package.content.state_hash);
+            let cup_interval_length = catch_up_package
+                .content
+                .block
+                .into_inner()
+                .payload
+                .as_ref()
+                .as_summary()
+                .dkg
+                .interval_length;
+
+            self.state_manager.fetch_state(
+                catch_up_height,
+                catch_up_package.content.state_hash,
+                cup_interval_length,
+            );
         }
     }
 
@@ -73,7 +88,7 @@ impl<'a> CatchUpPackageMaker {
     /// does not.
     fn report_state_divergence_if_required(&self, pool: &PoolReader<'_>) {
         let catch_up_package = pool.get_highest_catch_up_package();
-        if let Ok(Some(hash)) = self
+        if let Ok(hash) = self
             .state_manager
             .get_state_hash_at(catch_up_package.height())
         {
@@ -82,7 +97,7 @@ impl<'a> CatchUpPackageMaker {
             if catch_up_package.height().get() > 0 && hash != catch_up_package.content.state_hash {
                 // This will delete the diverged states and panic.
                 self.state_manager
-                    .report_diverged_state(catch_up_package.height())
+                    .report_diverged_checkpoint(catch_up_package.height())
             }
         }
     }
@@ -96,13 +111,37 @@ impl<'a> CatchUpPackageMaker {
 
         self.report_state_divergence_if_required(pool);
 
-        let start_block = pool.get_highest_summary_block();
-        let height = start_block.height();
+        let current_cup_height = pool.get_catch_up_height();
+        let mut block = pool.get_highest_summary_block();
 
-        // Skip if we have a full CatchUpPackage already
-        if height <= pool.get_catch_up_height() {
-            return None;
+        while block.height() > current_cup_height {
+            let result = self.consider_block(pool, block.clone());
+            if result.is_some() {
+                // If we were able to generate a share, we simply return.
+                // Subsequent calls into the catch up package maker will only
+                // result in the creation of shares at earlier heights being, if
+                // the creation of this share does not result in an aggregated
+                // catch up package.
+                return result;
+            }
+
+            let next_start_height = pool
+                .get_finalized_block(block.height.decrement())?
+                .payload
+                .as_ref()
+                .dkg_interval_start_height();
+            block = pool.get_finalized_block(next_start_height)?;
         }
+        None
+    }
+
+    /// Consider the provided block for the creation of a catch up package.
+    fn consider_block(
+        &self,
+        pool: &PoolReader<'_>,
+        start_block: Block,
+    ) -> Option<CatchUpPackageShare> {
+        let height = start_block.height();
 
         // Skip if this node is not in the committee to make CUP shares
         let my_node_id = self.replica_config.node_id;
@@ -134,7 +173,7 @@ impl<'a> CatchUpPackageMaker {
         }
 
         match self.state_manager.get_state_hash_at(height) {
-            Err(StateManagerError::StateNotCommittedYet(_)) => {
+            Err(StateHashError::Transient(StateNotCommittedYet(_))) => {
                 // TODO: Setup a delay before retry
                 debug!(
                     self.log,
@@ -143,22 +182,28 @@ impl<'a> CatchUpPackageMaker {
                 );
                 None
             }
-            Err(StateManagerError::StateRemoved(_)) => {
+            Err(StateHashError::Transient(HashNotComputedYet(_))) => {
+                debug!(self.log, "Cannot make CUP at height {} because state hash is not computed yet. Will retry", height);
+                None
+            }
+            Err(StateHashError::Permanent(StateRemoved(_))) => {
                 // This should never happen as we don't want to remove the state
                 // for CUP before the hash is fetched.
                 panic!(
                     "State at height {} had disappeared before we had a chance to make a CUP. This should not happen.",
                     height,
-                )
+                );
             }
-            Ok(None) => {
-                debug!(self.log, "Cannot make CUP at height {} because state hash is not computed yet. Will retry", height);
-                None
+            Err(StateHashError::Permanent(StateNotFullyCertified(_))) => {
+                panic!(
+                    "Height {} is not a fully certified height. This should not happen.",
+                    height,
+                );
             }
-            Ok(Some(state_hash)) => {
+            Ok(state_hash) => {
                 let content = CatchUpContent::new(
-                    HashedBlock::new(ic_crypto::crypto_hash, start_block),
-                    HashedRandomBeacon::new(ic_crypto::crypto_hash, random_beacon),
+                    HashedBlock::new(ic_types::crypto::crypto_hash, start_block),
+                    HashedRandomBeacon::new(ic_types::crypto::crypto_hash, random_beacon),
                     state_hash,
                 );
                 let share_content = CatchUpShareContent::from(&content);
@@ -199,9 +244,9 @@ mod tests {
     use ic_logger::replica_logger::no_op_logger;
     use ic_test_utilities::{
         message_routing::FakeMessageRouting,
-        registry::SubnetRecordBuilder,
         types::ids::{node_test_id, subnet_test_id},
     };
+    use ic_test_utilities_registry::SubnetRecordBuilder;
     use std::sync::{Arc, RwLock};
 
     #[test]
@@ -230,7 +275,7 @@ mod tests {
             state_manager
                 .get_mut()
                 .expect_get_state_hash_at()
-                .return_const(Ok(Some(CryptoHashOfState::from(CryptoHash(Vec::new())))));
+                .return_const(Ok(CryptoHashOfState::from(CryptoHash(Vec::new()))));
 
             let message_routing = FakeMessageRouting::new();
             *message_routing.next_batch_height.write().unwrap() = Height::from(2);
@@ -254,7 +299,7 @@ mod tests {
             let mut proposal = pool.make_next_block();
             let mut block = proposal.content.as_mut();
             block.context.certified_height = block.height();
-            proposal.content = HashedBlock::new(ic_crypto::crypto_hash, block.clone());
+            proposal.content = HashedBlock::new(ic_types::crypto::crypto_hash, block.clone());
             pool.insert_validated(proposal.clone());
             pool.notarize(&proposal);
             pool.finalize(&proposal);
@@ -302,16 +347,15 @@ mod tests {
             state_manager
                 .get_mut()
                 .expect_get_state_hash_at()
-                .return_const(Ok(Some(CryptoHashOfState::from(CryptoHash(Vec::new())))));
+                .return_const(Ok(CryptoHashOfState::from(CryptoHash(Vec::new()))));
 
             let fetch_height = Arc::new(RwLock::new(Height::from(0)));
             let fetch_height_cl = fetch_height.clone();
-            state_manager
-                .get_mut()
-                .expect_fetch_state()
-                .returning(move |height, _hash| {
+            state_manager.get_mut().expect_fetch_state().returning(
+                move |height, _hash, _cup_interval_length| {
                     *fetch_height_cl.write().unwrap() = height;
-                });
+                },
+            );
 
             let message_routing = FakeMessageRouting::new();
             *message_routing.next_batch_height.write().unwrap() = Height::from(2);
@@ -378,7 +422,9 @@ mod tests {
                 .get_mut()
                 .expect_get_state_hash_at()
                 .times(1)
-                .return_const(Err(StateManagerError::StateNotCommittedYet(cup_height)));
+                .return_const(Err(StateHashError::Transient(StateNotCommittedYet(
+                    cup_height,
+                ))));
 
             // Nothing happens, because the state is not commited yet.
             assert!(cup_maker.on_state_change(&PoolReader::new(&pool)).is_none());
@@ -387,7 +433,9 @@ mod tests {
                 .get_mut()
                 .expect_get_state_hash_at()
                 .times(1)
-                .return_const(Ok(None));
+                .return_const(Err(StateHashError::Transient(HashNotComputedYet(
+                    cup_height,
+                ))));
 
             // Still nothing happens, because the state hash is not computed
             // yet.
@@ -398,11 +446,11 @@ mod tests {
             state_manager
                 .get_mut()
                 .expect_get_state_hash_at()
-                .return_const(Ok(Some(CryptoHashOfState::from(CryptoHash(vec![1, 2, 3])))));
+                .return_const(Ok(CryptoHashOfState::from(CryptoHash(vec![1, 2, 3]))));
 
             state_manager
                 .get_mut()
-                .expect_report_diverged_state()
+                .expect_report_diverged_checkpoint()
                 .times(1)
                 .return_const(());
             cup_maker.on_state_change(&PoolReader::new(&pool));

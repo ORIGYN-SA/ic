@@ -1,23 +1,36 @@
 //! Consensus utility functions
 use crate::consensus::{membership::Membership, pool_reader::PoolReader, prelude::*};
-use ic_interfaces::{
-    consensus_pool::ConsensusPoolCache, crypto::CryptoHashable, registry::RegistryClient,
-    state_manager::StateManager, time_source::TimeSource,
-};
+use ic_interfaces::consensus::{PayloadTransientError, PayloadValidationError};
+use ic_interfaces::validation::ValidationError;
+use ic_interfaces::{consensus_pool::ConsensusPoolCache, time_source::TimeSource};
+use ic_interfaces_registry::RegistryClient;
+use ic_interfaces_state_manager::StateManager;
 use ic_logger::{error, warn, ReplicaLogger};
 use ic_protobuf::registry::subnet::v1::SubnetRecord;
-use ic_registry_client::helper::subnet::{NotarizationDelaySettings, SubnetRegistry};
-use ic_registry_common::values::deserialize_registry_value;
-use ic_registry_keys::make_subnet_record_key;
-use ic_registry_subnet_type::SubnetType;
+use ic_registry_client_helpers::subnet::{NotarizationDelaySettings, SubnetRegistry};
 use ic_replicated_state::ReplicatedState;
+use ic_types::replica_config::ReplicaConfig;
 use ic_types::{
     consensus::Rank,
-    crypto::threshold_sig::ni_dkg::{NiDkgTag, NiDkgTranscript},
+    crypto::{
+        threshold_sig::ni_dkg::{NiDkgTag, NiDkgTranscript},
+        CryptoHashable,
+    },
 };
-use std::collections::BTreeMap;
-use std::convert::TryFrom;
+use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
+
+/// The acceptable gap between the finalized height and the certified height. If
+/// the actual gap is greater than this, consensus starts slowing down the block
+/// rate.
+pub const ACCEPTABLE_FINALIZATION_CERTIFICATION_GAP: u64 = 3;
+
+/// The acceptable ratio between the length of the dkg interval and the gap
+/// between a summary height and the current finalized tip that transpires
+/// without the production the cup. This means that we will start slowing down
+/// if we get approximately halfway through a dkg interval without producing the
+/// cup for the last summary block.
+pub const ACCEPTABLE_CUP_GAP_RATIO: f64 = 0.5;
 
 /// Rotate on_state_change calls with a round robin schedule to ensure fairness.
 #[derive(Default)]
@@ -48,7 +61,7 @@ impl RoundRobin {
 
 /// Convert a CryptoHashable into a 32 bytes which can be used to seed a RNG
 pub fn crypto_hashable_to_seed<T: CryptoHashable>(hashable: &T) -> [u8; 32] {
-    let hash = ic_crypto::crypto_hash(hashable);
+    let hash = ic_types::crypto::crypto_hash(hashable);
     let CryptoHash(hash_bytes) = hash.get();
     let mut seed = [0; 32]; // zero padded if digest is less than 32 bytes
     let n = hash_bytes.len().min(32);
@@ -75,19 +88,14 @@ pub fn is_root_subnet(
     subnet_id: SubnetId,
     registry_version: RegistryVersion,
 ) -> Result<bool, String> {
-    let bytes = registry_client.get_value(&make_subnet_record_key(subnet_id), registry_version);
-    let subnet_record =
-        deserialize_registry_value::<SubnetRecord>(bytes).map_err(|e| e.to_string())?;
-    match subnet_record {
-        Some(SubnetRecord { subnet_type, .. }) => {
-            let subnet_type = SubnetType::try_from(subnet_type).map_err(|err| err.to_string())?;
-            Ok(subnet_type == SubnetType::System)
-        }
-        None => Err(format!(
-            "subnet record for subnet {:?} not found at registry version {:?}",
-            subnet_id, registry_version
-        )),
-    }
+    let root_subnet_id = registry_client
+        .get_root_subnet_id(registry_version)
+        .map_err(|e| format!("Encountered error retrieving root subnet id {:?}", e))?
+        .ok_or(format!(
+            "No value for root subnet id at registry version {:?}",
+            registry_version
+        ))?;
+    Ok(root_subnet_id == subnet_id)
 }
 
 /// Return true if the time since round start is greater than the required block
@@ -119,7 +127,8 @@ pub fn is_time_to_make_block(
 /// Calculate the required delay for notary based on the rank of block to
 /// notarize, adjusted by a multiplier depending the gap between finalized and
 /// notarized heights, and adjusted by how far the certified height lags behind
-/// the finalized height.
+/// the finalized height. Use membership and height to determine the
+/// notarization settings that should be used.
 pub fn get_adjusted_notary_delay(
     membership: &Membership,
     pool: &PoolReader<'_>,
@@ -128,16 +137,34 @@ pub fn get_adjusted_notary_delay(
     height: Height,
     rank: Rank,
 ) -> Option<Duration> {
+    Some(get_adjusted_notary_delay_from_settings(
+        get_notarization_delay_settings(
+            log,
+            &*membership.registry_client,
+            membership.subnet_id,
+            pool.registry_version(height)?,
+        )?,
+        pool,
+        state_manager,
+        rank,
+    ))
+}
+
+/// Calculate the required delay for notary based on the rank of block to
+/// notarize, adjusted by a multiplier depending the gap between finalized and
+/// notarized heights, and adjusted by how far the certified height lags behind
+/// the finalized height.
+pub fn get_adjusted_notary_delay_from_settings(
+    settings: NotarizationDelaySettings,
+    pool: &PoolReader<'_>,
+    state_manager: &dyn StateManager<State = ReplicatedState>,
+    rank: Rank,
+) -> Duration {
     let NotarizationDelaySettings {
         unit_delay,
         initial_notary_delay,
         ..
-    } = get_notarization_delay_settings(
-        log,
-        &*membership.registry_client,
-        membership.subnet_id,
-        pool.registry_version(height)?,
-    )?;
+    } = settings;
     // We adjust regular delay based on the gap between finalization and
     // notarization to make it exponentially longer to keep the gap from growing too
     // big. This is because increasing delay leads to higher chance of notarizing
@@ -151,14 +178,39 @@ pub fn get_adjusted_notary_delay(
         (initial_delay + ranked_delay * 1.5_f32.powi(finality_gap)) as u64;
 
     // We adjust the delay based on the gap between the finalized height and the
-    // certified height: when the certified height is more than 3 rounds behind the
+    // certified height: when the certified height is more than
+    // ACCEPTABLE_FINALIZATION_CERTIFICATION_GAP rounds behind the
     // finalized height, we increase the delay. More precisely, for every additional
     // round that certified height is behind finalized height, we add `unit_delay`.
-    let certified_gap =
-        finalized_height.saturating_sub(state_manager.latest_certified_height().get() + 3);
+    let certified_gap = finalized_height.saturating_sub(
+        state_manager.latest_certified_height().get() + ACCEPTABLE_FINALIZATION_CERTIFICATION_GAP,
+    );
 
-    let adjusted_delay = finality_adjusted_delay + unit_delay.as_millis() as u64 * certified_gap;
-    Some(Duration::from_millis(adjusted_delay))
+    let certified_adjusted_delay =
+        finality_adjusted_delay + unit_delay.as_millis() as u64 * certified_gap;
+
+    let cup_gap = finalized_height.saturating_sub(pool.get_catch_up_height().get());
+    let last_cup_dkg_info = pool
+        .get_highest_catch_up_package()
+        .content
+        .block
+        .as_ref()
+        .payload
+        .as_ref()
+        .as_summary()
+        .dkg
+        .clone();
+
+    let last_interval_length = last_cup_dkg_info.interval_length;
+    let missing_cup_interval_length = last_cup_dkg_info.next_interval_length;
+
+    let acceptable_gap_size = last_interval_length.get()
+        + (ACCEPTABLE_CUP_GAP_RATIO * missing_cup_interval_length.get() as f64).round() as u64;
+
+    let cup_multiple = cup_gap.saturating_sub(acceptable_gap_size);
+
+    let adjusted_delay = certified_adjusted_delay + unit_delay.as_millis() as u64 * cup_multiple;
+    Duration::from_millis(adjusted_delay)
 }
 
 /// Return the validated block proposals with the lowest rank at height `h`, if
@@ -233,10 +285,11 @@ pub fn get_notarization_delay_settings(
 ///
 /// * `artifact_shares` - A vector of artifact shares, e.g.
 ///   `Vec<&RandomBeaconShare>`
+#[allow(clippy::type_complexity)]
 pub fn aggregate<
     Message: Eq + Ord + Clone + std::fmt::Debug + HasHeight + HasCommittee,
     CryptoMessage,
-    Signature,
+    Signature: Ord,
     KeySelector: Copy,
     CommitteeSignature,
     Shares: Iterator<Item = Signed<Message, Signature>>,
@@ -251,7 +304,7 @@ pub fn aggregate<
         .into_iter()
         .filter_map(|(content_ref, shares)| {
             let selector = selector(&content_ref).or_else(|| {
-                error!(
+                warn!(
                     log,
                     "aggregate: cannot find selector for content {:?}", content_ref
                 );
@@ -283,15 +336,18 @@ pub fn aggregate<
 
 // Return a mapping from the unique content contained in `shares` to the
 // shares that contain this content
-fn group_shares<C: Eq + Ord, S, Shares: Iterator<Item = Signed<C, S>>>(
+pub(crate) fn group_shares<C: Eq + Ord, S: Ord, Shares: Iterator<Item = Signed<C, S>>>(
     shares: Shares,
-) -> BTreeMap<C, Vec<S>> {
+) -> BTreeMap<C, BTreeSet<S>> {
     shares.fold(BTreeMap::new(), |mut grouped_shares, share| {
         match grouped_shares.get_mut(&share.content) {
-            Some(existing) => existing.push(share.signature),
+            Some(existing) => {
+                existing.insert(share.signature);
+            }
             None => {
-                let new_vec = vec![share.signature];
-                grouped_shares.insert(share.content, new_vec);
+                let mut new_set = BTreeSet::new();
+                new_set.insert(share.signature);
+                grouped_shares.insert(share.content, new_set);
             }
         };
         grouped_shares
@@ -300,7 +356,7 @@ fn group_shares<C: Eq + Ord, S, Shares: Iterator<Item = Signed<C, S>>>(
 
 /// Return the hash of a block as a string.
 pub fn get_block_hash_string(block: &Block) -> String {
-    hex::encode(ic_crypto::crypto_hash(block).get().0)
+    hex::encode(ic_types::crypto::crypto_hash(block).get().0)
 }
 
 /// Helper function to lookup replica version, and log errors if any.
@@ -330,6 +386,50 @@ pub fn lookup_replica_version(
             None
         }
     }
+}
+
+/// Determine whether a replica upgrade is pending given the running replica
+/// version and the block height.
+pub fn is_upgrade_pending(
+    height: Height,
+    registry_client: &dyn RegistryClient,
+    replica_config: &ReplicaConfig,
+    log: &ReplicaLogger,
+    pool: &PoolReader<'_>,
+) -> Option<bool> {
+    let registry_version = pool.registry_version(height)?;
+    let replica_version = lookup_replica_version(
+        registry_client,
+        replica_config.subnet_id,
+        log,
+        registry_version,
+    )?;
+
+    Some(replica_version != ReplicaVersion::default())
+}
+
+/// Determine whether a replica upgrade is finalized, meaning the blockchain
+/// advanced enough such that we can wait for a CUP and the upgrade will
+/// execute. Note that it is important that we wait until the finalized
+/// certified_height exceeds the CUP height since this is the condition for CUP
+/// making.
+pub fn is_upgrade_finalized(
+    registry_client: &dyn RegistryClient,
+    replica_config: &ReplicaConfig,
+    log: &ReplicaLogger,
+    pool: &PoolReader<'_>,
+) -> Option<bool> {
+    let finalized_tip = pool.get_finalized_tip();
+    let finalized_certified_height = finalized_tip.context.certified_height;
+    let registry_version = pool.registry_version(finalized_certified_height)?;
+    let replica_version = lookup_replica_version(
+        registry_client,
+        replica_config.subnet_id,
+        log,
+        registry_version,
+    )?;
+
+    Some(replica_version != ReplicaVersion::default())
 }
 
 // Data we usually pull from the latest relevant DKG summary block.
@@ -393,7 +493,7 @@ fn get_active_data_at(reader: &dyn ConsensusPoolCache, height: Height) -> Option
 /// Return the active DKGData active at the given height using the given summary
 /// block.
 fn get_active_data_at_given_summary(summary_block: &Block, height: Height) -> Option<DkgData> {
-    let dkg_summary = summary_block.payload.as_ref().as_summary();
+    let dkg_summary = &summary_block.payload.as_ref().as_summary().dkg;
     if dkg_summary.current_interval_includes(height) {
         Some(DkgData {
             registry_version: dkg_summary.registry_version,
@@ -421,6 +521,31 @@ fn get_active_data_at_given_summary(summary_block: &Block, height: Height) -> Op
     }
 }
 
+/// Get the [`SubnetRecord`] of this subnet with the
+/// specified [`RegistryVersion`]
+pub(crate) fn get_subnet_record(
+    registry_client: &dyn RegistryClient,
+    subnet_id: SubnetId,
+    registry_version: RegistryVersion,
+    logger: &ReplicaLogger,
+) -> Result<SubnetRecord, PayloadValidationError> {
+    match registry_client.get_subnet_record(subnet_id, registry_version) {
+        Ok(Some(record)) => Ok(record),
+        Ok(None) => {
+            warn!(logger, "Subnet id {:?} not found in registry", subnet_id);
+            Err(ValidationError::Transient(
+                PayloadTransientError::SubnetNotFound(subnet_id),
+            ))
+        }
+        Err(err) => {
+            warn!(logger, "Failed to get subnet record in block_maker");
+            Err(ValidationError::Transient(
+                PayloadTransientError::RegistryUnavailable(err),
+            ))
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -430,22 +555,91 @@ mod tests {
     /// that a different share is grouped by itself
     #[test]
     fn test_group_shares() {
-        let share1 = fake_share(1);
-        let share2 = fake_share(1);
-        let share3 = fake_share(2);
+        let share1 = fake_share(1, vec![1]);
+        let share2 = fake_share(1, vec![2]);
+        let share3 = fake_share(2, vec![1]);
 
         let grouped_shares = group_shares(Box::new(vec![share1, share2, share3].into_iter()));
         assert_eq!(grouped_shares.get(&1).unwrap().len(), 2);
         assert_eq!(grouped_shares.get(&2).unwrap().len(), 1);
     }
 
-    fn fake_share<C: Eq + Ord + Clone>(content: C) -> Signed<C, ThresholdSignatureShare<C>> {
+    fn fake_share<C: Eq + Ord + Clone>(
+        content: C,
+        sig: Vec<u8>,
+    ) -> Signed<C, ThresholdSignatureShare<C>> {
         let signer = node_test_id(0);
         let signature = ThresholdSignatureShare {
-            signature: ThresholdSigShareOf::new(ThresholdSigShare(vec![])),
+            signature: ThresholdSigShareOf::new(ThresholdSigShare(sig)),
             signer,
         };
         Signed { content, signature }
+    }
+
+    #[test]
+    fn test_get_adjusted_notary_delay_cup_delay() {
+        ic_test_utilities::artifact_pool_config::with_test_pool_config(|pool_config| {
+            let settings = NotarizationDelaySettings {
+                unit_delay: Duration::from_secs(1),
+                initial_notary_delay: Duration::from_secs(0),
+            };
+            let crate::consensus::mocks::Dependencies {
+                mut pool,
+                state_manager,
+                ..
+            } = crate::consensus::mocks::dependencies(pool_config, 3);
+            let last_cup_dkg_info = PoolReader::new(&pool)
+                .get_highest_catch_up_package()
+                .content
+                .block
+                .as_ref()
+                .payload
+                .as_ref()
+                .as_summary()
+                .dkg
+                .clone();
+
+            for _ in 0..last_cup_dkg_info.interval_length.get() {
+                pool.advance_round_normal_operation_no_cup();
+            }
+
+            for _ in 0..(last_cup_dkg_info.next_interval_length.get() / 2 + 1) {
+                pool.advance_round_normal_operation_no_cup();
+            }
+
+            state_manager
+                .get_mut()
+                .expect_latest_certified_height()
+                .return_const(PoolReader::new(&pool).get_finalized_height());
+
+            assert_eq!(
+                get_adjusted_notary_delay_from_settings(
+                    settings.clone(),
+                    &PoolReader::new(&pool),
+                    state_manager.as_ref(),
+                    Rank(0),
+                ),
+                Duration::from_secs(0)
+            );
+
+            state_manager.get_mut().checkpoint();
+            state_manager
+                .get_mut()
+                .expect_latest_certified_height()
+                .return_const(PoolReader::new(&pool).get_finalized_height());
+
+            pool.advance_round_normal_operation_no_cup();
+
+            assert_eq!(
+                get_adjusted_notary_delay_from_settings(
+                    settings,
+                    &PoolReader::new(&pool),
+                    state_manager.as_ref(),
+                    Rank(0),
+                ),
+                Duration::from_secs(1)
+            );
+        });
     }
 
     #[test]
@@ -465,7 +659,7 @@ mod tests {
 
         // check if empty returns are skipped
         let round_robin = RoundRobin::default();
-        let make_empty = || vec![];
+        let make_empty = Vec::new;
         let calls: [&'_ dyn Fn() -> Vec<u8>; 6] = [
             &make_empty,
             &make_1,

@@ -1,7 +1,6 @@
-use ic_crypto_sha256::Sha256;
-use ic_interfaces::crypto::Signable;
+use ic_crypto_sha::Sha256;
 use ic_test_utilities::types::ids::canister_test_id;
-use ic_types::{messages::Delegation, time::UNIX_EPOCH};
+use ic_types::{crypto::Signable, messages::Delegation, time::UNIX_EPOCH};
 
 // NOTE: Ideally, this test should be in the types crate where `Delegation` is
 // defined, but the test is here to avoid circular dependencies between the
@@ -22,9 +21,7 @@ fn delegation_signed_bytes() {
     expiration_hash.extend_from_slice(&Sha256::hash(b"expiration"));
     expiration_hash.extend_from_slice(&Sha256::hash(&[0]));
 
-    let mut hashes: Vec<Vec<u8>> = Vec::new();
-    hashes.push(pubkey_hash);
-    hashes.push(expiration_hash);
+    let mut hashes: Vec<Vec<u8>> = vec![pubkey_hash, expiration_hash];
     hashes.sort();
 
     let mut hasher = Sha256::new();
@@ -60,10 +57,7 @@ fn delegation_with_targets_signed_bytes() {
         canister_test_id(1).get().as_slice(),
     )));
 
-    let mut hashes: Vec<Vec<u8>> = Vec::new();
-    hashes.push(pubkey_hash);
-    hashes.push(expiration_hash);
-    hashes.push(targets_hash);
+    let mut hashes: Vec<Vec<u8>> = vec![pubkey_hash, expiration_hash, targets_hash];
     hashes.sort();
 
     let mut hasher = Sha256::new();

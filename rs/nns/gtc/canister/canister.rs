@@ -12,6 +12,7 @@ use ic_nns_gtc::{
     pb::v1::{AccountState, Gtc},
     LOG_PREFIX,
 };
+use ic_nns_gtc_accounts::FORWARD_WHITELIST;
 
 #[cfg(target_arch = "wasm32")]
 use dfn_core::println;
@@ -72,15 +73,27 @@ fn canister_post_upgrade() {
     println!("{}Executing post upgrade", LOG_PREFIX);
 
     let serialized = stable::get();
-    match gtc_mut().merge(&serialized[..]) {
-        Err(err) => panic!(
+    let gtc = gtc_mut();
+    if let Err(err) = gtc.merge(&serialized[..]) {
+        panic!(
             "Error deserializing canister state post-upgrade. \
              CANISTER MIGHT HAVE BROKEN STATE!!!!. Error: {:?}",
             err
-        ),
-        Ok(()) => (),
+        )
+    }
+
+    // If the set of whitelisted accounts is empty (like it would
+    // normally be in production) add the accounts in the
+    // FORWARD_WHITELIST array.
+    if gtc.whitelisted_accounts_to_forward.is_empty() {
+        for gtc_address in FORWARD_WHITELIST {
+            gtc.whitelisted_accounts_to_forward
+                .push(gtc_address.to_string());
+        }
     }
 }
+
+ic_nervous_system_common_build_metadata::define_get_build_metadata_candid_method! {}
 
 /// Returns the sum of all token balances in the internal ledger
 #[export_name = "canister_query total"]
@@ -156,19 +169,19 @@ async fn donate_account_(hex_pubkey: String) -> Result<(), String> {
     gtc_mut().donate_account(&caller(), hex_pubkey).await
 }
 
-/// Transfer the funds of all unclaimed accounts to the Neuron given by the
-/// GTC's `forward_all_unclaimed_accounts_recipient_neuron_id`.
+/// Transfer the funds of whitelisted unclaimed accounts to the Neuron given by
+/// the GTC's `forward_whitelisted_unclaimed_accounts_recipient_neuron_id`.
 ///
 /// This method may be called by anyone 6 months after the IC Genesis.
-#[export_name = "canister_update forward_all_unclaimed_accounts"]
-fn forward_all_unclaimed_accounts() {
-    println!("{}forward_all_unclaimed_accounts", LOG_PREFIX);
-    over_async(candid_one, forward_all_unclaimed_accounts_)
+#[export_name = "canister_update forward_whitelisted_unclaimed_accounts"]
+fn forward_whitelisted_unclaimed_accounts() {
+    println!("{}forward_whitelisted_unclaimed_accounts", LOG_PREFIX);
+    over_async(candid_one, forward_whitelisted_unclaimed_accounts_)
 }
 
-#[candid_method(update, rename = "forward_all_unclaimed_accounts")]
-async fn forward_all_unclaimed_accounts_(_: ()) -> Result<(), String> {
-    gtc_mut().forward_all_unclaimed_accounts().await
+#[candid_method(update, rename = "forward_whitelisted_unclaimed_accounts")]
+async fn forward_whitelisted_unclaimed_accounts_(_: ()) -> Result<(), String> {
+    gtc_mut().forward_whitelisted_unclaimed_accounts().await
 }
 
 // When run on native this prints the candid service definition of this
@@ -192,16 +205,21 @@ fn main() {}
 
 #[test]
 fn check_gtc_candid_file() {
-    let gtc_did = String::from_utf8(std::fs::read("canister/gtc.did").unwrap()).unwrap();
+    let did_path = std::path::PathBuf::from(
+        std::env::var_os("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR env var undefined"),
+    )
+    .join("canister/gtc.did");
+    let did_contents = String::from_utf8(std::fs::read(did_path).unwrap()).unwrap();
 
     // See comments in main above
     candid::export_service!();
     let expected = __export_service();
 
-    if gtc_did != expected {
+    if did_contents != expected {
         panic!(
             "Generated candid definition does not match canister/gtc.did. \
-            Run `cargo run --bin genesis-token-canister > canister/gtc.did` in \
+            Run `bazel run :generate_did > canister/gtc.did` (no nix and/or direnv) or \
+            `cargo run --bin genesis-token-canister > canister/gtc.did` in \
             rs/nns/gtc to update canister/gtc.did."
         )
     }

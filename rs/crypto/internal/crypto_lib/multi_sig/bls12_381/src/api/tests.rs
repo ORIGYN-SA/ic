@@ -7,8 +7,8 @@ use crate::types::{
 use ic_crypto_internal_test_vectors::unhex::{hex_to_32_bytes, hex_to_96_bytes};
 use ic_types::crypto::CryptoResult;
 use proptest::prelude::*;
+use rand::SeedableRng;
 use rand_chacha::ChaCha20Rng;
-use rand_core::SeedableRng;
 
 /// This test checks that the functionality is consistent; the values are
 /// not "correct" but they must never change.
@@ -20,12 +20,12 @@ fn bls12_key_generation_is_stable() {
     assert_eq!(
         secret_key,
         SecretKeyBytes(hex_to_32_bytes(
-            "54ee2937b4dfc1905ccaf277a60b5e53c7ea791f6b9bdadd7e84e7f458d4d0a4"
+            "55f292a9a75dc429aa86f5fb84756558c5210a2de4a8d4d3b4207beb0d419072"
         ))
     );
     assert_eq!(
         public_key,
-        PublicKeyBytes(hex_to_96_bytes("986b177ef16c61c633e13769c42b079791cfa9702decd36eeb347be21bd98e8d1c4d9f2a1f16f2e09b995ae7ff856a830d382d0081c6ae253a7d2abf97de945f70a42e677ca30b129bcd08c91f78f8573fe2463a86afacf870e9fe4960f5c55f"))
+        PublicKeyBytes(hex_to_96_bytes("b5077d187db1ff824d246bc7c311f909047e20375dc836087da1d7e5c3add0e8fc838af6aaa7373b41824c9bd080f47c0a50e3cdf06bf1cb4061a6cc6ab1802acce096906cece92e7487a29e89a187b618e6af1292515202640795f3359161c2"))
 
         );
 }
@@ -40,14 +40,13 @@ fn test_happy_path(
 ) {
     let pops: CryptoResult<Vec<PopBytes>> = keys
         .iter()
-        .map(|(secret_key, public_key)| multi_sig::create_pop(*public_key, *secret_key))
+        .map(|(secret_key, public_key)| multi_sig::create_pop(*public_key, secret_key.clone()))
         .collect();
-    let signatures: CryptoResult<Vec<IndividualSignatureBytes>> = keys
+    let signatures: Vec<IndividualSignatureBytes> = keys
         .iter()
-        .map(|(secret_key, _)| multi_sig::sign(message, *secret_key))
+        .map(|(secret_key, _)| multi_sig::sign(message, secret_key.clone()))
         .collect();
     let pops = pops.expect("PoP generation failed");
-    let signatures = signatures.expect("Signature generation failed");
     let signature = multi_sig::combine(&signatures);
     let signature = signature.expect("Signature combination failed");
     let public_keys: Vec<PublicKeyBytes> = keys
@@ -58,15 +57,13 @@ fn test_happy_path(
     let pop_verification: CryptoResult<()> = public_keys
         .iter()
         .zip(pops)
-        .map(|(public_key, pop)| multi_sig::verify_pop(pop, *public_key))
-        .collect();
+        .try_for_each(|(public_key, pop)| multi_sig::verify_pop(pop, *public_key));
     let individual_verification: CryptoResult<()> = public_keys
         .iter()
         .zip(signatures.clone())
-        .map(|(public_key, signature)| {
+        .try_for_each(|(public_key, signature)| {
             multi_sig::verify_individual(message, signature, *public_key)
-        })
-        .collect();
+        });
     assert!(pop_verification.is_ok(), "PoP verification failed");
     assert!(
         individual_verification.is_ok(),
@@ -101,7 +98,7 @@ proptest! {
       evil_signature in arbitrary::individual_signature_bytes()
     ) {
         let (secret_key, public_key) = keys;
-        let signature = multi_sig::sign(&message, secret_key).expect("Failed to sign");
+        let signature = multi_sig::sign(&message, secret_key);
         prop_assume!(evil_signature != signature);
         assert!(multi_sig::verify_individual(&message, evil_signature, public_key).is_err())
     }

@@ -6,7 +6,7 @@
 // In order to store these parent/child/sibling/cousin relationships under
 // the same struct it's necessary to use unsafe operation as the borrow checker
 // won't allow it.
-use crate::lmdb_pool::HeightKey;
+use crate::lmdb_pool::{HeightKey, IdKey};
 use ic_logger::{error, ReplicaLogger};
 use lmdb::{Cursor, Database, Environment, Iter, RoCursor, RoTransaction, Transaction};
 use std::sync::Arc;
@@ -90,5 +90,61 @@ impl<'a, T, F: Fn(&RoTransaction<'_>, &[u8]) -> lmdb::Result<T>> Iterator for LM
                 .map_err(|err| error!(self.log, "deserialization error: {:?}", err))
                 .ok()
         }
+    }
+}
+
+/// A standalone iterator for the Ecdsa LMDB pool. This is similar to LMDBIterator
+/// for the most part, except that the ECDSA pool does not have a notion of key
+/// ordering or min/max values of the keys. So this is just a plain iterator
+/// that starts from the beginning of the DB and goes till the end.
+pub(crate) struct LMDBEcdsaIterator<'a, F> {
+    log: ReplicaLogger,
+    deserialize: F,
+    iter: Option<Iter<'a>>,
+    _cursor: RoCursor<'a>,
+    _tx: RoTransaction<'a>,
+    _db_env: Arc<Environment>,
+}
+
+impl<'a, F> LMDBEcdsaIterator<'a, F> {
+    pub fn new(
+        db_env: Arc<Environment>,
+        db: Database,
+        deserialize: F,
+        start_pos: Option<IdKey>,
+        log: ReplicaLogger,
+    ) -> Self {
+        let tx: RoTransaction<'_> = unsafe { std::mem::transmute(db_env.begin_ro_txn().unwrap()) };
+        let mut cursor: RoCursor<'_> =
+            unsafe { std::mem::transmute(tx.open_ro_cursor(db).unwrap()) };
+        let iter: Iter<'_> = match start_pos {
+            Some(id_key) => unsafe { std::mem::transmute(cursor.iter_from(id_key)) },
+            None => unsafe { std::mem::transmute(cursor.iter_start()) },
+        };
+        Self {
+            log,
+            _db_env: db_env,
+            _cursor: cursor,
+            _tx: tx,
+            iter: Some(iter),
+            deserialize,
+        }
+    }
+}
+
+impl<'a, K, T, F: Fn(&[u8], &[u8]) -> Option<(K, T)>> Iterator for LMDBEcdsaIterator<'a, F> {
+    type Item = (K, T);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let mut iter = self.iter.take()?;
+        let (key, bytes) = iter
+            .next()
+            .transpose()
+            .map_err(|err| error!(self.log, "iterator error {:?}", err))
+            .ok()
+            .flatten()?;
+
+        self.iter = Some(iter);
+        (self.deserialize)(key, bytes)
     }
 }

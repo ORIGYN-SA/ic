@@ -21,6 +21,7 @@ pub mod id;
 pub mod transcripts_to_retain;
 
 use ic_crypto_internal_types::sign::threshold_sig::public_coefficients::CspPublicCoefficients;
+use ic_protobuf::registry::subnet::v1::InitialNiDkgTranscriptRecord;
 pub use id::NiDkgId;
 
 #[cfg(test)]
@@ -238,6 +239,7 @@ impl NiDkgTranscript {
         committee: Vec<NodeId>,
         dkg_tag: NiDkgTag,
         threshold: u32,
+        registry_version: u64,
     ) -> Self {
         Self {
             dkg_id: NiDkgId {
@@ -250,7 +252,7 @@ impl NiDkgTranscript {
                 .expect("Couldn't create a non-interactive DKG threshold."),
             committee: NiDkgReceivers::new(committee.into_iter().collect())
                 .expect("Couldn't create non-interactive DKG committee"),
-            registry_version: RegistryVersion::from(0),
+            registry_version: RegistryVersion::from(registry_version),
             internal_csp_transcript: CspNiDkgTranscript::placeholder_to_delete(),
         }
     }
@@ -259,6 +261,7 @@ impl NiDkgTranscript {
             vec![NodeId::from(PrincipalId::new_node_test_id(0))],
             NiDkgTag::LowThreshold,
             1,
+            0,
         )
     }
 }
@@ -267,5 +270,26 @@ impl NiDkgTranscript {
     /// Computes the threshold-committee public key from the transcript.
     pub fn public_key(&self) -> ThresholdSigPublicKey {
         ThresholdSigPublicKey::from(self)
+    }
+}
+
+/// Converts an NI-DKG transcript into the corresponding protobuf
+/// representation.
+impl From<NiDkgTranscript> for InitialNiDkgTranscriptRecord {
+    fn from(transcript: NiDkgTranscript) -> Self {
+        let dkg_id = NiDkgIdProto::from(transcript.dkg_id);
+        InitialNiDkgTranscriptRecord {
+            id: Some(dkg_id),
+            threshold: transcript.threshold.get().get(),
+            committee: transcript
+                .committee
+                .get()
+                .iter()
+                .map(|node| node.get().into_vec())
+                .collect(),
+            registry_version: transcript.registry_version.get(),
+            internal_csp_transcript: serde_cbor::to_vec(&transcript.internal_csp_transcript)
+                .expect("failed to serialize CSP NI-DKG transcript to CBOR"),
+        }
     }
 }

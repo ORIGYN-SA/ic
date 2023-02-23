@@ -2,6 +2,7 @@
 
 use crate::malicious_flags::MaliciousFlags;
 use serde::{Deserialize, Serialize};
+use std::time::Duration;
 
 /// When testing our system we need to make some nodes act badly to make sure
 /// they don't affect the system more than we expect. These options should NEVER
@@ -15,7 +16,7 @@ use serde::{Deserialize, Serialize};
 /// These are runtime flags because it's very easy to accidentally set compile
 /// time flags in rust. It also stops you needing to compile your code against
 /// every possible permutation of compile flags on CI.
-#[derive(Clone, Deserialize, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Deserialize, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize)]
 pub struct MaliciousBehaviour {
     pub allow_malicious_behaviour: bool,
     // No structs apart from 'allow_malicious_behaviour' should be directly accessible
@@ -43,42 +44,6 @@ impl MaliciousBehaviour {
     pub fn set_maliciously_seg_fault(self) -> Self {
         self.set_malicious_behaviour(|mut s| {
             s.maliciously_seg_fault = true;
-            s
-        })
-    }
-
-    // Each flag gets its own set function
-    pub fn set_maliciously_gossip_drop_requests(self) -> Self {
-        self.set_malicious_behaviour(|mut s| {
-            s.malicious_flags.maliciously_gossip_drop_requests = true;
-            s
-        })
-    }
-
-    pub fn set_maliciously_gossip_artifact_not_found(self) -> Self {
-        self.set_malicious_behaviour(|mut s| {
-            s.malicious_flags.maliciously_gossip_artifact_not_found = true;
-            s
-        })
-    }
-
-    pub fn set_maliciously_gossip_send_many_artifacts(self) -> Self {
-        self.set_malicious_behaviour(|mut s| {
-            s.malicious_flags.maliciously_gossip_send_many_artifacts = true;
-            s
-        })
-    }
-
-    pub fn set_maliciously_gossip_send_invalid_artifacts(self) -> Self {
-        self.set_malicious_behaviour(|mut s| {
-            s.malicious_flags.maliciously_gossip_send_invalid_artifacts = true;
-            s
-        })
-    }
-
-    pub fn set_maliciously_gossip_send_late_artifacts(self) -> Self {
-        self.set_malicious_behaviour(|mut s| {
-            s.malicious_flags.maliciously_gossip_send_late_artifacts = true;
             s
         })
     }
@@ -149,6 +114,34 @@ impl MaliciousBehaviour {
             },
             height,
         )
+    }
+
+    pub fn set_maliciously_disable_ingress_validation(self) -> Self {
+        self.set_malicious_behaviour(|mut s| {
+            s.malicious_flags.maliciously_disable_ingress_validation = true;
+            s
+        })
+    }
+
+    pub fn set_maliciously_corrupt_ecdsa_dealings(self) -> Self {
+        self.set_malicious_behaviour(|mut s| {
+            s.malicious_flags.maliciously_corrupt_ecdsa_dealings = true;
+            s
+        })
+    }
+
+    pub fn set_maliciously_delay_execution(self, delay: Duration) -> Self {
+        self.set_malicious_behaviour(|mut s| {
+            s.malicious_flags.maliciously_delay_execution = Some(delay);
+            s
+        })
+    }
+
+    pub fn set_maliciously_delay_state_sync(self, delay: Duration) -> Self {
+        self.set_malicious_behaviour(|mut s| {
+            s.malicious_flags.maliciously_delay_state_sync = Some(delay);
+            s
+        })
     }
 
     fn set_malicious_behaviour<F: FnOnce(Self) -> Self>(self, f: F) -> Self {

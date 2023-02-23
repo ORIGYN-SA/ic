@@ -16,9 +16,8 @@
 //! 3. Replicated states below the certified height recorded in the block
 //! in the latest CatchUpPackage can be purged.
 use crate::consensus::{metrics::PurgerMetrics, pool_reader::PoolReader, prelude::*};
-use ic_interfaces::{
-    consensus_pool::HeightRange, messaging::MessageRouting, state_manager::StateManager,
-};
+use ic_interfaces::{consensus_pool::HeightRange, messaging::MessageRouting};
+use ic_interfaces_state_manager::StateManager;
 use ic_logger::{trace, warn, ReplicaLogger};
 use ic_metrics::MetricsRegistry;
 use ic_replicated_state::ReplicatedState;
@@ -28,6 +27,8 @@ use std::sync::Arc;
 /// The Purger sub-component.
 pub struct Purger {
     prev_expected_batch_height: RefCell<Height>,
+    prev_finalized_certified_height: RefCell<Height>,
+    prev_maximum_cup_height: RefCell<Height>,
     state_manager: Arc<dyn StateManager<State = ReplicatedState>>,
     message_routing: Arc<dyn MessageRouting>,
     log: ReplicaLogger,
@@ -44,6 +45,8 @@ impl Purger {
         Self {
             // expected_batch_height starts from 1
             prev_expected_batch_height: RefCell::new(Height::from(1)),
+            prev_finalized_certified_height: RefCell::new(Height::from(1)),
+            prev_maximum_cup_height: RefCell::new(Height::from(1)),
             state_manager,
             message_routing,
             log,
@@ -60,14 +63,37 @@ impl Purger {
     pub fn on_state_change(&self, pool: &PoolReader<'_>) -> ChangeSet {
         let mut changeset = ChangeSet::new();
         self.purge_unvalidated_pool_by_expected_batch_height(pool, &mut changeset);
-        if self.purge_validated_pool_by_catch_up_package(pool, &mut changeset) {
-            // When we do purge consensus artifacts, we also want to purge state too.
-            // NOTE: Unlike changeset, this function has an immediate side-effect.
-            self.purge_replicated_state_by_catch_up_height(pool);
+        self.purge_validated_pool_by_catch_up_package(pool, &mut changeset);
+
+        let certified_height_increased = self.update_finalized_certified_height(pool);
+        let cup_height_increased = self.update_cup_height(pool);
+
+        if certified_height_increased {
+            self.purge_replicated_state_by_finalized_certified_height(pool);
+        }
+        // If we observe a new CUP with a larger height than the previous max
+        // OR the finalized certified height increases(see: CON-930), purge
+        if cup_height_increased || certified_height_increased {
+            self.purge_checkpoints_below_cup_height(pool);
         }
         changeset
     }
-
+    /// Updates the purger's copy of the finalized certified height, and returns true if
+    /// if the height increased. Otherwise returns false.
+    fn update_finalized_certified_height(&self, pool: &PoolReader<'_>) -> bool {
+        let finalized_certified_height = pool.get_finalized_tip().context.certified_height;
+        let prev_finalized_certified_height = self
+            .prev_finalized_certified_height
+            .replace(finalized_certified_height);
+        finalized_certified_height > prev_finalized_certified_height
+    }
+    /// Updates the purger's copy of the cup height, and returns true if the height
+    /// increased.
+    fn update_cup_height(&self, pool: &PoolReader<'_>) -> bool {
+        let cup_height = pool.get_catch_up_height();
+        let prev_cup_height = self.prev_maximum_cup_height.replace(cup_height);
+        cup_height > prev_cup_height
+    }
     /// Unvalidated pool below or equal to the latest expected batch height can
     /// be purged from the pool.
     ///
@@ -103,10 +129,10 @@ impl Purger {
             let unvalidated_pool = pool_reader.pool().unvalidated();
             fn below_range_max(h: Height, range: &Option<HeightRange>) -> bool {
                 range.as_ref().map(|r| h < r.max).unwrap_or(false)
-            };
+            }
             fn above_range_min(h: Height, range: &Option<HeightRange>) -> bool {
                 range.as_ref().map(|r| h > r.min).unwrap_or(false)
-            };
+            }
             // Skip purging if we have unprocessed but needed CatchUpPackage
             let unvalidated_catch_up_range = unvalidated_pool.catch_up_package().height_range();
             if below_range_max(catch_up_height, &unvalidated_catch_up_range)
@@ -123,8 +149,12 @@ impl Purger {
                 return;
             }
             *prev_expected_batch_height = expected_batch_height;
-            // artifacts below or equal to expected batch height can be purged.
-            changeset.push(ChangeAction::PurgeUnvalidatedBelow(expected_batch_height));
+            // Because random_beacon of expected_batch_height - 1 is required to
+            // make progress, we should only purge below expected_batch_height - 1.
+            // This is safe because expected_batch_height is always greater than 0.
+            changeset.push(ChangeAction::PurgeUnvalidatedBelow(
+                expected_batch_height.decrement(),
+            ));
             trace!(
                 self.log,
                 "Purge unvalidated pool below {:?}",
@@ -156,6 +186,7 @@ impl Purger {
                 true
             } else {
                 warn!(
+                    every_n_seconds => 30,
                     self.log,
                     "Execution state is not yet available at {:?} that is below \
                     CUP height at {:?}. Cancel purge.",
@@ -169,25 +200,42 @@ impl Purger {
         }
     }
 
-    /// Ask state manager to purge all states below the certified height
-    /// recorded in the block in the latest CatchUpPackage.
-    fn purge_replicated_state_by_catch_up_height(&self, pool_reader: &PoolReader<'_>) {
-        let catch_up_package = pool_reader.get_highest_catch_up_package();
-        let state_purge_height = catch_up_package
-            .content
-            .block
-            .as_ref()
-            .context
-            .certified_height;
-        self.state_manager.remove_states_below(state_purge_height);
+    /// Ask state manager to purge all states below the given height
+    fn purge_replicated_state_by_finalized_certified_height(&self, pool: &PoolReader<'_>) {
+        let height = pool.get_finalized_tip().context.certified_height;
+        self.state_manager.remove_inmemory_states_below(height);
         trace!(
             self.log,
-            "Purge replicated states below {:?}",
-            state_purge_height
+            "Purge replicated states below [memory] {:?}",
+            height
         );
         self.metrics
             .replicated_state_purge_height
-            .set(state_purge_height.get() as i64);
+            .set(height.get() as i64);
+    }
+
+    /// Notify the [`StateManager`] that states with heights strictly less than
+    /// the given height can be removed.
+    ///
+    /// Note from the [`StateManager::remove_states_below`] docs:
+    ///  * The initial state (height = 0) cannot be removed.
+    ///  * Some states matching the removal criteria might be kept alive.  For
+    ///    example, the last fully persisted state might be preserved to
+    ///    optimize future operations.
+    ///
+    /// To find more details on the concrete StateManager implementation and the heuristic for
+    /// state removal, check: [`ic_state_manager::StateManagerImpl::remove_states_below`].
+    fn purge_checkpoints_below_cup_height(&self, pool: &PoolReader<'_>) {
+        let cup_height = pool.get_catch_up_height();
+        self.state_manager.remove_states_below(cup_height);
+        trace!(
+            self.log,
+            "Purge replicated states below [disk] {:?}",
+            cup_height
+        );
+        self.metrics
+            .replicated_state_purge_height_disk
+            .set(cup_height.get() as i64);
     }
 }
 
@@ -247,7 +295,7 @@ mod tests {
             state_manager
                 .get_mut()
                 .expect_get_state_hash_at()
-                .return_const(Ok(Some(CryptoHashOfState::from(CryptoHash(Vec::new())))));
+                .return_const(Ok(CryptoHashOfState::from(CryptoHash(Vec::new()))));
             let execution_height = Arc::new(RwLock::new(Height::from(0)));
             let execution_height_clone = Arc::clone(&execution_height);
             let increment_execution_state = move || {
@@ -258,13 +306,26 @@ mod tests {
                 .get_mut()
                 .expect_latest_state_height()
                 .returning(move || *execution_height_clone.read().unwrap());
-            let state_purge_height = Arc::new(RwLock::new(Height::from(0)));
-            let state_purge_height_clone = Arc::clone(&state_purge_height);
+            // In-memory purge height depends on certified height of latest finalized block
+            let inmemory_purge_height = Arc::new(RwLock::new(Height::from(0)));
+            // Checkpoint purge height depends on certified height of highest checkpoint
+            let checkpoint_purge_height = Arc::new(RwLock::new(Height::from(0)));
+
+            let inmemory_purge_height_clone = Arc::clone(&inmemory_purge_height);
+            let checkpoint_purge_height_clone = Arc::clone(&checkpoint_purge_height);
+
+            state_manager
+                .get_mut()
+                .expect_remove_inmemory_states_below()
+                .withf(move |height| *height == *inmemory_purge_height_clone.read().unwrap())
+                .return_const(());
+
             state_manager
                 .get_mut()
                 .expect_remove_states_below()
-                .withf(move |height| *height == *state_purge_height_clone.read().unwrap())
+                .withf(move |height| *height == *checkpoint_purge_height_clone.read().unwrap())
                 .return_const(());
+
             let mut message_routing = MockMessageRouting::new();
             let expected_batch_height = Arc::new(RwLock::new(Height::from(0)));
             let expected_batch_height_clone = Arc::clone(&expected_batch_height);
@@ -289,7 +350,9 @@ mod tests {
             assert_eq!(changeset.len(), 1);
             assert_eq!(
                 changeset[0],
-                ChangeAction::PurgeUnvalidatedBelow(*expected_batch_height.read().unwrap())
+                ChangeAction::PurgeUnvalidatedBelow(
+                    expected_batch_height.read().unwrap().decrement()
+                )
             );
 
             // No more purge action when called again
@@ -306,19 +369,17 @@ mod tests {
             let pool_reader = PoolReader::new(&pool);
             assert!(get_purge_height(&pool_reader).is_some());
             // Make sure state manager is purged at purge_height too
-            *state_purge_height.write().unwrap() = pool_reader
-                .get_highest_catch_up_package()
-                .content
-                .block
-                .as_ref()
-                .context
-                .certified_height;
+            *inmemory_purge_height.write().unwrap() =
+                pool_reader.get_finalized_tip().context.certified_height;
+            *checkpoint_purge_height.write().unwrap() = pool_reader.get_catch_up_height();
             *expected_batch_height.write().unwrap() = Height::from(65);
             let changeset = purger.on_state_change(&pool_reader);
             assert_eq!(changeset.len(), 2);
             assert_eq!(
                 changeset[0],
-                ChangeAction::PurgeUnvalidatedBelow(*expected_batch_height.read().unwrap())
+                ChangeAction::PurgeUnvalidatedBelow(
+                    expected_batch_height.read().unwrap().decrement()
+                )
             );
             assert_eq!(
                 changeset[1],

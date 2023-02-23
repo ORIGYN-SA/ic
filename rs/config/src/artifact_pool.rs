@@ -9,18 +9,21 @@ const MAX_CONSENSUS_POOL_VALIDATED_CAPACITY: usize = 2048;
 const MAX_CONSENSUS_POOL_UNVALIDATED_CAPACITY_PER_PEER: usize = 2048;
 const PERSISTENT_POOL_VALIDATED_PURGE_INTERVAL: u64 = 5000;
 
+/// The number of height folders we store grouped inside a single "shard" folder
+/// (to avoid running into inode limits on potentially misconfigured file
+/// systems).
+pub const BACKUP_GROUP_SIZE: u64 = 10000;
+
 /// External configuration for artifact pools meant to be used by replica's
 /// config file.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ArtifactPoolTomlConfig {
     /// The path in which to store the validated section of the consensus pool.
     pub consensus_pool_path: PathBuf,
-
-    /// If the total entries in validated + unvalidated ingress pool exceeds
-    /// this threshold, reject the user HTTP request. If this field is not
-    /// specified, throttling would be disabled.
-    pub ingress_pool_size_threshold: Option<usize>,
-
+    /// See [`ArtifactPoolConfig`]
+    pub ingress_pool_max_count: usize,
+    /// See [`ArtifactPoolConfig`]
+    pub ingress_pool_max_bytes: usize,
     /// Choice of persistent pool backend database. None means default choice,
     /// which at the moment is "lmdb".
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -37,7 +40,8 @@ impl ArtifactPoolTomlConfig {
     pub fn new(consensus_pool_path: PathBuf, backup: Option<BackupConfig>) -> Self {
         Self {
             consensus_pool_path,
-            ingress_pool_size_threshold: None,
+            ingress_pool_max_count: usize::MAX,
+            ingress_pool_max_bytes: usize::MAX,
             consensus_pool_backend: Some("lmdb".to_string()),
             backup,
         }
@@ -66,9 +70,13 @@ pub struct ArtifactPoolConfig {
     /// The maximum size, in number of messages, of the unvalidated section
     /// of the ingress pool, per peer.
     pub ingress_pool_unvalidated_capacity_per_peer: usize,
-    /// Threshold for ingress rate limiting. If this field is not
-    /// specified, throttling would be disabled.
-    pub ingress_pool_size_threshold: Option<usize>,
+    /// Maximum number of artifacts in ingress pool. If exceeded, we start
+    /// throttling ingress. We also throttle if [`ingress_pool_size_max_bytes`]
+    /// is exceeded.
+    pub ingress_pool_max_count: usize,
+    /// Maximum byte size of ingress pool. If exceeded, we start throttling ingress.
+    /// We also throttle if [`ingress_pool_size_max_count`] is exceeded.
+    pub ingress_pool_max_bytes: usize,
     /// The maximum size, in number of messages, of the unvalidated section
     /// of the artifact pool, per peer.
     pub consensus_pool_unvalidated_capacity_per_peer: usize,
@@ -86,7 +94,7 @@ pub struct ArtifactPoolConfig {
 /// Choice of persistent pool database is either LMDB or RocksDB.
 #[derive(Clone, Debug)]
 pub enum PersistentPoolBackend {
-    LMDB(LMDBConfig),
+    Lmdb(LMDBConfig),
     RocksDB(RocksDBConfig),
 }
 
@@ -120,7 +128,7 @@ impl From<ArtifactPoolTomlConfig> for ArtifactPoolConfig {
             .consensus_pool_backend
             .unwrap_or_else(|| "lmdb".to_string());
         let persistent_pool_backend = match backend.as_str() {
-            "lmdb" => PersistentPoolBackend::LMDB(LMDBConfig {
+            "lmdb" => PersistentPoolBackend::Lmdb(LMDBConfig {
                 persistent_pool_validated_persistent_db_path: toml_config.consensus_pool_path,
             }),
             "rocksdb" => PersistentPoolBackend::RocksDB(RocksDBConfig {
@@ -138,7 +146,8 @@ impl From<ArtifactPoolTomlConfig> for ArtifactPoolConfig {
             ingress_pool_validated_capacity: MAX_INGRESS_POOL_VALIDATED_CAPACITY,
             ingress_pool_unvalidated_capacity_per_peer:
                 MAX_INGRESS_POOL_UNVALIDATED_CAPACITY_PER_PEER,
-            ingress_pool_size_threshold: toml_config.ingress_pool_size_threshold,
+            ingress_pool_max_count: toml_config.ingress_pool_max_count,
+            ingress_pool_max_bytes: toml_config.ingress_pool_max_bytes,
             consensus_pool_unvalidated_capacity_per_peer: MAX_CONSENSUS_POOL_VALIDATED_CAPACITY,
             consensus_pool_validated_capacity: MAX_CONSENSUS_POOL_UNVALIDATED_CAPACITY_PER_PEER,
             persistent_pool_backend,
@@ -156,7 +165,7 @@ impl ArtifactPoolConfig {
     /// Return the directory path to the persistent pool database.
     pub fn persistent_pool_db_path(&self) -> PathBuf {
         match &self.persistent_pool_backend {
-            PersistentPoolBackend::LMDB(config) => {
+            PersistentPoolBackend::Lmdb(config) => {
                 config.persistent_pool_validated_persistent_db_path.clone()
             }
             PersistentPoolBackend::RocksDB(config) => {

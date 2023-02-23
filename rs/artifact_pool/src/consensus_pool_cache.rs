@@ -1,18 +1,21 @@
 //! We define a cache for consensus objects/values that is updated whenever
 //! consensus updates the consensus pool.
+use crate::consensus_pool::BlockChainIterator;
 use ic_interfaces::consensus_pool::{
-    ChainIterator, ChangeAction, ConsensusPool, ConsensusPoolCache,
+    ChainIterator, ChangeAction, ConsensusBlockCache, ConsensusBlockChain, ConsensusBlockChainErr,
+    ConsensusPool, ConsensusPoolCache,
 };
 use ic_types::{
     consensus::{
-        catchup::CUPWithOriginalProtobuf, Block, CatchUpPackage, ConsensusMessage, Finalization,
-        HasHeight,
+        catchup::CUPWithOriginalProtobuf, ecdsa::EcdsaPayload, Block, BlockPayload, CatchUpPackage,
+        ConsensusMessage, Finalization, HasHeight,
     },
     Height, Time,
 };
 use std::cmp::Ordering;
+use std::collections::BTreeMap;
 use std::convert::TryFrom;
-use std::sync::RwLock;
+use std::sync::{Arc, RwLock};
 
 /// Implementation of ConsensusCache and ConsensusPoolCache.
 pub(crate) struct ConsensusCacheImpl {
@@ -31,6 +34,7 @@ struct CachedData {
     finalized_block: Block,
     summary_block: Block,
     catch_up_package: CUPWithOriginalProtobuf,
+    finalized_chain: ConsensusBlockChainImpl,
 }
 
 impl CachedData {
@@ -81,6 +85,12 @@ impl ConsensusPoolCache for ConsensusCacheImpl {
     }
 }
 
+impl ConsensusBlockCache for ConsensusCacheImpl {
+    fn finalized_chain(&self) -> Arc<dyn ConsensusBlockChain> {
+        Arc::new(self.cache.read().unwrap().finalized_chain.clone())
+    }
+}
+
 impl ConsensusCacheImpl {
     /// Initialize and return a new ConsensusCache with data from the given
     /// ConsensusPool.
@@ -89,12 +99,14 @@ impl ConsensusCacheImpl {
         let finalized_block = get_highest_finalized_block(pool, &catch_up_package.cup);
         let mut summary_block = catch_up_package.cup.content.block.as_ref().clone();
         update_summary_block(pool, &mut summary_block, &finalized_block);
+        let finalized_chain = ConsensusBlockChainImpl::new(pool, &summary_block, &finalized_block);
 
         Self {
             cache: RwLock::new(CachedData {
                 finalized_block,
                 summary_block,
                 catch_up_package,
+                finalized_chain,
             }),
         }
     }
@@ -142,6 +154,9 @@ impl ConsensusCacheImpl {
             }
         });
         update_summary_block(pool, &mut cache.summary_block, &cache.finalized_block);
+        cache
+            .finalized_chain
+            .update(pool, &cache.summary_block, &cache.finalized_block);
     }
 }
 
@@ -174,7 +189,7 @@ pub(crate) fn get_highest_finalized_block(
 pub(crate) fn get_highest_catch_up_package(pool: &dyn ConsensusPool) -> CUPWithOriginalProtobuf {
     let protobuf = pool.validated().highest_catch_up_package_proto();
     let cup = CatchUpPackage::try_from(&protobuf).expect("CUP should be retrievable from protobuf");
-    CUPWithOriginalProtobuf { protobuf, cup }
+    CUPWithOriginalProtobuf { cup, protobuf }
 }
 
 /// Find the DKG summary block that is between the given 'summary_block' and a
@@ -242,23 +257,154 @@ pub(crate) fn update_summary_block(
     }
 }
 
+#[derive(Clone)]
+pub(crate) struct ConsensusBlockChainImpl {
+    /// The ECDSA payload of the blocks in the chain between [summary_block, tip],
+    /// ends inclusive. So this can never be empty.
+    blocks: BTreeMap<Height, Option<Arc<EcdsaPayload>>>,
+}
+
+impl ConsensusBlockChainImpl {
+    pub(crate) fn new(
+        consensus_pool: &dyn ConsensusPool,
+        summary_block: &Block,
+        tip: &Block,
+    ) -> Self {
+        let mut blocks = BTreeMap::new();
+        match summary_block.height().cmp(&tip.height()) {
+            Ordering::Less | Ordering::Equal => {
+                Self::add_blocks(consensus_pool, summary_block.height(), tip, &mut blocks)
+            }
+            Ordering::Greater => {
+                panic!(
+                    "ConsensusBlockChainImpl::new(): summary height {} > tip height {}",
+                    summary_block.height(),
+                    tip.height()
+                );
+            }
+        }
+
+        Self { blocks }
+    }
+
+    /// Updates the blocks based on the new summary_block/tip.
+    fn update(&mut self, consensus_pool: &dyn ConsensusPool, summary_block: &Block, tip: &Block) {
+        // The map can never be empty, hence these unwraps are safe.
+        let cur_summary_height = *self.blocks.keys().next().unwrap();
+        let cur_tip_height = *self.blocks.keys().next_back().unwrap();
+
+        let start_height = if cur_summary_height == summary_block.height() {
+            match cur_tip_height.cmp(&tip.height()) {
+                Ordering::Less => {
+                    // Common case: only the tip moved. Just append the new blocks
+                    cur_tip_height.increment()
+                }
+                Ordering::Equal => return,
+                Ordering::Greater => {
+                    panic!(
+                        "ConsensusBlockChainImpl::update(): current tip {} > new tip {}",
+                        cur_tip_height,
+                        tip.height(),
+                    );
+                }
+            }
+        } else {
+            // Summary block changed. Rebuild the chain with the new range.
+            self.blocks.clear();
+            summary_block.height()
+        };
+
+        assert!(
+            start_height <= tip.height(),
+            "ConsensusBlockChainImpl::update(): start_height {} > new tip {}, \
+            cur_tip = {}, cur_summary = {}, new_summary = {}",
+            start_height,
+            tip.height(),
+            cur_tip_height,
+            cur_summary_height,
+            summary_block.height(),
+        );
+        Self::add_blocks(consensus_pool, start_height, tip, &mut self.blocks)
+    }
+
+    /// Adds the blocks in the range [start_height, tip.height()] to the
+    /// chain(ends inclusive).
+    fn add_blocks(
+        consensus_pool: &dyn ConsensusPool,
+        start_height: Height,
+        tip: &Block,
+        blocks: &mut BTreeMap<Height, Option<Arc<EcdsaPayload>>>,
+    ) {
+        BlockChainIterator::new(consensus_pool, tip.clone())
+            .take_while(|block| block.height() >= start_height)
+            .for_each(|block| {
+                let height = block.height();
+                let ecdsa_payload = BlockPayload::from(block.payload)
+                    .as_ecdsa()
+                    .map(|ecdsa_payload| Arc::new(ecdsa_payload.clone()));
+                blocks.insert(height, ecdsa_payload);
+            })
+    }
+}
+
+impl ConsensusBlockChain for ConsensusBlockChainImpl {
+    fn tip(&self) -> (Height, Option<Arc<EcdsaPayload>>) {
+        let (height, ecdsa_payload) = self.blocks.iter().next_back().unwrap();
+        (*height, ecdsa_payload.clone())
+    }
+
+    fn ecdsa_payload(&self, height: Height) -> Result<Arc<EcdsaPayload>, ConsensusBlockChainErr> {
+        let payload_option = self
+            .blocks
+            .get(&height)
+            .ok_or(ConsensusBlockChainErr::BlockNotFound(height))?;
+
+        if let Some(payload) = payload_option {
+            Ok(payload.clone())
+        } else {
+            Err(ConsensusBlockChainErr::EcdsaPayloadNotFound(height))
+        }
+    }
+
+    fn len(&self) -> usize {
+        self.blocks.len()
+    }
+}
+
 #[cfg(test)]
 mod test {
     use super::*;
-    use ic_consensus_message::ConsensusMessageHashable;
-    use ic_test_artifact_pool::consensus_pool::TestConsensusPool;
+    use ic_ic00_types::EcdsaKeyId;
+    use ic_interfaces::consensus_pool::HEIGHT_CONSIDERED_BEHIND;
+    use ic_test_artifact_pool::consensus_pool::{Round, TestConsensusPool};
     use ic_test_utilities::{
         consensus::fake::*,
         crypto::CryptoReturningOk,
         mock_time,
-        registry::{setup_registry, SubnetRecordBuilder},
         state_manager::FakeStateManager,
         types::ids::{node_test_id, subnet_test_id},
         FastForwardTimeSource,
     };
+    use ic_test_utilities_registry::{setup_registry, SubnetRecordBuilder};
     use ic_types::consensus::*;
+    use std::str::FromStr;
     use std::sync::Arc;
     use std::time::Duration;
+
+    // Verifies that the finalized chain has the specified blocks
+    fn check_finalized_chain(consensus_cache: &ConsensusCacheImpl, expected: &[Height]) {
+        let finalized_chain = consensus_cache.finalized_chain();
+        assert_eq!(finalized_chain.len(), expected.len());
+
+        for height in expected {
+            assert!(finalized_chain.ecdsa_payload(*height).is_err());
+        }
+
+        assert_eq!(
+            finalized_chain.tip().0,
+            *expected.iter().next_back().unwrap()
+        );
+    }
 
     #[test]
     fn test_consensus_cache() {
@@ -291,6 +437,7 @@ mod test {
             assert_eq!(consensus_cache.finalized_block().height(), Height::from(0));
             // No consensus time when there is only genesis block
             assert_eq!(consensus_cache.consensus_time(), None);
+            check_finalized_chain(&consensus_cache, &[Height::from(0)]);
 
             assert_eq!(pool.advance_round_normal_operation_n(2), Height::from(2));
             let mut block = pool.make_next_block();
@@ -305,7 +452,7 @@ mod test {
 
             // 2. Cache can be updated by finalization
             let updates = consensus_cache.prepare(&[ChangeAction::AddToValidated(
-                finalization.clone().to_message(),
+                finalization.clone().into_message(),
             )]);
             assert_eq!(updates, vec![CacheUpdateAction::Finalization]);
             pool.insert_validated(finalization);
@@ -314,6 +461,15 @@ mod test {
             assert_eq!(consensus_cache.consensus_time(), Some(time));
             pool.insert_validated(pool.make_next_beacon());
             pool.insert_validated(pool.make_next_tape());
+            check_finalized_chain(
+                &consensus_cache,
+                &[
+                    Height::from(0),
+                    Height::from(1),
+                    Height::from(2),
+                    Height::from(3),
+                ],
+            );
 
             // 3. Cache can be updated by CatchUpPackage
             assert_eq!(
@@ -322,13 +478,104 @@ mod test {
             );
             let catch_up_package = pool.make_catch_up_package(Height::from(4));
             let updates = consensus_cache.prepare(&[ChangeAction::AddToValidated(
-                catch_up_package.clone().to_message(),
+                catch_up_package.clone().into_message(),
             )]);
             assert_eq!(updates, vec![CacheUpdateAction::CatchUpPackage]);
             pool.insert_validated(catch_up_package.clone());
             consensus_cache.update(&pool, updates);
             assert_eq!(consensus_cache.catch_up_package(), catch_up_package);
             assert_eq!(consensus_cache.finalized_block().height(), Height::from(4));
+            check_finalized_chain(&consensus_cache, &[Height::from(4)]);
         })
+    }
+
+    /// Tests that `is_replica_behind` (trait method of [`ConsensusPoolCache`]) works as expected
+    #[test]
+    fn test_is_replica_behind() {
+        ic_test_utilities::artifact_pool_config::with_test_pool_config(|pool_config| {
+            let subnet_records = vec![(
+                1,
+                SubnetRecordBuilder::from(&[node_test_id(0)])
+                    .with_dkg_interval_length(3)
+                    .build(),
+            )];
+
+            let mut pool = TestConsensusPool::new(
+                subnet_test_id(1),
+                pool_config,
+                FastForwardTimeSource::new(),
+                setup_registry(subnet_test_id(1), subnet_records),
+                Arc::new(CryptoReturningOk::default()),
+                Arc::new(FakeStateManager::new()),
+                None,
+            );
+
+            let consensus_cache = ConsensusCacheImpl::new(&pool);
+
+            // Initially the replica is not behind
+            assert!(!consensus_cache.is_replica_behind(Height::new(0)));
+
+            // Advance and set the certified height to one below where the replica would be considered behind
+            pool.advance_round_normal_operation_n(HEIGHT_CONSIDERED_BEHIND.get() - 1);
+            Round::new(&mut pool)
+                .with_certified_height(HEIGHT_CONSIDERED_BEHIND)
+                .advance();
+            consensus_cache.update(&pool, vec![CacheUpdateAction::Finalization]);
+
+            // Check that the replica is still not considered behind
+            assert!(!consensus_cache.is_replica_behind(Height::new(0)));
+
+            // Advance one more round
+            Round::new(&mut pool)
+                .with_certified_height(HEIGHT_CONSIDERED_BEHIND + Height::new(1))
+                .advance();
+            consensus_cache.update(&pool, vec![CacheUpdateAction::Finalization]);
+
+            // At this height, the replica should be considered behind
+            assert!(consensus_cache.is_replica_behind(Height::new(0)))
+        })
+    }
+
+    #[test]
+    fn test_block_chain() {
+        let mut chain = ConsensusBlockChainImpl {
+            blocks: BTreeMap::new(),
+        };
+
+        let height = Height::new(100);
+        assert_eq!(chain.len(), 0);
+        assert_eq!(
+            chain.ecdsa_payload(height).err().unwrap(),
+            ConsensusBlockChainErr::BlockNotFound(height)
+        );
+
+        chain.blocks.insert(height, None);
+        assert_eq!(chain.len(), 1);
+        assert_eq!(
+            chain.ecdsa_payload(height).err().unwrap(),
+            ConsensusBlockChainErr::EcdsaPayloadNotFound(height)
+        );
+
+        let height = Height::new(200);
+        chain.blocks.insert(
+            height,
+            Some(Arc::new(EcdsaPayload {
+                signature_agreements: BTreeMap::new(),
+                ongoing_signatures: BTreeMap::new(),
+                available_quadruples: BTreeMap::new(),
+                quadruples_in_creation: BTreeMap::new(),
+                uid_generator: ecdsa::EcdsaUIDGenerator::new(subnet_test_id(1), Height::new(0)),
+                idkg_transcripts: BTreeMap::new(),
+                ongoing_xnet_reshares: BTreeMap::new(),
+                xnet_reshare_agreements: BTreeMap::new(),
+                key_transcript: ecdsa::EcdsaKeyTranscript {
+                    current: None,
+                    next_in_creation: ecdsa::KeyTranscriptCreation::Begin,
+                    key_id: EcdsaKeyId::from_str("Secp256k1:some_key").unwrap(),
+                },
+            })),
+        );
+        assert_eq!(chain.len(), 2);
+        assert!(chain.ecdsa_payload(height).is_ok());
     }
 }

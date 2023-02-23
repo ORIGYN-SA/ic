@@ -7,6 +7,7 @@ use crate::consensus::{
 };
 use ic_interfaces::messaging::MessageRouting;
 use ic_logger::ReplicaLogger;
+use std::cmp::min;
 use std::sync::Arc;
 
 /// The ShareAggregator is responsible for aggregating shares of random beacons,
@@ -66,9 +67,13 @@ impl ShareAggregator {
     fn aggregate_random_tape_shares(&self, pool: &PoolReader<'_>) -> Vec<ConsensusMessage> {
         let expected_height = self.message_routing.expected_batch_height();
         let finalized_height = pool.get_finalized_height();
+        let max_height = min(
+            expected_height + Height::from(RANDOM_TAPE_CHECK_MAX_HEIGHT_RANGE),
+            finalized_height.increment(),
+        );
         // Filter out those at a height where we have a full tape already.
         let shares = pool
-            .get_random_tape_shares(expected_height, finalized_height.increment())
+            .get_random_tape_shares(expected_height, max_height)
             .filter(|share| pool.get_random_tape(share.height()).is_none());
         let state_reader = pool.as_cache();
         to_messages(utils::aggregate(
@@ -118,37 +123,58 @@ impl ShareAggregator {
 
     /// Attempt to construct `CatchUpPackage`s.
     fn aggregate_catch_up_package_shares(&self, pool: &PoolReader<'_>) -> Vec<ConsensusMessage> {
-        let start_block = pool.get_highest_summary_block();
-        let height = start_block.height();
+        let mut start_block = pool.get_highest_summary_block();
+        let current_cup_height = pool.get_catch_up_height();
 
-        // Skip if we have a full CatchUpPackage already
-        if height <= pool.get_catch_up_height() {
-            return Vec::new();
-        }
-        let shares = pool.get_catch_up_package_shares(height).map(|share| {
-            let block = pool
-                .get_block(&share.content.block, height)
-                .unwrap_or_else(|err| panic!("Block not found for {:?}, error: {:?}", share, err));
-            Signed {
-                content: CatchUpContent::from_share_content(share.content, block),
-                signature: share.signature,
+        while start_block.height() > current_cup_height {
+            let height = start_block.height();
+            let shares = pool.get_catch_up_package_shares(height).map(|share| {
+                let block = pool
+                    .get_block(&share.content.block, height)
+                    .unwrap_or_else(|err| {
+                        panic!("Block not found for {:?}, error: {:?}", share, err)
+                    });
+                Signed {
+                    content: CatchUpContent::from_share_content(share.content, block),
+                    signature: share.signature,
+                }
+            });
+            let state_reader = pool.as_cache();
+            let dkg_id = utils::active_high_threshold_transcript(state_reader, height)
+                .map(|transcript| transcript.dkg_id);
+            let result = utils::aggregate(
+                &self.log,
+                self.membership.as_ref(),
+                self.crypto.as_aggregate(),
+                Box::new(|_| dkg_id),
+                shares,
+            );
+            if !result.is_empty() {
+                return to_messages(result);
             }
-        });
-        let state_reader = pool.as_cache();
-        let dkg_id = utils::active_high_threshold_transcript(state_reader, height)
-            .map(|transcript| transcript.dkg_id);
-        to_messages(utils::aggregate(
-            &self.log,
-            self.membership.as_ref(),
-            self.crypto.as_aggregate(),
-            Box::new(|_| dkg_id),
-            shares,
-        ))
+
+            if let Some(block_from_last_interval) =
+                pool.get_finalized_block(start_block.height.decrement())
+            {
+                let next_start_height = block_from_last_interval
+                    .payload
+                    .as_ref()
+                    .dkg_interval_start_height();
+                if let Some(new_start_block) = pool.get_finalized_block(next_start_height) {
+                    start_block = new_start_block;
+                } else {
+                    break;
+                }
+            } else {
+                break;
+            }
+        }
+        Vec::new()
     }
 }
 
 fn to_messages<T: ConsensusMessageHashable>(artifacts: Vec<T>) -> Vec<ConsensusMessage> {
-    artifacts.into_iter().map(|a| a.to_message()).collect()
+    artifacts.into_iter().map(|a| a.into_message()).collect()
 }
 
 #[cfg(test)]
@@ -160,9 +186,9 @@ mod tests {
     use ic_test_utilities::{
         consensus::fake::*,
         message_routing::FakeMessageRouting,
-        registry::SubnetRecordBuilder,
         types::ids::{node_test_id, subnet_test_id},
     };
+    use ic_test_utilities_registry::SubnetRecordBuilder;
     use std::sync::Arc;
 
     #[test]
@@ -223,10 +249,9 @@ mod tests {
             pool.insert_validated(finalization_share);
 
             let messages = aggregator.on_state_change(&PoolReader::new(&pool));
-            let finalization_was_created = messages.iter().any(|x| match x {
-                ConsensusMessage::Finalization(_) => true,
-                _ => false,
-            });
+            let finalization_was_created = messages
+                .iter()
+                .any(|x| matches!(x, ConsensusMessage::Finalization(_)));
 
             assert!(finalization_was_created);
             assert_eq!(messages.len(), 1);
@@ -279,8 +304,11 @@ mod tests {
                 let state_hash = CryptoHashOf::from(CryptoHash(Vec::new()));
                 CatchUpPackageShare {
                     content: (&CatchUpContent::new(
-                        HashedBlock::new(ic_crypto::crypto_hash, start_block.clone()),
-                        HashedRandomBeacon::new(ic_crypto::crypto_hash, random_beacon.clone()),
+                        HashedBlock::new(ic_types::crypto::crypto_hash, start_block.clone()),
+                        HashedRandomBeacon::new(
+                            ic_types::crypto::crypto_hash,
+                            random_beacon.clone(),
+                        ),
                         state_hash,
                     ))
                         .into(),

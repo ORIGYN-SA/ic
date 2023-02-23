@@ -1,23 +1,28 @@
 //! The consensus pool public interface.
+
 use crate::{
     artifact_pool::{UnvalidatedArtifact, ValidatedArtifact},
     time_source::TimeSource,
 };
+use ic_base_types::RegistryVersion;
 use ic_protobuf::types::v1 as pb;
 use ic_types::{
     artifact::ConsensusMessageId,
     consensus::{
-        catchup::CUPWithOriginalProtobuf, Block, BlockProposal, CatchUpPackage,
-        CatchUpPackageShare, ConsensusMessage, ContentEq, Finalization, FinalizationShare,
-        HasHeight, HashedBlock, Notarization, NotarizationShare, RandomBeacon, RandomBeaconShare,
-        RandomTape, RandomTapeShare,
+        catchup::CUPWithOriginalProtobuf, ecdsa::EcdsaPayload, Block, BlockProposal,
+        CatchUpPackage, CatchUpPackageShare, ConsensusMessage, ContentEq, Finalization,
+        FinalizationShare, HasHeight, HashedBlock, Notarization, NotarizationShare, RandomBeacon,
+        RandomBeaconShare, RandomTape, RandomTapeShare,
     },
     time::Time,
     Height,
 };
 use serde::{Deserialize, Serialize};
+use std::sync::Arc;
 
-// tag::change_set[]
+/// The height, at which we consider a replica to be behind
+pub const HEIGHT_CONSIDERED_BEHIND: Height = Height::new(20);
+
 pub type ChangeSet = Vec<ChangeAction>;
 
 /// Change actions applicable to the consensus pool.
@@ -32,7 +37,6 @@ pub enum ChangeAction {
     PurgeValidatedBelow(Height),
     PurgeUnvalidatedBelow(Height),
 }
-// end::change_set[]
 
 impl From<ChangeAction> for ChangeSet {
     fn from(action: ChangeAction) -> Self {
@@ -60,7 +64,7 @@ impl ChangeSetOperation for ChangeSet {
     }
 
     fn dedup_push(&mut self, action: ChangeAction) -> Result<(), ChangeAction> {
-        if self.iter().find(|x| x.content_eq(&action)).is_none() {
+        if !self.iter().any(|x| x.content_eq(&action)) {
             self.push(action);
             Ok(())
         } else {
@@ -204,6 +208,9 @@ pub trait ConsensusPool {
 
     /// Return a reference to the consensus cache (ConsensusPoolCache).
     fn as_cache(&self) -> &dyn ConsensusPoolCache;
+
+    /// Return a reference to the consensus block cache (ConsensusBlockCache).
+    fn as_block_cache(&self) -> &dyn ConsensusBlockCache;
 }
 
 /// Mutation operations on top of ConsensusPool.
@@ -248,8 +255,7 @@ pub trait HeightIndexedPool<T> {
     fn get_highest(&self) -> Result<T, OnlyError>;
 
     /// Return an iterator over instances of artifact of type T at the highest
-    /// height currently in the pool. Returns an error if there isn't one, or
-    /// if there are more than one.
+    /// height currently in the pool.
     fn get_highest_iter(&self) -> Box<dyn Iterator<Item = T>>;
 }
 // end::interface[]
@@ -277,6 +283,66 @@ pub trait ConsensusPoolCache: Send + Sync {
     /// yet made a catch-up package, this will be different than the block
     /// in the latest catch-up package.
     fn summary_block(&self) -> Block;
+
+    /// Returns the oldest registry version that is still relevant to DKG.
+    ///
+    /// P2P should keep up connections to all nodes registered in any registry
+    /// between the one returned from this function and the current
+    /// `RegistryVersion`.
+    fn get_oldest_registry_version_in_use(&self) -> RegistryVersion {
+        self.catch_up_package()
+            .content
+            .block
+            .get_value()
+            .payload
+            .as_ref()
+            .as_summary()
+            .get_oldest_registry_version_in_use()
+    }
+
+    /// The target height that the StateManager should start at given
+    /// this consensus pool during startup.
+    fn starting_height(&self) -> Height {
+        let certified_height = self.finalized_block().context.certified_height;
+        let catchup_package_height = self.catch_up_package().height();
+        certified_height.max(catchup_package_height)
+    }
+
+    /// Returns true if the `certified_height` provided is significantly behind the
+    /// `certified_height` referenced by the current finalized block.
+    ///
+    /// This indicates that the node does not have a recent certified state.
+    fn is_replica_behind(&self, certified_height: Height) -> bool {
+        certified_height + HEIGHT_CONSIDERED_BEHIND
+            < self.finalized_block().context.certified_height
+    }
+}
+
+/// Cache of blocks from the block chain.
+pub trait ConsensusBlockCache: Send + Sync {
+    /// Returns the block at the given height from the finalized tip.
+    /// The implementation can choose the number of past blocks to cache.
+    fn finalized_chain(&self) -> Arc<dyn ConsensusBlockChain>;
+}
+
+/// Snapshot of the block chain
+#[allow(clippy::len_without_is_empty)]
+pub trait ConsensusBlockChain: Send + Sync {
+    /// Returns the height and the ECDSA payload of the tip in the block chain.
+    fn tip(&self) -> (Height, Option<Arc<EcdsaPayload>>);
+
+    /// Returns the ECDSA payload from the block at the given height.
+    /// The implementation can choose the number of past blocks to cache.
+    fn ecdsa_payload(&self, height: Height) -> Result<Arc<EcdsaPayload>, ConsensusBlockChainErr>;
+
+    /// Returns the length of the chain.
+    fn len(&self) -> usize;
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ConsensusBlockChainErr {
+    BlockNotFound(Height),
+    EcdsaPayloadNotFound(Height),
 }
 
 /// An iterator for block ancestors.
@@ -287,7 +353,7 @@ pub struct ChainIterator<'a> {
 }
 
 impl<'a> ChainIterator<'a> {
-    /// Return an interator that iterates block acenstors, going backwards
+    /// Return an iterator that iterates block ancestors, going backwards
     /// from the `from_block` to the `to_block` (both inclusive), or until a
     /// parent is not found in the consensus pool if the `to_block` is not
     /// specified.

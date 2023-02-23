@@ -1,0 +1,12 @@
+load("@rules_rust//rust:defs.bzl", "rust_library")
+
+package(default_visibility = ["//visibility:public"])
+
+rust_library(
+    name = "criterion_time",
+    srcs = glob(["src/**"]),
+    deps = [
+        "@crate_index//:criterion",
+        "@crate_index//:libc",
+    ],
+)

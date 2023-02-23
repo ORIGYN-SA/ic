@@ -21,6 +21,15 @@ pub fn new_replica_logger(log: slog::Logger, config: &LoggerConfig) -> ReplicaLo
     ReplicaLogger::new(log_entry_logger)
 }
 
+pub fn new_replica_logger_from_config(logger_config: &LoggerConfig) -> (ReplicaLogger, AsyncGuard) {
+    let LoggerImpl {
+        root,
+        async_log_guard,
+    } = LoggerImpl::new(logger_config, "logger".into());
+    let logger = new_replica_logger(root, logger_config);
+    (logger, async_log_guard)
+}
+
 pub struct LoggerImpl {
     pub root: Logger,
     pub async_log_guard: AsyncGuard,
@@ -29,18 +38,21 @@ pub struct LoggerImpl {
 impl LoggerImpl {
     pub fn new(config: &LoggerConfig, thread_name: String) -> Self {
         match config.target.clone() {
-            LogTarget::Stdout => Self::new_internal(std::io::stdout(), &config, thread_name),
-            LogTarget::Stderr => Self::new_internal(std::io::stderr(), &config, thread_name),
+            LogTarget::Stdout => Self::new_internal(std::io::stdout(), config, thread_name),
+            LogTarget::Stderr => Self::new_internal(std::io::stderr(), config, thread_name),
             LogTarget::File(f) => Self::new_internal(
                 std::fs::File::create(f).expect("Couldn't open/create log file"),
-                &config,
+                config,
                 thread_name,
             ),
         }
     }
 
-    pub fn new_for_test(config: LoggerConfig) -> Self {
-        Self::new_internal(slog_term::TestStdoutWriter, &config, "test".to_string())
+    pub fn new_for_test<W>(writer: W, config: &LoggerConfig) -> Self
+    where
+        W: 'static + io::Write + Send,
+    {
+        Self::new_internal(writer, config, "logger-for-test".to_string())
     }
 
     fn new_internal<W>(i: W, config: &LoggerConfig, thread_name: String) -> Self

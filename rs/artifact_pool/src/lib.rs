@@ -1,17 +1,25 @@
+pub mod canister_http_pool;
 pub mod certification_pool;
 pub mod consensus_pool;
 mod consensus_pool_cache;
 pub mod dkg_pool;
+pub mod ecdsa_pool;
 mod height_index;
 pub mod ingress_pool;
 mod inmemory_pool;
 mod metrics;
 mod peer_index;
+mod pool_common;
+#[cfg(test)]
+mod test_utils;
 
-mod backup;
+pub mod backup;
 mod lmdb_iterator;
 mod lmdb_pool;
+
+#[cfg(feature = "rocksdb_backend")]
 mod rocksdb_iterator;
+#[cfg(feature = "rocksdb_backend")]
 mod rocksdb_pool;
 
 use ic_types::ReplicaVersion;
@@ -55,7 +63,6 @@ pub fn ensure_persistent_pool_replica_version_compatibility(pool_path: PathBuf) 
 mod tests {
     use super::*;
     use std::convert::TryFrom;
-    use std::panic;
 
     #[test]
     fn test_ensure_persistent_pool_replica_version_compatibility() {

@@ -7,9 +7,9 @@ use ic_interfaces::{
         VerifierError,
     },
     consensus_pool::ConsensusPoolCache,
-    state_manager::StateManager,
     validation::ValidationError,
 };
+use ic_interfaces_state_manager::StateManager;
 use ic_logger::{debug, error, trace, ReplicaLogger};
 use ic_metrics::{buckets::decimal_buckets, MetricsRegistry};
 use ic_replicated_state::ReplicatedState;
@@ -188,7 +188,7 @@ impl Certifier for CertifierImpl {
             &state_hashes_to_certify,
         );
         if !shares.is_empty() {
-            self.metrics.shares_created.inc_by(shares.len() as i64);
+            self.metrics.shares_created.inc_by(shares.len() as u64);
             trace!(
                 &self.log,
                 "Created {} certification shares in {:?}",
@@ -222,7 +222,7 @@ impl Certifier for CertifierImpl {
         if !certifications.is_empty() {
             self.metrics
                 .certifications_aggregated
-                .inc_by(certifications.len() as i64);
+                .inc_by(certifications.len() as u64);
             trace!(
                 &self.log,
                 "Aggregated {} threshold-signatures in {:?}",
@@ -343,7 +343,7 @@ impl CertifierImpl {
                 {
                     Ok(signature) => Some(CertificationShare {
                         height,
-                        signed: Signed { signature, content },
+                        signed: Signed { content, signature },
                     }),
                     Err(err) => {
                         error!(self.log, "Couldn't create a signature: {:?}", err);
@@ -595,21 +595,19 @@ mod tests {
     use ic_interfaces::consensus_pool::ConsensusPool;
     use ic_test_utilities::consensus::fake::*;
     use ic_test_utilities::types::ids::{node_test_id, subnet_test_id};
-    use ic_test_utilities::with_test_replica_logger;
+    use ic_test_utilities_logger::with_test_replica_logger;
     use ic_types::artifact::CertificationMessageId;
     use ic_types::consensus::certification::CertificationMessageHash;
     use ic_types::{
         artifact::Priority,
-        consensus::{
-            certification::{
-                Certification, CertificationContent, CertificationMessage, CertificationShare,
-            },
-            ThresholdSignature, ThresholdSignatureShare,
+        consensus::certification::{
+            Certification, CertificationContent, CertificationMessage, CertificationShare,
         },
         crypto::{
             threshold_sig::ni_dkg::{NiDkgId, NiDkgTag, NiDkgTargetSubnet},
             CryptoHash, CryptoHashOf,
         },
+        signature::*,
         CryptoHashOfPartialState, Height,
     };
 
@@ -647,7 +645,7 @@ mod tests {
         signature.signer = dkg_id;
         CertificationMessage::Certification(Certification {
             height,
-            signed: Signed { signature, content },
+            signed: Signed { content, signature },
         })
     }
 
@@ -1256,11 +1254,7 @@ mod tests {
                 assert!(
                     change_set
                         .iter()
-                        .all(|x| if let ChangeAction::RemoveFromUnvalidated(_) = x {
-                            true
-                        } else {
-                            false
-                        }),
+                        .all(|x| matches!(x, ChangeAction::RemoveFromUnvalidated(_))),
                     "Both items should be RemoveFromUnvalidated"
                 );
 

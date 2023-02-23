@@ -1,10 +1,13 @@
 //! A crate that groups user-facing and internal error types and codes produced
 //! by the Internet Computer.
-use candid::Error;
-use ic_protobuf::proxy::ProxyDecodeError;
 use serde::{Deserialize, Serialize};
 use std::{convert::TryFrom, fmt};
 use strum_macros::EnumIter;
+
+#[derive(Clone, Copy, Debug)]
+pub enum TryFromError {
+    ValueOutOfRange(u64),
+}
 
 /// Reject codes are integers that canisters should pass to msg.reject
 /// system API calls. These errors are designed for programmatic error
@@ -40,7 +43,7 @@ impl RejectCode {
 }
 
 impl TryFrom<u64> for RejectCode {
-    type Error = ProxyDecodeError;
+    type Error = TryFromError;
     fn try_from(code: u64) -> Result<Self, Self::Error> {
         match code {
             1 => Ok(RejectCode::SysFatal),
@@ -48,10 +51,7 @@ impl TryFrom<u64> for RejectCode {
             3 => Ok(RejectCode::DestinationInvalid),
             4 => Ok(RejectCode::CanisterReject),
             5 => Ok(RejectCode::CanisterError),
-            _ => Err(ProxyDecodeError::ValueOutOfRange {
-                typ: "RejectCode",
-                err: code.to_string(),
-            }),
+            _ => Err(TryFromError::ValueOutOfRange(code)),
         }
     }
 }
@@ -62,13 +62,17 @@ impl From<ErrorCode> for RejectCode {
         use RejectCode::*;
         match err {
             SubnetOversubscribed => SysFatal,
+            MaxNumberOfCanistersReached => SysFatal,
+            CanisterOutputQueueFull => SysTransient,
+            IngressMessageTimeout => SysTransient,
+            CanisterQueueNotEmpty => SysTransient,
+            IngressHistoryFull => SysTransient,
             CanisterInvalidController => CanisterError,
             CanisterNotFound => DestinationInvalid,
             CanisterMethodNotFound => DestinationInvalid,
             CanisterFunctionNotFound => CanisterError,
             CanisterWasmModuleNotFound => DestinationInvalid,
             CanisterAlreadyInstalled => DestinationInvalid,
-            CanisterEmpty => DestinationInvalid,
             CanisterNonEmpty => CanisterError,
             CanisterOutOfCycles => CanisterError,
             CanisterTrapped => CanisterError,
@@ -77,22 +81,27 @@ impl From<ErrorCode> for RejectCode {
             CanisterInvalidWasm => CanisterError,
             CanisterDidNotReply => CanisterError,
             CanisterOutOfMemory => CanisterError,
-            CanisterOutputQueueFull => SysTransient,
             CanisterStopped => CanisterError,
             CanisterStopping => CanisterError,
             CanisterNotStopped => CanisterError,
             CanisterStoppingCancelled => CanisterError,
-            IngressMessageTimeout => SysTransient,
-            InsufficientTransferFunds => CanisterReject,
             InsufficientCyclesForCreateCanister => CanisterReject,
             CertifiedStateUnavailable => SysTransient,
             InsufficientMemoryAllocation => CanisterReject,
             SubnetNotFound => CanisterReject,
             CanisterRejectedMessage => CanisterReject,
-            InterCanisterQueryLoopDetected => CanisterError,
+            QueryCallGraphLoopDetected => CanisterError,
             UnknownManagementMessage => CanisterReject,
             InvalidManagementPayload => CanisterReject,
             InsufficientCyclesInCall => CanisterError,
+            CanisterWasmEngineError => CanisterError,
+            CanisterInstructionLimitExceeded => CanisterError,
+            CanisterInstallCodeRateLimited => SysTransient,
+            CanisterMemoryAccessLimitExceeded => CanisterError,
+            QueryCallGraphTooDeep => CanisterError,
+            QueryCallGraphTotalInstructionLimitExceeded => CanisterError,
+            CompositeQueryCalledInReplicatedMode => CanisterError,
+            CanisterNotHostedBySubnet => CanisterReject,
         }
     }
 }
@@ -106,17 +115,19 @@ impl From<ErrorCode> for RejectCode {
 #[derive(Clone, Copy, Debug, PartialEq, EnumIter, Eq, Hash, Serialize, Deserialize)]
 pub enum ErrorCode {
     SubnetOversubscribed = 101,
+    MaxNumberOfCanistersReached = 102,
     CanisterOutputQueueFull = 201,
     IngressMessageTimeout = 202,
+    CanisterQueueNotEmpty = 203,
+    IngressHistoryFull = 204,
     CanisterNotFound = 301,
     CanisterMethodNotFound = 302,
     CanisterAlreadyInstalled = 303,
     CanisterWasmModuleNotFound = 304,
-    CanisterEmpty = 305,
-    InsufficientTransferFunds = 401,
     InsufficientMemoryAllocation = 402,
     InsufficientCyclesForCreateCanister = 403,
     SubnetNotFound = 404,
+    CanisterNotHostedBySubnet = 405,
     CanisterOutOfCycles = 501,
     CanisterTrapped = 502,
     CanisterCalledTrap = 503,
@@ -133,37 +144,37 @@ pub enum ErrorCode {
     CanisterNonEmpty = 514,
     CertifiedStateUnavailable = 515,
     CanisterRejectedMessage = 516,
-    InterCanisterQueryLoopDetected = 517,
+    QueryCallGraphLoopDetected = 517,
     UnknownManagementMessage = 518,
     InvalidManagementPayload = 519,
     InsufficientCyclesInCall = 520,
-}
-
-impl From<candid::Error> for UserError {
-    fn from(err: Error) -> Self {
-        UserError::new(
-            ErrorCode::CanisterContractViolation,
-            format!("Error decoding candid: {}", err),
-        )
-    }
+    CanisterWasmEngineError = 521,
+    CanisterInstructionLimitExceeded = 522,
+    CanisterInstallCodeRateLimited = 523,
+    CanisterMemoryAccessLimitExceeded = 524,
+    QueryCallGraphTooDeep = 525,
+    QueryCallGraphTotalInstructionLimitExceeded = 526,
+    CompositeQueryCalledInReplicatedMode = 527,
 }
 
 impl TryFrom<u64> for ErrorCode {
-    type Error = ProxyDecodeError;
+    type Error = TryFromError;
     fn try_from(err: u64) -> Result<ErrorCode, Self::Error> {
         match err {
             101 => Ok(ErrorCode::SubnetOversubscribed),
+            102 => Ok(ErrorCode::MaxNumberOfCanistersReached),
             201 => Ok(ErrorCode::CanisterOutputQueueFull),
             202 => Ok(ErrorCode::IngressMessageTimeout),
+            203 => Ok(ErrorCode::CanisterQueueNotEmpty),
+            204 => Ok(ErrorCode::IngressHistoryFull),
             301 => Ok(ErrorCode::CanisterNotFound),
             302 => Ok(ErrorCode::CanisterMethodNotFound),
             303 => Ok(ErrorCode::CanisterAlreadyInstalled),
             304 => Ok(ErrorCode::CanisterWasmModuleNotFound),
-            305 => Ok(ErrorCode::CanisterEmpty),
-            401 => Ok(ErrorCode::InsufficientTransferFunds),
             402 => Ok(ErrorCode::InsufficientMemoryAllocation),
             403 => Ok(ErrorCode::InsufficientCyclesForCreateCanister),
             404 => Ok(ErrorCode::SubnetNotFound),
+            405 => Ok(ErrorCode::CanisterNotHostedBySubnet),
             501 => Ok(ErrorCode::CanisterOutOfCycles),
             502 => Ok(ErrorCode::CanisterTrapped),
             503 => Ok(ErrorCode::CanisterCalledTrap),
@@ -180,14 +191,18 @@ impl TryFrom<u64> for ErrorCode {
             514 => Ok(ErrorCode::CanisterNonEmpty),
             515 => Ok(ErrorCode::CertifiedStateUnavailable),
             516 => Ok(ErrorCode::CanisterRejectedMessage),
-            517 => Ok(ErrorCode::InterCanisterQueryLoopDetected),
+            517 => Ok(ErrorCode::QueryCallGraphLoopDetected),
             518 => Ok(ErrorCode::UnknownManagementMessage),
             519 => Ok(ErrorCode::InvalidManagementPayload),
             520 => Ok(ErrorCode::InsufficientCyclesInCall),
-            _ => Err(ProxyDecodeError::ValueOutOfRange {
-                typ: "ErrorCode",
-                err: err.to_string(),
-            }),
+            521 => Ok(ErrorCode::CanisterWasmEngineError),
+            522 => Ok(ErrorCode::CanisterInstructionLimitExceeded),
+            523 => Ok(ErrorCode::CanisterInstallCodeRateLimited),
+            524 => Ok(ErrorCode::CanisterMemoryAccessLimitExceeded),
+            525 => Ok(ErrorCode::QueryCallGraphTooDeep),
+            526 => Ok(ErrorCode::QueryCallGraphTotalInstructionLimitExceeded),
+            527 => Ok(ErrorCode::CompositeQueryCalledInReplicatedMode),
+            _ => Err(TryFromError::ValueOutOfRange(err)),
         }
     }
 }
@@ -234,6 +249,52 @@ impl UserError {
     pub fn reject_code(&self) -> RejectCode {
         self.code().into()
     }
+
+    pub fn is_system_error(&self) -> bool {
+        match self.code {
+            ErrorCode::CanisterWasmEngineError => true,
+            ErrorCode::SubnetOversubscribed
+            | ErrorCode::MaxNumberOfCanistersReached
+            | ErrorCode::CanisterOutputQueueFull
+            | ErrorCode::IngressMessageTimeout
+            | ErrorCode::CanisterQueueNotEmpty
+            | ErrorCode::CanisterNotFound
+            | ErrorCode::CanisterMethodNotFound
+            | ErrorCode::CanisterAlreadyInstalled
+            | ErrorCode::CanisterWasmModuleNotFound
+            | ErrorCode::InsufficientMemoryAllocation
+            | ErrorCode::InsufficientCyclesForCreateCanister
+            | ErrorCode::SubnetNotFound
+            | ErrorCode::CanisterNotHostedBySubnet
+            | ErrorCode::CanisterOutOfCycles
+            | ErrorCode::CanisterTrapped
+            | ErrorCode::CanisterCalledTrap
+            | ErrorCode::CanisterContractViolation
+            | ErrorCode::CanisterInvalidWasm
+            | ErrorCode::CanisterDidNotReply
+            | ErrorCode::CanisterOutOfMemory
+            | ErrorCode::CanisterStopped
+            | ErrorCode::CanisterStopping
+            | ErrorCode::CanisterNotStopped
+            | ErrorCode::CanisterStoppingCancelled
+            | ErrorCode::CanisterInvalidController
+            | ErrorCode::CanisterFunctionNotFound
+            | ErrorCode::CanisterNonEmpty
+            | ErrorCode::CertifiedStateUnavailable
+            | ErrorCode::CanisterRejectedMessage
+            | ErrorCode::QueryCallGraphLoopDetected
+            | ErrorCode::UnknownManagementMessage
+            | ErrorCode::IngressHistoryFull
+            | ErrorCode::InvalidManagementPayload
+            | ErrorCode::InsufficientCyclesInCall
+            | ErrorCode::CanisterInstructionLimitExceeded
+            | ErrorCode::CanisterInstallCodeRateLimited
+            | ErrorCode::CanisterMemoryAccessLimitExceeded
+            | ErrorCode::QueryCallGraphTooDeep
+            | ErrorCode::QueryCallGraphTotalInstructionLimitExceeded
+            | ErrorCode::CompositeQueryCalledInReplicatedMode => false,
+        }
+    }
 }
 
 impl std::error::Error for UserError {
@@ -267,7 +328,7 @@ mod tests {
             let int_code = code as u64;
             match ErrorCode::try_from(int_code) {
                 Ok(decoded_code) => assert_eq!(code, decoded_code),
-                Err(err) => panic!("Could not decode {} to an ErrorCode: {}.", int_code, err),
+                Err(err) => panic!("Could not decode {} to an ErrorCode: {:?}.", int_code, err),
             }
         }
     }

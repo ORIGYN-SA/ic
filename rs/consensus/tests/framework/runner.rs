@@ -2,6 +2,8 @@ use super::delivery::*;
 use super::execution::*;
 use super::types::*;
 use ic_config::artifact_pool::ArtifactPoolConfig;
+use ic_consensus::consensus::dkg_key_manager::DkgKeyManager;
+use ic_consensus::consensus::pool_reader::PoolReader;
 use ic_consensus::{
     certification::CertifierImpl,
     consensus::{ConsensusImpl, Membership},
@@ -17,6 +19,7 @@ use rand_chacha::{rand_core::SeedableRng, ChaChaRng};
 use slog::Drain;
 use std::cell::{RefCell, RefMut};
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::time::Duration;
 
 fn stop_immediately(_: &ConsensusInstance<'_>) -> bool {
@@ -116,12 +119,21 @@ impl<'a> ConsensusRunner<'a> {
         fake_crypto: Arc<CryptoReturningOk>,
         deps: &'a ConsensusDependencies,
         pool_config: ArtifactPoolConfig,
+        pool_reader: &PoolReader<'_>,
     ) {
         let node_id = deps.replica_config.node_id;
 
         let mut context = self.logger.get_context();
-        context.node_id = format!("{}", node_id.clone().get());
+        context.node_id = format!("{}", node_id.get());
+
         let replica_logger = self.logger.with_new_context(context);
+
+        let dkg_key_manager = Arc::new(Mutex::new(DkgKeyManager::new(
+            deps.metrics_registry.clone(),
+            Arc::clone(&fake_crypto) as Arc<_>,
+            replica_logger.clone(),
+            pool_reader,
+        )));
 
         let consensus = ConsensusImpl::new(
             deps.replica_config.clone(),
@@ -131,10 +143,15 @@ impl<'a> ConsensusRunner<'a> {
             fake_crypto.clone(),
             deps.ingress_selector.clone(),
             deps.xnet_payload_builder.clone(),
+            deps.self_validating_payload_builder.clone(),
+            deps.canister_http_payload_builder.clone(),
             deps.dkg_pool.clone(),
+            deps.ecdsa_pool.clone(),
+            dkg_key_manager.clone(),
             deps.message_routing.clone(),
             deps.state_manager.clone(),
             Arc::clone(&self.time) as Arc<_>,
+            Duration::from_secs(0),
             MaliciousFlags::default(),
             deps.metrics_registry.clone(),
             replica_logger.clone(),
@@ -144,6 +161,7 @@ impl<'a> ConsensusRunner<'a> {
             deps.replica_config.node_id,
             fake_crypto.clone(),
             deps.consensus_pool.read().unwrap().get_cache(),
+            dkg_key_manager,
             deps.metrics_registry.clone(),
             replica_logger.clone(),
         );
@@ -222,7 +240,6 @@ impl<'a> ConsensusRunner<'a> {
                 break;
             }
         }
-
         if stopped {
             NetworkStatus::Stopped
         } else if delivered {
@@ -280,7 +297,7 @@ impl ConsensusRunnerConfig {
         for (key, value) in std::env::vars() {
             if key.eq_ignore_ascii_case("num_nodes") {
                 if value.eq_ignore_ascii_case("random") {
-                    num_nodes = rng.gen_range(1, 20);
+                    num_nodes = rng.gen_range(1..20);
                 } else {
                     num_nodes = value
                         .parse()
@@ -297,11 +314,9 @@ impl ConsensusRunnerConfig {
         let mut config = Self::default();
         config.num_nodes = num_nodes;
         config.random_seed = random_seed;
-        config.num_rounds = rng.gen_range(10, 101);
-        config.degree = rng.gen_range(
-            std::cmp::min(5, config.num_nodes / 2),
-            std::cmp::min(config.num_nodes, 20),
-        );
+        config.num_rounds = rng.gen_range(10..101);
+        config.degree = rng
+            .gen_range(std::cmp::min(5, config.num_nodes / 2)..std::cmp::min(config.num_nodes, 20));
         config.reset_strategies();
         config
     }
@@ -310,8 +325,8 @@ impl ConsensusRunnerConfig {
     fn reset_strategies(&mut self) {
         let mut rng = ChaChaRng::seed_from_u64(self.random_seed);
         let (mut executions, mut deliveries) = self.strategies(&mut rng);
-        self.execution = executions.remove(rng.gen_range(0, executions.len()));
-        self.delivery = deliveries.remove(rng.gen_range(0, deliveries.len()));
+        self.execution = executions.remove(rng.gen_range(0..executions.len()));
+        self.delivery = deliveries.remove(rng.gen_range(0..deliveries.len()));
     }
 
     fn strategies<R: Rng>(&self, rng: &mut R) -> Strategies {

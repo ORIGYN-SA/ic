@@ -1,9 +1,7 @@
 use ic_base_types::{CanisterIdError, PrincipalIdBlobParseError};
-use ic_registry_subnet_type::SubnetType;
-use ic_types::{
-    methods::WasmMethod, user_error::UserError, CanisterId, CanisterStatusType, Cycles,
-};
-use ic_wasm_types::{WasmInstrumentationError, WasmValidationError};
+use ic_error_types::UserError;
+use ic_types::{methods::WasmMethod, CanisterId, Cycles, NumInstructions};
+use ic_wasm_types::{WasmEngineError, WasmInstrumentationError, WasmValidationError};
 use serde::{Deserialize, Serialize};
 
 /// Various traps that a canister can create.
@@ -12,9 +10,11 @@ pub enum TrapCode {
     StackOverflow,
     HeapOutOfBounds,
     StableMemoryOutOfBounds,
+    StableMemoryTooBigFor32Bit,
     IntegerDivByZero,
     Unreachable,
     TableOutOfBounds,
+    CyclesAmountTooBigFor64Bit,
     Other,
 }
 
@@ -24,55 +24,44 @@ impl std::fmt::Display for TrapCode {
             Self::StackOverflow => write!(f, "stack overflow"),
             Self::HeapOutOfBounds => write!(f, "heap out of bounds"),
             Self::StableMemoryOutOfBounds => write!(f, "stable memory out of bounds"),
+            Self::StableMemoryTooBigFor32Bit => write!(
+                f,
+                "32 bit stable memory api used on a memory larger than 4GB"
+            ),
             Self::IntegerDivByZero => write!(f, "integer division by 0"),
             Self::Unreachable => write!(f, "unreachable"),
             Self::TableOutOfBounds => write!(f, "table out of bounds"),
+            Self::CyclesAmountTooBigFor64Bit => {
+                write!(f, "cycles amount exceeds 64-bit representation")
+            }
             Self::Other => write!(f, "unknown"),
         }
     }
 }
 
-/// Errors when executing `canister_heartbeat`.
-#[derive(Debug, Eq, PartialEq)]
-pub enum CanisterHeartbeatError {
-    /// The canister isn't running.
-    CanisterNotRunning {
-        status: CanisterStatusType,
-    },
-
-    /// The subnet type isn't a system subnet.
-    NotSystemSubnet {
-        subnet_type_given: SubnetType,
-    },
-
-    OutOfCycles,
-
-    /// Execution failed while executing the `canister_heartbeat`.
-    CanisterExecutionFailed(HypervisorError),
+/// Error when a canister's balance is too low compared to its freezing
+/// threshold and cannot perform the requested action.
+///
+/// Should be used as the wrapped error by various components that need to
+/// handle such cases.
+#[derive(Clone, Debug, Hash, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CanisterOutOfCyclesError {
+    pub canister_id: CanisterId,
+    pub available: Cycles,
+    pub requested: Cycles,
+    pub threshold: Cycles,
 }
 
-/// Different types of errors that can be returned from the function(s) that
-/// check if messages should be accepted or not.
-#[derive(Debug, Eq, PartialEq)]
-pub enum MessageAcceptanceError {
-    /// The canister that the message is destined for was not found. So no
-    /// checks could be performed.
-    CanisterNotFound,
+impl std::error::Error for CanisterOutOfCyclesError {}
 
-    /// The canister that the message is destined for does not have a wasm
-    /// module. So it will not be able to handle the message even if the message
-    /// was accepted.
-    CanisterHasNoWasmModule,
-
-    /// The canister explicitly rejected the message.
-    CanisterRejected,
-
-    /// The canister doesn't have enough cycles to execute the message.
-    CanisterOutOfCycles,
-
-    /// The canister experienced a failure while executing the `inspect_message`
-    /// method
-    CanisterExecutionFailed(HypervisorError),
+impl std::fmt::Display for CanisterOutOfCyclesError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "Canister {} is out of cycles: requested {} cycles but the available balance is {} cycles and the freezing threshold {} cycles",
+            self.canister_id, self.requested, self.available, self.threshold
+        )
+    }
 }
 
 /// Errors returned by the Hypervisor.
@@ -90,7 +79,9 @@ pub enum HypervisorError {
     /// to a user of IC.
     ContractViolation(String),
     /// Wasm execution consumed too many instructions.
-    OutOfInstructions,
+    InstructionLimitExceeded,
+    /// Wasm execution was too complex, i.e. had too many System API calls.
+    ExecutionComplexityLimitExceeded,
     /// We could not validate the wasm module
     InvalidWasm(WasmValidationError),
     /// We could not instrument the wasm module
@@ -109,12 +100,6 @@ pub enum HypervisorError {
     /// An attempt to perform an operation that isn't allowed when the canister
     /// is stopped.
     CanisterStopped,
-    /// Canister performed an 'exec' system call.
-    /// Strictly speaking this is not an error. However, it immediately aborts
-    /// the execution in the same manner an error would. And it must be handled
-    /// by the Hypervisor. The payload is WASM bytecode.
-    /// Thus, it can be thought of as 'recoverable error'.
-    CanisterExec(Vec<u8>, Vec<u8>),
     /// An attempt was made to use more cycles than was available in a call
     /// context.
     InsufficientCyclesInCall {
@@ -129,14 +114,27 @@ pub enum HypervisorError {
     MessageRejected,
     /// An attempt was made to add more cycles to an outgoing call than
     /// available in the canister's balance.
-    InsufficientCyclesBalance {
-        available: Cycles,
-        requested: Cycles,
-    },
+    InsufficientCyclesBalance(CanisterOutOfCyclesError),
     Cleanup {
         callback_err: Box<HypervisorError>,
         cleanup_err: Box<HypervisorError>,
     },
+    WasmEngineError(WasmEngineError),
+    /// The canister is close to running out of Wasm memory and
+    /// attempted to allocate reserved Wasm pages.
+    WasmReservedPages,
+    /// The execution was aborted by deterministic time slicing. This error is
+    /// not observable by the user and should be processed before leaving Wasm
+    /// execution.
+    Aborted,
+    /// A single operation like `stable_write()` exceeded the slice instruction
+    /// limit and caused the Wasm execution to fail.
+    SliceOverrun {
+        instructions: NumInstructions,
+        limit: NumInstructions,
+    },
+    /// A canister has written too much new data in a single message.
+    MemoryAccessLimitExceeded(String),
 }
 
 impl From<WasmInstrumentationError> for HypervisorError {
@@ -151,6 +149,12 @@ impl From<WasmValidationError> for HypervisorError {
     }
 }
 
+impl From<WasmEngineError> for HypervisorError {
+    fn from(err: WasmEngineError) -> Self {
+        Self::WasmEngineError(err)
+    }
+}
+
 impl std::fmt::Display for HypervisorError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{:?}", self)
@@ -159,7 +163,7 @@ impl std::fmt::Display for HypervisorError {
 
 impl HypervisorError {
     pub fn into_user_error(self, canister_id: &CanisterId) -> UserError {
-        use ic_types::user_error::ErrorCode as E;
+        use ic_error_types::ErrorCode as E;
 
         match self {
             Self::MessageRejected => UserError::new(
@@ -184,6 +188,7 @@ impl HypervisorError {
                 let kind = match wasm_method {
                     WasmMethod::Update(_) => "update",
                     WasmMethod::Query(_) => "query",
+                    WasmMethod::CompositeQuery(_) => "composite_query",
                     WasmMethod::System(_) => "system",
                 };
 
@@ -204,9 +209,13 @@ impl HypervisorError {
                     canister_id, description
                 ),
             ),
-            Self::OutOfInstructions => UserError::new(
-                E::CanisterOutOfCycles,
-                format!("Canister {} exceeded the cycles limit for single message execution.", canister_id),
+            Self::InstructionLimitExceeded => UserError::new(
+                E::CanisterInstructionLimitExceeded,
+                format!("Canister {} exceeded the instruction limit for single message execution.", canister_id),
+            ),
+            Self::ExecutionComplexityLimitExceeded => UserError::new(
+                E::CanisterInstructionLimitExceeded,
+                format!("Canister {} exceeded the instruction limit for single message execution due to too many System API calls.", canister_id),
             ),
             Self::InvalidWasm(err) => UserError::new(
                 E::CanisterInvalidWasm,
@@ -237,13 +246,16 @@ impl HypervisorError {
                     canister_id
                 ),
             ),
+            Self::WasmReservedPages => UserError::new(
+                E::CanisterOutOfMemory,
+                format!(
+                    "Canister {} ran out of available Wasm memory.",
+                    canister_id
+                ),
+            ),
             Self::CanisterStopped => UserError::new(
                 E::CanisterStopped,
                 format!("Canister {} is stopped", canister_id,),
-            ),
-            Self::CanisterExec(_, _) => UserError::new(
-                E::CanisterContractViolation,
-                "Calling exec is only allowed in the update call".to_string(),
             ),
             Self::InsufficientCyclesInCall {
                 available,
@@ -263,15 +275,9 @@ impl HypervisorError {
                 E::CanisterTrapped,
                 format!("Canister {} provided invalid canister id", canister_id),
             ),
-            Self::InsufficientCyclesBalance {
-                available,
-                requested,
-            } => UserError::new(
+            Self::InsufficientCyclesBalance(err) => UserError::new(
                 E::CanisterOutOfCycles,
-                format!(
-                    "Canister {} attempted to send {} cycles when only {} were available in its balance",
-                    canister_id, requested, available
-                ),
+                err.to_string(),
             ),
             Self::Cleanup {
                 callback_err,
@@ -288,6 +294,56 @@ impl HypervisorError {
                     )
                 )
             }
+            Self::WasmEngineError(err) => UserError::new(
+                E::CanisterWasmEngineError,
+                format!(
+                    "Canister {} encountered a Wasm engine error: {}", canister_id, err
+                ),
+            ),
+            Self::Aborted => {
+                unreachable!("Aborted execution should not be visible to the user.");
+            },
+            Self::SliceOverrun {instructions, limit} => UserError::new(
+                E::CanisterInstructionLimitExceeded,
+                format!("Canister {} attempted to perform \
+                a large memory operation that used {} instructions and \
+                exceeded the slice limit {}.", canister_id, instructions, limit),
+            ),
+            Self::MemoryAccessLimitExceeded(s) => UserError::new(
+                E::CanisterMemoryAccessLimitExceeded,
+                format!("Canister exceeded memory access limits: {}", s)
+
+            ),
+        }
+    }
+
+    /// Returns a string slice representation of the enum variant name for use
+    /// e.g. as a metric label.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            HypervisorError::FunctionNotFound(..) => "FunctionNotFound",
+            HypervisorError::MethodNotFound(_) => "MethodNotFound",
+            HypervisorError::ContractViolation(_) => "ContractViolation",
+            HypervisorError::InstructionLimitExceeded => "InstructionLimitExceeded",
+            HypervisorError::ExecutionComplexityLimitExceeded => "ExecutionComplexityLimitExceeded",
+            HypervisorError::InvalidWasm(_) => "InvalidWasm",
+            HypervisorError::InstrumentationFailed(_) => "InstrumentationFailed",
+            HypervisorError::Trapped(_) => "Trapped",
+            HypervisorError::CalledTrap(_) => "CalledTrap",
+            HypervisorError::WasmModuleNotFound => "WasmModuleNotFound",
+            HypervisorError::OutOfMemory => "OutOfMemory",
+            HypervisorError::CanisterStopped => "CanisterStopped",
+            HypervisorError::InsufficientCyclesInCall { .. } => "InsufficientCyclesInCall",
+            HypervisorError::InvalidPrincipalId(_) => "InvalidPrincipalId",
+            HypervisorError::InvalidCanisterId(_) => "InvalidCanisterId",
+            HypervisorError::MessageRejected => "MessageRejected",
+            HypervisorError::InsufficientCyclesBalance { .. } => "InsufficientCyclesBalance",
+            HypervisorError::Cleanup { .. } => "Cleanup",
+            HypervisorError::WasmEngineError(_) => "WasmEngineError",
+            HypervisorError::WasmReservedPages => "WasmReservedPages",
+            HypervisorError::Aborted => "Aborted",
+            HypervisorError::SliceOverrun { .. } => "SliceOverrun",
+            HypervisorError::MemoryAccessLimitExceeded(_) => "MemoryAccessLimitExceeded",
         }
     }
 }

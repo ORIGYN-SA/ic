@@ -1,0 +1,54 @@
+load("//bazel:prost.bzl", "generated_files_check")
+load("@rules_rust//rust:defs.bzl", "rust_doc_test", "rust_library", "rust_test")
+
+package(default_visibility = ["//visibility:public"])
+
+filegroup(
+    name = "protos",
+    srcs = glob(["def/**"]),
+)
+
+rust_library(
+    name = "protobuf",
+    srcs = glob([
+        "src/**",
+        "gen/**",
+    ]),
+    crate_name = "ic_protobuf",
+    version = "0.8.0",
+    deps = [
+        "@crate_index//:bincode",
+        "@crate_index//:candid",
+        "@crate_index//:erased-serde",
+        "@crate_index//:hex",
+        "@crate_index//:maplit",
+        "@crate_index//:prost",
+        "@crate_index//:serde",
+        "@crate_index//:serde_json",
+        "@crate_index//:slog",
+    ],
+)
+
+rust_test(
+    name = "protobuf_test",
+    crate = ":protobuf",
+)
+
+rust_doc_test(
+    name = "protobuf_doc_test",
+    crate = ":protobuf",
+)
+
+generated_files_check(
+    name = "check_generated_files",
+    srcs = ["tests/check_generated_files.rs"],
+    data = glob([
+        "gen/**",
+    ]) + [":protos"],
+    manifest_dir = "rs/protobuf",
+    deps = [
+        "//rs/protobuf/generator:lib",
+        "//rs/test_utilities/compare_dirs",
+        "@crate_index//:tempfile",
+    ],
+)

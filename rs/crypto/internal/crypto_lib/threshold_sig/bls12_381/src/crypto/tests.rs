@@ -9,26 +9,22 @@ use super::super::types::{
 };
 use crate::crypto::hash_message_to_g1;
 use crate::types::PublicKey;
-use ff::Field;
-use ic_crypto_internal_bls12381_common::{g1_to_bytes, hash_to_fr};
+use ic_crypto_internal_bls12_381_type::{G2Projective, Scalar};
+use ic_crypto_internal_seed::Seed;
 use ic_types::crypto::error::InvalidArgumentError;
-use ic_types::{NodeIndex, NumberOfNodes, Randomness};
-use pairing::bls12_381::Fr;
+use ic_types::{NodeIndex, NumberOfNodes};
 use proptest::prelude::*;
 use proptest::std_facade::HashSet;
-use rand::seq::IteratorRandom;
-use rand::Rng;
+use rand::SeedableRng;
 use rand_chacha::ChaChaRng;
-use rand_core::SeedableRng;
-use std::convert::TryFrom;
+use std::ops::AddAssign;
 
 pub mod util {
     use super::{
         crypto, select_n, IndividualSignature, InvalidArgumentError, NodeIndex, NumberOfNodes,
-        Polynomial, PublicCoefficients, Randomness, SecretKey,
+        Polynomial, PublicCoefficients, Scalar, SecretKey,
     };
-    use ff::Field;
-    use pairing::bls12_381::Fr;
+    use ic_crypto_internal_seed::Seed;
 
     // A public key as computed by the holder of the private key is the same as the
     // public key as computed from the public public_coefficients.
@@ -50,10 +46,10 @@ pub mod util {
     /// Useful for testing with the standard dealing API that throws away the
     /// original secret polynomial.
     fn combined_secret_key(secret_keys: &[SecretKey]) -> SecretKey {
-        let coordinates: Vec<(Fr, SecretKey)> = secret_keys
+        let coordinates: Vec<(Scalar, SecretKey)> = secret_keys
             .iter()
-            .zip(0 as NodeIndex..)
-            .map(|(y, index)| (crypto::x_for_index(index), *y))
+            .zip(0_u32..)
+            .map(|(y, index)| (crypto::x_for_index(index), y.clone()))
             .collect();
         Polynomial::interpolate(&coordinates)
             .coefficients
@@ -89,7 +85,7 @@ pub mod util {
         public_coefficients: &PublicCoefficients,
         secret_keys: &[SecretKey],
         threshold: NumberOfNodes,
-        seed: Randomness,
+        seed: Seed,
         message: &[u8],
     ) {
         let signatures: Vec<IndividualSignature> = secret_keys
@@ -103,7 +99,7 @@ pub mod util {
 
             // Correct values validate:
             assert_eq!(
-                crypto::verify(message, *signature, public_key),
+                crypto::verify(message, signature, &public_key),
                 Ok(()),
                 "Individual signature failed verification for signatory number {}/{}",
                 index,
@@ -116,7 +112,7 @@ pub mod util {
                 let wrong_public_key =
                     crypto::individual_public_key(public_coefficients, wrong_index as NodeIndex);
                 assert!(
-                    crypto::verify(message, *signature, wrong_public_key).is_err(),
+                    crypto::verify(message, signature, &wrong_public_key).is_err(),
                     "Individual signature verification accepted incorrect signatory {} instead of {}/{}",
                     wrong_index,
                     index,
@@ -126,7 +122,7 @@ pub mod util {
         }
 
         // Get the combined public key
-        let public_key = crypto::combined_public_key(&public_coefficients);
+        let public_key = crypto::combined_public_key(public_coefficients);
         let secret_key = combined_secret_key(secret_keys);
         assert_eq!(public_key, crypto::public_key_from_secret_key(&secret_key));
 
@@ -136,7 +132,7 @@ pub mod util {
             .expect("Failed to combine signatures");
 
         // Correct values validate:
-        assert_eq!(crypto::verify(message, signature, public_key), Ok(()));
+        assert_eq!(crypto::verify(message, &signature, &public_key), Ok(()));
 
         // Incorrect values are rejected:
         if !public_coefficients.coefficients.is_empty() {
@@ -145,12 +141,12 @@ pub mod util {
                 incorrect_message != message,
                 "Bad test: The messages should be different"
             );
-            assert!(crypto::verify(&incorrect_message, signature, public_key).is_err());
+            assert!(crypto::verify(&incorrect_message, &signature, &public_key).is_err());
         }
         if public_coefficients.coefficients.len() > 1 {
-            let some_individual_signature = signatures[0];
+            let some_individual_signature = signatures[0].clone();
             assert!(
-                crypto::verify(message, some_individual_signature, public_key).is_err(),
+                crypto::verify(message, &some_individual_signature, &public_key).is_err(),
                 "Signature verification passed with incorrect signature: got {:?} expected {:?}",
                 some_individual_signature,
                 signature
@@ -158,8 +154,8 @@ pub mod util {
         }
         if public_coefficients.coefficients.len() > 1 {
             let some_individual_public_key =
-                crypto::individual_public_key(public_coefficients, 11 as NodeIndex);
-            assert!(crypto::verify(message, signature, some_individual_public_key).is_err());
+                crypto::individual_public_key(public_coefficients, 11_u32);
+            assert!(crypto::verify(message, &signature, &some_individual_public_key).is_err());
         }
     }
 
@@ -173,36 +169,26 @@ pub mod util {
         public_coefficients: &PublicCoefficients,
         secret_keys: &[SecretKey],
         threshold: NumberOfNodes,
-        seed: Randomness,
+        seed: Seed,
         message: &[u8],
     ) {
         test_individual_public_key_matches(public_coefficients, secret_keys);
         test_threshold_signatures(public_coefficients, secret_keys, threshold, seed, message);
     }
 
-    // TODO(DFN-1412): Test scenarios where only some keys are generated
-    pub fn keygen(
-        seed: Randomness,
+    pub fn generate_threshold_key(
+        seed: Seed,
         threshold: NumberOfNodes,
         number_of_shares: NumberOfNodes,
     ) -> Result<(PublicCoefficients, Vec<SecretKey>), InvalidArgumentError> {
-        let which_shares = vec![true; number_of_shares.get() as usize];
-        crypto::keygen(seed, threshold, &which_shares).map(|(public_coefficients, keys_maybe)| {
-            let keys: Vec<SecretKey> = keys_maybe
-                .iter()
-                .cloned()
-                .filter_map(|maybe| maybe)
-                .collect();
-            (public_coefficients, keys)
-        })
+        crypto::generate_threshold_key(seed, threshold, number_of_shares)
     }
 
     /// Combining multiple key generations should yield a valid generation.
-    /// TODO(DFN-1412): Extend these tests for the case where keys have gaps.
     pub fn assert_keygen_composes(
         generations: &[(PublicCoefficients, Vec<SecretKey>)],
         threshold: NumberOfNodes,
-        seed: Randomness,
+        seed: Seed,
         message: &[u8],
     ) {
         // Sum public_coefficients and secret keys.  We treat the vector of secret keys
@@ -228,15 +214,15 @@ pub mod util {
 #[test]
 fn x_for_index_is_correct() {
     // First N values:
-    let mut x = Fr::one();
+    let mut x = Scalar::one();
     for i in 0..100 {
         assert_eq!(crypto::x_for_index(i), x);
-        x.add_assign(&Fr::one());
+        x.add_assign(&Scalar::one());
     }
     // Binary 0, 1, 11, 111, ... all the way up to the maximum NodeIndex.
     // The corresponding x values are binary 1, 10, 100, ... and the last value is
     // one greater than the maximum NodeIndex.
-    let mut x = Fr::one();
+    let mut x = Scalar::one();
     let mut i: NodeIndex = 0;
     loop {
         assert_eq!(crypto::x_for_index(i), x);
@@ -256,7 +242,7 @@ fn test_distinct_messages_yield_distinct_hashes() {
     let points: HashSet<_> = (0..number_of_messages as u32)
         .map(|number| {
             let g1 = hash_message_to_g1(&number.to_be_bytes()[..]);
-            let bytes = g1_to_bytes(&g1);
+            let bytes = g1.serialize();
             // It suffices to prove that the first 32 bytes are distinct.  More requires a
             // custom hash implementation.
             let mut hashable = [0u8; 32];
@@ -272,11 +258,11 @@ fn test_distinct_messages_yield_distinct_hashes() {
 fn omnipotent_dealer() {
     let threshold = NumberOfNodes::from(3);
     let num_shares = NumberOfNodes::from(6);
-    let seed = Randomness::from([1u8; 32]);
+    let seed = Seed::from_bytes(&[1u8; 32]);
     let message = b"foo";
 
     let (public_coefficients, shares) =
-        util::keygen(seed, threshold, num_shares).expect("Could not generate keys");
+        util::generate_threshold_key(seed, threshold, num_shares).expect("Could not generate keys");
     let public_key = PublicKey::from(&public_coefficients);
 
     let signature_options: Vec<Option<IndividualSignature>> = shares
@@ -286,7 +272,7 @@ fn omnipotent_dealer() {
             let signature = crypto::sign_message(message, secret_key);
             let public_key =
                 crypto::individual_public_key(&public_coefficients, index as NodeIndex);
-            assert!(crypto::verify(&message[..], signature, public_key).is_ok());
+            assert!(crypto::verify(&message[..], &signature, &public_key).is_ok());
             Some(signature)
         })
         .collect();
@@ -296,39 +282,9 @@ fn omnipotent_dealer() {
             .expect("Combining signatures failed");
 
     assert_eq!(
-        crypto::verify(&message[..], combined_signature, public_key),
+        crypto::verify(&message[..], &combined_signature, &public_key),
         Ok(())
     );
-}
-
-#[test]
-#[ignore]
-/// Verifies that `verify_keygen_args` returns an error if the vector of
-/// eligible nodes is too long.
-///
-/// The maximum length that should be accepted is `NodeIndex::max_value()`.
-/// More should fail.
-///
-/// Note: This is a slow test and can consume a lot of RAM, depending on the
-/// definition of NodeIndex.  To test quickly, change NodeIndex to u16.  If the
-/// code is clean and compiles, this test will run quickly.
-fn verify_keygen_args_rejects_too_many_share_indices() {
-    let max_node_index = usize::try_from(NodeIndex::max_value());
-    if max_node_index.is_err() {
-        return; // usize is smaller than NodeIndex
-    }
-    let max_node_index = max_node_index.unwrap();
-
-    if usize::max_value() > max_node_index {
-        assert!(
-            crypto::verify_keygen_args(NumberOfNodes::from(0), &vec![true; max_node_index]).is_ok()
-        );
-        assert!(crypto::verify_keygen_args(
-            NumberOfNodes::from(0),
-            &vec![true; max_node_index + 1]
-        )
-        .is_err());
-    }
 }
 
 proptest! {
@@ -338,20 +294,20 @@ proptest! {
         })]
 
         #[test]
-        fn single_keygen_is_valid(keygen_seed: [u8;32], test_seed: [u8;32], threshold in 0 as NodeIndex..5, redundancy in (0 as NodeIndex..10), message: Vec<u8>) {
+        fn single_keygen_is_valid(keygen_seed: [u8;32], test_seed: [u8;32], threshold in 0_u32..5, redundancy in (0_u32..10), message: Vec<u8>) {
             let threshold = NumberOfNodes::from(threshold);
             let num_shares = threshold + NumberOfNodes::from(redundancy);
-            let (public_coefficients, secret_keys) = util::keygen(Randomness::from(keygen_seed), threshold, num_shares).expect("Failed to generate keys");
-            util::test_valid_public_coefficients(&public_coefficients, &secret_keys, threshold, Randomness::from(test_seed), &message);
+            let (public_coefficients, secret_keys) = util::generate_threshold_key(Seed::from_bytes(&keygen_seed), threshold, num_shares).expect("Failed to generate keys");
+            util::test_valid_public_coefficients(&public_coefficients, &secret_keys, threshold, Seed::from_bytes(&test_seed), &message);
         }
 
 
         #[test]
-        fn proptest_keygen_composes(keygen_seeds in proptest::collection::vec(any::<[u8;32]>(), 1..10), test_seed: [u8;32], threshold in 0 as NodeIndex..10, redundancy in (0 as NodeIndex..10), message: Vec<u8>) {
+        fn proptest_keygen_composes(keygen_seeds in proptest::collection::vec(any::<[u8;32]>(), 1..10), test_seed: [u8;32], threshold in 0_u32..10, redundancy in (0_u32..10), message: Vec<u8>) {
             let threshold = NumberOfNodes::from(threshold);
             let num_shares = threshold + NumberOfNodes::from(redundancy);
-            let generations = keygen_seeds.into_iter().map(|seed| util::keygen(Randomness::from(seed), threshold, num_shares).expect("Could not generate keys")).collect::<Vec<_>>();
-            util::assert_keygen_composes(&generations, threshold, Randomness::from(test_seed), &message)
+            let generations = keygen_seeds.into_iter().map(|seed| util::generate_threshold_key(Seed::from_bytes(&seed), threshold, num_shares).expect("Could not generate keys")).collect::<Vec<_>>();
+            util::assert_keygen_composes(&generations, threshold, Seed::from_bytes(&test_seed), &message)
         }
 
         #[test]
@@ -362,54 +318,28 @@ proptest! {
             util::test_combined_secret_key(polynomial, NumberOfNodes::from(num_receivers as NodeIndex));
         }
 
-        /// Verifies that verify_keygen_args returns an error if the number of eligible nodes
-        /// is strictly less than the threshold.
-        /// In this test the other requirements of verify_keygen_args are satisfied, so when
-        /// the number of eligible nodes is greater than or equal to the threshold this checks
-        /// that no error is returned.
-        #[test]
-        fn verify_keygen_args_rejects_insufficient_eligible_nodes(
-            threshold in 0 as NodeIndex..10,
-            eligible in 0 as NodeIndex..10,
-            ineligible in 0 as NodeIndex..10,
-            seed: Randomness,
-        ) {
-            let all_nodes = vec![true;(eligible+ineligible) as usize];
-            let eligible_nodes: Vec<bool> = select_n(seed, NumberOfNodes::from(eligible), &all_nodes).iter().map(|entry| entry.is_some()).collect();
-            assert_eq!(crypto::verify_keygen_args(NumberOfNodes::from(threshold), &eligible_nodes).is_ok(), eligible >= threshold);
-        }
-
         /// Keygen with secret is identical to the normal keygen except
         /// that the threshold key is specified.  here we check that the
         /// threshold key is correct by examining the threshold public
         /// key of the generated key.
         #[test]
-        fn verifies_that_keygen_with_secret_has_the_correct_public_coefficient_at_zero(
-            threshold in 1 as NodeIndex..5,
-            redundancy in 0 as NodeIndex..5,
-            idle_receivers in 0 as NodeIndex..5,
-            seed: Randomness
+        fn verifies_that_threshold_share_secret_key_has_the_correct_public_coefficient_at_zero(
+            threshold in 1_u32..5,
+            redundancy in 0_u32..5,
+            idle_receivers in 0_u32..5,
+            seed: [u8; 32]
         ) {
-            let mut rng = ChaChaRng::from_seed(seed.get());
+            let mut rng = ChaChaRng::from_seed(seed);
             let receivers_size = (threshold+redundancy+idle_receivers) as usize;
 
-            let secret_key = SecretKey::random(&mut rng);
+            let secret_key = Scalar::random(&mut rng);
 
-            let eligibility = {
-                let mut eligibility = vec![true;receivers_size];
-                for index in (0..receivers_size).choose_multiple(&mut rng, idle_receivers as usize) {
-                    eligibility[index] = false;
-                }
-                eligibility
-            };
-
-            let (public_coefficients, _secret_keys) = crypto::keygen_with_secret(
-                            Randomness::from(rng.gen::<[u8; 32]>()),
-                            NumberOfNodes::from(threshold),
-                            &eligibility,
-                            &secret_key,
-                        )
-                        .expect("Reshare keygen failed");
+            let (public_coefficients, _secret_keys) = crypto::threshold_share_secret_key(
+                Seed::from_rng(&mut rng),
+                NumberOfNodes::from(threshold),
+                NumberOfNodes::from(receivers_size as u32),
+                &secret_key,
+            ).expect("Reshare keygen failed");
 
             let expected_public_key = crypto::public_key_from_secret_key(&secret_key);
             let actual_public_key = PublicKey::from(&public_coefficients);
@@ -419,9 +349,8 @@ proptest! {
 
 mod resharing_util {
     use super::*;
-    use pairing::bls12_381::G2;
 
-    pub type ToyDealing = (PublicCoefficients, Vec<Option<SecretKey>>);
+    pub type ToyDealing = (PublicCoefficients, Vec<SecretKey>);
 
     /// For each resharing dealer, generate keys.
     ///
@@ -432,80 +361,62 @@ mod resharing_util {
     /// * `new_threshold` is the minimum number of signatures that will be
     ///   needed to create a valid threshold signature in the new threshold
     ///   system.
-    /// * `new_eligibility` indicates which of the new receivers should receive
-    ///   keys.
+    /// * `new_receivers` indicates how many receivers get a new share
     pub fn multiple_keygen(
-        rng: &mut ChaChaRng,
-        original_receiver_shares: &[Option<SecretKey>],
+        mut rng: &mut ChaChaRng,
+        original_receiver_shares: &[SecretKey],
         new_threshold: NumberOfNodes,
-        new_eligibility: &[bool],
-    ) -> Vec<Option<ToyDealing>> {
+        new_receivers: NumberOfNodes,
+    ) -> Vec<ToyDealing> {
         original_receiver_shares
             .iter()
-            .map(|key_maybe| {
-                key_maybe.map(|secret_key| {
-                    crypto::keygen_with_secret(
-                        Randomness::from(rng.gen::<[u8; 32]>()),
-                        new_threshold,
-                        new_eligibility,
-                        &secret_key,
-                    )
-                    .expect("Reshare keygen failed")
-                })
+            .map(|key| {
+                crypto::threshold_share_secret_key(
+                    Seed::from_rng(&mut rng),
+                    new_threshold,
+                    new_receivers,
+                    key,
+                )
+                .expect("Reshare keygen failed")
             })
             .collect()
     }
 
     /// Given multiple secret keys (y values) at different indices (which give x
     /// values) interpolate the value at zero.
-    pub fn interpolate_secret_key(shares: &[Option<SecretKey>]) -> SecretKey {
+    pub fn interpolate_secret_key(shares: &[SecretKey]) -> SecretKey {
         let shares: Vec<(SecretKey, SecretKey)> = shares
             .iter()
             .enumerate()
-            .filter_map(|(index, share_maybe)| {
-                share_maybe.map(|share| (crypto::x_for_index(index as NodeIndex), share))
-            })
+            .map(|(index, share)| (crypto::x_for_index(index as NodeIndex), share.clone()))
             .collect();
-        Polynomial::interpolate(&shares).coefficients[0]
+        Polynomial::interpolate(&shares).coefficients[0].clone()
     }
 
     /// Given multiple public keys (y values) at different points (which give x
     /// values) interpolate the value at zero.
-    pub fn interpolate_public_key(shares: &[Option<PublicKey>]) -> PublicKey {
-        let shares: Vec<(SecretKey, G2)> = shares
+    pub fn interpolate_public_key(shares: &[PublicKey]) -> PublicKey {
+        let shares: Vec<(SecretKey, G2Projective)> = shares
             .iter()
             .enumerate()
-            .filter_map(|(index, share_maybe)| {
-                share_maybe.map(|share| (crypto::x_for_index(index as NodeIndex), share.0))
-            })
+            .map(|(index, share)| (crypto::x_for_index(index as NodeIndex), share.0.clone()))
             .collect();
-        PublicKey(PublicCoefficients::interpolate(&shares).unwrap())
+        PublicKey(PublicCoefficients::interpolate_g2(&shares).unwrap())
     }
 
     /// For each active new receiver, this provides a single encrypted secret
     /// threshold key.
     pub fn compute_combined_encrypted_shares(
-        eligibility: &[bool],
-        dealings: &[Option<ToyDealing>],
-    ) -> Vec<Option<SecretKey>> {
-        (0..)
-            .zip(eligibility)
-            .map(|(new_receiver_index, eligible)| {
-                if *eligible {
-                    Some({
-                        let new_receiver_shares: Vec<Option<SecretKey>> = dealings
-                            .iter()
-                            .map(|dealing_maybe| {
-                                dealing_maybe.as_ref().map(|dealing| {
-                                    dealing.1[new_receiver_index].expect("Missing share")
-                                })
-                            })
-                            .collect();
-                        resharing_util::interpolate_secret_key(&new_receiver_shares)
-                    })
-                } else {
-                    None
-                }
+        receivers: NumberOfNodes,
+        dealings: &[ToyDealing],
+    ) -> Vec<SecretKey> {
+        (0..receivers.get() as usize)
+            .map(|new_receiver_index| {
+                let new_receiver_shares: Vec<SecretKey> = dealings
+                    .iter()
+                    .map(|dealing| dealing.1[new_receiver_index].clone())
+                    .collect();
+                resharing_util::interpolate_secret_key(&new_receiver_shares)
             })
             .collect()
     }
@@ -514,18 +425,14 @@ mod resharing_util {
     // the dealings.
     pub fn compute_new_public_coefficients(
         new_threshold: NumberOfNodes,
-        dealings: &[Option<ToyDealing>],
+        dealings: &[ToyDealing],
     ) -> PublicCoefficients {
         PublicCoefficients {
             coefficients: (0..new_threshold.get() as usize)
                 .map(|coefficient_index| {
-                    let new_receiver_shares: Vec<Option<PublicKey>> = dealings
+                    let new_receiver_shares: Vec<PublicKey> = dealings
                         .iter()
-                        .map(|dealing_maybe| {
-                            dealing_maybe
-                                .as_ref()
-                                .map(|dealing| dealing.0.coefficients[coefficient_index])
-                        })
+                        .map(|dealing| dealing.0.coefficients[coefficient_index].clone())
                         .collect();
                     resharing_util::interpolate_public_key(&new_receiver_shares)
                 })
@@ -540,35 +447,34 @@ mod resharing_util {
 /// A complication that is omitted is the encryption of the key shares.
 #[test]
 fn simplified_resharing_should_preserve_the_threshold_key() {
-    let original_threshold = 3;
-    let new_threshold = 4;
-    let original_eligibility = vec![true, true, false, true, true];
-    let new_eligibility = vec![true, false, true, false, true, true, true];
+    let original_threshold = NumberOfNodes::from(3);
+    let original_receivers = NumberOfNodes::from(5);
+    let new_threshold = NumberOfNodes::from(4);
+    let new_receivers = NumberOfNodes::from(7);
+
     let mut rng = ChaChaRng::from_seed([9u8; 32]);
-    let (original_public_coefficients, original_receiver_shares) = crypto::keygen(
-        Randomness::from(rng.gen::<[u8; 32]>()),
-        NumberOfNodes::from(original_threshold),
-        &original_eligibility,
+
+    let (original_public_coefficients, original_receiver_shares) = crypto::generate_threshold_key(
+        Seed::from_rng(&mut rng),
+        original_threshold,
+        original_receivers,
     )
     .expect("Original keygen failed");
-    let reshares: Vec<Option<resharing_util::ToyDealing>> = resharing_util::multiple_keygen(
+    let reshares = resharing_util::multiple_keygen(
         &mut rng,
         &original_receiver_shares,
-        NumberOfNodes::from(new_threshold),
-        &new_eligibility,
+        new_threshold,
+        new_receivers,
     );
-    let new_receiver_shares: Vec<Option<SecretKey>> =
-        resharing_util::compute_combined_encrypted_shares(&new_eligibility, &reshares);
+    let new_receiver_shares: Vec<SecretKey> =
+        resharing_util::compute_combined_encrypted_shares(new_receivers, &reshares);
     assert_eq!(
         resharing_util::interpolate_secret_key(&original_receiver_shares),
         resharing_util::interpolate_secret_key(&new_receiver_shares),
         "New secret doesn't match old"
     );
     let new_public_coefficients: PublicCoefficients =
-        resharing_util::compute_new_public_coefficients(
-            NumberOfNodes::from(new_threshold),
-            &reshares,
-        );
+        resharing_util::compute_new_public_coefficients(new_threshold, &reshares);
     assert_eq!(
         original_public_coefficients.coefficients[0], new_public_coefficients.coefficients[0],
         "New public key doesn't match old"
@@ -586,84 +492,67 @@ fn resharing_with_encryption_should_preserve_the_threshold_key() {
     ///
     /// Note: The original receiver is the new dealer.
     fn dh_stub(original_receiver_index: NodeIndex, new_receiver_index: NodeIndex) -> SecretKey {
-        let mut hash = ic_crypto_sha256::Sha256::new();
+        let mut hash = ic_crypto_sha::Sha256::new();
         hash.write(&(original_receiver_index as NodeIndex).to_be_bytes()[..]);
         hash.write(&(new_receiver_index as NodeIndex).to_be_bytes()[..]);
-        hash_to_fr(hash)
+        // This reduces modulo the group order which would introduce a slight bias, which
+        // would be dangerous in production code but is acceptable in a test.
+        SecretKey::deserialize_unchecked(hash.finish())
     }
-    let original_threshold = 3;
-    let new_threshold = 4;
-    let original_eligibility = vec![true, true, false, true, true];
-    let new_eligibility = vec![true, false, true, false, true, true, true];
+    let original_threshold = NumberOfNodes::from(3);
+    let original_receivers = NumberOfNodes::from(5);
+    let new_threshold = NumberOfNodes::from(5);
+    let new_receivers = NumberOfNodes::from(7);
     let mut rng = ChaChaRng::from_seed([9u8; 32]);
-    let (original_public_coefficients, original_receiver_shares) = crypto::keygen(
-        Randomness::from(rng.gen::<[u8; 32]>()),
-        NumberOfNodes::from(original_threshold),
-        &original_eligibility,
+    let (original_public_coefficients, original_receiver_shares) = crypto::generate_threshold_key(
+        Seed::from_rng(&mut rng),
+        original_threshold,
+        original_receivers,
     )
     .expect("Original keygen failed");
-    let unencrypted_reshares: Vec<Option<resharing_util::ToyDealing>> =
-        resharing_util::multiple_keygen(
-            &mut rng,
-            &original_receiver_shares,
-            NumberOfNodes::from(new_threshold),
-            &new_eligibility,
-        );
+    let unencrypted_reshares = resharing_util::multiple_keygen(
+        &mut rng,
+        &original_receiver_shares,
+        new_threshold,
+        new_receivers,
+    );
     let reshares = {
         let mut reshares = unencrypted_reshares;
         // Encrypt all shares with the stub DiffieHellman.
-        for (original_receiver_index, dealing_maybe) in reshares.iter_mut().enumerate() {
-            for dealing in dealing_maybe.iter_mut() {
-                for (new_receiver_index, key_maybe) in dealing.1.iter_mut().enumerate() {
-                    for key in key_maybe.iter_mut() {
-                        key.add_assign(&dh_stub(
-                            original_receiver_index as NodeIndex,
-                            new_receiver_index as NodeIndex,
-                        ))
-                    }
-                }
+        for (original_receiver_index, dealings) in reshares.iter_mut().enumerate() {
+            for (new_receiver_index, key) in dealings.1.iter_mut().enumerate() {
+                *key += dh_stub(
+                    original_receiver_index as NodeIndex,
+                    new_receiver_index as NodeIndex,
+                );
             }
         }
         reshares
     };
-    let new_combined_encrypted_receiver_shares: Vec<Option<SecretKey>> =
-        resharing_util::compute_combined_encrypted_shares(&new_eligibility, &reshares);
+    let new_combined_encrypted_receiver_shares: Vec<SecretKey> =
+        resharing_util::compute_combined_encrypted_shares(new_receivers, &reshares);
     let new_public_coefficients: PublicCoefficients =
-        resharing_util::compute_new_public_coefficients(
-            NumberOfNodes::from(new_threshold),
-            &reshares,
-        );
+        resharing_util::compute_new_public_coefficients(new_threshold, &reshares);
     assert_eq!(
         original_public_coefficients.coefficients[0], new_public_coefficients.coefficients[0],
         "New public key doesn't match old"
     );
-    let new_combined_receiver_shares: Vec<Option<SecretKey>> =
-        new_combined_encrypted_receiver_shares
-            .iter()
-            .enumerate()
-            .map(|(new_receiver_index, new_share_maybe)| {
-                new_share_maybe.map(|new_encrypted_share| {
-                    let dh_keys: Vec<Option<SecretKey>> = original_eligibility
-                        .iter()
-                        .enumerate()
-                        .map(|(original_receiver_index, eligible)| {
-                            if *eligible {
-                                Some(dh_stub(
-                                    original_receiver_index as NodeIndex,
-                                    new_receiver_index as NodeIndex,
-                                ))
-                            } else {
-                                None
-                            }
-                        })
-                        .collect();
-                    let dh_key = resharing_util::interpolate_secret_key(&dh_keys);
-                    let mut new_receiver_share: SecretKey = new_encrypted_share;
-                    new_receiver_share.sub_assign(&dh_key);
-                    new_receiver_share
+    let new_combined_receiver_shares: Vec<SecretKey> = new_combined_encrypted_receiver_shares
+        .iter()
+        .enumerate()
+        .map(|(new_receiver_index, new_encrypted_share)| {
+            let dh_keys: Vec<SecretKey> = (0..original_receivers.get())
+                .map(|original_receiver_index| {
+                    dh_stub(
+                        original_receiver_index as NodeIndex,
+                        new_receiver_index as NodeIndex,
+                    )
                 })
-            })
-            .collect();
+                .collect();
+            let dh_key = resharing_util::interpolate_secret_key(&dh_keys);
+            new_encrypted_share - &dh_key
+        })
+        .collect();
 
     assert_eq!(
         resharing_util::interpolate_secret_key(&original_receiver_shares),

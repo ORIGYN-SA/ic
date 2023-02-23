@@ -1,0 +1,57 @@
+deploy-guest-os-baseimg:
+  extends:
+    - .ubuntu-nix-docker-protected
+    - .rules-protected-branch-manual
+  stage: guest-os-build
+  needs: []
+  script:
+   - |
+    set -euo pipefail
+
+    TAG=$(date '+%Y-%m-%d-%H%M')
+
+    docker login -u "$DOCKER_HUB_USER" -p "$DOCKER_HUB_PASSWORD"
+    cd "${CI_PROJECT_DIR}/ic-os/guestos/rootfs"
+    docker build -q -t dfinity/guestos-base:"$TAG" -t dfinity/guestos-base:latest -f Dockerfile.base .
+    docker push dfinity/guestos-base:"$TAG"
+    docker build -q -t dfinity/guestos-base-dev:"$TAG" -t dfinity/guestos-base-dev:latest --build-arg PACKAGE_FILES="packages.common packages.dev" -f Dockerfile.base .
+    docker push dfinity/guestos-base-dev:"$TAG"
+
+    cd "${CI_PROJECT_DIR}/ic-os/generic-guestos/rootfs"
+    docker build -q -t dfinity/genericos-base:"$TAG" -t dfinity/genericos-base:latest -f Dockerfile.base .
+    docker push dfinity/genericos-base:"$TAG"
+
+    cd "${CI_PROJECT_DIR}/ic-os/boundary-guestos/rootfs"
+    docker build -q -t dfinity/boundaryos-base:"$TAG" -t dfinity/boundaryos-base:latest -f Dockerfile.base .
+    docker push dfinity/boundaryos-base:"$TAG"
+
+    echo "Use the image with it's SHA256 DIGEST below for IC-OS Dockerfile"
+    docker inspect --format='{{index .RepoDigests 0}}' dfinity/guestos-base:"$TAG"
+    echo "Use the image with it's SHA256 DIGEST below for IC-OS Dockerfile (dev version)"
+    docker inspect --format='{{index .RepoDigests 0}}' dfinity/guestos-base-dev:"$TAG"
+    echo "Use the image with it's SHA256 DIGEST below for GENERIC IC-OS Dockerfile"
+    docker inspect --format='{{index .RepoDigests 0}}' dfinity/genericos-base:"$TAG"
+    echo "Use the image with it's SHA256 DIGEST below for BOUNDARY IC-OS Dockerfile"
+    docker inspect --format='{{index .RepoDigests 0}}' dfinity/boundaryos-base:"$TAG"
+
+build-guest-os-baseimg:
+  extends:
+    - .cargo-build-docker
+    - .rules-dockerfile-base-changes
+  stage: guest-os-build
+  needs: []
+  script:
+  - |
+    set -euo pipefail
+
+    TAG=$(date '+%Y-%m-%d-%H%M')
+    cd "${CI_PROJECT_DIR}/ic-os/guestos/rootfs"
+    docker build -t dfinity/guestos-base:"$TAG" -t dfinity/guestos-base:latest -f Dockerfile.base .
+    docker build -t dfinity/guestos-base-dev:"$TAG" -t dfinity/guestos-base-dev:latest --build-arg PACKAGE_FILES="packages.common packages.dev" -f Dockerfile.base .
+
+    cd "${CI_PROJECT_DIR}/ic-os/generic-guestos/rootfs"
+    docker build -t dfinity/genericos-base:"$TAG" -t dfinity/genericos-base:latest -f Dockerfile.base .
+
+    cd "${CI_PROJECT_DIR}/ic-os/boundary-guestos/rootfs"
+    docker build -t dfinity/boundaryos-base:"$TAG" -t dfinity/boundaryos-base:latest -f Dockerfile.base .
+

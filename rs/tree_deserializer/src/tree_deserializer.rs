@@ -23,7 +23,7 @@ macro_rules! unsupported_type {
 
 /// `Error` describes error conditions that can happen when deserializing a tree
 /// into a data structure.
-#[derive(Debug, PartialEq)]
+#[derive(Debug, PartialEq, Eq)]
 pub enum Error {
     /// The type with the given name is not supported by this deserializer.
     UnsupportedType(&'static str),
@@ -132,7 +132,7 @@ impl<'de> MapAccess<'de> for TreeMapAccess<'de> {
         let t = self.value.ok_or_else(|| {
             Error::BadState("attempt to take a value before getting the key".to_string())
         })?;
-        let d = LabeledTreeDeserializer::new(&t);
+        let d = LabeledTreeDeserializer::new(t);
         seed.deserialize(d)
     }
 }
@@ -173,6 +173,10 @@ impl<'de> SeqAccess<'de> for ByteSeqAccess<'de> {
 
 impl<'de> Deserializer<'de> for LabeledTreeDeserializer<'de> {
     type Error = Error;
+
+    fn is_human_readable(&self) -> bool {
+        false
+    }
 
     unsupported_type!(deserialize_unit, "unit");
     unsupported_type!(deserialize_bool, "bool");
@@ -432,6 +436,10 @@ struct LabelDeserializer<'a>(&'a [u8]);
 impl<'de> Deserializer<'de> for LabelDeserializer<'de> {
     type Error = Error;
 
+    fn is_human_readable(&self) -> bool {
+        false
+    }
+
     fn deserialize_any<V>(self, visitor: V) -> Result<V::Value, Self::Error>
     where
         V: Visitor<'de>,
@@ -498,7 +506,7 @@ impl<'de> Deserializer<'de> for LabelDeserializer<'de> {
     where
         V: Visitor<'de>,
     {
-        visitor.visit_borrowed_bytes(&self.0[..])
+        visitor.visit_borrowed_bytes(self.0)
     }
 
     fn deserialize_byte_buf<V>(self, visitor: V) -> Result<V::Value, Self::Error>
@@ -539,6 +547,10 @@ struct ByteSerializer<'de>(u8, PhantomData<&'de u8>);
 
 impl<'de> Deserializer<'de> for ByteSerializer<'de> {
     type Error = Error;
+
+    fn is_human_readable(&self) -> bool {
+        false
+    }
 
     fn deserialize_any<V>(self, visitor: V) -> Result<V::Value, Self::Error>
     where

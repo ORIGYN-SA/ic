@@ -267,14 +267,11 @@ fn prune_witness_impl(
         LabeledTree::Leaf(v) => {
             match witness {
                 // LabeledTree <-> Witness mismatch.
-                Witness::Fork { .. } | Witness::Node { .. } => {
+                Witness::Fork { .. } | Witness::Node { .. } | Witness::Pruned { .. } => {
                     Err(TreeHashError::InconsistentPartialTree {
                         offending_path: curr_path.to_owned(),
                     })
                 }
-
-                // Nothing to do here.
-                Witness::Pruned { .. } => Ok(witness.to_owned()),
 
                 // Provided 'Leaf`, prune it.
                 Witness::Known() => Ok(Witness::Pruned {
@@ -356,7 +353,7 @@ pub fn recompute_digest(
         Witness::Pruned { digest } => Ok(digest),
         Witness::Fork { .. } | Witness::Node { .. } | Witness::Known() => {
             Err(TreeHashError::InconsistentPartialTree {
-                offending_path: path_to_first_known(&pruned).unwrap_or_else(Vec::new),
+                offending_path: path_to_first_known(&pruned).unwrap_or_default(),
             })
         }
     }
@@ -443,7 +440,7 @@ fn find_missing_label(
     map: &FlatMap<Label, LabeledTree<Digest>>,
 ) -> Option<Label> {
     for label in needed_labels {
-        if map.get(label) == None {
+        if map.get(label).is_none() {
             return Some(label.to_owned());
         }
     }
@@ -454,14 +451,29 @@ fn find_missing_label(
 /// structure and allows us to use the same algorithm to construct both
 /// witnesses that don't contain the data (e.g., for XNet) and the ones that do
 /// contain it (e.g., for certified reads).
-trait WitnessBuilder {
+pub trait WitnessBuilder {
+    /// Type of the trees that this builder produces.
     type Tree;
 
+    /// Creates a witness for an empty tree.
     fn make_empty() -> Self::Tree;
+
+    /// Constructs a witness for a labeled tree node pointing to the specified
+    /// subtree.
     fn make_node(label: Label, subtree: Self::Tree) -> Self::Tree;
+
+    /// Constructs a witness for a fork given the witnesses for left and right
+    /// subtrees.
     fn make_fork(lhs: Self::Tree, rhs: Self::Tree) -> Self::Tree;
+
+    /// Constructs a witness for a leaf containing the specified data.
     fn make_leaf(data: &[u8]) -> Self::Tree;
+
+    /// Constructs a witness that only reveals a subtree hash.
     fn make_pruned(digest: Digest) -> Self::Tree;
+
+    /// Merges two witnesses for the same tree.
+    fn merge_trees(lhs: Self::Tree, lhs: Self::Tree) -> Self::Tree;
 }
 
 impl WitnessBuilder for Witness {
@@ -492,6 +504,10 @@ impl WitnessBuilder for Witness {
     fn make_pruned(digest: Digest) -> Self {
         Self::Pruned { digest }
     }
+
+    fn merge_trees(lhs: Self, rhs: Self) -> Self {
+        Self::merge(lhs, rhs)
+    }
 }
 
 impl WitnessBuilder for MixedHashTree {
@@ -515,6 +531,10 @@ impl WitnessBuilder for MixedHashTree {
 
     fn make_pruned(digest: Digest) -> Self {
         Self::Pruned(digest)
+    }
+
+    fn merge_trees(lhs: Self, rhs: Self) -> Self {
+        Self::merge(lhs, rhs)
     }
 }
 
@@ -543,7 +563,7 @@ fn find_subtree_node<'a>(target_label: &Label, hash_tree: &'a HashTree) -> &'a H
             right_tree,
             ..
         } => {
-            let largest_left = largest_label(&left_tree);
+            let largest_left = largest_label(left_tree);
             if *target_label <= largest_left {
                 find_subtree_node(target_label, left_tree)
             } else {
@@ -597,7 +617,6 @@ fn witness_for_subtree<Builder: WitnessBuilder>(
 
 impl WitnessGeneratorImpl {
     fn witness_impl<Builder: WitnessBuilder, T: std::convert::AsRef<[u8]> + Debug>(
-        &self,
         partial_tree: &LabeledTree<T>,
         orig_tree: &LabeledTree<Digest>,
         hash_tree: &HashTree,
@@ -638,7 +657,7 @@ impl WitnessGeneratorImpl {
                     let mut sub_witnesses = FlatMap::new();
                     for label in children.keys() {
                         curr_path.push(label.to_owned());
-                        let sub_witness = self.witness_impl::<Builder, _>(
+                        let sub_witness = Self::witness_impl::<Builder, _>(
                             children.get(label).expect("Could not get label"),
                             orig_children.get(label).expect("Could not get label"),
                             find_subtree_node(label, hash_tree),
@@ -687,11 +706,11 @@ impl fmt::Debug for WitnessGeneratorImpl {
 
 fn path_as_string(path: &[Label]) -> String {
     let mut str = String::new();
-    str.push_str("[");
+    str.push('[');
     for label in path {
         str.push_str(&label.to_string())
     }
-    str.push_str("]");
+    str.push(']');
     str
 }
 
@@ -874,7 +893,7 @@ impl WitnessGenerator for WitnessGeneratorImpl {
 
     fn witness(&self, partial_tree: &LabeledTree<Vec<u8>>) -> Result<Witness, TreeHashError> {
         let mut path = Vec::new();
-        self.witness_impl::<Witness, _>(partial_tree, &self.orig_tree, &self.hash_tree, &mut path)
+        Self::witness_impl::<Witness, _>(partial_tree, &self.orig_tree, &self.hash_tree, &mut path)
     }
 
     fn mixed_hash_tree(
@@ -882,7 +901,7 @@ impl WitnessGenerator for WitnessGeneratorImpl {
         partial_tree: &LabeledTree<Vec<u8>>,
     ) -> Result<MixedHashTree, TreeHashError> {
         let mut path = Vec::new();
-        self.witness_impl::<MixedHashTree, _>(
+        Self::witness_impl::<MixedHashTree, _>(
             partial_tree,
             &self.orig_tree,
             &self.hash_tree,
@@ -944,11 +963,9 @@ impl HashTreeBuilderImpl {
     /// Does not `panic!`.
     #[allow(dead_code)]
     pub fn as_hash_tree(&self) -> Option<HashTree> {
-        if let Some(hash_tree) = self.hash_tree.as_ref() {
-            Some((*hash_tree).to_owned())
-        } else {
-            None
-        }
+        self.hash_tree
+            .as_ref()
+            .map(|hash_tree| (*hash_tree).to_owned())
     }
 
     /// Returns the HashTree corresponding to the traversed tree if the
@@ -962,11 +979,9 @@ impl HashTreeBuilderImpl {
     /// Does not `panic!`.
     #[allow(dead_code)]
     pub fn as_labeled_tree(&self) -> Option<LabeledTree<Digest>> {
-        if let Some(labeled_tree) = self.labeled_tree.as_ref() {
-            Some(labeled_tree.to_owned())
-        } else {
-            None
-        }
+        self.labeled_tree
+            .as_ref()
+            .map(|labeled_tree| labeled_tree.to_owned())
     }
 }
 

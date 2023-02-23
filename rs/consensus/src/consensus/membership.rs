@@ -1,8 +1,9 @@
 use crate::consensus::utils::{
     active_high_threshold_transcript, active_low_threshold_transcript, registry_version_at_height,
 };
-use ic_crypto::prng::{Csprng, RandomnessPurpose};
-use ic_interfaces::{consensus_pool::ConsensusPoolCache, registry::RegistryClient};
+use ic_crypto_prng::{Csprng, RandomnessPurpose};
+use ic_interfaces::consensus_pool::ConsensusPoolCache;
+use ic_interfaces_registry::RegistryClient;
 use ic_types::{
     consensus::{
         get_committee_size, get_faults_tolerated, Committee, HasHeight, RandomBeacon, Rank,
@@ -44,10 +45,10 @@ impl Membership {
     }
 
     /// Return the node IDs from the registry.
-    fn get_nodes(&self, height: Height) -> Result<Vec<NodeId>, MembershipError> {
-        use ic_registry_client::helper::subnet::SubnetRegistry;
+    pub fn get_nodes(&self, height: Height) -> Result<Vec<NodeId>, MembershipError> {
+        use ic_registry_client_helpers::subnet::SubnetRegistry;
         let registry_version = registry_version_at_height(self.consensus_cache.as_ref(), height)
-            .ok_or_else(|| MembershipError::UnableToRetrieveDkgSummary(height))?;
+            .ok_or(MembershipError::UnableToRetrieveDkgSummary(height))?;
 
         let list = self
             .registry_client
@@ -79,7 +80,7 @@ impl Membership {
         // `sort_unstable` is effectively the same as `sort` but slightly more
         // efficient.
         node_ids.sort_unstable();
-        let mut rng = Csprng::from_random_beacon_and_purpose(&previous_beacon, purpose);
+        let mut rng = Csprng::from_random_beacon_and_purpose(previous_beacon, purpose);
         node_ids.shuffle(&mut rng);
         Ok(node_ids)
     }
@@ -137,6 +138,9 @@ impl Membership {
             Committee::Notarization => {
                 unreachable!("Notarization/Finalization does not use threshold committee")
             }
+            Committee::CanisterHttp => {
+                unreachable!("CanisterHttp does not use threshold committee")
+            }
         }
     }
 
@@ -151,6 +155,7 @@ impl Membership {
             Committee::HighThreshold => self.get_high_threshold_committee_threshold(height),
             Committee::LowThreshold => self.get_low_threshold_committee_threshold(height),
             Committee::Notarization => self.get_notarization_committee_threshold(height),
+            Committee::CanisterHttp => self.get_canister_http_committee_threshold(height),
         }
     }
 
@@ -171,6 +176,27 @@ impl Membership {
             Some(i) => i < get_committee_size(shuffled_nodes.len()),
             None => false,
         })
+    }
+
+    /// Get the committee to be used for canister http at the given height
+    pub fn get_canister_http_committee(
+        &self,
+        height: Height,
+    ) -> Result<Vec<NodeId>, MembershipError> {
+        self.get_nodes(height)
+    }
+
+    /// Return true if the given node ID is part of the canister http committee
+    /// at the given height
+    pub fn node_belongs_to_canister_http_committee(
+        &self,
+        height: Height,
+        node_id: NodeId,
+    ) -> Result<bool, MembershipError> {
+        Ok(self
+            .get_canister_http_committee(height)?
+            .iter()
+            .any(|id| *id == node_id))
     }
 
     /// Return true if the given node ID is in the low threshold committee at
@@ -231,6 +257,14 @@ impl Membership {
             None => Err(MembershipError::UnableToRetrieveDkgSummary(height)),
         }
     }
+
+    fn get_canister_http_committee_threshold(
+        &self,
+        height: Height,
+    ) -> Result<Threshold, MembershipError> {
+        let subnet_size = self.get_nodes(height)?.len();
+        Ok(subnet_size - get_faults_tolerated(subnet_size))
+    }
 }
 
 /// Returns the notary threshold for the given committee size.
@@ -249,20 +283,20 @@ pub mod test {
     fn test_sufficient_block_makers_elected() {
         for n in 1..201 {
             let subnet_members = (0..n).map(node_test_id).collect::<Vec<NodeId>>();
-            let block_makers: Vec<_> = subnet_members
-                .iter()
-                .filter(|node| {
-                    match Membership::get_block_maker_rank_from_shuffled_nodes(
-                        *node,
-                        &subnet_members,
-                    ) {
-                        Ok(Some(_)) => true,
-                        _ => false,
-                    }
-                })
-                .collect();
+
             assert_eq!(
-                block_makers.len(),
+                subnet_members
+                    .iter()
+                    .filter(|node| {
+                        matches!(
+                            Membership::get_block_maker_rank_from_shuffled_nodes(
+                                node,
+                                &subnet_members,
+                            ),
+                            Ok(Some(_))
+                        )
+                    })
+                    .count(),
                 get_faults_tolerated(subnet_members.len()) + 1usize
             );
         }

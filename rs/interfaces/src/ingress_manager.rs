@@ -1,17 +1,18 @@
 //! The ingress manager public interface.
 use crate::{
-    execution_environment::IngressHistoryError,
-    ingress_pool::{ChangeSet, IngressPool, IngressPoolSelect},
-    state_manager::StateManagerError,
+    execution_environment::{CanisterOutOfCyclesError, IngressHistoryError},
+    ingress_pool::{ChangeSet, IngressPool},
     validation::{ValidationError, ValidationResult},
 };
 use ic_types::{
     artifact::IngressMessageId,
     batch::{IngressPayload, IngressPayloadError, ValidationContext},
+    consensus::Payload,
     crypto::CryptoError,
+    ingress::IngressSets,
     messages::MessageId,
     time::{Time, UNIX_EPOCH},
-    CanisterId,
+    CanisterId, Height, NumBytes,
 };
 use std::collections::HashSet;
 
@@ -40,11 +41,20 @@ impl IngressSetQuery for HashSet<IngressMessageId> {
     }
 }
 
+impl IngressSetQuery for IngressSets {
+    fn contains(&self, msg_id: &IngressMessageId) -> bool {
+        self.get_hash_sets().iter().any(|set| set.contains(msg_id))
+    }
+
+    fn get_expiry_lower_bound(&self) -> Time {
+        *self.get_min_block_time()
+    }
+}
+
 /// Permanent errors returned by the Ingress Selector.
 #[derive(Debug)]
 pub enum IngressPermanentError {
     CryptoError(CryptoError),
-    StateManagerError(StateManagerError),
     IngressValidationError(MessageId, String),
     IngressBucketError(MessageId),
     IngressHistoryError(IngressHistoryError),
@@ -54,16 +64,17 @@ pub enum IngressPermanentError {
     IngressPayloadTooBig(usize, usize),
     IngressPayloadTooManyMessages(usize, usize),
     DuplicatedIngressMessage(MessageId),
-    InsufficientCycles(CanisterId),
+    InsufficientCycles(CanisterOutOfCyclesError),
     CanisterNotFound(CanisterId),
     InvalidManagementMessage,
+    StateRemoved(Height),
 }
 
 /// Transient errors returned by the Ingress Selector.
 #[derive(Debug)]
 pub enum IngressTransientError {
     CryptoError(CryptoError),
-    StateManagerError(StateManagerError),
+    StateNotCommittedYet(Height),
 }
 
 pub type IngressPayloadValidationError =
@@ -120,8 +131,6 @@ pub trait IngressSelector: Send + Sync {
     /// to Consensus.
     ///
     /// #Input
-    /// [IngressPool] passed as a read-only reference. It's the trait object to
-    /// read validated messages from the IngressPool.
     /// [past_ingress] allows querying if an ingress message exists in past
     /// blocks. It is used for deduplication purpose.
     /// [ValidationContext] contains registry_version that allows to validate
@@ -129,13 +138,16 @@ pub trait IngressSelector: Send + Sync {
     /// used as parameter for the valid set rule check run to select a valid
     /// set of messages.
     ///
+    /// The following invariant is placed on this function by consensus:
+    /// get_ingress_payload(..., byte_limit).count_bytes() <= byte_limit
+    ///
     /// #Returns
     /// [IngressPayload] which is a collection of valid ingress messages
     fn get_ingress_payload(
         &self,
-        ingress_pool: &dyn IngressPoolSelect,
         past_ingress: &dyn IngressSetQuery,
         context: &ValidationContext,
+        byte_limit: NumBytes,
     ) -> IngressPayload;
 
     /// Validates an IngressPayload against the past payloads and
@@ -160,6 +172,15 @@ pub trait IngressSelector: Send + Sync {
         past_ingress: &dyn IngressSetQuery,
         context: &ValidationContext,
     ) -> ValidationResult<IngressPayloadValidationError>;
+
+    /// Extracts the sequence of past ingress messages from `past_payloads`. The
+    /// past_ingress is actually a list of HashSet of MessageIds taken from the
+    /// ingress_payload_cache.
+    fn filter_past_payloads(
+        &self,
+        past_payloads: &[(Height, Time, Payload)],
+        context: &ValidationContext,
+    ) -> IngressSets;
 
     /// Request purge of the given ingress messages from the pool when
     /// they have already been included in finalized blocks.

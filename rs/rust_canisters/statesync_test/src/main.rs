@@ -3,8 +3,8 @@
 /// been called.
 use dfn_macro::{query, update};
 use lazy_static::lazy_static;
-use mersenne_twister::MT19937;
 use rand::{Rng, SeedableRng};
+use rand_pcg::Pcg64Mcg;
 use std::sync::Mutex;
 
 /// Size of data vector in canister, 128 MB
@@ -21,7 +21,7 @@ lazy_static! {
     static ref V_DATA_6: Mutex<Vec<u8>> = Mutex::new(vec![6; VECTOR_LENGTH]);
     static ref V_DATA_7: Mutex<Vec<u8>> = Mutex::new(vec![7; VECTOR_LENGTH]);
     static ref V_DATA_8: Mutex<Vec<u8>> = Mutex::new(vec![8; VECTOR_LENGTH]);
-    static ref NUM_CHANGED: Mutex<u64> = Mutex::new(0 as u64);
+    static ref NUM_CHANGED: Mutex<u64> = Mutex::new(0_u64);
 }
 
 /// Changes every 1023rd byte in `V_DATA` to a random value.
@@ -31,10 +31,10 @@ lazy_static! {
 async fn change_state(seed: u32) -> Result<u64, String> {
     let mut state = V_DATA.lock().unwrap();
     let mut num_changed = NUM_CHANGED.lock().unwrap();
-    let mut rng = MT19937::from_seed(seed);
+    let mut rng = Pcg64Mcg::seed_from_u64(seed as u64);
 
     for index in (0..VECTOR_LENGTH).step_by(1023) {
-        state[index] = rng.next_u32() as u8;
+        state[index] = rng.gen();
     }
     *num_changed += 1;
     Ok(*num_changed)
@@ -45,11 +45,11 @@ async fn change_state(seed: u32) -> Result<u64, String> {
 ///
 /// Returns the number of times it has been called.
 #[update]
-async fn expand_state(index: u32) -> Result<u64, String> {
+async fn expand_state(index: u32, seed: u32) -> Result<u64, String> {
     let mut num_changed = NUM_CHANGED
         .lock()
         .expect("Could not lock NUM_CHANGED mutex");
-    let mut rng = MT19937::from_seed(index);
+    let mut rng = Pcg64Mcg::seed_from_u64(seed as u64);
     let mut state = match index % 8 {
         1 => V_DATA_1.lock().expect("Could not lock V_DATA_1 mutex"),
         2 => V_DATA_2.lock().expect("Could not lock V_DATA_2 mutex"),
@@ -60,8 +60,9 @@ async fn expand_state(index: u32) -> Result<u64, String> {
         7 => V_DATA_7.lock().expect("Could not lock V_DATA_7 mutex"),
         _ => V_DATA_8.lock().expect("Could not lock V_DATA_8 mutex"),
     };
-    for index in (0..VECTOR_LENGTH).step_by(1_048_576) {
-        state[index] = rng.next_u32() as u8;
+    let offset = rng.gen::<u16>();
+    for ind in (offset as usize..VECTOR_LENGTH).step_by(1_048_576) {
+        state[ind] = rng.gen();
     }
     *num_changed += 1;
     Ok(*num_changed)

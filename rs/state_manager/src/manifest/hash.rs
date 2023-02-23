@@ -1,4 +1,4 @@
-use ic_crypto_sha256::Sha256;
+use ic_crypto_sha::Sha256;
 
 /// Trait specifying how a type should be hashed when it's included into a
 /// manifest.
@@ -54,18 +54,18 @@ pub fn manifest_hasher() -> Sha256 {
     hasher_for_domain("ic-state-manifest")
 }
 
+pub fn meta_manifest_hasher() -> Sha256 {
+    hasher_for_domain("ic-state-meta-manifest")
+}
+
+pub fn sub_manifest_hasher() -> Sha256 {
+    hasher_for_domain("ic-state-sub-manifest")
+}
+
 pub fn file_hasher() -> Sha256 {
     hasher_for_domain("ic-state-file")
 }
 
-pub fn cow_file_hasher() -> Sha256 {
-    hasher_for_domain("ic-cow-state-file")
-}
-
 pub fn chunk_hasher() -> Sha256 {
     hasher_for_domain("ic-state-chunk")
-}
-
-pub fn cow_chunk_hasher() -> Sha256 {
-    hasher_for_domain("ic-state-cow-chunk")
 }

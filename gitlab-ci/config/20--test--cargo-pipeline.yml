@@ -1,0 +1,45 @@
+gen-cargo-pipeline:
+  extends:
+    - .ubuntu-nix-docker
+    - .cargo-rules-autorun-on-trigger
+  # Child pipeline must be generated in a stage prior to the one where it runs
+  stage: init
+  script:
+    - |
+      set -euo pipefail
+      ssh-add -L
+      cd gitlab-ci/src/gen_gitlab_cargo_pipeline
+      $SHELL_WRAPPER nix-shell --run "
+        python gen_gitlab_cargo_pipeline.py ../../../rs/ ../../../ic-os -v --out=../../../child-pipeline.yml
+      " ../shell.nix
+      cd -
+      # slots: zh=48 (22%), sf=64 (29%), ch=108 (49%)
+      # this tags are required on ci runners
+      DCS=(
+          "zh" "zh" "zh" "zh"
+          "sf" "sf" "sf" "sf" "sf" "sf"
+          "ch" "ch" "ch" "ch" "ch" "ch" "ch" "ch" "ch" "ch"
+      )
+      RANDOM=$$$(date +%s)
+      echo "DC_TAG=${DCS[$RANDOM % ${#DCS[@]} ]}" >> dc.env
+  artifacts:
+    paths:
+      - child-pipeline.yml
+    reports:
+      dotenv: dc.env
+
+cargo-pipeline:
+  extends: .cargo-rules-autorun-on-trigger
+  stage: test
+  needs:
+    - job: gen-cargo-pipeline
+    - job: docker-autobuild-protected
+      optional: true
+  variables:
+    CI_PARENT_PIPELINE_SOURCE: "${CI_PIPELINE_SOURCE}"
+    SELECTED_DC: "$DC_TAG"
+  trigger:
+    include:
+      - artifact: child-pipeline.yml
+        job: gen-cargo-pipeline
+    strategy: depend

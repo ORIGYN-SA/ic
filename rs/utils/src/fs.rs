@@ -1,7 +1,12 @@
-use std::{fs, io, path::Path};
+use std::ffi::{OsStr, OsString};
+use std::io::Write;
+use std::{fs, io, io::Error, path::Path, path::PathBuf};
 
-/// The character length of the random string used for temporary file names.
-const TMP_NAME_LEN: usize = 7;
+#[cfg(target_family = "unix")] // Otherwise, clippy complains about lack of use.
+use std::io::ErrorKind::AlreadyExists;
+
+#[cfg(target_os = "linux")]
+use thiserror::Error;
 
 /// Represents an action that should be run when this objects runs out of scope,
 /// unless it's explicitly deactivated.
@@ -32,6 +37,7 @@ where
     action: Option<F>,
 }
 
+#[cfg(target_family = "unix")] // Otherwise, clippy complains about lack of use.
 impl<F> OnScopeExit<F>
 where
     F: FnOnce(),
@@ -76,11 +82,10 @@ pub fn write_atomically_using_tmp_file<PDst, PTmp, F>(
     action: F,
 ) -> io::Result<()>
 where
-    F: FnOnce(&mut io::BufWriter<&fs::File>) -> io::Result<()>,
+    F: FnOnce(&mut io::BufWriter<&std::fs::File>) -> io::Result<()>,
     PDst: AsRef<Path>,
     PTmp: AsRef<Path>,
 {
-    use std::io::Write;
     let mut cleanup = OnScopeExit::new(|| {
         let _ = fs::remove_file(tmp.as_ref());
     });
@@ -88,6 +93,7 @@ where
     let f = fs::OpenOptions::new()
         .write(true)
         .create(true)
+        .truncate(true) // Otherwise we'd overwrite existing content
         .open(tmp.as_ref())?;
     {
         let mut w = io::BufWriter::new(&f);
@@ -96,9 +102,27 @@ where
     }
     f.sync_all()?;
     fs::rename(tmp.as_ref(), dst.as_ref())?;
+    sync_path(dst.as_ref().parent().unwrap_or_else(|| Path::new("/")))?;
 
     cleanup.deactivate();
     Ok(())
+}
+
+/// Invokes sync_all on the file or directory located at given path.
+pub fn sync_path<P>(path: P) -> std::io::Result<()>
+where
+    P: AsRef<Path>,
+{
+    // There is no special API for syncing directories, so we do the same thing
+    // for both files and directories. This works because directories are just
+    // files treated in a special way by the kernel.
+    let f = std::fs::File::open(path.as_ref())?;
+    f.sync_all().map_err(|e| {
+        Error::new(
+            e.kind(),
+            format!("failed to sync path {}: {}", path.as_ref().display(), e),
+        )
+    })
 }
 
 #[cfg(any(target_os = "linux"))]
@@ -109,14 +133,15 @@ where
 /// on certain file systems that support COW (btrfs/zfs), copy_file_range
 /// is a metadata operation and is extremely efficient   
 pub fn copy_file_sparse(from: &Path, to: &Path) -> io::Result<u64> {
+    if *ic_sys::IS_WSL {
+        return copy_file_sparse_portable(from, to);
+    }
+
     use cvt::*;
-    use fs::{File, OpenOptions};
-    use io::{Error, ErrorKind, Read, Write};
+    use fs::OpenOptions;
+    use io::{ErrorKind, Read};
     use libc::{ftruncate64, lseek64};
-    use std::os::unix::{
-        fs::{OpenOptionsExt, PermissionsExt},
-        io::AsRawFd,
-    };
+    use std::os::unix::{fs::OpenOptionsExt, fs::PermissionsExt, io::AsRawFd};
 
     unsafe fn copy_file_range(
         fd_in: libc::c_int,
@@ -137,7 +162,7 @@ pub fn copy_file_sparse(from: &Path, to: &Path) -> io::Result<u64> {
         )
     }
 
-    let mut reader = File::open(from)?;
+    let mut reader = std::fs::File::open(from)?;
 
     let (mode, len) = {
         let metadata = reader.metadata()?;
@@ -292,6 +317,10 @@ pub fn copy_file_sparse(from: &Path, to: &Path) -> io::Result<u64> {
 
 #[cfg(not(target_os = "linux"))]
 pub fn copy_file_sparse(from: &Path, to: &Path) -> io::Result<u64> {
+    copy_file_sparse_portable(from, to)
+}
+
+fn copy_file_sparse_portable(from: &Path, to: &Path) -> io::Result<u64> {
     fs::copy(from, to)
 }
 
@@ -308,7 +337,7 @@ pub fn copy_file_sparse(from: &Path, to: &Path) -> io::Result<u64> {
 #[cfg(target_family = "unix")]
 pub fn write_atomically<PDst, F>(dst: PDst, action: F) -> io::Result<()>
 where
-    F: FnOnce(&mut io::BufWriter<&fs::File>) -> io::Result<()>,
+    F: FnOnce(&mut io::BufWriter<&std::fs::File>) -> io::Result<()>,
     PDst: AsRef<Path>,
 {
     // `.parent()` returns `None` for either `/` or a prefix (e.g. 'c:\\` on
@@ -323,8 +352,121 @@ where
     write_atomically_using_tmp_file(dst, tmp_path.as_path(), action)
 }
 
+/// Append .tmp to given file path
+///
+/// Examples:
+/// bla.txt -> bla.txt.tmp
+/// /tmp/bla.txt -> /tmp/bla.txt.tmp
+/// /tmp/bla -> /tmp/bla.tmp
+/// /tmp/ -> /tmp.tmp
+pub fn get_tmp_for_path<P>(path: P) -> PathBuf
+where
+    P: AsRef<Path>,
+{
+    let extension = match path.as_ref().extension() {
+        None => OsString::from("tmp"),
+        Some(extension) => {
+            let mut extension = OsString::from(extension);
+            extension.push(OsStr::new(".tmp"));
+            extension
+        }
+    };
+    path.as_ref().with_extension(extension)
+}
+
+#[cfg(any(target_family = "unix"))]
+/// Write the given string to file `dest` in a crash-safe mannger
+pub fn write_string_using_tmp_file<P>(dest: P, content: &str) -> io::Result<()>
+where
+    P: AsRef<Path>,
+{
+    write_using_tmp_file(dest, |f| f.write_all(content.as_bytes()))
+}
+
+#[cfg(any(target_family = "unix"))]
+/// Serialize given protobuf message to file `dest` in a crash-safe manner
+pub fn write_protobuf_using_tmp_file<P>(dest: P, message: &impl prost::Message) -> io::Result<()>
+where
+    P: AsRef<Path>,
+{
+    write_using_tmp_file(dest, |writer| {
+        let encoded_message = message.encode_to_vec();
+        writer.write_all(&encoded_message)?;
+        Ok(())
+    })
+}
+
+#[cfg(any(target_family = "unix"))]
+/// Create and open a file exclusively with the given name.
+///
+/// If the file already exists, attempt to remove the file and retry.
+fn create_file_exclusive_and_open<P>(f: P) -> io::Result<std::fs::File>
+where
+    P: AsRef<Path>,
+{
+    loop {
+        // Important is to use create_new, which on Unix uses O_CREATE | O_EXCL
+        // https://github.com/rust-lang/rust/blob/5ab502c6d308b0ccac8127c0464e432334755a60/library/std/src/sys/unix/fs.rs#L774
+        let file = fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(f.as_ref());
+
+        match file {
+            Err(ref e) if e.kind() == AlreadyExists => {
+                std::fs::remove_file(f.as_ref())?;
+            }
+            Err(e) => {
+                return Err(e);
+            }
+            Ok(f) => {
+                return Ok(f);
+            }
+        }
+    }
+}
+
+#[cfg(any(target_family = "unix"))]
+/// Write to file `dest` using `action` in a crash-safe manner
+///
+/// A new temporary file `dest.tmp` will be created. If it already exists,
+/// it will be deleted first. The file will be opened in exclusive mode
+/// and `action` executed with the BufWriter to that file.
+///
+/// The buffer and file will then be fsynced followed by renaming the
+/// `dest.tmp` to `dest`. Target file `dest` will be overwritten in that
+/// process if it already exists.
+///
+/// After renaming, the parent directory of `dest` will be fsynced.
+///
+/// The function will fail if `dest` exists but is a directory.
+pub fn write_using_tmp_file<P, F>(dest: P, action: F) -> io::Result<()>
+where
+    P: AsRef<Path>,
+    F: FnOnce(&mut io::BufWriter<&std::fs::File>) -> io::Result<()>,
+{
+    let dest_tmp = get_tmp_for_path(&dest);
+
+    {
+        let file = create_file_exclusive_and_open(&dest_tmp)?;
+        let mut w = io::BufWriter::new(&file);
+        action(&mut w)?;
+        w.flush()?;
+        file.sync_all()?;
+    }
+
+    let dest = dest.as_ref();
+    fs::rename(dest_tmp.as_path(), dest)?;
+
+    sync_path(dest.parent().unwrap_or_else(|| Path::new("/")))?;
+    Ok(())
+}
+
 #[cfg(target_family = "unix")]
 fn tmp_name() -> String {
+    /// The character length of the random string used for temporary file names.
+    const TMP_NAME_LEN: usize = 7;
+
     use rand::{distributions::Alphanumeric, Rng};
 
     let mut rng = rand::thread_rng();
@@ -335,8 +477,127 @@ fn tmp_name() -> String {
         .collect()
 }
 
+#[cfg(target_os = "linux")]
+#[derive(Error, Clone, Debug, PartialEq, Eq)]
+pub enum CopyFileRangeAllError {
+    #[error(transparent)]
+    Nix(#[from] nix::Error),
+    #[error("zero bytes copied")]
+    WriteZero,
+}
+
+/// Copy a range of data from one file to another
+///
+/// As opposed to `nix::fcntl::copy_file_range` that it is based on, this
+/// function either copies all bytes or returns an error
+#[cfg(target_os = "linux")]
+pub fn copy_file_range_all(
+    src: &std::fs::File,
+    mut src_offset: i64,
+    dst: &std::fs::File,
+    mut dst_offset: i64,
+    len: usize,
+) -> Result<(), CopyFileRangeAllError> {
+    use std::os::unix::io::AsRawFd;
+    let mut copied_total = 0;
+    while copied_total < len {
+        let copied = nix::fcntl::copy_file_range(
+            src.as_raw_fd(),
+            Some(&mut src_offset),
+            dst.as_raw_fd(),
+            Some(&mut dst_offset),
+            len - copied_total,
+        );
+        match copied {
+            Ok(0) => return Err(CopyFileRangeAllError::WriteZero),
+            Ok(copied) => copied_total += copied,
+            Err(nix::errno::Errno::EINTR) | Err(nix::errno::Errno::EAGAIN) => continue,
+            Err(err) => return Err(err.into()),
+        }
+    }
+    Ok(())
+}
+
+/// Reads and then writes a chunk of size `size` starting at `offset` in the file at `path`.
+/// This defragments the file partially on some COW capable file systems
+#[cfg(target_family = "unix")]
+pub fn defrag_file_partially(path: &Path, offset: u64, size: usize) -> std::io::Result<()> {
+    use std::os::unix::prelude::FileExt;
+
+    let mut content = vec![0; size];
+    let f = std::fs::OpenOptions::new()
+        .write(true)
+        .read(true)
+        .create(false)
+        .open(path)?;
+    f.read_exact_at(&mut content[..], offset)?;
+    f.write_all_at(&content, offset)?;
+    Ok(())
+}
+
+/// Write a slice of slices to a file
+/// Replacement for std::io::Write::write_all_vectored as long as it's nightly rust only
+pub fn write_all_vectored(file: &mut fs::File, bufs: &[&[u8]]) -> std::io::Result<()> {
+    use io::ErrorKind;
+    use io::IoSlice;
+
+    let mut slices: Vec<IoSlice> = bufs.iter().map(|s| IoSlice::new(s)).collect();
+    let mut front = 0;
+    // Guarantee that bufs is empty if it contains no data,
+    // to avoid calling write_vectored if there is no data to be written.
+    while front < slices.len() && slices[front].is_empty() {
+        front += 1;
+    }
+    while front < slices.len() {
+        match file.write_vectored(&slices[front..]) {
+            Ok(0) => {
+                return Err(io::Error::new(
+                    ErrorKind::WriteZero,
+                    "failed to write whole buffer",
+                ));
+            }
+            Ok(n) => {
+                // drop n bytes from the front of the data
+                advance_slices(&mut slices, &mut front, n, bufs);
+            }
+            Err(ref e) if e.kind() == ErrorKind::Interrupted => {}
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(())
+}
+
+/// Advance a slice of IoSlices by `drop`. Will increment `front` to
+/// point past fully used slices, and modify slices if we point to the
+/// middle of a slice
+fn advance_slices<'a>(
+    slices: &mut [io::IoSlice<'a>],
+    front: &mut usize,
+    drop: usize,
+    bufs: &'a [&'a [u8]],
+) {
+    let mut written = drop;
+    while written > 0 && *front < slices.len() {
+        let first_len = slices[*front].len();
+        if written >= first_len {
+            // drop the first slice
+            written -= first_len;
+            *front += 1;
+        } else {
+            // drop only part of the first slice
+            let new_data_len = first_len - written;
+            let new_data: &[u8] = &bufs[*front][(bufs[*front].len() - new_data_len)..];
+            let new_slice = io::IoSlice::new(new_data);
+            slices[*front] = new_slice;
+            written = 0;
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use super::advance_slices;
+    use super::io::IoSlice;
     use super::write_atomically_using_tmp_file;
 
     #[test]
@@ -389,5 +650,42 @@ mod tests {
             std::fs::read(&dst).expect("failed to read destination file"),
             b"original contents".to_vec()
         );
+    }
+
+    #[test]
+    fn test_advance_slices() {
+        let slice_size = 4096;
+        let num_slices = 5;
+        let data = vec![vec![1u8; slice_size]; num_slices];
+        let bufs: &[&[u8]] = &data.iter().map(|v| v.as_slice()).collect::<Vec<&[u8]>>();
+        let mut slices: Vec<IoSlice> = bufs.iter().map(|s| IoSlice::new(s)).collect();
+        let mut front = 0;
+
+        // advance two full slices
+        advance_slices(&mut slices, &mut front, 2 * slice_size, bufs);
+        assert_eq!(2, front);
+        for i in front..num_slices {
+            assert_eq!(*slices[i], *bufs[i]);
+        }
+
+        // advance 1.5 slices
+        advance_slices(&mut slices, &mut front, slice_size + slice_size / 2, bufs);
+        assert_eq!(3, front);
+        assert_eq!(*slices[front], bufs[front][slice_size / 2..]);
+        for i in (front + 1)..num_slices {
+            assert_eq!(*slices[i], *bufs[i]);
+        }
+
+        // advance 1/4 slice
+        advance_slices(&mut slices, &mut front, slice_size / 4, bufs);
+        assert_eq!(3, front);
+        assert_eq!(*slices[front], bufs[front][3 * slice_size / 4..]);
+        for i in (front + 1)..num_slices {
+            assert_eq!(*slices[i], *bufs[i]);
+        }
+
+        // advance the remaining 1.25 slices
+        advance_slices(&mut slices, &mut front, slice_size + slice_size / 4, bufs);
+        assert_eq!(5, front);
     }
 }

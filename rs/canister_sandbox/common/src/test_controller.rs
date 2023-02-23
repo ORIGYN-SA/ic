@@ -1,3 +1,4 @@
+use ic_canister_sandbox_common::protocol::id::WasmId;
 use ic_canister_sandbox_common::protocol::logging::LogRequest;
 use ic_canister_sandbox_common::protocol::{ctlsvc, sbxsvc};
 use std::sync::atomic::AtomicBool;
@@ -9,18 +10,18 @@ struct DummyControllerService {}
 
 /// RPC interface exposed by sandbox process.
 impl ControllerService for DummyControllerService {
-    fn exec_finished(
+    fn execution_finished(
         &self,
-        _req: ctlsvc::ExecFinishedRequest,
-    ) -> rpc::Call<ctlsvc::ExecFinishedReply> {
+        _req: ctlsvc::ExecutionFinishedRequest,
+    ) -> rpc::Call<ctlsvc::ExecutionFinishedReply> {
         unimplemented!();
     }
 
-    fn canister_system_call(
+    fn execution_paused(
         &self,
-        _req: ctlsvc::CanisterSystemCallRequest,
-    ) -> rpc::Call<ctlsvc::CanisterSystemCallReply> {
-        unimplemented!();
+        _req: ctlsvc::ExecutionPausedRequest,
+    ) -> rpc::Call<ctlsvc::ExecutionPausedReply> {
+        unimplemented!()
     }
 
     fn log_via_replica(&self, _req: LogRequest) -> rpc::Call<()> {
@@ -42,9 +43,9 @@ fn main() {
     .unwrap();
 
     println!("Controller: Sending 'open_wasm' request");
+    let wasm_id = WasmId::new();
     sbx.open_wasm(sbxsvc::OpenWasmRequest {
-        wasm_file_path: None,
-        wasm_id: "foo".to_owned(),
+        wasm_id,
         wasm_src: Vec::new(),
     })
     .sync()

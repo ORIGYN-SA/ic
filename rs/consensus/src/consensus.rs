@@ -1,15 +1,17 @@
 //! This module encapsulates all components required for establishing of a
 //! distributed consensus.
 
-mod block_maker;
+pub mod batch_delivery;
+pub(crate) mod block_maker;
 mod catchup_package_maker;
 pub(crate) mod crypto;
-mod dkg_key_manager;
+pub mod dkg_key_manager;
 mod finalizer;
 mod malicious_consensus;
 pub(crate) mod membership;
-mod metrics;
+pub(crate) mod metrics;
 mod notary;
+mod payload;
 pub mod payload_builder;
 pub mod pool_reader;
 mod prelude;
@@ -19,11 +21,15 @@ mod random_beacon_maker;
 mod random_tape_maker;
 mod share_aggregator;
 pub mod utils;
-mod validator;
+pub mod validator;
 
+#[cfg(all(test, feature = "proptest"))]
+mod proptests;
+
+pub use block_maker::SubnetRecords;
 pub use crypto::ConsensusCrypto;
-pub use finalizer::generate_responses_to_subnet_calls;
 pub use membership::Membership;
+pub use metrics::ValidatorMetrics;
 
 #[cfg(test)]
 pub(crate) mod mocks;
@@ -33,8 +39,7 @@ use crate::consensus::{
     catchup_package_maker::CatchUpPackageMaker,
     dkg_key_manager::DkgKeyManager,
     finalizer::Finalizer,
-    metrics::ConsensusMetrics,
-    metrics::ValidatorMetrics,
+    metrics::{ConsensusGossipMetrics, ConsensusMetrics},
     notary::Notary,
     payload_builder::PayloadBuilderImpl,
     pool_reader::PoolReader,
@@ -48,32 +53,33 @@ use crate::consensus::{
     validator::Validator,
 };
 use ic_config::consensus::ConsensusConfig;
-use ic_interfaces::registry::LocalStoreCertifiedTimeReader;
 use ic_interfaces::{
+    canister_http::CanisterHttpPayloadBuilder,
     consensus::{Consensus, ConsensusGossip},
     consensus_pool::ConsensusPool,
     dkg::DkgPool,
+    ecdsa::EcdsaPool,
     ingress_manager::IngressSelector,
-    ingress_pool::IngressPoolSelect,
     messaging::{MessageRouting, XNetPayloadBuilder},
-    registry::RegistryClient,
-    state_manager::StateManager,
+    self_validating_payload::SelfValidatingPayloadBuilder,
     time_source::TimeSource,
 };
-use ic_logger::{error, info, trace, warn, ReplicaLogger};
+use ic_interfaces_registry::{LocalStoreCertifiedTimeReader, RegistryClient, POLLING_PERIOD};
+use ic_interfaces_state_manager::StateManager;
+use ic_logger::{debug, error, info, trace, warn, ReplicaLogger};
 use ic_metrics::MetricsRegistry;
-use ic_registry_client::helper::subnet::SubnetRegistry;
+use ic_registry_client_helpers::subnet::SubnetRegistry;
 use ic_replicated_state::ReplicatedState;
 use ic_types::{
     artifact::{ConsensusMessageFilter, ConsensusMessageId, PriorityFn},
     malicious_flags::MaliciousFlags,
     replica_config::ReplicaConfig,
 };
-use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::sync::RwLock;
 use std::time::Duration;
+use std::{cell::RefCell, sync::Mutex};
 use strum_macros::AsRefStr;
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Ord, PartialOrd, AsRefStr)]
@@ -110,10 +116,11 @@ pub struct ConsensusImpl {
     metrics: ConsensusMetrics,
     time_source: Arc<dyn TimeSource>,
     registry_client: Arc<dyn RegistryClient>,
-    dkg_key_manager: DkgKeyManager,
+    state_manager: Arc<dyn StateManager<State = ReplicatedState>>,
+    dkg_key_manager: Arc<Mutex<DkgKeyManager>>,
     last_invoked: RefCell<BTreeMap<ConsensusSubcomponent, Time>>,
     schedule: RoundRobin,
-    subnet_id: SubnetId,
+    replica_config: ReplicaConfig,
     #[allow(dead_code)]
     malicious_flags: MaliciousFlags,
     log: ReplicaLogger,
@@ -132,19 +139,29 @@ impl ConsensusImpl {
         crypto: Arc<dyn ConsensusCrypto>,
         ingress_selector: Arc<dyn IngressSelector>,
         xnet_payload_builder: Arc<dyn XNetPayloadBuilder>,
+        self_validating_payload_builder: Arc<dyn SelfValidatingPayloadBuilder>,
+        canister_http_payload_builder: Arc<dyn CanisterHttpPayloadBuilder>,
         dkg_pool: Arc<RwLock<dyn DkgPool>>,
+        ecdsa_pool: Arc<RwLock<dyn EcdsaPool>>,
+        dkg_key_manager: Arc<Mutex<DkgKeyManager>>,
         message_routing: Arc<dyn MessageRouting>,
         state_manager: Arc<dyn StateManager<State = ReplicatedState>>,
         time_source: Arc<dyn TimeSource>,
+        stable_registry_version_age: Duration,
         malicious_flags: MaliciousFlags,
         metrics_registry: MetricsRegistry,
         logger: ReplicaLogger,
         local_store_time_reader: Option<Arc<dyn LocalStoreCertifiedTimeReader>>,
     ) -> Self {
         let payload_builder = Arc::new(PayloadBuilderImpl::new(
+            replica_config.subnet_id,
+            registry_client.clone(),
             ingress_selector.clone(),
             xnet_payload_builder,
+            self_validating_payload_builder,
+            canister_http_payload_builder,
             metrics_registry.clone(),
+            logger.clone(),
         ));
 
         let current_time = time_source.get_relative_time();
@@ -158,11 +175,6 @@ impl ConsensusImpl {
         last_invoked.insert(ConsensusSubcomponent::Validator, current_time);
         last_invoked.insert(ConsensusSubcomponent::Aggregator, current_time);
         last_invoked.insert(ConsensusSubcomponent::Purger, current_time);
-        let dkg_key_manager = DkgKeyManager::new(
-            metrics_registry.clone(),
-            Arc::clone(&crypto),
-            logger.clone(),
-        );
 
         ConsensusImpl {
             dkg_key_manager,
@@ -182,7 +194,6 @@ impl ConsensusImpl {
                 crypto.clone(),
                 message_routing.clone(),
                 ingress_selector,
-                state_manager.clone(),
                 logger.clone(),
                 metrics_registry.clone(),
             ),
@@ -215,7 +226,9 @@ impl ConsensusImpl {
                 crypto.clone(),
                 payload_builder.clone(),
                 dkg_pool.clone(),
+                ecdsa_pool.clone(),
                 state_manager.clone(),
+                stable_registry_version_age,
                 metrics_registry.clone(),
                 logger.clone(),
             ),
@@ -239,7 +252,7 @@ impl ConsensusImpl {
                 logger.clone(),
             ),
             purger: Purger::new(
-                state_manager,
+                state_manager.clone(),
                 message_routing,
                 logger.clone(),
                 metrics_registry.clone(),
@@ -248,8 +261,9 @@ impl ConsensusImpl {
             log: logger,
             time_source,
             registry_client,
+            state_manager,
             malicious_flags,
-            subnet_id: replica_config.subnet_id,
+            replica_config,
             last_invoked: RefCell::new(last_invoked),
             schedule: RoundRobin::default(),
             config: consensus_config,
@@ -315,11 +329,14 @@ impl ConsensusImpl {
     /// latest registry version instructs the subnet to halt
     pub fn should_halt_by_subnet_record(&self) -> bool {
         let version = self.registry_client.get_latest_version();
-        match self.registry_client.get_is_halted(self.subnet_id, version) {
+        match self
+            .registry_client
+            .get_is_halted(self.replica_config.subnet_id, version)
+        {
             Ok(None) => {
                 panic!(
                     "No subnet record found for registry version={:?} and subnet_id={:?}",
-                    version, self.subnet_id,
+                    version, self.replica_config.subnet_id,
                 );
             }
             Err(err) => {
@@ -331,6 +348,29 @@ impl ConsensusImpl {
             }
             Ok(Some(is_halted)) => is_halted,
         }
+    }
+
+    /// Checks, whether DKG transcripts for this replica are available
+    fn dkgs_available(&self, pool_reader: &PoolReader) -> bool {
+        // Get last summary
+        let block_payload =
+            BlockPayload::from(pool_reader.get_highest_summary_block().payload).into_summary();
+
+        // Get transcripts from summary
+        let transcripts = block_payload.dkg.current_transcripts();
+
+        // Check that this replica is listed as a receiver for every transcript type
+        transcripts
+            .iter()
+            .map(|(_, transcript)| {
+                transcript
+                    .committee
+                    .get()
+                    .iter()
+                    .any(|id| *id == self.replica_config.node_id)
+            })
+            .reduce(|a, b| a && b)
+            .unwrap_or(false)
     }
 }
 
@@ -354,25 +394,25 @@ impl Consensus for ConsensusImpl {
     /// finalizing anything, due to the above decision of having to return
     /// early. The order of the rest subcomponents decides whom is given
     /// a priority, but it should not affect liveness or correctness.
-    fn on_state_change(
-        &self,
-        pool: &dyn ConsensusPool,
-        ingress_pool: &dyn IngressPoolSelect,
-    ) -> ChangeSet {
+    fn on_state_change(&self, pool: &dyn ConsensusPool) -> ChangeSet {
         let pool_reader = PoolReader::new(pool);
         trace!(self.log, "on_state_change");
 
         // Load new transcripts, remove outdated keys.
-        self.dkg_key_manager.on_state_change(&pool_reader);
+        self.dkg_key_manager
+            .lock()
+            .unwrap()
+            .on_state_change(&pool_reader);
 
         // For non-root subnets, we must halt if our registry is outdated
         if let Ok(false) = is_root_subnet(
             self.registry_client.as_ref(),
-            self.subnet_id,
+            self.replica_config.subnet_id,
             self.registry_client.get_latest_version(),
         ) {
             if let Err(e) = self.check_registry_outdated() {
                 info!(
+                    every_n_seconds => 5,
                     self.log,
                     "consensus is halted due to outdated registry. {:?}", e
                 );
@@ -383,11 +423,24 @@ impl Consensus for ConsensusImpl {
         // Consensus halts if instructed by the registry
         if self.should_halt_by_subnet_record() {
             info!(
+                every_n_seconds => 5,
                 self.log,
                 "consensus is halted by instructions of the subnet record in the registry"
             );
             return ChangeSet::new();
         }
+
+        // Log some information about the state of consensus
+        // This is useful for testing purposes
+        debug!(
+            every_n_seconds => 5,
+            self.log,
+            "Consensus finalized height: {}, state available: {}, DKG key material available: {}",
+            pool_reader.get_finalized_height(),
+            pool_reader.get_finalized_tip().context.certified_height
+                <= self.state_manager.latest_certified_height(),
+            self.dkgs_available(&pool_reader)
+        );
 
         let finalize = || {
             self.call_with_metrics(ConsensusSubcomponent::Finalizer, || {
@@ -421,7 +474,7 @@ impl Consensus for ConsensusImpl {
         };
         let make_block = || {
             self.call_with_metrics(ConsensusSubcomponent::BlockMaker, || {
-                add_to_validated(self.block_maker.on_state_change(&pool_reader, ingress_pool))
+                add_to_validated(self.block_maker.on_state_change(&pool_reader))
             })
         };
         let validate = || {
@@ -448,26 +501,36 @@ impl Consensus for ConsensusImpl {
 
         let changeset = self.schedule.call_next(&calls);
 
-        if self.config.detect_starvation() {
-            // Check for starvation
-            if let Some(settings) = get_notarization_delay_settings(
-                &self.log,
-                &*self.registry_client,
-                self.subnet_id,
-                self.registry_client.get_latest_version(),
-            ) {
-                let initial_notary_delay = settings.initial_notary_delay;
-                let current_time = self.time_source.get_relative_time();
-                for (component, last_invoked_time) in self.last_invoked.borrow().iter() {
-                    let time_since_last_invoked = current_time - *last_invoked_time;
-                    if time_since_last_invoked > initial_notary_delay {
-                        warn!(
-                            self.log,
-                            "starvation detected: {:?} has not been invoked for {:?}",
-                            component,
-                            time_since_last_invoked
-                        );
-                    }
+        if let Some(settings) = get_notarization_delay_settings(
+            &self.log,
+            &*self.registry_client,
+            self.replica_config.subnet_id,
+            self.registry_client.get_latest_version(),
+        ) {
+            let unit_delay = settings.unit_delay;
+            let current_time = self.time_source.get_relative_time();
+            for (component, last_invoked_time) in self.last_invoked.borrow().iter() {
+                let time_since_last_invoked = current_time - *last_invoked_time;
+                let component_name = component.as_ref();
+                self.metrics
+                    .time_since_last_invoked
+                    .with_label_values(&[component_name])
+                    .set(time_since_last_invoked.as_secs_f64());
+
+                // Log starvation if configured
+                if self.config.detect_starvation() && time_since_last_invoked > unit_delay {
+                    self.metrics
+                        .starvation_counter
+                        .with_label_values(&[component_name])
+                        .inc();
+
+                    warn!(
+                        every_n_seconds => 5,
+                        self.log,
+                        "starvation detected: {:?} has not been invoked for {:?}",
+                        component,
+                        time_since_last_invoked
+                    );
                 }
             }
         }
@@ -476,7 +539,6 @@ impl Consensus for ConsensusImpl {
         if self.malicious_flags.is_consensus_malicious() {
             crate::consensus::malicious_consensus::maliciously_alter_changeset(
                 &pool_reader,
-                ingress_pool,
                 changeset,
                 &self.malicious_flags,
                 &self.block_maker,
@@ -496,24 +558,31 @@ impl Consensus for ConsensusImpl {
 pub(crate) fn add_all_to_validated<T: ConsensusMessageHashable>(messages: Vec<T>) -> ChangeSet {
     messages
         .into_iter()
-        .map(|msg| ChangeAction::AddToValidated(msg.to_message()))
+        .map(|msg| ChangeAction::AddToValidated(msg.into_message()))
         .collect()
 }
 
 fn add_to_validated<T: ConsensusMessageHashable>(msg: Option<T>) -> ChangeSet {
-    msg.map(|msg| ChangeAction::AddToValidated(msg.to_message()).into())
+    msg.map(|msg| ChangeAction::AddToValidated(msg.into_message()).into())
         .unwrap_or_default()
 }
 
 /// Implement Consensus Gossip interface.
 pub struct ConsensusGossipImpl {
     message_routing: Arc<dyn MessageRouting>,
+    metrics: ConsensusGossipMetrics,
 }
 
 impl ConsensusGossipImpl {
     /// Create a new ConsensusGossipImpl.
-    pub fn new(message_routing: Arc<dyn MessageRouting>) -> Self {
-        ConsensusGossipImpl { message_routing }
+    pub fn new(
+        message_routing: Arc<dyn MessageRouting>,
+        metrics_registry: MetricsRegistry,
+    ) -> Self {
+        ConsensusGossipImpl {
+            message_routing,
+            metrics: ConsensusGossipMetrics::new(metrics_registry),
+        }
     }
 }
 
@@ -523,7 +592,11 @@ impl ConsensusGossip for ConsensusGossipImpl {
         &self,
         pool: &dyn ConsensusPool,
     ) -> PriorityFn<ConsensusMessageId, ConsensusMessageAttribute> {
-        get_priority_function(pool, self.message_routing.expected_batch_height())
+        get_priority_function(
+            pool,
+            self.message_routing.expected_batch_height(),
+            &self.metrics,
+        )
     }
 
     /// Return a filter that represents what artifacts are needed above the
@@ -551,7 +624,11 @@ pub fn setup(
     crypto: Arc<dyn ConsensusCrypto>,
     ingress_selector: Arc<dyn IngressSelector>,
     xnet_payload_builder: Arc<dyn XNetPayloadBuilder>,
+    self_validating_payload_builder: Arc<dyn SelfValidatingPayloadBuilder>,
+    canister_http_payload_builder: Arc<dyn CanisterHttpPayloadBuilder>,
     dkg_pool: Arc<RwLock<dyn DkgPool>>,
+    ecdsa_pool: Arc<RwLock<dyn EcdsaPool>>,
+    dkg_key_manager: Arc<Mutex<DkgKeyManager>>,
     message_routing: Arc<dyn MessageRouting>,
     state_manager: Arc<dyn StateManager<State = ReplicatedState>>,
     time_source: Arc<dyn TimeSource>,
@@ -559,7 +636,19 @@ pub fn setup(
     metrics_registry: MetricsRegistry,
     logger: ReplicaLogger,
     local_store_time_reader: Option<Arc<dyn LocalStoreCertifiedTimeReader>>,
+    registry_poll_delay_duration_ms: u64,
 ) -> (ConsensusImpl, ConsensusGossipImpl) {
+    // Currently, the orchestrator polls the registry every
+    // `registry_poll_delay_duration_ms` and writes new updates into the
+    // registry local store. The registry client polls the local store
+    // for updates every `registry::POLLING_PERIOD`. These two polls are completelly
+    // async, so that every replica sees a new registry version at any time
+    // between >0 and the sum of both polling intervals. To accomodate for that,
+    // we use this sum as the minimal age of a registry version we consider as
+    // stable.
+
+    let stable_registry_version_age =
+        POLLING_PERIOD + Duration::from_millis(registry_poll_delay_duration_ms);
     (
         ConsensusImpl::new(
             replica_config,
@@ -569,16 +658,21 @@ pub fn setup(
             crypto,
             ingress_selector,
             xnet_payload_builder,
+            self_validating_payload_builder,
+            canister_http_payload_builder,
             dkg_pool,
+            ecdsa_pool,
+            dkg_key_manager,
             message_routing.clone(),
             state_manager,
             time_source,
+            stable_registry_version_age,
             malicious_flags,
-            metrics_registry,
+            metrics_registry.clone(),
             logger,
             local_store_time_reader,
         ),
-        ConsensusGossipImpl { message_routing },
+        ConsensusGossipImpl::new(message_routing, metrics_registry),
     )
 }
 
@@ -591,15 +685,16 @@ mod tests {
     use ic_metrics::MetricsRegistry;
     use ic_protobuf::registry::subnet::v1::SubnetRecord;
     use ic_registry_subnet_type::SubnetType;
-    use ic_test_artifact_pool::ingress_pool::TestIngressPool;
     use ic_test_utilities::{
+        canister_http::FakeCanisterHttpPayloadBuilder,
         ingress_selector::FakeIngressSelector,
         message_routing::FakeMessageRouting,
-        registry::{FakeLocalStoreCertifiedTimeReader, SubnetRecordBuilder},
+        self_validating_payload_builder::FakeSelfValidatingPayloadBuilder,
         types::ids::{node_test_id, subnet_test_id},
         xnet_payload_builder::FakeXNetPayloadBuilder,
         FastForwardTimeSource,
     };
+    use ic_test_utilities_registry::{FakeLocalStoreCertifiedTimeReader, SubnetRecordBuilder};
     use std::borrow::Borrow;
     use std::sync::Arc;
     use std::time::Duration;
@@ -612,7 +707,18 @@ mod tests {
         Box<dyn ConsensusPool>,
         Arc<FastForwardTimeSource>,
     ) {
-        let subnet_id = subnet_test_id(0);
+        set_up_consensus_with_subnet_record_and_subnet_id(record, pool_config, subnet_test_id(0))
+    }
+
+    fn set_up_consensus_with_subnet_record_and_subnet_id(
+        record: SubnetRecord,
+        pool_config: ArtifactPoolConfig,
+        subnet_id: SubnetId,
+    ) -> (
+        ConsensusImpl,
+        Box<dyn ConsensusPool>,
+        Arc<FastForwardTimeSource>,
+    ) {
         let Dependencies {
             pool,
             membership,
@@ -622,6 +728,7 @@ mod tests {
             replica_config,
             state_manager,
             dkg_pool,
+            ecdsa_pool,
             ..
         } = dependencies_with_subnet_params(pool_config, subnet_id, vec![(1, record)]);
         state_manager
@@ -631,22 +738,34 @@ mod tests {
         state_manager
             .get_mut()
             .expect_get_state_hash_at()
-            .return_const(Ok(Some(CryptoHashOfState::from(CryptoHash(Vec::new())))));
+            .return_const(Ok(CryptoHashOfState::from(CryptoHash(Vec::new()))));
+
+        let metrics_registry = MetricsRegistry::new();
 
         let consensus_impl = ConsensusImpl::new(
             replica_config,
             ConsensusConfig::default(),
             registry,
             membership,
-            crypto,
+            crypto.clone(),
             Arc::new(FakeIngressSelector::new()),
             Arc::new(FakeXNetPayloadBuilder::new()),
+            Arc::new(FakeSelfValidatingPayloadBuilder::new()),
+            Arc::new(FakeCanisterHttpPayloadBuilder::new()),
             dkg_pool,
+            ecdsa_pool,
+            Arc::new(Mutex::new(DkgKeyManager::new(
+                metrics_registry.clone(),
+                crypto,
+                no_op_logger(),
+                &PoolReader::new(&pool),
+            ))),
             Arc::new(FakeMessageRouting::new()),
             state_manager,
             time_source.clone(),
+            Duration::from_secs(0),
             MaliciousFlags::default(),
-            MetricsRegistry::new(),
+            metrics_registry,
             no_op_logger(),
             Some(Arc::new(FakeLocalStoreCertifiedTimeReader::new(
                 time_source.clone(),
@@ -660,7 +779,6 @@ mod tests {
         ic_test_utilities::artifact_pool_config::with_test_pool_config(|pool_config| {
             let committee: Vec<_> = (0..4).map(node_test_id).collect();
             let interval_length = 99;
-            let ingress_pool = TestIngressPool::new(pool_config.clone());
 
             // ensure that a consensus implementation with a subnet record with is_halted =
             // false returns changes
@@ -672,9 +790,7 @@ mod tests {
                 pool_config.clone(),
             );
 
-            assert!(!consensus_impl
-                .on_state_change(pool.borrow(), &ingress_pool)
-                .is_empty());
+            assert!(!consensus_impl.on_state_change(pool.borrow()).is_empty());
 
             // ensure that an consensus_impl with a subnet record with is_halted =
             // true returns no changes
@@ -685,9 +801,7 @@ mod tests {
                     .build(),
                 pool_config,
             );
-            assert!(consensus_impl
-                .on_state_change(pool.borrow(), &ingress_pool)
-                .is_empty());
+            assert!(consensus_impl.on_state_change(pool.borrow()).is_empty());
         })
     }
 
@@ -696,16 +810,16 @@ mod tests {
         ic_test_utilities::artifact_pool_config::with_test_pool_config(|pool_config| {
             let committee: Vec<_> = (0..4).map(node_test_id).collect();
             let interval_length = 99;
-            let ingress_pool = TestIngressPool::new(pool_config.clone());
 
             // ensure that an consensus_impl with a subnet record with is_halted = false
             // returns changes
             let (mut consensus_impl, pool, consensus_time_source) =
-                set_up_consensus_with_subnet_record(
+                set_up_consensus_with_subnet_record_and_subnet_id(
                     SubnetRecordBuilder::from(&committee)
                         .with_dkg_interval_length(interval_length)
                         .build(),
                     pool_config,
+                    subnet_test_id(1),
                 );
 
             // when the consensus time source and the registry time are equal, consensus
@@ -717,35 +831,27 @@ mod tests {
             registry_time_source
                 .set_time(consensus_impl.time_source.get_relative_time())
                 .unwrap();
-            assert!(!consensus_impl
-                .on_state_change(pool.borrow(), &ingress_pool)
-                .is_empty());
+            assert!(!consensus_impl.on_state_change(pool.borrow()).is_empty());
 
             // advance the consensus time such that it's `HALT_AFTER_REGISTRY_UNREACHABLE`
             // ahead of the registry time. Consensus should not be halted yet.
             let new_time =
                 consensus_time_source.get_relative_time() + HALT_AFTER_REGISTRY_UNREACHABLE;
             consensus_time_source.set_time(new_time).unwrap();
-            assert!(!consensus_impl
-                .on_state_change(pool.borrow(), &ingress_pool)
-                .is_empty());
+            assert!(!consensus_impl.on_state_change(pool.borrow()).is_empty());
 
             // advance the consensus time another second, such that it's more than
             // `HALT_AFTER_REGISTRY_UNREACHABLE` ahead of the registry time. Consensus
             // should now be stalled.
             let new_time = consensus_time_source.get_relative_time() + Duration::from_secs(1);
             consensus_time_source.set_time(new_time).unwrap();
-            assert!(consensus_impl
-                .on_state_change(pool.borrow(), &ingress_pool)
-                .is_empty());
+            assert!(consensus_impl.on_state_change(pool.borrow()).is_empty());
 
             // if we advance the registry time such that it's <=
             // `HALT_AFTER_REGISTRY_UNREACHABLE` behind the consensus time,
             // consensus should no longer be halted.
             registry_time_source.set_time(new_time).unwrap();
-            assert!(!consensus_impl
-                .on_state_change(pool.borrow(), &ingress_pool)
-                .is_empty());
+            assert!(!consensus_impl.on_state_change(pool.borrow()).is_empty());
         })
     }
 
@@ -754,7 +860,6 @@ mod tests {
         ic_test_utilities::artifact_pool_config::with_test_pool_config(|pool_config| {
             let committee: Vec<_> = (0..4).map(node_test_id).collect();
             let interval_length = 99;
-            let ingress_pool = TestIngressPool::new(pool_config.clone());
 
             // ensure that an consensus_impl with a subnet record with is_halted = false
             // returns changes
@@ -784,9 +889,7 @@ mod tests {
                 + HALT_AFTER_REGISTRY_UNREACHABLE
                 + Duration::from_secs(1);
             consensus_time_source.set_time(new_time).unwrap();
-            assert!(!consensus_impl
-                .on_state_change(pool.borrow(), &ingress_pool)
-                .is_empty());
+            assert!(!consensus_impl.on_state_change(pool.borrow()).is_empty());
         })
     }
 }

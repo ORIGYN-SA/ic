@@ -2,7 +2,6 @@ use crate::{
     consensus_pool::{MutablePoolSection, PoolSectionOp, PoolSectionOps},
     height_index::{HeightIndex, Indexes, SelectIndex},
 };
-use ic_consensus_message::ConsensusMessageHashable;
 use ic_interfaces::{
     artifact_pool::{HasTimestamp, IntoInner},
     consensus_pool::{HeightIndexedPool, HeightRange, OnlyError, PoolSection},
@@ -34,7 +33,7 @@ impl<T: IntoInner<ConsensusMessage> + HasTimestamp + Clone> InMemoryPoolSection<
     fn insert(&mut self, artifact: T) {
         let msg = artifact.as_ref();
         let hash = msg.get_cm_hash().digest().clone();
-        self.indexes.insert(&msg, &hash);
+        self.indexes.insert(msg, &hash);
         self.artifacts.entry(hash).or_insert(artifact);
     }
 
@@ -206,7 +205,11 @@ where
                 std::ops::Bound::Included(range.max),
             ))
             .map(|(h, _)| h);
-        let vec: Vec<T> = heights.map(|h| self.get_by_height(*h)).flatten().collect();
+
+        // returning the iterator directly isn't trusted due to the use of `self` in the
+        // closure
+        #[allow(clippy::needless_collect)]
+        let vec: Vec<T> = heights.flat_map(|h| self.get_by_height(*h)).collect();
         Box::new(vec.into_iter())
     }
 
@@ -240,7 +243,7 @@ impl<T: IntoInner<ConsensusMessage> + HasTimestamp + Clone> PoolSection<T>
     for InMemoryPoolSection<T>
 {
     fn contains(&self, msg_id: &ConsensusMessageId) -> bool {
-        self.artifacts.get(&msg_id.hash.digest()).is_some()
+        self.artifacts.get(msg_id.hash.digest()).is_some()
     }
 
     fn get(&self, msg_id: &ConsensusMessageId) -> Option<ConsensusMessage> {
@@ -318,7 +321,7 @@ impl<T: IntoInner<ConsensusMessage> + HasTimestamp + Clone> MutablePoolSection<T
 pub mod test {
     use super::*;
     use ic_interfaces::artifact_pool::ValidatedArtifact;
-    use ic_test_utilities::consensus::fake::*;
+    use ic_test_utilities::consensus::{fake::*, make_genesis};
 
     fn make_summary(genesis_height: Height) -> ic_types::consensus::dkg::Summary {
         let mut summary = ic_types::consensus::dkg::Summary::fake();
@@ -327,7 +330,7 @@ pub mod test {
     }
 
     fn fake_random_beacon(h: Height) -> RandomBeacon {
-        let parent = ic_consensus_message::make_genesis(make_summary(h.decrement()))
+        let parent = make_genesis(make_summary(h.decrement()))
             .content
             .random_beacon;
         RandomBeacon::from_parent(parent.as_ref())
@@ -351,11 +354,10 @@ pub mod test {
                 pool.insert(make_artifact(fake_random_beacon(min)));
                 pool.insert(make_artifact(fake_random_beacon(max)));
 
-                let result: Vec<RandomBeacon> = pool
+                let result = pool
                     .random_beacon()
-                    .get_by_height_range(pool.random_beacon().height_range().unwrap())
-                    .collect();
-                assert_eq!(result.len(), 2);
+                    .get_by_height_range(pool.random_beacon().height_range().unwrap());
+                assert_eq!(result.count(), 2);
             }
         ));
     }

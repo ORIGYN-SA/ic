@@ -3,11 +3,11 @@ use canister_test::*;
 #[test]
 fn test_statesync_test_canisters() {
     local_test_e(|r| async move {
-        let proj = Project::new(env!("CARGO_MANIFEST_DIR"));
+        let proj = Project::new();
 
         println!("Start installing statesync test canister");
         let canister = proj
-            .cargo_bin("statesync-test-canister")
+            .cargo_bin("statesync-test-canister", &[])
             .install(&r)
             .with_memory_allocation(8 * 1024 * 1024 * 1024) // 8GiB
             .bytes(Vec::new())
@@ -15,7 +15,7 @@ fn test_statesync_test_canisters() {
         println!("Installed statesync test canister");
 
         let mut res: Result<u8, String> = canister
-            .query_("read_state", dfn_json::json, 0 as usize)
+            .query_("read_state", dfn_json::json, 0_usize)
             .await
             .unwrap();
         assert_eq!(
@@ -26,7 +26,7 @@ fn test_statesync_test_canisters() {
         );
 
         res = canister
-            .update_("change_state", dfn_json::json, 33 as u32)
+            .update_("change_state", dfn_json::json, 33_u32)
             .await
             .unwrap();
         assert_eq!(
@@ -37,12 +37,12 @@ fn test_statesync_test_canisters() {
         );
 
         res = canister
-            .query_("read_state", dfn_json::json, 0 as usize)
+            .query_("read_state", dfn_json::json, 0_usize)
             .await
             .unwrap();
         assert_eq!(
             res,
-            Ok(20),
+            Ok(119),
             "Queried 0th element of state vector, should be 20 for seed 33, was {:?}",
             res
         );

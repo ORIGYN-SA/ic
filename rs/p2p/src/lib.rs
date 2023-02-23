@@ -94,20 +94,32 @@
 //! <img src="../../../../../docs/assets/p2p.png" height="960"
 //! width="540"/> </div> <hr/>
 
+use ic_config::transport::TransportConfig;
+use ic_interfaces::{artifact_manager::ArtifactManager, consensus_pool::ConsensusPoolCache};
+use ic_interfaces_registry::RegistryClient;
+use ic_interfaces_transport::{Transport, TransportChannelId};
+use ic_logger::ReplicaLogger;
+use ic_metrics::MetricsRegistry;
+use ic_types::{NodeId, SubnetId};
 use serde::{Deserialize, Serialize};
 use std::{
     error,
     fmt::{Display, Formatter, Result as FmtResult},
+    sync::Arc,
 };
+use tower::util::BoxCloneService;
 
 mod artifact_download_list;
+mod discovery;
 mod download_management;
 mod download_prioritization;
 mod event_handler;
 mod gossip_protocol;
-mod malicious_gossip;
+mod gossip_types;
 mod metrics;
-pub mod p2p;
+mod peer_context;
+
+pub use event_handler::{AdvertBroadcaster, P2PThreadJoiner};
 
 /// Custom P2P result type returning a P2P error in case of error.
 pub(crate) type P2PResult<T> = std::result::Result<T, P2PError>;
@@ -115,27 +127,66 @@ pub(crate) type P2PResult<T> = std::result::Result<T, P2PError>;
 pub(crate) mod utils {
     //! The utils module provides a mapping from a gossip message to the
     //! corresponding flow tag.
-    use ic_types::transport::FlowTag;
+    use crate::gossip_types::GossipMessage;
+    use ic_interfaces_transport::TransportChannelId;
 
-    use crate::gossip_protocol::GossipMessage;
-
-    /// The FlowMapper struct holds a vector of flow tags.
-    pub(crate) struct FlowMapper {
-        flow_tags: Vec<FlowTag>,
+    /// An ordered collection of transport channels.
+    pub(crate) struct TransportChannelIdMapper {
+        transport_channels: Vec<TransportChannelId>,
     }
 
-    impl FlowMapper {
-        /// The function creates a new FlowMapper instance.
-        pub(crate) fn new(flow_tags: Vec<FlowTag>) -> Self {
-            assert_eq!(flow_tags.len(), 1);
-            Self { flow_tags }
+    impl TransportChannelIdMapper {
+        /// The function creates a new TransportChannelIdMapper instance.
+        pub(crate) fn new(transport_channels: Vec<TransportChannelId>) -> Self {
+            assert_eq!(transport_channels.len(), 1);
+            Self { transport_channels }
         }
 
         /// The function returns the flow tag of the flow the message maps to.
-        pub(crate) fn map(&self, _msg: &GossipMessage) -> FlowTag {
-            self.flow_tags[0]
+        pub(crate) fn map(&self, _msg: &GossipMessage) -> TransportChannelId {
+            self.transport_channels[0]
         }
     }
+}
+
+/// Starts the P2P stack and returns the objects that interact with P2P.
+#[allow(clippy::too_many_arguments)]
+pub fn start_p2p(
+    metrics_registry: MetricsRegistry,
+    log: ReplicaLogger,
+    node_id: NodeId,
+    subnet_id: SubnetId,
+    _transport_config: TransportConfig,
+    registry_client: Arc<dyn RegistryClient>,
+    transport: Arc<dyn Transport>,
+    consensus_pool_cache: Arc<dyn ConsensusPoolCache>,
+    artifact_manager: Arc<dyn ArtifactManager>,
+    advert_broadcaster: &AdvertBroadcaster,
+) -> P2PThreadJoiner {
+    let p2p_transport_channels = vec![TransportChannelId::from(0)];
+    let gossip = Arc::new(gossip_protocol::GossipImpl::new(
+        node_id,
+        subnet_id,
+        consensus_pool_cache,
+        registry_client.clone(),
+        artifact_manager.clone(),
+        transport.clone(),
+        p2p_transport_channels,
+        log.clone(),
+        &metrics_registry,
+    ));
+
+    let event_handler = event_handler::AsyncTransportEventHandlerImpl::new(
+        node_id,
+        log.clone(),
+        &metrics_registry,
+        event_handler::ChannelConfig::default(),
+        gossip.clone(),
+    );
+    transport.set_event_handler(BoxCloneService::new(event_handler));
+    advert_broadcaster.start(gossip.clone());
+
+    P2PThreadJoiner::new(log, gossip)
 }
 
 /// Generic P2P Error codes.
@@ -144,7 +195,7 @@ pub(crate) mod utils {
 /// protocol results. Some results are also used for internal
 /// operation, i.e., they are not represented in the on-wire protocol.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub(crate) enum P2PErrorCode {
+enum P2PErrorCode {
     /// The requested entity artifact/chunk/server/client was not found
     NotFound = 1,
     /// An artifact (chunk) was received that already exists.

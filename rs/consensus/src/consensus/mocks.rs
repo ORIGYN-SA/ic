@@ -1,31 +1,33 @@
 //! Contains mocks for traits internal to consensus
 use crate::consensus::{membership::Membership, payload_builder::PayloadBuilder};
-use ic_artifact_pool::dkg_pool::DkgPoolImpl;
-use ic_config::artifact_pool::ArtifactPoolConfig;
-use ic_interfaces::{
-    consensus::PayloadValidationError, ingress_pool::IngressPoolSelect,
-    messaging::XNetPayloadError, validation::ValidationResult,
+use ic_artifact_pool::{
+    canister_http_pool::CanisterHttpPoolImpl, dkg_pool::DkgPoolImpl, ecdsa_pool::EcdsaPoolImpl,
 };
+use ic_config::artifact_pool::ArtifactPoolConfig;
+use ic_interfaces::{consensus::PayloadValidationError, validation::ValidationResult};
 use ic_protobuf::registry::subnet::v1::SubnetRecord;
-use ic_registry_client::fake::FakeRegistryClient;
-use ic_registry_common::proto_registry_data_provider::ProtoRegistryDataProvider;
+use ic_registry_client_fake::FakeRegistryClient;
+use ic_registry_keys::ROOT_SUBNET_ID_KEY;
+use ic_registry_proto_data_provider::ProtoRegistryDataProvider;
 use ic_test_artifact_pool::consensus_pool::TestConsensusPool;
 use ic_test_utilities::{
     crypto::CryptoReturningOk,
-    registry::{setup_registry_non_final, SubnetRecordBuilder},
     state_manager::RefMockStateManager,
     types::ids::{node_test_id, subnet_test_id},
     FastForwardTimeSource,
 };
+use ic_test_utilities_registry::{setup_registry_non_final, SubnetRecordBuilder};
 use ic_types::{
     batch::{BatchPayload, ValidationContext},
     consensus::Payload,
     replica_config::ReplicaConfig,
-    Height, SubnetId, Time,
+    Height, RegistryVersion, SubnetId, Time,
 };
 use mockall::predicate::*;
 use mockall::*;
 use std::sync::{Arc, RwLock};
+
+use super::block_maker::SubnetRecords;
 
 mock! {
     pub PayloadBuilder {}
@@ -34,12 +36,14 @@ mock! {
         fn get_payload<'a>(
             &self,
             height: Height,
-            ingress_pool: &'a (dyn IngressPoolSelect + 'a),
             past_payloads: &[(Height, Time, Payload)],
-            context: &ValidationContext
-        ) -> Result<BatchPayload, XNetPayloadError>;
+            context: &ValidationContext,
+            subnet_records: &SubnetRecords,
+        ) -> BatchPayload;
+
         fn validate_payload(
             &self,
+            height: Height,
             payload: &Payload,
             past_payloads: &[(Height, Time, Payload)],
             context: &ValidationContext,
@@ -57,6 +61,8 @@ pub struct Dependencies {
     pub replica_config: ReplicaConfig,
     pub state_manager: Arc<RefMockStateManager>,
     pub dkg_pool: Arc<RwLock<DkgPoolImpl>>,
+    pub ecdsa_pool: Arc<RwLock<EcdsaPoolImpl>>,
+    pub canister_http_pool: Arc<RwLock<CanisterHttpPoolImpl>>,
 }
 
 /// Creates most common consensus components used for testing. All components
@@ -69,7 +75,15 @@ pub fn dependencies_with_subnet_records_with_raw_state_manager(
     records: Vec<(u64, SubnetRecord)>,
 ) -> Dependencies {
     let time_source = FastForwardTimeSource::new();
+    let registry_version = RegistryVersion::from(records[0].clone().0);
     let (registry_data_provider, registry) = setup_registry_non_final(subnet_id, records);
+    registry_data_provider
+        .add(
+            ROOT_SUBNET_ID_KEY,
+            registry_version,
+            Some(ic_types::subnet_id_into_protobuf(subnet_test_id(0))),
+        )
+        .unwrap();
     registry.update_to_latest_version();
     let replica_config = ReplicaConfig {
         subnet_id,
@@ -78,6 +92,14 @@ pub fn dependencies_with_subnet_records_with_raw_state_manager(
     let crypto = Arc::new(CryptoReturningOk::default());
     let state_manager = Arc::new(RefMockStateManager::default());
     let dkg_pool = Arc::new(RwLock::new(DkgPoolImpl::new(
+        ic_metrics::MetricsRegistry::new(),
+    )));
+    let ecdsa_pool = Arc::new(RwLock::new(EcdsaPoolImpl::new(
+        pool_config.clone(),
+        ic_logger::replica_logger::no_op_logger(),
+        ic_metrics::MetricsRegistry::new(),
+    )));
+    let canister_http_pool = Arc::new(RwLock::new(CanisterHttpPoolImpl::new(
         ic_metrics::MetricsRegistry::new(),
     )));
     let pool = TestConsensusPool::new(
@@ -95,15 +117,17 @@ pub fn dependencies_with_subnet_records_with_raw_state_manager(
         subnet_id,
     ));
     Dependencies {
-        time_source,
-        registry_data_provider,
-        registry,
-        membership,
         crypto,
+        registry,
+        registry_data_provider,
+        membership,
+        time_source,
         pool,
         replica_config,
         state_manager,
         dkg_pool,
+        ecdsa_pool,
+        canister_http_pool,
     }
 }
 
@@ -126,27 +150,31 @@ pub fn dependencies_with_subnet_params(
         replica_config,
         state_manager,
         dkg_pool,
+        ecdsa_pool,
+        canister_http_pool,
         ..
     } = dependencies_with_subnet_records_with_raw_state_manager(pool_config, subnet_id, records);
 
     state_manager
         .get_mut()
         .expect_get_state_at()
-        .return_const(Ok(ic_interfaces::state_manager::Labeled::new(
+        .return_const(Ok(ic_interfaces_state_manager::Labeled::new(
             Height::new(0),
             Arc::new(ic_test_utilities::state::get_initial_state(0, 0)),
         )));
 
     Dependencies {
-        time_source,
-        registry_data_provider,
-        registry,
-        membership,
         crypto,
+        registry,
+        registry_data_provider,
+        membership,
+        time_source,
         pool,
         replica_config,
         state_manager,
         dkg_pool,
+        ecdsa_pool,
+        canister_http_pool,
     }
 }
 

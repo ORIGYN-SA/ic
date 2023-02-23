@@ -1,27 +1,26 @@
-#[cfg(target_arch = "x86_64")]
+#[cfg(not(target_arch = "wasm32"))]
 use crate::pb::v1::{neuron::DissolveState, neuron::Followees, Topic};
-#[cfg(target_arch = "x86_64")]
-use ledger_canister::Subaccount;
-#[cfg(target_arch = "x86_64")]
-use rand::rngs::StdRng;
-#[cfg(target_arch = "x86_64")]
-use rand_core::{RngCore, SeedableRng};
-#[cfg(target_arch = "x86_64")]
+#[cfg(not(target_arch = "wasm32"))]
+use ic_nervous_system_common::ledger;
+#[cfg(not(target_arch = "wasm32"))]
+use icp_ledger::Subaccount;
+#[cfg(not(target_arch = "wasm32"))]
+use rand::{RngCore, SeedableRng};
+#[cfg(not(target_arch = "wasm32"))]
+use rand_chacha::ChaCha20Rng;
+#[cfg(not(target_arch = "wasm32"))]
 use std::path::Path;
 
 use crate::pb::v1::{Governance, NetworkEconomics, Neuron};
 use ic_base_types::PrincipalId;
-use ic_nns_common::{
-    pb::v1::{CanisterAuthzInfo, MethodAuthzInfo},
-    types::NeuronId,
-};
+use ic_nns_common::types::NeuronId;
 
 #[allow(dead_code)]
 pub struct GovernanceCanisterInitPayloadBuilder {
     pub proto: Governance,
     voters_to_add_to_all_neurons: Vec<PrincipalId>,
-    #[cfg(target_arch = "x86_64")]
-    rng: StdRng,
+    #[cfg(not(target_arch = "wasm32"))]
+    rng: ChaCha20Rng,
 }
 
 #[allow(clippy::new_without_default)]
@@ -30,22 +29,13 @@ impl GovernanceCanisterInitPayloadBuilder {
         Self {
             proto: Governance {
                 economics: Some(NetworkEconomics::with_default_values()),
-                authz: Some(CanisterAuthzInfo {
-                    methods_authz: vec![MethodAuthzInfo {
-                        method_name: "submit_proposal".to_string(),
-                        principal_ids: vec![
-                            ic_nns_constants::ROOT_CANISTER_ID.get().to_vec(),
-                            ic_nns_constants::LIFELINE_CANISTER_ID.get().to_vec(),
-                        ],
-                    }],
-                }),
-                wait_for_quiet_threshold_seconds: 60 * 60 * 24 * 2, // 2 days
+                wait_for_quiet_threshold_seconds: 60 * 60 * 24 * 4, // 4 days
                 short_voting_period_seconds: 60 * 60 * 12,          // 12 hours
                 ..Default::default()
             },
             voters_to_add_to_all_neurons: Vec::new(),
-            #[cfg(target_arch = "x86_64")]
-            rng: StdRng::seed_from_u64(0),
+            #[cfg(not(target_arch = "wasm32"))]
+            rng: ChaCha20Rng::seed_from_u64(0),
         }
     }
 
@@ -53,19 +43,16 @@ impl GovernanceCanisterInitPayloadBuilder {
     // Moving forward we should only actually assign the ids to neurons
     // on the canister and should come up with a naming scheme to layout
     // the following graph on initialization that doesn't rely on ids.
-    #[cfg(target_arch = "x86_64")]
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn new_neuron_id(&mut self) -> NeuronId {
-        let neuron_id;
-
         let random_id = self.rng.next_u64();
-        neuron_id = NeuronId(random_id);
 
-        neuron_id
+        NeuronId(random_id)
     }
 
-    #[cfg(not(target_arch = "x86_64"))]
+    #[cfg(target_arch = "wasm32")]
     pub fn new_neuron_id(&mut self) -> NeuronId {
-        unimplemented!("Not implemented for non-x86_64");
+        unimplemented!("Not implemented for wasm32");
     }
 
     pub fn get_balance(&self) -> u64 {
@@ -79,17 +66,13 @@ impl GovernanceCanisterInitPayloadBuilder {
     pub fn with_governance_proto(&mut self, proto: Governance) -> &mut Self {
         // Save the neurons from the current proto, to account for the neurons
         // possibly already crated (say, for the GTC).
-        let mut proto = proto;
         let neurons = self.proto.neurons.clone();
-        if proto.authz.is_none() {
-            proto.authz = self.proto.authz.clone();
-        }
         self.proto = proto;
         self.proto.neurons.extend(neurons);
         self
     }
 
-    #[cfg(target_arch = "x86_64")]
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn make_subaccount(&mut self) -> Subaccount {
         let mut bytes = [0u8; 32];
         self.rng.fill_bytes(&mut bytes);
@@ -98,12 +81,12 @@ impl GovernanceCanisterInitPayloadBuilder {
 
     /// Initializes the governance canister with a few neurons to be used
     /// in tests.
-    #[cfg(target_arch = "x86_64")]
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn with_test_neurons(&mut self) -> &mut Self {
         use ic_nns_common::pb::v1::NeuronId as NeuronIdProto;
 
         const TWELVE_MONTHS_SECONDS: u64 = 30 * 12 * 24 * 60 * 60;
-        use ic_nns_constants::ids::{
+        use ic_nervous_system_common_test_keys::{
             TEST_NEURON_1_OWNER_PRINCIPAL, TEST_NEURON_2_OWNER_PRINCIPAL,
             TEST_NEURON_3_OWNER_PRINCIPAL,
         };
@@ -183,7 +166,7 @@ impl GovernanceCanisterInitPayloadBuilder {
     /// version doesn't include this method.
     ///
     /// An example is available at `rs/nns/governance/test/init.rs`.
-    #[cfg(target_arch = "x86_64")]
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn add_all_neurons_from_csv_file(&mut self, csv_file: &Path) -> &mut Self {
         use ic_nns_common::pb::v1::NeuronId as NeuronIdProto;
 
@@ -215,7 +198,7 @@ impl GovernanceCanisterInitPayloadBuilder {
                         "follows",
                     ]
                 );
-            } else {
+            } else if headers.len() == 8 {
                 assert_eq!(
                     headers,
                     vec![
@@ -227,6 +210,23 @@ impl GovernanceCanisterInitPayloadBuilder {
                         "earnings",
                         "follows",
                         "not_for_profit"
+                    ]
+                );
+            } else {
+                assert_eq!(
+                    headers,
+                    vec![
+                        "neuron_id",
+                        "owner_id",
+                        "created_ts_ns",
+                        "duration_to_dissolution_ns",
+                        "staked_icpt",
+                        "earnings",
+                        "follows",
+                        "not_for_profit",
+                        "memo",
+                        "maturity_e8s_equivalent",
+                        "kyc_verified"
                     ]
                 );
             }
@@ -267,30 +267,51 @@ impl GovernanceCanisterInitPayloadBuilder {
 
             let neuron_id = NeuronIdProto::from(neuron_id);
 
-            let not_for_profit;
-            if record.len() < 8 {
-                not_for_profit = false;
+            let not_for_profit = if record.len() < 8 {
+                false
             } else {
-                not_for_profit = record[7]
+                record[7]
                     .parse::<bool>()
-                    .expect("couldn't read the neuron's not-for-profit flag");
-            }
+                    .expect("couldn't read the neuron's not-for-profit flag")
+            };
+
+            let memo = if record.len() < 9 {
+                self.rng.next_u64()
+            } else {
+                record[8].parse::<u64>().expect("could not parse memo")
+            };
+
+            let maturity_e8s_equivalent = if record.len() < 10 {
+                0
+            } else {
+                record[9].parse::<u64>().expect("could not parse maturity")
+            };
+
+            let kyc_verified = if record.len() < 11 {
+                false
+            } else {
+                record[10]
+                    .parse::<bool>()
+                    .expect("could not parse kyc_verified")
+            };
 
             let neuron = Neuron {
                 id: Some(neuron_id.clone()),
-                account: self.make_subaccount().into(),
+                account: ledger::compute_neuron_staking_subaccount(principal_id, memo).into(),
                 controller: Some(principal_id),
                 hot_keys: vec![principal_id],
                 cached_neuron_stake_e8s: staked_icpt * 100_000_000, // to e8s
                 created_timestamp_seconds: creation_ts_ns / (1_000_000_000), // to sec
                 aging_since_timestamp_seconds: creation_ts_ns / (1_000_000_000), // to sec
+                kyc_verified,
+                maturity_e8s_equivalent,
                 not_for_profit,
                 dissolve_state: Some(DissolveState::DissolveDelaySeconds(
                     duration_to_dissolution_ns / (1_000_000_000),
                 )), // to sec
                 followees: [(Topic::Unspecified as i32, Followees { followees })]
-                    .to_vec()
-                    .into_iter()
+                    .iter()
+                    .cloned()
                     .collect(),
                 ..Default::default()
             };

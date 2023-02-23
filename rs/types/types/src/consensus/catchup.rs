@@ -2,8 +2,8 @@
 
 use crate::{
     consensus::{
-        Block, Committee, HasCommittee, HasHeight, HasVersion, HashedBlock, HashedRandomBeacon,
-        RandomBeacon, ThresholdSignature, ThresholdSignatureShare,
+        Block, Committee, ConsensusMessageHashable, HasCommittee, HasHeight, HasVersion,
+        HashedBlock, HashedRandomBeacon, RandomBeacon, ThresholdSignature, ThresholdSignatureShare,
     },
     crypto::threshold_sig::ni_dkg::NiDkgId,
     crypto::*,
@@ -20,12 +20,13 @@ use std::convert::TryFrom;
 pub type CatchUpContent = CatchUpContentT<HashedBlock>;
 
 /// A generic struct shared between CatchUpContent and CatchUpContentShare.
+/// Consists of objects all occuring at a specific height which we will refer to
+/// as the catch up height.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, PartialOrd, Ord, Hash)]
 pub struct CatchUpContentT<T> {
     /// Replica version that was running when this CUP was created.
     version: ReplicaVersion,
-    /// A finalized Block that contains DKG summary. We call its height the
-    /// catchup height.
+    /// A finalized Block that contains DKG summary.
     pub block: T,
     /// The RandomBeacon that is used at the catchup height.
     pub random_beacon: HashedRandomBeacon,
@@ -56,6 +57,7 @@ impl CatchUpContent {
             .payload
             .as_ref()
             .as_summary()
+            .dkg
             .registry_version
     }
 
@@ -156,7 +158,7 @@ impl From<&CatchUpPackage> for pb::CatchUpPackage {
 impl TryFrom<&pb::CatchUpPackage> for CatchUpPackage {
     type Error = String;
     fn try_from(cup: &pb::CatchUpPackage) -> Result<CatchUpPackage, String> {
-        Ok(CatchUpPackage {
+        let ret = CatchUpPackage {
             content: CatchUpContent::try_from(
                 pb::CatchUpContent::decode(&cup.content[..])
                     .map_err(|e| format!("CatchUpContent failed to decode {:?}", e))?,
@@ -171,7 +173,12 @@ impl TryFrom<&pb::CatchUpPackage> for CatchUpPackage {
                 )
                 .map_err(|e| format!("Unable to decode CUP signer {:?}", e))?,
             },
-        })
+        };
+        if ret.check_integrity() {
+            Ok(ret)
+        } else {
+            Err("CatchUpPackage validity check failed".to_string())
+        }
     }
 }
 
@@ -193,7 +200,7 @@ impl From<&CatchUpContent> for CatchUpShareContent {
 /// committee.
 pub type CatchUpPackageShare = Signed<CatchUpShareContent, ThresholdSignatureShare<CatchUpContent>>;
 
-/// The parameters used to request `CatchUpPackage` (by nodemanager).
+/// The parameters used to request `CatchUpPackage` (by orchestrator).
 ///
 /// We make use of the `Ord` trait to determine if one `CatchUpPackage` is newer
 /// than the other:
@@ -203,7 +210,7 @@ pub type CatchUpPackageShare = Signed<CatchUpShareContent, ThresholdSignatureSha
 ///   C1.height > C2.height ||
 ///   C1.height == C2.height && C1.registry_version > C2.registry_version
 /// ```
-#[derive(Serialize, Deserialize, Ord, PartialEq, Eq, Clone, Copy, Debug)]
+#[derive(Serialize, Deserialize, PartialEq, Eq, Clone, Copy, Debug)]
 pub struct CatchUpPackageParam {
     height: Height,
     registry_version: RegistryVersion,
@@ -213,9 +220,19 @@ pub struct CatchUpPackageParam {
 /// the ordering of the struct fields.
 impl PartialOrd for CatchUpPackageParam {
     fn partial_cmp(&self, other: &CatchUpPackageParam) -> Option<Ordering> {
-        match self.height.cmp(&other.height) {
-            Ordering::Greater => Some(Ordering::Greater),
-            _ => self.registry_version.partial_cmp(&other.registry_version),
+        match (
+            self.height.cmp(&other.height),
+            self.registry_version.partial_cmp(&other.registry_version),
+        ) {
+            // If height is less, registry version needs to be less or equal
+            (Ordering::Less, Some(x)) if x != Ordering::Greater => Some(Ordering::Less),
+            // If height is equal, registry version decides ordering
+            (Ordering::Equal, Some(x)) => Some(x),
+            // If height is greater, registry version needs to be equal or greater
+            (Ordering::Greater, Some(x)) if x != Ordering::Less => Some(Ordering::Greater),
+            // All other combinations of height and registry versions are incomparable
+            // This also covers the case, that the registry versions themselves are incomparable
+            _ => None,
         }
     }
 }
@@ -237,7 +254,7 @@ pub struct CatchUpContentProtobufBytes(pub Vec<u8>);
 /// A catch up package paired with the original protobuf. Note that the protobuf
 /// contained in this struct is only partially deserialized and has the ORIGINAL
 /// bytes CatchUpContent bytes that were signed in yet to be deserialized form.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, Hash)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct CUPWithOriginalProtobuf {
     /// The CUP as [`CatchUpPackage`](type@CatchUpPackage)
     pub cup: CatchUpPackage,
@@ -279,13 +296,25 @@ fn test_catch_up_package_param_partial_ord() {
         height: Height::from(2),
         registry_version: RegistryVersion::from(2),
     };
+    let c4 = CatchUpPackageParam {
+        height: Height::from(1),
+        registry_version: RegistryVersion::from(2),
+    };
+    let c5 = CatchUpPackageParam {
+        height: Height::from(0),
+        registry_version: RegistryVersion::from(2),
+    };
     // c2 > c1
-    assert_eq!(c2.cmp(&c1), Ordering::Greater);
+    assert_eq!(c2.partial_cmp(&c1), Some(Ordering::Greater));
     // c3 > c1
-    assert_eq!(c3.cmp(&c1), Ordering::Greater);
+    assert_eq!(c3.partial_cmp(&c1), Some(Ordering::Greater));
     // c3 > c2. This can happen when we want to recover a stuck subnet
     // with a new CatchUpPackage.
-    assert_eq!(c3.cmp(&c2), Ordering::Greater);
+    assert_eq!(c3.partial_cmp(&c2), Some(Ordering::Greater));
     // c3 == c3
-    assert_eq!(c3.cmp(&c3), Ordering::Equal);
+    assert_eq!(c3.partial_cmp(&c3), Some(Ordering::Equal));
+    // c4 > c1
+    assert_eq!(c4.partial_cmp(&c1), Some(Ordering::Greater));
+    // c5 does not compare to c1
+    assert_eq!(c5.partial_cmp(&c1), None);
 }

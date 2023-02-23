@@ -5,16 +5,18 @@ use ic_crypto::{
     CryptoComponent, KeyBytesContentType,
 };
 use ic_crypto_internal_test_vectors::test_data;
-use ic_interfaces::crypto::{BasicSigVerifierByPublicKey, SignableMock, DOMAIN_IC_REQUEST};
+use ic_interfaces::crypto::BasicSigVerifierByPublicKey;
 use ic_logger::replica_logger::no_op_logger;
-use ic_registry_client::fake::FakeRegistryClient;
-use ic_registry_common::proto_registry_data_provider::ProtoRegistryDataProvider;
-use ic_test_utilities::types::ids::node_test_id;
+use ic_registry_client_fake::FakeRegistryClient;
+use ic_registry_proto_data_provider::ProtoRegistryDataProvider;
 use ic_types::crypto::{AlgorithmId, BasicSig, BasicSigOf, UserPublicKey};
+use ic_types::crypto::{SignableMock, DOMAIN_IC_REQUEST};
 use ic_types::messages::MessageId;
-use rand_core::OsRng;
+use ic_types_test_utils::ids::node_test_id;
 use std::sync::Arc;
 
+use ic_crypto_test_utils::ed25519_utils::ed25519_signature_and_public_key;
+use ic_interfaces::time_source::SysTimeSource;
 use openssl::ec::{EcGroup, EcKey};
 use openssl::ecdsa::EcdsaSig;
 use openssl::nid::Nid;
@@ -339,31 +341,6 @@ fn new_pk_der(curve_name: Nid) -> Vec<u8> {
         .expect("unable to DER-encode public key")
 }
 
-fn ed25519_signature_and_public_key(
-    request_id: &MessageId,
-) -> (BasicSigOf<MessageId>, UserPublicKey) {
-    use ed25519_dalek::Signer;
-    let ed25519_keypair = {
-        let mut rng = OsRng::default(); // use `ChaChaRng::seed_from_u64` for deterministic keys
-        ed25519_dalek::Keypair::generate(&mut rng)
-    };
-    let signature: BasicSigOf<MessageId> = {
-        let bytes_to_sign = {
-            let mut buf = vec![];
-            buf.extend_from_slice(DOMAIN_IC_REQUEST);
-            buf.extend_from_slice(request_id.as_bytes());
-            buf
-        };
-        let signature_bytes = ed25519_keypair.sign(&bytes_to_sign).to_bytes();
-        BasicSigOf::new(BasicSig(signature_bytes.to_vec()))
-    };
-    let public_key = UserPublicKey {
-        key: ed25519_keypair.public.to_bytes().to_vec(),
-        algorithm_id: AlgorithmId::Ed25519,
-    };
-    (signature, public_key)
-}
-
 fn ecdsa_signature_and_public_key(
     nid: Nid,
     request_id: &MessageId,
@@ -401,8 +378,10 @@ fn crypto_component(config: &CryptoConfig) -> CryptoComponent {
     let dummy_registry = FakeRegistryClient::new(Arc::new(ProtoRegistryDataProvider::new()));
     CryptoComponent::new_with_fake_node_id(
         config,
+        None,
         Arc::new(dummy_registry),
         node_test_id(42),
         no_op_logger(),
+        Arc::new(SysTimeSource::new()),
     )
 }

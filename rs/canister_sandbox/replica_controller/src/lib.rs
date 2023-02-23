@@ -1,6 +1,7 @@
-mod canister_descriptor_table;
-pub mod controller;
-mod controller_service;
-mod process_watcher;
-mod sandbox_fsm;
-pub mod session_nonce;
+pub mod active_execution_state_registry;
+pub mod controller_service_impl;
+pub mod launch_as_process;
+mod process_exe_and_args;
+pub mod process_os_metrics;
+mod sandbox_process_eviction;
+pub mod sandboxed_execution_controller;

@@ -1,15 +1,18 @@
+use crate::messages::Blob;
 use crate::{
     messages::{
-        message_id::hash_of_map, HasCanisterId, HttpHandlerError, HttpUserQuery, MessageId,
+        message_id::hash_of_map, HasCanisterId, HttpRequestError, HttpUserQuery, MessageId,
         RawHttpRequestVal,
     },
     CanisterId, PrincipalId, UserId,
 };
+use ic_error_types::RejectCode;
 use maplit::btreemap;
+use serde::{Deserialize, Serialize};
 use std::convert::TryFrom;
 
 /// Represents a Query that is sent by an end user to a canister.
-#[derive(Clone, PartialEq, Debug)]
+#[derive(Clone, PartialEq, Eq, Debug)]
 pub struct UserQuery {
     pub source: UserId,
     pub receiver: CanisterId,
@@ -40,18 +43,18 @@ impl UserQuery {
 }
 
 impl TryFrom<HttpUserQuery> for UserQuery {
-    type Error = HttpHandlerError;
+    type Error = HttpRequestError;
 
     fn try_from(query: HttpUserQuery) -> Result<Self, Self::Error> {
         Ok(Self {
             source: UserId::from(PrincipalId::try_from(query.sender.0).map_err(|err| {
-                HttpHandlerError::InvalidPrincipalId(format!(
+                HttpRequestError::InvalidPrincipalId(format!(
                     "Converting sender to PrincipalId failed with {}",
                     err
                 ))
             })?),
             receiver: CanisterId::try_from(query.canister_id.0).map_err(|err| {
-                HttpHandlerError::InvalidPrincipalId(format!(
+                HttpRequestError::InvalidPrincipalId(format!(
                     "Converting canister_id to PrincipalId failed with {:?}",
                     err
                 ))
@@ -68,6 +71,33 @@ impl HasCanisterId for UserQuery {
     fn canister_id(&self) -> CanisterId {
         self.receiver
     }
+}
+
+/// Represents a Query that is sent by the IC.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct AnonymousQuery {
+    pub receiver: CanisterId,
+    pub method_name: String,
+    pub method_payload: Vec<u8>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+#[serde(tag = "status")]
+pub enum AnonymousQueryResponse {
+    Replied {
+        reply: AnonymousQueryResponseReply,
+    },
+    Rejected {
+        reject_code: RejectCode,
+        reject_message: String,
+    },
+}
+
+/// The body of the `AnonymousQueryResponse`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AnonymousQueryResponseReply {
+    pub arg: Blob,
 }
 
 #[cfg(test)]

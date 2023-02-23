@@ -1,7 +1,6 @@
 use crate::height_index::HeightIndex;
 use crate::metrics::{PoolMetrics, POOL_TYPE_UNVALIDATED, POOL_TYPE_VALIDATED};
 use ic_config::artifact_pool::{ArtifactPoolConfig, PersistentPoolBackend};
-use ic_crypto::crypto_hash;
 use ic_interfaces::{
     certification::{CertificationPool, ChangeAction, ChangeSet, MutableCertificationPool},
     consensus_pool::HeightIndexedPool,
@@ -9,6 +8,7 @@ use ic_interfaces::{
 };
 use ic_logger::ReplicaLogger;
 use ic_metrics::MetricsRegistry;
+use ic_types::crypto::crypto_hash;
 use ic_types::{
     artifact::CertificationMessageId,
     consensus::certification::{
@@ -43,18 +43,23 @@ impl CertificationPoolImpl {
         metrics_registry: MetricsRegistry,
     ) -> Self {
         let persistent_pool = match config.persistent_pool_backend {
-            PersistentPoolBackend::LMDB(lmdb_config) => Box::new(
+            PersistentPoolBackend::Lmdb(lmdb_config) => Box::new(
                 crate::lmdb_pool::PersistentHeightIndexedPool::new_certification_pool(
                     lmdb_config,
                     config.persistent_pool_read_only,
                     log,
                 ),
             ) as Box<_>,
+            #[cfg(feature = "rocksdb_backend")]
             PersistentPoolBackend::RocksDB(config) => Box::new(
                 crate::rocksdb_pool::PersistentHeightIndexedPool::new_certification_pool(
                     config, log,
                 ),
             ) as Box<_>,
+            #[allow(unreachable_patterns)]
+            cfg => {
+                unimplemented!("Configuration {:?} is not supported", cfg)
+            }
         };
 
         CertificationPoolImpl {
@@ -281,7 +286,7 @@ impl GossipPool<CertificationMessage, ChangeSet> for CertificationPoolImpl {
         match &id.hash {
             CertificationMessageHash::CertificationShare(hash) => self
                 .shares_at_height(id.height)
-                .find(|share| &crypto_hash(&*share) == hash)
+                .find(|share| &crypto_hash(share) == hash)
                 .map(CertificationMessage::CertificationShare),
             CertificationMessageHash::Certification(hash) => {
                 self.certification_at_height(id.height).and_then(|cert| {
@@ -323,16 +328,14 @@ mod tests {
     use ic_test_utilities::consensus::fake::{Fake, FakeSigner};
     use ic_test_utilities::types::ids::{node_test_id, subnet_test_id};
     use ic_types::{
-        consensus::{
-            certification::{
-                Certification, CertificationContent, CertificationMessage, CertificationShare,
-            },
-            ThresholdSignature, ThresholdSignatureShare,
+        consensus::certification::{
+            Certification, CertificationContent, CertificationMessage, CertificationShare,
         },
         crypto::{
             threshold_sig::ni_dkg::{NiDkgId, NiDkgTag, NiDkgTargetSubnet},
             CryptoHash, Signed,
         },
+        signature::*,
         CryptoHashOfPartialState, Height,
     };
 
@@ -356,7 +359,7 @@ mod tests {
         let signature = ThresholdSignature::fake();
         CertificationMessage::Certification(Certification {
             height: Height::from(height),
-            signed: Signed { signature, content },
+            signed: Signed { content, signature },
         })
     }
 

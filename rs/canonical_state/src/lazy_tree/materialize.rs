@@ -1,7 +1,7 @@
 //! Support for materializing (part of) a [`LazyTree`] as a [`LabeledTree`].
 
 use super::LazyTree;
-use ic_crypto_tree_hash::{FlatMap, Label, LabeledTree};
+use ic_crypto_tree_hash::{FlatMap, LabeledTree};
 use LazyTree::*;
 
 /// A pattern to be used for fitering the parts of a [`LazyTree`] to be
@@ -10,16 +10,12 @@ pub type TreePattern = LabeledTree<()>;
 
 fn materialize(lazy_tree: &LazyTree<'_>) -> Option<LabeledTree<Vec<u8>>> {
     match lazy_tree {
-        Blob(blob) => Some(LabeledTree::Leaf(blob.to_vec())),
+        Blob(blob, _) => Some(LabeledTree::Leaf(blob.to_vec())),
         LazyBlob(f) => Some(LabeledTree::Leaf(f().to_vec())),
         LazyFork(f) => {
             let children: Vec<_> = f
-                .labels()
-                .filter_map(|l| {
-                    let lazy_tree = f.edge(&l[..])?;
-                    let t = materialize(&lazy_tree)?;
-                    Some((Label::from(l), t))
-                })
+                .children()
+                .filter_map(|(l, t)| Some((l, materialize(&t)?)))
                 .collect();
 
             if children.is_empty() {
@@ -47,13 +43,13 @@ pub fn materialize_partial(
     pattern: &TreePattern,
 ) -> Option<LabeledTree<Vec<u8>>> {
     match pattern {
-        LabeledTree::Leaf(()) => materialize(&lazy_tree),
+        LabeledTree::Leaf(()) => materialize(lazy_tree),
         LabeledTree::SubTree(children) => {
             if let LazyFork(f) = lazy_tree {
                 let subtrees: Vec<_> = children
                     .iter()
                     .filter_map(|(label, pattern)| {
-                        let lazy_tree = f.edge(label.as_bytes())?;
+                        let lazy_tree = f.edge(label)?;
                         let t = materialize_partial(&lazy_tree, pattern)?;
                         Some((label.clone(), t))
                     })

@@ -2,24 +2,31 @@
 
 use std::collections::HashMap;
 
+use ic_config::embedders::Config as EmbeddersConfig;
+use ic_embedders::WasmtimeEmbedder;
 use wasmtime::{Config, Engine, Instance, Module, Store};
 
 use ic_wasm_types::BinaryEncodedWasm;
 
 /// Helper function to instantiate Wasm module in Wasmtime and call "run"
 /// function. The goal is to use plain Wasmtime, without any of our additions.
-pub fn wasmtime_instantiate_and_call_run(wasm: &BinaryEncodedWasm) -> Vec<wasmtime::Val> {
+pub fn wasmtime_instantiate_and_call_run(wasm: &BinaryEncodedWasm) {
     // check that instrumented module instantiates correctly
-    let wasmtime = WasmtimeSimple::new();
+    let mut wasmtime = WasmtimeSimple::new();
 
     let (imports_module_instance, imports_module_exports) = {
-        let imports_wasm = wabt::wat2wasm(
+        let imports_wasm = wat::parse_str(
             r#"
             (module
                 (func (export "out_of_instructions"))
                 (func (export "update_available_memory") (param i32 i32) (result i32)
                     i32.const 42
                 )
+                (func (export "try_grow_stable_memory") (param i64 i64 i32) (result i64)
+                    i64.const 0
+                )
+                (func (export "deallocate_pages") (param i64))
+                (func (export "internal_trap") (param i32))
             )"#,
         )
         .unwrap();
@@ -27,6 +34,9 @@ pub fn wasmtime_instantiate_and_call_run(wasm: &BinaryEncodedWasm) -> Vec<wasmti
         let mut e = HashMap::new();
         e.insert("out_of_instructions".to_string(), 0);
         e.insert("update_available_memory".to_string(), 1);
+        e.insert("try_grow_stable_memory".to_string(), 2);
+        e.insert("deallocate_pages".to_string(), 3);
+        e.insert("internal_trap".to_string(), 4);
         (i, e)
     };
 
@@ -37,19 +47,19 @@ pub fn wasmtime_instantiate_and_call_run(wasm: &BinaryEncodedWasm) -> Vec<wasmti
     );
 
     let instance = wasmtime.instantiate(&registry, wasm.as_slice());
-    invoke(&instance, "run", &[])
+    invoke(wasmtime.store, &instance, "run", &[])
 }
 
 pub struct WasmtimeSimple {
     engine: Engine,
-    store: Store,
+    store: Store<()>,
 }
 
 /// Used to resolve module imports during instantiation.
 /// Example:
 ///
 /// ```
-/// let wasm = wabt::wat2wasm(
+/// let wasm = wat::parse_str(
 ///     r#"(module
 ///       (import "__" "magic_number" (func $magic_number (result i32)))
 ///       (func (export "run") (result i32) (call $magic_number))
@@ -59,7 +69,7 @@ pub struct WasmtimeSimple {
 /// let wasmtime = ic_test_utilities::wasmtime_simple::WasmtimeSimple::new();
 ///
 /// let (imports_module_instance, imports_module_exports) = {
-///     let imports_wasm = wabt::wat2wasm(
+///     let imports_wasm = wat::parse_str(
 ///         r#"(module
 ///           (func (export "magic_number") (result i32) (i32.const 42))
 ///         )"#,
@@ -86,73 +96,81 @@ pub type ModuleRegistry = HashMap<String, (Instance, HashMap<String, usize>)>;
 #[allow(clippy::new_without_default)]
 impl WasmtimeSimple {
     pub fn new() -> Self {
-        let config = Config::default();
-        let engine = Engine::new(&config);
-        let store = Store::new(&engine);
+        let engine = Engine::new(&WasmtimeEmbedder::initial_wasmtime_config(
+            &EmbeddersConfig::default(),
+        ))
+        .expect("Failed to initialize Wasmtime engine");
+        let store = Store::new(&engine, ());
         Self { engine, store }
     }
 
-    pub fn instantiate(&self, module_registry: &ModuleRegistry, wasm_binary: &[u8]) -> Instance {
-        instantiate_module(&self.engine, &self.store, module_registry, &wasm_binary).unwrap()
+    pub fn instantiate(
+        &mut self,
+        module_registry: &ModuleRegistry,
+        wasm_binary: &[u8],
+    ) -> Instance {
+        instantiate_module(&self.engine, &mut self.store, module_registry, wasm_binary).unwrap()
     }
 }
 
-pub fn get_globals(instance: &Instance) -> Vec<wasmtime::Val> {
-    instance
-        .exports()
+pub fn get_globals(mut store: Store<()>, instance: &Instance) -> Vec<wasmtime::Val> {
+    let globals: Vec<_> = instance
+        .exports(&mut store)
         .filter_map(|e| e.into_global())
-        .map(|g| match g.ty().content() {
-            wasmtime::ValType::I32 => g.get(),
-            wasmtime::ValType::I64 => g.get(),
+        .collect();
+    globals
+        .iter()
+        .map(|g| match g.ty(&store).content() {
+            wasmtime::ValType::I32 => g.get(&mut store),
+            wasmtime::ValType::I64 => g.get(&mut store),
             _ => panic!("unexpected global value type"),
         })
         .collect()
 }
 
-pub fn invoke(instance: &Instance, func_name: &str, args: &[wasmtime::Val]) -> Vec<wasmtime::Val> {
+pub fn invoke(mut store: Store<()>, instance: &Instance, func_name: &str, args: &[wasmtime::Val]) {
     instance
-        .get_export(func_name)
+        .get_export(&mut store, func_name)
         .unwrap()
         .into_func()
         .unwrap_or_else(|| panic!("{} export is not a function", func_name))
-        .call(args)
+        .call(&mut store, args, &mut [])
         .unwrap()
-        .to_vec()
 }
 
 fn instantiate_module(
     engine: &Engine,
-    store: &Store,
+    mut store: &mut Store<()>,
     module_registry: &ModuleRegistry,
     wasm_binary: &[u8],
 ) -> Result<Instance, Box<dyn std::error::Error>> {
-    let module = Module::new(&engine, &wasm_binary)?;
+    let module = Module::new(engine, wasm_binary)?;
     // Resolve import using module_registry.
-    let imports: Vec<wasmtime::Extern> = module
-        .imports()
-        .map(|i| {
-            let module_name = i.module().to_string();
-            if let Some((instance, map)) = module_registry.get(&module_name) {
-                let field_name = i.name().unwrap().to_string();
-                if let Some(export_index) = map.get(&field_name) {
+    let mut imports = vec![];
+    for i in module.imports() {
+        let module_name = i.module().to_string();
+        if let Some((instance, map)) = module_registry.get(&module_name) {
+            let field_name = i.name().to_string();
+            if let Some(export_index) = map.get(&field_name) {
+                imports.push(
                     instance
-                        .exports()
+                        .exports(&mut store)
                         .nth(*export_index)
                         .unwrap()
                         .clone()
-                        .into_extern()
-                } else {
-                    panic!(
-                        "Import {} was not found in module {}",
-                        field_name, module_name
-                    )
-                }
+                        .into_extern(),
+                );
             } else {
-                panic!("Import module {} was not found", module_name)
+                panic!(
+                    "Import {} was not found in module {}",
+                    field_name, module_name
+                )
             }
-        })
-        .collect();
+        } else {
+            panic!("Import module {} was not found", module_name)
+        }
+    }
 
-    let mut instance = Instance::new(&store, &module, &imports)?;
+    let mut instance = Instance::new(store, &module, &imports)?;
     Ok(instance)
 }

@@ -61,8 +61,8 @@ impl From<&HashTree> for RoseHashTree {
                     right_tree,
                     ..
                 } => {
-                    collect_children(&*left_tree, children);
-                    collect_children(&*right_tree, children);
+                    collect_children(left_tree, children);
+                    collect_children(right_tree, children);
                 }
             }
         }
@@ -262,7 +262,7 @@ fn diff_rose_trees(lhs: &RoseHashTree, rhs: &RoseHashTree) -> Changes {
 mod tests {
     use super::RoseHashTree::Leaf;
     use super::*;
-    use ic_crypto_sha256::Sha256;
+    use ic_crypto_sha::Sha256;
     use proptest::collection::btree_map;
     use proptest::prelude::*;
 
@@ -340,9 +340,9 @@ mod tests {
                 RoseHashTree::Leaf(_) => Err(idx - 1),
                 RoseHashTree::Fork { children, .. } => {
                     let mut i = idx;
-                    for (label, mut child) in children.iter_mut() {
+                    for (label, child) in children.iter_mut() {
                         path.push(label.clone());
-                        match go_rec(&mut child, i, new_hash.clone(), path) {
+                        match go_rec(child, i, new_hash.clone(), path) {
                             Ok(result) => return Ok(result),
                             Err(new_index) => i = new_index,
                         }
@@ -378,7 +378,7 @@ mod tests {
                     let mut i = idx;
                     let mut removed_child = None;
 
-                    for (label, mut child) in children.iter_mut() {
+                    for (label, child) in children.iter_mut() {
                         if i == 0 {
                             removed_child = Some(label.clone());
                             break;
@@ -387,7 +387,7 @@ mod tests {
                         i -= 1;
 
                         path.push(label.clone());
-                        match go_rec(&mut child, i, path) {
+                        match go_rec(child, i, path) {
                             Ok(result) => return Ok(result),
                             Err(new_index) => i = new_index,
                         }

@@ -32,6 +32,19 @@ impl SandboxService for SandboxClientStub {
         Call::new(cell)
     }
 
+    fn open_wasm_serialized(
+        &self,
+        req: OpenWasmSerializedRequest,
+    ) -> Call<OpenWasmSerializedReply> {
+        let cell = self
+            .channel
+            .call(Request::OpenWasmSerialized(req), |rep| match rep {
+                Reply::OpenWasmSerialized(rep) => Ok(rep),
+                _ => Err(Error::ServerError),
+            });
+        Call::new(cell)
+    }
+
     fn close_wasm(&self, req: CloseWasmRequest) -> Call<CloseWasmReply> {
         let cell = self.channel.call(Request::CloseWasm(req), |rep| match rep {
             Reply::CloseWasm(rep) => Ok(rep),
@@ -40,41 +53,80 @@ impl SandboxService for SandboxClientStub {
         Call::new(cell)
     }
 
-    fn open_state(&self, req: OpenStateRequest) -> Call<OpenStateReply> {
-        let cell = self.channel.call(Request::OpenState(req), |rep| match rep {
-            Reply::OpenState(rep) => Ok(rep),
-            _ => Err(Error::ServerError),
-        });
-        Call::new(cell)
-    }
-
-    fn close_state(&self, req: CloseStateRequest) -> Call<CloseStateReply> {
+    fn open_memory(&self, req: OpenMemoryRequest) -> Call<OpenMemoryReply> {
         let cell = self
             .channel
-            .call(Request::CloseState(req), |rep| match rep {
-                Reply::CloseState(rep) => Ok(rep),
+            .call(Request::OpenMemory(req), |rep| match rep {
+                Reply::OpenMemory(rep) => Ok(rep),
                 _ => Err(Error::ServerError),
             });
         Call::new(cell)
     }
 
-    fn open_execution(&self, req: OpenExecutionRequest) -> Call<OpenExecutionReply> {
+    fn close_memory(&self, req: CloseMemoryRequest) -> Call<CloseMemoryReply> {
         let cell = self
             .channel
-            .call(Request::OpenExecution(req), |rep| match rep {
-                Reply::OpenExecution(rep) => Ok(rep),
+            .call(Request::CloseMemory(req), |rep| match rep {
+                Reply::CloseMemory(rep) => Ok(rep),
                 _ => Err(Error::ServerError),
             });
         Call::new(cell)
     }
 
-    fn close_execution(&self, req: CloseExecutionRequest) -> Call<CloseExecutionReply> {
+    fn start_execution(&self, req: StartExecutionRequest) -> Call<StartExecutionReply> {
         let cell = self
             .channel
-            .call(Request::CloseExecution(req), |rep| match rep {
-                Reply::CloseExecution(rep) => Ok(rep),
+            .call(Request::StartExecution(req), |rep| match rep {
+                Reply::StartExecution(rep) => Ok(rep),
                 _ => Err(Error::ServerError),
             });
+        Call::new(cell)
+    }
+
+    fn resume_execution(&self, req: ResumeExecutionRequest) -> Call<ResumeExecutionReply> {
+        let cell = self
+            .channel
+            .call(Request::ResumeExecution(req), |rep| match rep {
+                Reply::ResumeExecution(rep) => Ok(rep),
+                _ => Err(Error::ServerError),
+            });
+        Call::new(cell)
+    }
+
+    fn abort_execution(&self, req: AbortExecutionRequest) -> Call<AbortExecutionReply> {
+        let cell = self
+            .channel
+            .call(Request::AbortExecution(req), |rep| match rep {
+                Reply::AbortExecution(rep) => Ok(rep),
+                _ => Err(Error::ServerError),
+            });
+        Call::new(cell)
+    }
+
+    fn create_execution_state(
+        &self,
+        req: CreateExecutionStateRequest,
+    ) -> Call<CreateExecutionStateReply> {
+        let cell = self
+            .channel
+            .call(Request::CreateExecutionState(req), |rep| match rep {
+                Reply::CreateExecutionState(rep) => Ok(rep),
+                _ => Err(Error::ServerError),
+            });
+        Call::new(cell)
+    }
+
+    fn create_execution_state_serialized(
+        &self,
+        req: CreateExecutionStateSerializedRequest,
+    ) -> Call<CreateExecutionStateSerializedReply> {
+        let cell = self.channel.call(
+            Request::CreateExecutionStateSerialized(req),
+            |rep| match rep {
+                Reply::CreateExecutionStateSerialized(rep) => Ok(rep),
+                _ => Err(Error::ServerError),
+            },
+        );
         Call::new(cell)
     }
 }

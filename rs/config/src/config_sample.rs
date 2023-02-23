@@ -77,28 +77,15 @@ pub const SAMPLE_CONFIG: &str = r#"
     transport: {
         // IP address to bind if p2p_connections is not empty.
         node_ip: "127.0.0.1",
-
-        // mapping of flow ids to TCP port number, also depth of send queue
-        p2p_flows: [{flow_tag: 1, server_port: 3000, queue_size: 1024}],
+        // Listening port used by transport to establish peer connections.
+        listening_port: 3000,
+        // The size of the buffered messages on the transport send queue.
+        send_queue_size: 1024,
     },
     // ============================================
     // Configuration of registry client
     // ============================================
     registry_client: {
-        // Alternatives:
-        //   * EXAMPLE: registry_canister_url: "https://registry.ic.org/",
-        //     fetch updates from node at given url
-        //     DEPRECATED (use local_store)
-        //   * EXAMPLE: protobuf_file: "/tmp/registry.proto"
-        //     read the registry from a file during boot
-        //     DEPRECATED (use local_store)
-        //   * EXAMPLE: bootstrap:{registry_canister_url: ["<url>"],initial_registry_file:"<path>"}
-        //     used to bootstrap the NNS subnetwork. V1 is read from `initial_registry_file`,
-        //     all request beyond V1 are forwarded to registry_canister_url
-        //     DEPRECATED (use local_store)
-        //   * EXAMPLE: local_store: "/tmp/local_store"
-        //     read registry from the registry's local store.
-        //
         // The default is not to specify it.
     },
     // ============================================
@@ -114,6 +101,9 @@ pub const SAMPLE_CONFIG: &str = r#"
     artifact_pool: {
         // The directory that should be used to persist consensus artifacts.
         consensus_pool_path: "/tmp/ic_consensus_pool",
+        // usize::MAX on 64-bit
+        ingress_pool_max_count: 9223372036854775807,
+        ingress_pool_max_bytes: 9223372036854775807,
         backup: {
             // The directory for the blockchain backup.
             spool_path: "/tmp/ic_backup/",
@@ -135,14 +125,21 @@ pub const SAMPLE_CONFIG: &str = r#"
     // ============================================
     crypto: {
         // The directory that should be used to persist node's cryptographic keys.
-        crypto_root: "/tmp/ic_crypto"
+        crypto_root: "/tmp/ic_crypto",
+        // The type of CspVault to be used.
+        // Alternatives:
+        // - EXAMPLE: csp_vault_type: "in_replica",
+        //   CspVault is an internal structure of the replica process.
+        // - EXAMPLE: csp_vault_type: { unix_socket: "/some/path/to/socket" },
+        //   CspVault is run as a separate process, which can be reached via a Unix socket.
+        csp_vault_type: { unix_socket: "/some/path/to/socket" },
     },
     // ========================================
     // Configuration of the message scheduling.
     // ========================================
     scheduler: {
         // The max number of cores to use for canister code execution.
-        scheduler_cores: 1,
+        scheduler_cores: 2,
 
         // Maximum amount of instructions a single round can consume.
         max_instructions_per_round: 26843545600,
@@ -155,10 +152,6 @@ pub const SAMPLE_CONFIG: &str = r#"
     // Configuration of the execution environment.
     // ================================================
     hypervisor: {
-        // Which implementation of the runtime to use.
-        // For now, "wasmtime" is the default option.
-        embedder_type: "wasmtime",
-
         // Which technology to use to intercept Wasm memory changes.
         //
         // Alternatives:
@@ -188,7 +181,11 @@ pub const SAMPLE_CONFIG: &str = r#"
         //   Expose prometheus metrics on the specified address.
         // - EXAMPLE: exporter: { file: "/path/to/file" },
         //   Dump prometheus metrics to the specified file on shutdown.
-        exporter: "log"
+        exporter: "log",
+        connection_read_timeout_seconds: 300,
+        max_outstanding_connections: 20,
+        max_concurrent_requests: 50,
+        request_timeout_seconds: 30,
     },
     // ===================================
     // Configuration of the logging setup.
@@ -228,12 +225,12 @@ pub const SAMPLE_CONFIG: &str = r#"
         //
         // The default for this value is `false` and thus matches the previously expected behavior in
         // production use cases.
-        block_on_overflow: false,
+        block_on_overflow: true,
     },
     // ===================================
-    // Configuration of the logging setup for the nodemanager.
+    // Configuration of the logging setup for the orchestrator.
     // ===================================
-    nodemanager_logger: {
+    orchestrator_logger: {
         // The node id to append to log lines. [deprecated]
         node_id: 100,
 
@@ -268,7 +265,47 @@ pub const SAMPLE_CONFIG: &str = r#"
         //
         // The default for this value is `false` and thus matches the previously expected behavior in
         // production use cases.
-        block_on_overflow: false,
+        block_on_overflow: true,
+    },
+    // ===================================
+    // Configuration of the logging setup for the CSP vault.
+    // ===================================
+    csp_vault_logger: {
+        // The node id to append to log lines. [deprecated]
+        node_id: 100,
+
+        // The datacenter id to append to log lines. [deprecated]
+        dc_id: 200,
+
+        // The log level to use.
+        // EXAMPLE: level: "critical",
+        // EXAMPLE: level: "error",
+        // EXAMPLE: level: "warning",
+        // EXAMPLE: level: "info",
+        // EXAMPLE: level: "debug",
+        // EXAMPLE: level: "trace",
+        level: "info",
+
+        // The format of emitted log lines
+        // EXAMPLE: format: "text_full",
+        // EXAMPLE: format: "json",
+        format: "text_full",
+
+        // Output debug logs for these module paths
+        // EXAMPLE: debug_overrides: ["ic_crypto_internal_csp::vault"],
+        debug_overrides: [],
+
+        // Output logs for these tags
+        // EXAMPLE: enabled_tags: ["artifact_tracing"],
+        enabled_tags: [],
+
+        // If `true` the async channel for low-priority messages will block instead of drop messages.
+        // This behavior is required for instrumentation in System Testing until we have a
+        // dedicated solution for instrumentation.
+        //
+        // The default for this value is `false` and thus matches the previously expected behavior in
+        // production use cases.
+        block_on_overflow: true,
     },
     // =================================
     // Configuration of Message Routing.
@@ -284,11 +321,6 @@ pub const SAMPLE_CONFIG: &str = r#"
        maliciously_seg_fault: false,
 
        malicious_flags: {
-         maliciously_gossip_drop_requests: false,
-         maliciously_gossip_artifact_not_found: false,
-         maliciously_gossip_send_many_artifacts: false,
-         maliciously_gossip_send_invalid_artifacts: false,
-         maliciously_gossip_send_late_artifacts: false,
          maliciously_propose_equivocating_blocks: false,
          maliciously_propose_empty_blocks: false,
          maliciously_finalize_all: false,
@@ -297,16 +329,22 @@ pub const SAMPLE_CONFIG: &str = r#"
          maliciously_certify_invalid_hash: false,
          maliciously_malfunctioning_xnet_endpoint: false,
          maliciously_disable_execution: false,
-         maliciously_disable_http_handler_ingress_validation: false,
          maliciously_corrupt_own_state_at_heights: [],
+         maliciously_disable_ingress_validation: false,
+         maliciously_corrupt_ecdsa_dealings: false,
        },
     },
 
     firewall: {
         config_file: "/path/to/nftables/config",
-        firewall_config: "",
-        ipv4_prefixes: [],
-        ipv6_prefixes: [],
+        file_template: "",
+        ipv4_rule_template: "",
+        ipv6_rule_template: "",
+        ipv4_user_output_rule_template: "",
+        ipv6_user_output_rule_template: "",
+        default_rules: [],
+        ports_for_node_whitelist: [],
+        ports_for_http_adapter_blacklist: [],
     },
 
     // =================================
@@ -320,6 +358,16 @@ pub const SAMPLE_CONFIG: &str = r#"
     // =================================
     nns_registry_replicator: {
       poll_delay_duration_ms: 5000
+    },
+    // ====================================
+    // Configuration of various adapters. 
+    // ====================================
+    adapters_config: {
+        bitcoin_testnet_uds_path: "/tmp/bitcoin_uds",
+        // IPC socket path for canister http adapter. This UDS path has to be the same as
+        // specified in the systemd socket file.
+        // The canister http adapter socket file is: /ic-os/guestos/rootfs/systemd/system/ic-https-outcalls-adapter.socket
+        https_outcalls_uds_path: "/run/ic-node/https-outcalls-adapter/socket",
     },
 }
 "#;
@@ -349,14 +397,14 @@ mod tests {
 
             if trimmed.starts_with("//") {
                 if let Some(pos) = line.find(EXAMPLE_MARKER) {
-                    last_group.push(&line[pos + EXAMPLE_MARKER.len()..].trim())
+                    last_group.push(line[pos + EXAMPLE_MARKER.len()..].trim())
                 }
             } else if !trimmed.is_empty() || !last_group.is_empty() {
                 if trimmed.starts_with('}') && !last_group.is_empty() {
-                    line_variants.push(std::mem::replace(&mut last_group, Vec::new()));
+                    line_variants.push(std::mem::take(&mut last_group));
                 }
                 last_group.push(line);
-                line_variants.push(std::mem::replace(&mut last_group, Vec::new()));
+                line_variants.push(std::mem::take(&mut last_group));
             }
         }
         if !last_group.is_empty() {

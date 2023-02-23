@@ -1,0 +1,223 @@
+syntax = "proto3";
+
+package ic_sns_init.pb.v1;
+
+import "ic_base_types/pb/v1/types.proto";
+
+// This struct contains all the parameters necessary to initialize an SNS. All fields are optional
+// to avoid future candid compatibility problems. However, for the struct to be "valid", all fields
+// must be populated.
+message SnsInitPayload {
+  // Fee of a transaction.
+  optional uint64 transaction_fee_e8s = 1;
+
+  // The name of the token issued by an SNS Ledger.
+  // This field has no default, a value must be provided by the user.
+  // Must be a string length between {} and {} characters
+  //
+  // Example: Bitcoin
+  optional string token_name = 2;
+
+  // The symbol of the token issued by an SNS Ledger. This field has no
+  // default, a value must be provided by the user. Must be a string length
+  // between 3 and 10 characters
+  optional string token_symbol = 3;
+
+  // Cost of making a proposal that doesnt pass.
+  optional uint64 proposal_reject_cost_e8s = 4;
+
+  // The minimum amount of SNS Token e8s an SNS Ledger account must have to stake a neuron.
+  optional uint64 neuron_minimum_stake_e8s = 5;
+
+  // The initial tokens and neurons available at genesis will be distributed according
+  // to the strategy and configuration picked via the initial_token_distribution
+  // parameter.
+  oneof initial_token_distribution {
+    // See `FractionalDeveloperVotingPower`
+    FractionalDeveloperVotingPower fractional_developer_voting_power = 6;
+  };
+
+  // If the swap fails, control of the dapp canister(s) will be set to these
+  // principal IDs. In most use-cases, this would be the same as the original
+  // set of controller(s). Must not be empty.
+  repeated string fallback_controller_principal_ids = 7;
+
+  // The logo for the SNS project represented as a base64 encoded string.
+  optional string logo = 8;
+
+  // Url to the dapp controlled by the SNS project.
+  optional string url = 9;
+
+  // Name of the SNS project. This may differ from the name of the associated token.
+  optional string name = 10;
+
+  // Description of the SNS project.
+  optional string description = 11;
+
+  // The minimum dissolve_delay in seconds a neuron must have to be able to cast votes on proposals.
+  optional uint64 neuron_minimum_dissolve_delay_to_vote_seconds = 12;
+
+  reserved 13;
+  reserved "sns_initialization_parameters";
+
+  // The amount of rewards is proportional to token_supply * current_rate. In
+  // turn, current_rate is somewhere between these two values. In the first
+  // reward period, it is the initial growth rate, and after the growth rate
+  // transition period has elapsed, the growth rate becomes the final growth
+  // rate, and remains at that value for the rest of time. The transition
+  // between the initial and final growth rates is quadratic, and levels out at
+  // the end of the growth rate transition period.
+  //
+  // (A basis point is one in ten thousand.)
+  optional uint64 initial_reward_rate_basis_points = 14;
+  optional uint64 final_reward_rate_basis_points = 15;
+
+  // The amount of time that the growth rate changes (presumably, decreases)
+  // from the initial growth rate to the final growth rate. (See the two
+  // *_reward_rate_basis_points fields bellow.) The transition is quadratic, and
+  // levels out at the end of the growth rate transition period.
+  optional uint64 reward_rate_transition_duration_seconds = 16;
+
+  // The maximum dissolve delay that a neuron can have. That is, the maximum
+  // that a neuron's dissolve delay can be increased to. The maximum is also enforced
+  // when saturating the dissolve delay bonus in the voting power computation.
+  optional uint64 max_dissolve_delay_seconds = 17;
+
+  // The age of a neuron that saturates the age bonus for the voting power computation.
+  optional uint64 max_neuron_age_seconds_for_age_bonus = 18;
+
+  // E.g. if a large dissolve delay can double the voting power of a neuron,
+  // then this field would have a value of 2.0.
+  //
+  // For no bonus, this should be set to 1.
+  //
+  // To achieve functionality equivalent to NNS, this should be set to 2.
+  optional uint64 max_dissolve_delay_bonus_percentage = 19;
+
+  // Analogous to the previous field (see the previous comment),
+  // but this one relates to neuron age instead of dissolve delay.
+  //
+  // To achieve functionality equivalent to NNS, this should be set to 1.25.
+  optional uint64 max_age_bonus_percentage = 20;
+
+  // The initial voting period of a newly created proposal.
+  // A proposal's voting period may then be further increased during
+  // a proposal's lifecycle due to the wait-for-quiet algorithm.
+  //
+  // The voting period must be between (inclusive) the defined floor
+  // INITIAL_VOTING_PERIOD_SECONDS_FLOOR and ceiling
+  // INITIAL_VOTING_PERIOD_SECONDS_CEILING.
+  optional uint64 initial_voting_period_seconds = 21;
+
+  // The wait for quiet algorithm extends the voting period of a proposal when
+  // there is a flip in the majority vote during the proposal's voting period.
+  // This parameter determines the maximum time period that the voting period 
+  // may be extended after a flip. If there is a flip at the very end of the
+  // original proposal deadline, the remaining time will be set to this parameter.
+  // If there is a flip before or after the original deadline, the deadline will
+  // extended by somewhat less than this parameter.
+  // The maximum total voting period extension is 2 * wait_for_quiet_deadline_increase_seconds. 
+  // For more information, see the wiki page on the wait-for-quiet algorithm: 
+  // https://wiki.internetcomputer.org/wiki/Network_Nervous_System#Proposal_decision_and_wait-for-quiet
+  optional uint64 wait_for_quiet_deadline_increase_seconds = 22;
+}
+
+// The FractionalDeveloperVotingPower token distribution strategy configures
+// how tokens and neurons are distributed via four "buckets": developers,
+// treasury, swap, and airdrops. This strategy will distribute all developer tokens
+// at genesis in restricted neurons with an additional voting power
+// multiplier applied. This voting power multiplier is calculated as
+// `swap_distribution.initial_swap_amount_e8s / swap_distribution.total_e8s`.
+// As more of the swap funds are swapped in future rounds, the voting power
+// multiplier will approach 1.0. The following preconditions must be met for
+// it to be a valid distribution:
+//    - developer_distribution.developer_neurons.stake_e8s.sum <= u64:MAX
+//    - developer_neurons.developer_neurons.stake_e8s.sum <= swap_distribution.total_e8s
+//    - airdrop_distribution.airdrop_neurons.stake_e8s.sum <= u64:MAX
+//    - swap_distribution.initial_swap_amount_e8s > 0
+//    - swap_distribution.initial_swap_amount_e8s <= swap_distribution.total_e8s
+//    - swap_distribution.total_e8s >= developer_distribution.developer_neurons.stake_e8s.sum
+message FractionalDeveloperVotingPower {
+  // The developer bucket.
+  DeveloperDistribution developer_distribution = 1;
+
+  // The treasury bucket.
+  TreasuryDistribution treasury_distribution = 2;
+
+  // The swap bucket.
+  SwapDistribution swap_distribution = 3;
+
+  // The airdrop bucket.
+  AirdropDistribution airdrop_distribution = 4;
+}
+
+// The distributions awarded to developers at SNS genesis.
+message DeveloperDistribution {
+  // List of `NeuronDistribution` that specify a Neuron controller and Neuron stake in e8s (10E-8 of a token).
+  // For each entry in the developer_neurons list, a neuron will be created with a voting multiplier applied
+  // (see `FractionalDeveloperVotingPower`) and will start in PreInitializationSwap mode.
+  repeated NeuronDistribution developer_neurons = 1;
+}
+
+// The funds for the SNS' Treasury account on the SNS Ledger. These funds are
+// in the SNS Ledger at genesis, but unavailable until after the initial swap
+// has successfully completed.
+message TreasuryDistribution {
+  // The total token distribution denominated in e8s (10E-8 of a token) of the
+  // treasury bucket.
+  uint64 total_e8s = 1;
+}
+
+// The funds for token swaps to decentralize an SNS. These funds are in the
+// SNS Ledger at genesis.
+message SwapDistribution {
+  // The total token distribution denominated in e8s (10E-8 of a token) of the
+  // swap bucket. All tokens used in initial_swap_amount_e8s will be
+  // deducted from total_e8s. The remaining tokens will be distributed to
+  // a subaccount of Governance for use in future token swaps.
+  uint64 total_e8s = 1;
+  // The initial number of tokens denominated in e8s (10E-8 of a token)
+  // deposited in the swap canister's account for the initial token swap.
+  uint64 initial_swap_amount_e8s = 2;
+}
+
+// The distributions airdropped at SNS genesis.
+message AirdropDistribution {
+  // List of `NeuronDistribution` that specify a Neuron controller and Neuron stake in e8s
+  // (10E-8 of a token). For each entry in the airdrop_neurons list, a neuron will be
+  // created with NO voting multiplier applied and will start in PreInitializationSwap mode.
+  repeated NeuronDistribution airdrop_neurons = 1;
+}
+
+// A tuple of values used to create a Neuron available at SNS genesis.
+message NeuronDistribution {
+  // The initial `PrincipalId` given permissions on a neuron available at genesis.
+  // The permissions granted to the controller will be set to the SNS' configured
+  // `NervousSystemParameters.neuron_claimer_permissions`. This controller
+  // will be the first available `PrincipalId` to manage a neuron.
+  ic_base_types.pb.v1.PrincipalId controller = 1;
+
+  // The stake denominated in e8s (10E-8 of a token) that the neuron will have
+  // at genesis. The `Neuron.cached_neuron_stake_e8s` in SNS Governance and the
+  // Neuron's account in the SNS Ledger will have this value.
+  uint64 stake_e8s = 2;
+
+  // The `memo` used along with the controller's `PrincipalId` to generate the subaccount
+  // of the neuron. This allows for a single `PrincipalId` to have multiple neurons as
+  // the identifier will be unique as long as the memo is unique.
+  uint64 memo = 3;
+
+  // The amount of time denominated in seconds that the neuron will have its dissolve delay
+  // set to. This value cannot be changed until after the decentralization sale is complete.
+  uint64 dissolve_delay_seconds = 4;
+
+  // The duration that this neuron is vesting.
+  //
+  // A neuron that is vesting is non-dissolving and cannot start dissolving until the vesting duration has elapsed.
+  // Vesting can be used to lock a neuron more than the max allowed dissolve delay. This allows devs and members of
+  // a particular SNS instance to prove their long-term commitment to the community. For example, the max dissolve delay
+  // for a particular SNS instance might be 1 year, but the devs of the project may set their vesting duration to 3
+  // years and dissolve delay to 1 year in order to prove that they are making a minimum 4 year commitment to the
+  // project.
+  optional uint64 vesting_period_seconds = 5;
+}

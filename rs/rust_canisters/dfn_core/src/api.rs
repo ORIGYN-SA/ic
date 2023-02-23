@@ -3,7 +3,7 @@ pub use self::futures::spawn;
 use self::futures::{CallFuture, FutureResult, RefCounted, TopLevelFuture};
 pub use ic_base_types::{CanisterId, PrincipalId};
 use on_wire::{FromWire, IntoWire, NewType};
-use std::convert::TryFrom;
+use std::convert::{TryFrom, TryInto};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use std::{cell::RefCell, future::Future};
 
@@ -45,18 +45,6 @@ pub mod ic0 {
         pub fn msg_reply();
         pub fn msg_reply_data_append(offset: u32, size: u32);
         pub fn trap(offset: u32, size: u32);
-        pub fn call_simple(
-            callee_src: u32,
-            callee_size: u32,
-            name_src: u32,
-            name_size: u32,
-            reply_fun: usize,
-            reply_env: u32,
-            reject_fun: usize,
-            reject_env: u32,
-            data_src: u32,
-            data_size: u32,
-        ) -> i32;
         pub fn call_new(
             callee_src: u32,
             callee_size: u32,
@@ -70,21 +58,32 @@ pub mod ic0 {
         pub fn call_data_append(src: u32, size: u32);
         pub fn call_on_cleanup(fun: usize, env: u32);
         pub fn call_cycles_add(amount: u64);
+        pub fn call_cycles_add128(amount_high: u64, amount_low: u64);
         pub fn call_perform() -> i32;
         pub fn stable_size() -> u32;
         pub fn stable_grow(additional_pages: u32) -> i32;
         pub fn stable_read(dst: u32, offset: u32, size: u32);
         pub fn stable_write(offset: u32, src: u32, size: u32);
+        pub fn stable64_size() -> u64;
+        pub fn stable64_grow(additional_pages: u64) -> i64;
+        pub fn stable64_read(dst: u64, offset: u64, size: u64);
+        pub fn stable64_write(offset: u64, src: u64, size: u64);
         pub fn time() -> u64;
+        pub fn performance_counter(counter_type: u32) -> u64;
         pub fn canister_cycle_balance() -> u64;
+        pub fn canister_cycle_balance128(dst: i32);
         pub fn msg_cycles_available() -> u64;
+        pub fn msg_cycles_available128(dst: i32);
         pub fn msg_cycles_refunded() -> u64;
+        pub fn msg_cycles_refunded128(dst: i32);
         pub fn msg_cycles_accept(amount: u64) -> u64;
+        pub fn msg_cycles_accept128(max_amount_high: i64, max_amount_low: i64, dst: i32);
         pub fn certified_data_set(src: u32, size: u32);
         pub fn data_certificate_present() -> u32;
         pub fn data_certificate_size() -> u32;
         pub fn data_certificate_copy(dst: u32, offset: u32, size: u32);
         pub fn canister_status() -> u32;
+        pub fn canister_version() -> u64;
         pub fn mint_cycles(amount: u64) -> u64;
     }
 }
@@ -155,20 +154,6 @@ pub mod ic0 {
     pub unsafe fn trap(_offset: u32, _size: u32) {
         wrong_arch("trap")
     }
-    pub unsafe fn call_simple(
-        _callee_src: u32,
-        _callee_size: u32,
-        _name_src: u32,
-        _name_size: u32,
-        _reply_fun: usize,
-        _reply_env: u32,
-        _reject_fun: usize,
-        _reject_env: u32,
-        _data_src: u32,
-        _data_size: u32,
-    ) -> i32 {
-        wrong_arch("call_simple")
-    }
 
     pub unsafe fn call_new(
         _callee_src: u32,
@@ -195,6 +180,10 @@ pub mod ic0 {
         wrong_arch("call_cycles_add")
     }
 
+    pub unsafe fn call_cycles_add128(_amount_high: u64, _amount_low: u64) {
+        wrong_arch("call_cycles_add128")
+    }
+
     pub unsafe fn call_perform() -> i32 {
         wrong_arch("call_perform")
     }
@@ -215,6 +204,22 @@ pub mod ic0 {
         wrong_arch("stable_write")
     }
 
+    pub unsafe fn stable64_size() -> u64 {
+        wrong_arch("stable64_size")
+    }
+
+    pub unsafe fn stable64_grow(_additional_pages: u64) -> i64 {
+        wrong_arch("stable64_grow")
+    }
+
+    pub unsafe fn stable64_read(_dst: u64, _offset: u64, _size: u64) {
+        wrong_arch("stable64_read")
+    }
+
+    pub unsafe fn stable64_write(_offset: u64, _src: u64, _size: u64) {
+        wrong_arch("stable64_write")
+    }
+
     pub unsafe fn time() -> u64 {
         std::time::SystemTime::now()
             .duration_since(std::time::SystemTime::UNIX_EPOCH)
@@ -222,20 +227,40 @@ pub mod ic0 {
             .as_nanos() as u64
     }
 
+    pub unsafe fn performance_counter(_counter_type: u32) -> u64 {
+        wrong_arch("performance_counter")
+    }
+
     pub unsafe fn canister_cycle_balance() -> u64 {
         wrong_arch("canister_cycle_balance")
+    }
+
+    pub unsafe fn canister_cycle_balance128(_dst: i32) {
+        wrong_arch("canister_cycle_balance128")
     }
 
     pub unsafe fn msg_cycles_available() -> u64 {
         wrong_arch("msg_cycles_available")
     }
 
+    pub unsafe fn msg_cycles_available128(_dst: i32) {
+        wrong_arch("msg_cycles_available128")
+    }
+
     pub unsafe fn msg_cycles_refunded() -> u64 {
         wrong_arch("msg_cycles_refunded")
     }
 
+    pub unsafe fn msg_cycles_refunded128(_dst: i32) {
+        wrong_arch("msg_cycles_refunded128")
+    }
+
     pub unsafe fn msg_cycles_accept(_amount: u64) -> u64 {
         wrong_arch("msg_cycles_accept")
+    }
+
+    pub unsafe fn msg_cycles_accept128(_amount_high: i64, _amount_low: i64, _dst: i32) {
+        wrong_arch("msg_cycles_accept128")
     }
 
     pub unsafe fn certified_data_set(_src: u32, _size: u32) {
@@ -258,6 +283,10 @@ pub mod ic0 {
         wrong_arch("canister_status")
     }
 
+    pub unsafe fn canister_version() -> u64 {
+        wrong_arch("canister_version")
+    }
+
     pub unsafe fn mint_cycles(_amount: u64) -> u64 {
         wrong_arch("mint_cycles")
     }
@@ -265,7 +294,7 @@ pub mod ic0 {
 
 // Convenience wrappers around the DFINTY System API
 
-/// A thin wrapper around `call_simple`.  Calls another canisters and invokes
+/// A thin wrapper around `call_new`, `call_data_append`, and `call_perform`.  Calls another canisters and invokes
 /// on_reply/on_reject with the given `env` once reply/reject is received.
 #[allow(clippy::too_many_arguments)]
 pub fn call_raw(
@@ -352,7 +381,7 @@ pub fn call_bytes(
     fn callback(future_ptr: *mut ()) {
         let ref_counted = unsafe { RefCounted::from_raw(future_ptr as *const RefCell<CallFuture>) };
         let top_level_future = ref_counted.borrow_mut().top_level_future;
-        let waker = {
+        let maybe_waker = {
             let mut future = ref_counted.borrow_mut();
             future.result = Some(match reject_code() {
                 0 => Ok(arg_data()),
@@ -360,14 +389,16 @@ pub fn call_bytes(
             });
             future.waker.take()
         };
-        waker.expect("there is no waker").wake();
+        if let Some(waker) = maybe_waker {
+            waker.wake();
+        }
         std::mem::drop(ref_counted);
         if !top_level_future.is_null() {
             unsafe {
                 TopLevelFuture::release(top_level_future);
             }
         }
-    };
+    }
     let future_for_closure = RefCounted::new(CallFuture::new());
     let future = future_for_closure.clone();
     let future_ptr = future_for_closure.into_raw();
@@ -381,7 +412,7 @@ pub fn call_bytes(
         future_ptr as *mut (),
         funds,
     );
-    // 0 is a special error code, meaning call_simple call succeeded
+    // 0 is a special error code, meaning call_perform call succeeded
     if err_code != 0 {
         // Decrease the refcount as the closure will not be called.
         std::mem::drop(unsafe { RefCounted::from_raw(future_ptr) });
@@ -402,7 +433,7 @@ pub fn call_bytes_with_cleanup(
     fn callback(future_ptr: *mut ()) {
         let ref_counted = unsafe { RefCounted::from_raw(future_ptr as *const RefCell<CallFuture>) };
         let top_level_future = ref_counted.borrow_mut().top_level_future;
-        let waker = {
+        let maybe_waker = {
             let mut future = ref_counted.borrow_mut();
             future.result = Some(match reject_code() {
                 0 => Ok(arg_data()),
@@ -410,14 +441,16 @@ pub fn call_bytes_with_cleanup(
             });
             future.waker.take()
         };
-        waker.expect("there is no waker").wake();
+        if let Some(waker) = maybe_waker {
+            waker.wake();
+        }
         std::mem::drop(ref_counted);
         if !top_level_future.is_null() {
             unsafe {
                 TopLevelFuture::release(top_level_future);
             }
         }
-    };
+    }
 
     fn cleanup(future_ptr: *mut ()) {
         let f = unsafe { RefCounted::from_raw(future_ptr as *const RefCell<CallFuture>) };
@@ -430,7 +463,7 @@ pub fn call_bytes_with_cleanup(
                 TopLevelFuture::drop_if_last_reference(top_level_future);
             }
         }
-    };
+    }
 
     let future_for_closure = RefCounted::new(CallFuture::new());
     let future = future_for_closure.clone();
@@ -445,7 +478,7 @@ pub fn call_bytes_with_cleanup(
         future_ptr as *mut (),
         funds,
     );
-    // 0 is a special error code, meaning call_simple call succeeded
+    // 0 is a special error code, meaning call_perform call succeeded
     if err_code != 0 {
         // Decrease the refcount as the closure will not be called.
         unsafe { RefCounted::from_raw(future_ptr) };
@@ -593,6 +626,12 @@ pub fn call_cycles_add(amount: u64) {
     }
 }
 
+pub fn call_cycles_add128(amount_high: u64, amount_low: u64) {
+    unsafe {
+        ic0::call_cycles_add128(amount_high, amount_low);
+    }
+}
+
 /// Safe wrapper around an unsafe function
 pub fn arg_size() -> u32 {
     unsafe { ic0::msg_arg_data_size() }
@@ -706,38 +745,86 @@ pub fn stable_memory_size_in_pages() -> u32 {
 /// Represents the different token units that are available on canisters.
 pub enum TokenUnit {
     Cycles = 0,
-    ICP = 1,
+    Icp = 1,
 }
 
 /// Based on the public spec, cycles is represented by `0x00` and ICP tokens by
 /// `0x01`.
-impl Into<Vec<u8>> for TokenUnit {
-    fn into(self) -> Vec<u8> {
-        match self {
-            TokenUnit::Cycles => hex::decode("00").unwrap(),
-            TokenUnit::ICP => hex::decode("01").unwrap(),
+impl From<TokenUnit> for Vec<u8> {
+    fn from(val: TokenUnit) -> Self {
+        match val {
+            TokenUnit::Cycles => vec![0x00],
+            TokenUnit::Icp => vec![0x01],
         }
     }
 }
 
+/// Returns a deterministic monotonically increasing integer approximating the amount of
+/// work the canister has done since the beginning of the current execution.
+pub fn performance_counter(counter_type: u32) -> u64 {
+    unsafe { ic0::performance_counter(counter_type) }
+}
+
 /// Returns the amount of cycles in the canister's account.
+/// This API supports only 64-bit values.
 pub fn canister_cycle_balance() -> u64 {
     unsafe { ic0::canister_cycle_balance() }
 }
 
+/// Returns the amount of cycles in the canister's account.
+pub fn canister_cycle_balance128() -> Vec<u8> {
+    let size = 16;
+    let mut buf = vec![0u8; size];
+    unsafe { ic0::canister_cycle_balance128(buf.as_mut_ptr() as i32) }
+    buf
+}
+
 /// Returns the cycles available in this current message.
+/// This API supports only 64-bit values.
 pub fn msg_cycles_available() -> u64 {
     unsafe { ic0::msg_cycles_available() }
 }
 
+/// Returns the cycles available in this current message.
+pub fn msg_cycles_available128() -> u128 {
+    let size = 16;
+    let mut buf = vec![0u8; size];
+    unsafe { ic0::msg_cycles_available128(buf.as_mut_ptr() as i32) }
+    u128::from_le_bytes(buf.try_into().unwrap())
+}
+
 /// Returns the amount of cycles refunded with a response.
+/// This API supports only 64-bit values.
 pub fn msg_cycles_refunded() -> u64 {
     unsafe { ic0::msg_cycles_refunded() }
 }
 
+/// Returns the amount of cycles refunded with a response.
+pub fn msg_cycles_refunded128() -> u128 {
+    let size = 16;
+    let mut buf = vec![0u8; size];
+    unsafe { ic0::msg_cycles_refunded128(buf.as_mut_ptr() as i32) }
+    u128::from_le_bytes(buf.try_into().unwrap())
+}
+
 /// Indicates that `amount` of cycles should be accepted in the current message.
+/// This API supports only 64-bit values.
 pub fn msg_cycles_accept(amount: u64) -> u64 {
     unsafe { ic0::msg_cycles_accept(amount) }
+}
+
+/// Indicates that `amount` of cycles should be accepted in the current message.
+pub fn msg_cycles_accept128(amount_high: u64, amount_low: u64) -> u128 {
+    let size = 16;
+    let mut buf = vec![0u8; size];
+    unsafe {
+        ic0::msg_cycles_accept128(
+            amount_high as i64,
+            amount_low as i64,
+            buf.as_mut_ptr() as i32,
+        )
+    }
+    u128::from_le_bytes(buf.try_into().unwrap())
 }
 
 /// Sets the certified data of this canister.
@@ -780,6 +867,10 @@ pub fn canister_status() -> CanisterStatus {
         3 => CanisterStatus::Stopped,
         other => panic!("Weird canister status: {}", other),
     }
+}
+
+pub fn canister_version() -> u64 {
+    unsafe { ic0::canister_version() }
 }
 
 pub fn mint_cycles(amount: u64) -> u64 {

@@ -5,9 +5,7 @@
 //! stateless crypto lib.
 
 use crate::api::{NiDkgCspClient, NodePublicKeyData};
-use crate::keygen::forward_secure_key_id;
-use crate::secret_key_store::{SecretKeyStore, SecretKeyStoreError};
-use crate::types::conversions::key_id_from_csp_pub_coeffs;
+use crate::key_id::KeyId;
 use crate::types::{CspPublicCoefficients, CspSecretKey};
 use crate::Csp;
 use ic_crypto_internal_threshold_sig_bls12381::api::ni_dkg_errors;
@@ -23,9 +21,8 @@ use ic_crypto_internal_types::sign::threshold_sig::ni_dkg::{
 };
 use ic_logger::debug;
 use ic_types::crypto::threshold_sig::ni_dkg::NiDkgId;
-use ic_types::crypto::{AlgorithmId, KeyId};
-use ic_types::{NodeId, NodeIndex, NumberOfNodes, Randomness};
-use rand::{CryptoRng, Rng};
+use ic_types::crypto::AlgorithmId;
+use ic_types::{NodeId, NodeIndex, NumberOfNodes};
 use std::collections::{BTreeMap, BTreeSet};
 
 #[cfg(test)]
@@ -37,63 +34,16 @@ pub const NIDKG_FS_SCOPE: Scope = Scope::Const(ConstScope::NiDkgFsEncryptionKeys
 /// Non-interactive distributed key generation client
 ///
 /// Please see the trait definition for full documentation.
-impl<R: Rng + CryptoRng, S: SecretKeyStore> NiDkgCspClient for Csp<R, S> {
+impl NiDkgCspClient for Csp {
     /// Creates a key pair for encrypting threshold key shares in transmission
     /// from dealers to receivers.
-    fn create_forward_secure_key_pair(
-        &mut self,
-        algorithm_id: AlgorithmId,
+    fn gen_dealing_encryption_key_pair(
+        &self,
         node_id: NodeId,
     ) -> Result<(CspFsEncryptionPublicKey, CspFsEncryptionPop), ni_dkg_errors::CspDkgCreateFsKeyError>
     {
-        debug!(self.logger; crypto.method_name => "create_forward_secure_key_pair");
-
-        // Get state
-        let seed = Randomness::from(self.rng_write_lock().gen::<[u8; 32]>());
-        // Specialise
-        let result = match algorithm_id {
-            AlgorithmId::NiDkg_Groth20_Bls12_381 => {
-                // Call lib:
-                let key_set = clib::create_forward_secure_key_pair(seed, node_id.get().as_slice());
-
-                // Generalise over fs key variants:
-                let public_key = CspFsEncryptionPublicKey::Groth20_Bls12_381(key_set.public_key);
-                let pop = CspFsEncryptionPop::Groth20WithPop_Bls12_381(key_set.pop);
-                let key_set = CspFsEncryptionKeySet::Groth20WithPop_Bls12_381(key_set);
-                Ok((public_key, pop, key_set))
-            }
-            other => Err(ni_dkg_errors::CspDkgCreateFsKeyError::UnsupportedAlgorithmId(other)),
-        };
-        let (public_key, pop, key_set) = result?;
-
-        // Update state:
-        let key_id = forward_secure_key_id(&public_key);
-        if let Err(err) = self.sks_write_lock().insert(
-            key_id,
-            CspSecretKey::FsEncryption(key_set),
-            Some(NIDKG_FS_SCOPE),
-        ) {
-            match err {
-              SecretKeyStoreError::DuplicateKeyId(_key_id) =>
-                panic!(
-                    "Could not insert key as the KeyId is already in use.  This suggests an insecure RNG."
-                ),
-            };
-        };
-
-        // FIN:
-        Ok((public_key, pop))
-    }
-
-    /// Verifies that a forward secure public key and PoP are valid.
-    fn verify_forward_secure_key(
-        &self,
-        algorithm_id: AlgorithmId,
-        public_key: CspFsEncryptionPublicKey,
-        pop: CspFsEncryptionPop,
-        node_id: NodeId,
-    ) -> Result<(), ni_dkg_errors::CspDkgVerifyFsKeyError> {
-        static_api::verify_forward_secure_key(algorithm_id, public_key, pop, node_id)
+        debug!(self.logger; crypto.method_name => "gen_dealing_encryption_key_pair");
+        self.csp_vault.gen_dealing_encryption_key_pair(node_id)
     }
 
     /// Erases forward secure secret keys before a given epoch
@@ -104,48 +54,9 @@ impl<R: Rng + CryptoRng, S: SecretKeyStore> NiDkgCspClient for Csp<R, S> {
     ) -> Result<(), ni_dkg_errors::CspDkgUpdateFsEpochError> {
         debug!(self.logger; crypto.method_name => "update_forward_secure_epoch", crypto.dkg_epoch => epoch.get());
 
-        // Get state
-        let seed = Randomness::from(self.rng_write_lock().gen::<[u8; 32]>());
-        let key_id = self.dkg_dealing_encryption_key_id();
-        let key_set = self.sks_read_lock().get(&key_id).ok_or_else(|| {
-            ni_dkg_errors::CspDkgUpdateFsEpochError::FsKeyNotInSecretKeyStoreError(
-                ni_dkg_errors::KeyNotFoundError {
-                    internal_error: "Cannot update forward secure key if it is missing".to_string(),
-                    key_id,
-                },
-            )
-        })?;
-        let key_set = specialise::fs_key_set(key_set).expect("Not a forward secure secret key; it should be impossible to retrieve a key of the wrong type.");
-
-        // Specialise
-        let key_set = match algorithm_id {
-            AlgorithmId::NiDkg_Groth20_Bls12_381 => {
-                // Specialise to Groth20
-                let mut key_set = specialise::groth20::fs_key_set(key_set)
-                    .expect("If key generation is correct, it should be impossible to retrieve a key of the wrong type.");
-                // Call lib:
-                let secret_key =
-                    clib::update_forward_secure_epoch(&key_set.secret_key, epoch, seed);
-                key_set.secret_key = secret_key;
-                // Generalise:
-                Ok(CspFsEncryptionKeySet::Groth20WithPop_Bls12_381(key_set))
-            }
-            other => Err(ni_dkg_errors::CspDkgUpdateFsEpochError::UnsupportedAlgorithmId(other)),
-        };
-
-        // Save state
-        if let Err(err) = self.sks_write_lock().insert_or_replace(
-            key_id,
-            CspSecretKey::FsEncryption(key_set?),
-            Some(NIDKG_FS_SCOPE),
-        ) {
-            match err {
-                SecretKeyStoreError::DuplicateKeyId(_key_id) => unreachable!(),
-            };
-        };
-
-        // FIN
-        Ok(())
+        let key_id = self.dkg_dealing_encryption_key_id()?;
+        self.csp_vault
+            .update_forward_secure_epoch(algorithm_id, key_id, epoch)
     }
 
     /// Creates a CSP dealing
@@ -159,48 +70,20 @@ impl<R: Rng + CryptoRng, S: SecretKeyStore> NiDkgCspClient for Csp<R, S> {
         receiver_keys: BTreeMap<NodeIndex, CspFsEncryptionPublicKey>,
     ) -> Result<CspNiDkgDealing, ni_dkg_errors::CspDkgCreateDealingError> {
         debug!(self.logger; crypto.method_name => "create_dealing", crypto.dkg_epoch => epoch.get());
-        // Specialisation to this scheme:
-        match algorithm_id {
-            AlgorithmId::NiDkg_Groth20_Bls12_381 => {
-                let receiver_keys = specialise::groth20::receiver_keys(&receiver_keys).map_err(
-                    |(receiver_index, error)| {
-                        ni_dkg_errors::CspDkgCreateDealingError::MalformedFsPublicKeyError {
-                            receiver_index,
-                            error,
-                        }
-                    },
-                )?;
-                // Stateless call to crypto lib
-                // Acquire an rng lock and generate randomness before invoking create_dealing
-                // because:
-                // * acquiring two locks inline in the create_dealing call would lead to a
-                //   deadlock.
-                // * we should not hold the write lock for the whole duration of create_dealing.
-                let (keygen_seed, encryption_seed) = {
-                    let mut rng = self.rng_write_lock();
-                    (rng.gen::<[u8; 32]>(), rng.gen::<[u8; 32]>())
-                };
-                let dealing = clib::create_dealing(
-                    Randomness::from(keygen_seed),
-                    Randomness::from(encryption_seed),
-                    threshold,
-                    &receiver_keys,
-                    epoch,
-                    dealer_index,
-                    None,
-                )?;
-                // Response
-                Ok(CspNiDkgDealing::Groth20_Bls12_381(dealing))
-            }
-            other => Err(ni_dkg_errors::CspDkgCreateDealingError::UnsupportedAlgorithmId(other)),
-        }
+        Ok(self.csp_vault.create_dealing(
+            algorithm_id,
+            dealer_index,
+            threshold,
+            epoch,
+            &receiver_keys,
+            None,
+        )?)
     }
 
     /// Creates a CSP dealing by resharing a previous secret key
     fn create_resharing_dealing(
         &self,
         algorithm_id: AlgorithmId,
-        dkg_id: NiDkgId,
         dealer_resharing_index: NodeIndex,
         threshold: NumberOfNodes,
         epoch: Epoch,
@@ -208,67 +91,15 @@ impl<R: Rng + CryptoRng, S: SecretKeyStore> NiDkgCspClient for Csp<R, S> {
         resharing_public_coefficients: CspPublicCoefficients,
     ) -> Result<CspNiDkgDealing, ni_dkg_errors::CspDkgCreateReshareDealingError> {
         debug!(self.logger; crypto.method_name => "create_resharing_dealing", crypto.dkg_epoch => epoch.get());
-        // Get state
-        // Fetch secret key corresponding to the resharing_public_coefficients from the
-        // Secret Key Store.
-        let resharing_secret_key = {
-            let key_id = key_id_from_csp_pub_coeffs(&resharing_public_coefficients);
-            let secret_key: Option<CspSecretKey> = self.sks_read_lock().get(&key_id);
-            secret_key.ok_or_else(|| {
-                ni_dkg_errors::CspDkgCreateReshareDealingError::ReshareKeyNotInSecretKeyStoreError(
-                    ni_dkg_errors::KeyNotFoundError {
-                        internal_error: format!(
-                            "Cannot find threshold key to be reshared:\n  Dkg: {}\n  Epoch:  {}",
-                            dkg_id, epoch
-                        ),
-                        key_id,
-                    },
-                )
-            })
-        }?;
-        // Specialisation to this scheme:
-        match algorithm_id {
-            AlgorithmId::NiDkg_Groth20_Bls12_381 => {
-                let resharing_secret_key = specialise::groth20::threshold_secret_key(
-                    resharing_secret_key,
-                )
-                .map_err(
-                    ni_dkg_errors::CspDkgCreateReshareDealingError::MalformedReshareSecretKeyError,
-                )?;
-                let receiver_keys = specialise::groth20::receiver_keys(&receiver_keys).map_err(
-                    |(receiver_index, error)| {
-                        ni_dkg_errors::CspDkgCreateReshareDealingError::MalformedFsPublicKeyError {
-                            receiver_index,
-                            error,
-                        }
-                    },
-                )?;
-                // Stateless call to crypto lib
-                // Acquire an rng lock and generate randomness before invoking create_dealing
-                // because:
-                // * acquiring two locks inline in the create_dealing call would lead to a
-                //   deadlock.
-                // * we should not hold the write lock for the whole duration of create_dealing.
-                let (keygen_seed, encryption_seed) = {
-                    let mut rng = self.rng_write_lock();
-                    (rng.gen::<[u8; 32]>(), rng.gen::<[u8; 32]>())
-                };
-                let dealing = clib::create_dealing(
-                    Randomness::from(keygen_seed),
-                    Randomness::from(encryption_seed),
-                    threshold,
-                    &receiver_keys,
-                    epoch,
-                    dealer_resharing_index,
-                    Some(resharing_secret_key),
-                )?;
-                // Response
-                Ok(CspNiDkgDealing::Groth20_Bls12_381(dealing))
-            }
-            other => {
-                Err(ni_dkg_errors::CspDkgCreateReshareDealingError::UnsupportedAlgorithmId(other))
-            }
-        }
+        let key_id = KeyId::from(&resharing_public_coefficients);
+        self.csp_vault.create_dealing(
+            algorithm_id,
+            dealer_resharing_index,
+            threshold,
+            epoch,
+            &receiver_keys,
+            Some(key_id),
+        )
     }
 
     /// Verify a CSP dealing
@@ -324,8 +155,15 @@ impl<R: Rng + CryptoRng, S: SecretKeyStore> NiDkgCspClient for Csp<R, S> {
         threshold: NumberOfNodes,
         number_of_receivers: NumberOfNodes,
         csp_dealings: BTreeMap<NodeIndex, CspNiDkgDealing>,
+        collection_threshold: NumberOfNodes,
     ) -> Result<CspNiDkgTranscript, ni_dkg_errors::CspDkgCreateTranscriptError> {
-        static_api::create_transcript(algorithm_id, threshold, number_of_receivers, csp_dealings)
+        static_api::create_transcript(
+            algorithm_id,
+            threshold,
+            number_of_receivers,
+            csp_dealings,
+            collection_threshold,
+        )
     }
 
     ///Create a CSP transcript from CSP resharing dealings
@@ -357,72 +195,26 @@ impl<R: Rng + CryptoRng, S: SecretKeyStore> NiDkgCspClient for Csp<R, S> {
         receiver_index: NodeIndex,
     ) -> Result<(), ni_dkg_errors::CspDkgLoadPrivateKeyError> {
         debug!(self.logger; crypto.method_name => "load_threshold_signing_key", crypto.dkg_epoch => epoch.get());
-        match algorithm_id {
-            AlgorithmId::NiDkg_Groth20_Bls12_381 => {
-                let threshold_key_id =
-                    key_id_from_csp_pub_coeffs(&CspPublicCoefficients::from(&csp_transcript));
 
-                // Convert types
-                let transcript = specialise::groth20::transcript(csp_transcript)
-                    .map_err(ni_dkg_errors::CspDkgLoadPrivateKeyError::MalformedTranscriptError)?;
+        let fs_key_id = self.dkg_dealing_encryption_key_id()?;
 
-                // Check if threshold key has been computed already
-                let threshold_secret_key: Option<CspSecretKey> =
-                    self.sks_read_lock().get(&threshold_key_id);
-                if let Some(secret_key) = threshold_secret_key {
-                    // this adds a sanity check to ensure the key is well formed:
-                    return specialise::groth20::threshold_secret_key(secret_key)
-                        .map(|_| ())
-                        .map_err(
-                            ni_dkg_errors::CspDkgLoadPrivateKeyError::MalformedSecretKeyError,
-                        );
-                }
-
-                // Compute the key
-                let fs_key_encryption_key = {
-                    let key_id = self.dkg_dealing_encryption_key_id();
-                    let key_set = self.sks_read_lock().get(&key_id).ok_or_else(||
-                      ni_dkg_errors::CspDkgLoadPrivateKeyError::KeyNotFoundError( // TODO (CRP-820): This name is inconsistent with the other error enums, where this is now called FsKeyNotInSecretKeyStoreError or some such paragraph-of-a-name.
-                        ni_dkg_errors::KeyNotFoundError {
-                          internal_error: "Cannot decrypt shares if the forward secure key encryption key is missing".to_string(),
-                          key_id,
-                        },
-                      )
-                    )?;
-                    let key_set = specialise::fs_key_set(key_set).expect("Not a forward secure secret key; it should be impossible to retrieve a key of the wrong type.");
-                    specialise::groth20::fs_key_set(key_set)
-                    .expect("If key generation is correct, it should be impossible to retrieve a key of the wrong type.")
-                };
-
-                let csp_secret_key = clib::compute_threshold_signing_key(
-                    &transcript,
-                    receiver_index,
-                    &fs_key_encryption_key.secret_key,
-                    epoch,
-                )
-                .map(CspSecretKey::ThresBls12_381)?;
-
-                match self.sks_write_lock().insert(
-                    threshold_key_id,
-                    csp_secret_key,
-                    Some(NIDKG_THRESHOLD_SCOPE),
-                ) {
-                    Ok(()) => Ok(()),
-                    Err(SecretKeyStoreError::DuplicateKeyId(_key_id)) => Ok(()),
-                }
-            }
-            other => Err(ni_dkg_errors::CspDkgLoadPrivateKeyError::UnsupportedAlgorithmId(other)),
-        }
+        self.csp_vault.load_threshold_signing_key(
+            algorithm_id,
+            epoch,
+            csp_transcript,
+            fs_key_id,
+            receiver_index,
+        )
     }
 
-    fn retain_threshold_keys_if_present(&self, active_keys: BTreeSet<CspPublicCoefficients>) {
+    fn retain_threshold_keys_if_present(
+        &self,
+        active_keys: BTreeSet<CspPublicCoefficients>,
+    ) -> Result<(), ni_dkg_errors::CspDkgRetainThresholdKeysError> {
         debug!(self.logger; crypto.method_name => "retain_threshold_keys_if_present");
-        let active_key_ids: BTreeSet<KeyId> =
-            active_keys.iter().map(key_id_from_csp_pub_coeffs).collect();
-        self.sks_write_lock().retain(
-            |key_id, _| active_key_ids.contains(key_id),
-            NIDKG_THRESHOLD_SCOPE,
-        )
+        let active_key_ids: BTreeSet<KeyId> = active_keys.iter().map(KeyId::from).collect();
+        self.csp_vault
+            .retain_threshold_keys_if_present(active_key_ids)
     }
 }
 
@@ -432,34 +224,10 @@ pub mod static_api {
     //! API methods.
     use super::*;
 
-    /// Verifies that a forward secure public key and PoP are valid.
-    pub fn verify_forward_secure_key(
-        algorithm_id: AlgorithmId,
-        public_key: CspFsEncryptionPublicKey,
-        pop: CspFsEncryptionPop,
-        node_id: NodeId,
-    ) -> Result<(), ni_dkg_errors::CspDkgVerifyFsKeyError> {
-        // Specialisation to this scheme:
-        match algorithm_id {
-            AlgorithmId::NiDkg_Groth20_Bls12_381 => {
-                // Specialise:
-                let public_key = specialise::groth20::fs_public_key(public_key)
-                    .map_err(ni_dkg_errors::CspDkgVerifyFsKeyError::MalformedPublicKeyError)?;
-                let fs_pop = specialise::groth20::fs_pop(pop)
-                    .map_err(ni_dkg_errors::CspDkgVerifyFsKeyError::MalformedPopError)?;
-
-                // Call lib:
-                clib::verify_forward_secure_key(&public_key, &fs_pop, node_id.get().as_slice())
-                    .map_err(ni_dkg_errors::CspDkgVerifyFsKeyError::InvalidPop)
-            }
-            other => Err(ni_dkg_errors::CspDkgVerifyFsKeyError::UnsupportedAlgorithmId(other)),
-        }
-    }
-
     /// Verifies a CSP dealing
     pub fn verify_dealing(
         algorithm_id: AlgorithmId,
-        dkg_id: NiDkgId,
+        _dkg_id: NiDkgId,
         dealer_index: NodeIndex,
         threshold: NumberOfNodes,
         epoch: Epoch,
@@ -480,14 +248,7 @@ pub mod static_api {
                     },
                 )?;
                 // Call the specialised library method:
-                clib::verify_dealing(
-                    dkg_id,
-                    dealer_index,
-                    threshold,
-                    epoch,
-                    &receiver_keys,
-                    &dealing,
-                )
+                clib::verify_dealing(dealer_index, threshold, epoch, &receiver_keys, &dealing)
             }
             other => Err(ni_dkg_errors::CspDkgVerifyDealingError::UnsupportedAlgorithmId(other)),
         }
@@ -497,7 +258,7 @@ pub mod static_api {
     #[allow(clippy::too_many_arguments)]
     pub fn verify_resharing_dealing(
         algorithm_id: AlgorithmId,
-        dkg_id: NiDkgId,
+        _dkg_id: NiDkgId,
         dealer_resharing_index: NodeIndex,
         threshold: NumberOfNodes,
         epoch: Epoch,
@@ -526,7 +287,6 @@ pub mod static_api {
                         )?;
                 // Call the specialised library method:
                 clib::verify_resharing_dealing(
-                    dkg_id,
                     dealer_resharing_index,
                     threshold,
                     epoch,
@@ -548,6 +308,7 @@ pub mod static_api {
         threshold: NumberOfNodes,
         number_of_receivers: NumberOfNodes,
         csp_dealings: BTreeMap<NodeIndex, CspNiDkgDealing>,
+        collection_threshold: NumberOfNodes,
     ) -> Result<CspNiDkgTranscript, ni_dkg_errors::CspDkgCreateTranscriptError> {
         match algorithm_id {
             AlgorithmId::NiDkg_Groth20_Bls12_381 => {
@@ -561,8 +322,12 @@ pub mod static_api {
                     },
                 )?;
                 // Call the specialised library method:
-                let transcript =
-                    clib::create_transcript(threshold, number_of_receivers, &csp_dealings)?;
+                let transcript = clib::create_transcript(
+                    threshold,
+                    number_of_receivers,
+                    &csp_dealings,
+                    collection_threshold,
+                )?;
                 // Generalise:
                 let transcript = CspNiDkgTranscript::Groth20_Bls12_381(transcript);
                 Ok(transcript)
@@ -646,7 +411,7 @@ pub mod specialise {
     /// An error during specialisation
     #[derive(Debug)]
     pub struct SpecialisationError {
-        unexpected_type_name: &'static str,
+        _unexpected_type_name: &'static str,
     }
 
     /// Converts a secret key into a forward secure secret key set.
@@ -656,8 +421,8 @@ pub mod specialise {
     pub fn fs_key_set(
         secret_key: CspSecretKey,
     ) -> Result<CspFsEncryptionKeySet, ni_dkg_errors::MalformedSecretKeyError> {
-        if let CspSecretKey::FsEncryption(key_set) = secret_key {
-            Ok(key_set)
+        if let CspSecretKey::FsEncryption(key_set) = &secret_key {
+            Ok(key_set.clone())
         } else {
             let unexpected_type_name: &'static str = secret_key.into();
             Err(ni_dkg_errors::MalformedSecretKeyError {
@@ -684,8 +449,8 @@ pub mod specialise {
             secret_key: CspSecretKey,
         ) -> Result<threshold_types::SecretKeyBytes, ni_dkg_errors::MalformedSecretKeyError>
         {
-            if let CspSecretKey::ThresBls12_381(secret_key) = secret_key {
-                Ok(secret_key)
+            if let CspSecretKey::ThresBls12_381(secret_key) = &secret_key {
+                Ok(secret_key.clone())
             } else {
                 let unexpected_type_name: &'static str = secret_key.into();
                 Err(ni_dkg_errors::MalformedSecretKeyError {
@@ -759,8 +524,8 @@ pub mod specialise {
             key_set: CspFsEncryptionKeySet,
         ) -> Result<clib::types::FsEncryptionKeySetWithPop, ni_dkg_errors::MalformedSecretKeyError>
         {
-            if let CspFsEncryptionKeySet::Groth20WithPop_Bls12_381(key_set) = key_set {
-                Ok(key_set)
+            if let CspFsEncryptionKeySet::Groth20WithPop_Bls12_381(key_set) = &key_set {
+                Ok(key_set.clone())
             } else {
                 let unexpected_type_name: &'static str = key_set.into();
                 Err(ni_dkg_errors::MalformedSecretKeyError {

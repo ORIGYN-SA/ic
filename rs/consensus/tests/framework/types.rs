@@ -1,24 +1,29 @@
 #![allow(dead_code)]
 use ic_artifact_pool::{
-    certification_pool::CertificationPoolImpl, consensus_pool::ConsensusPoolImpl, dkg_pool,
+    canister_http_pool, certification_pool::CertificationPoolImpl,
+    consensus_pool::ConsensusPoolImpl, dkg_pool, ecdsa_pool,
 };
 use ic_config::artifact_pool::ArtifactPoolConfig;
 use ic_consensus::{consensus::ConsensusImpl, dkg};
 use ic_interfaces::{
+    canister_http::CanisterHttpPayloadBuilder,
     certification::Certifier,
-    certified_stream_store::CertifiedStreamStore,
     ingress_manager::IngressSelector,
     messaging::{MessageRouting, XNetPayloadBuilder},
-    registry::RegistryClient,
-    state_manager::StateManager,
+    self_validating_payload::SelfValidatingPayloadBuilder,
     time_source::TimeSource,
 };
+use ic_interfaces_certified_stream_store::CertifiedStreamStore;
+use ic_interfaces_registry::RegistryClient;
+use ic_interfaces_state_manager::StateManager;
 use ic_logger::{replica_logger::no_op_logger, ReplicaLogger};
 use ic_metrics::MetricsRegistry;
 use ic_replicated_state::ReplicatedState;
 use ic_test_artifact_pool::ingress_pool::TestIngressPool;
 use ic_test_utilities::{
-    ingress_selector::FakeIngressSelector, message_routing::FakeMessageRouting,
+    canister_http::FakeCanisterHttpPayloadBuilder, ingress_selector::FakeIngressSelector,
+    message_routing::FakeMessageRouting,
+    self_validating_payload_builder::FakeSelfValidatingPayloadBuilder,
     state_manager::FakeStateManager, xnet_payload_builder::FakeXNetPayloadBuilder,
 };
 use ic_types::{
@@ -135,8 +140,12 @@ struct RcXNetPayloadBuilder {
 pub struct ConsensusDependencies {
     pub(crate) xnet_payload_builder: Arc<dyn XNetPayloadBuilder>,
     pub(crate) ingress_selector: Arc<dyn IngressSelector>,
+    pub(crate) self_validating_payload_builder: Arc<dyn SelfValidatingPayloadBuilder>,
+    pub(crate) canister_http_payload_builder: Arc<dyn CanisterHttpPayloadBuilder>,
     pub consensus_pool: Arc<RwLock<ConsensusPoolImpl>>,
     pub dkg_pool: Arc<RwLock<dkg_pool::DkgPoolImpl>>,
+    pub ecdsa_pool: Arc<RwLock<ecdsa_pool::EcdsaPoolImpl>>,
+    pub canister_http_pool: Arc<RwLock<canister_http_pool::CanisterHttpPoolImpl>>,
     pub message_routing: Arc<dyn MessageRouting>,
     pub state_manager: Arc<dyn StateManager<State = ReplicatedState>>,
     pub replica_config: ReplicaConfig,
@@ -159,21 +168,31 @@ impl ConsensusDependencies {
         let consensus_pool = Arc::new(RwLock::new(ConsensusPoolImpl::new_from_cup_without_bytes(
             replica_config.subnet_id,
             cup,
-            pool_config,
+            pool_config.clone(),
             metrics_registry.clone(),
             no_op_logger(),
         )));
         let dkg_pool = dkg_pool::DkgPoolImpl::new(metrics_registry.clone());
+        let ecdsa_pool =
+            ecdsa_pool::EcdsaPoolImpl::new(pool_config, no_op_logger(), metrics_registry.clone());
+        let canister_http_pool =
+            canister_http_pool::CanisterHttpPoolImpl::new(metrics_registry.clone());
+
         let xnet_payload_builder = FakeXNetPayloadBuilder::new();
+
         ConsensusDependencies {
             registry_client: Arc::clone(&registry_client),
             consensus_pool,
             dkg_pool: Arc::new(RwLock::new(dkg_pool)),
+            ecdsa_pool: Arc::new(RwLock::new(ecdsa_pool)),
+            canister_http_pool: Arc::new(RwLock::new(canister_http_pool)),
             message_routing: Arc::new(FakeMessageRouting::with_state_manager(
                 state_manager.clone(),
             )),
             ingress_selector: Arc::new(FakeIngressSelector::new()),
             xnet_payload_builder: Arc::new(xnet_payload_builder),
+            self_validating_payload_builder: Arc::new(FakeSelfValidatingPayloadBuilder::new()),
+            canister_http_payload_builder: Arc::new(FakeCanisterHttpPayloadBuilder::new()),
             state_manager,
             metrics_registry,
             replica_config,

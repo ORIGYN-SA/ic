@@ -1,0 +1,19 @@
+load("@rules_rust//rust:defs.bzl", "rust_library")
+
+package(default_visibility = ["//visibility:public"])
+
+rust_library(
+    name = "subnet_type",
+    srcs = glob(["src/**"]),
+    crate_name = "ic_registry_subnet_type",
+    proc_macro_deps = [
+        "@crate_index//:strum_macros",
+    ],
+    version = "0.8.0",
+    deps = [
+        "//rs/protobuf",
+        "@crate_index//:candid",
+        "@crate_index//:serde",
+        "@crate_index//:strum",
+    ],
+)

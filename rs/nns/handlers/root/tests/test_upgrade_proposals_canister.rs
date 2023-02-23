@@ -1,14 +1,11 @@
 use candid::Encode;
 use dfn_candid::candid;
 
-use ic_base_types::CanisterInstallMode::Upgrade;
-use ic_nns_handler_root::{
-    common::{
-        CanisterIdRecord, CanisterStatusResult, CanisterStatusType::Running,
-        ChangeNnsCanisterProposalPayload,
-    },
-    init::RootCanisterInitPayloadBuilder,
+use ic_ic00_types::CanisterInstallMode::Upgrade;
+use ic_nervous_system_root::{
+    CanisterIdRecord, CanisterStatusResult, CanisterStatusType::Running, ChangeCanisterProposal,
 };
+use ic_nns_handler_root::init::RootCanisterInitPayloadBuilder;
 use ic_nns_test_utils::itest_helpers::{
     forward_call_via_universal_canister, local_test_on_nns_subnet, set_up_root_canister,
     set_up_universal_canister,
@@ -63,12 +60,9 @@ fn test_upgrade_proposals_canister() {
             .await
             .unwrap();
 
-        let proposal_payload = ChangeNnsCanisterProposalPayload::new(
-            true,
-            Upgrade,
-            fake_proposal_canister.canister_id(),
-        )
-        .with_wasm(STABLE_MEMORY_READER_WASM.clone());
+        let proposal =
+            ChangeCanisterProposal::new(true, Upgrade, fake_proposal_canister.canister_id())
+                .with_wasm(STABLE_MEMORY_READER_WASM.clone());
 
         // The upgrade should work
         assert!(
@@ -76,7 +70,7 @@ fn test_upgrade_proposals_canister() {
                 &fake_proposal_canister,
                 &root,
                 "change_nns_canister",
-                Encode!(&proposal_payload).unwrap(),
+                Encode!(&proposal).unwrap(),
             )
             .await
         );

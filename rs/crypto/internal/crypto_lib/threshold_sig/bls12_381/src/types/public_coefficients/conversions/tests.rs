@@ -4,8 +4,8 @@ use super::super::arbitrary::arbitrary_public_coefficient_bytes;
 use super::*;
 use ic_crypto_internal_types::sign::threshold_sig::public_coefficients::bls12_381::PublicCoefficientsBytes;
 use proptest::prelude::*;
+use rand::SeedableRng;
 use rand_chacha::ChaChaRng;
-use rand_core::SeedableRng;
 
 /// Demonstrates that size error conversion works without panicking
 #[test]
@@ -21,17 +21,16 @@ fn invalid_size_conversion_should_work() {
 /// Verifies that the size of PublicCoefficients is measured correctly
 #[test]
 fn public_coefficients_size_should_be_correct() {
-    let mut rng = ChaChaRng::from_seed([1u8; 32]);
     let mut public_keys = Vec::new();
-    for size in 0 as NodeIndex..10 {
+    for size in 0_u32..10 {
         let public_coefficients = PublicCoefficients {
-            coefficients: public_keys.iter().map(|key| PublicKey(*key)).collect(),
+            coefficients: public_keys.clone(),
         };
         assert_eq!(
             NumberOfNodes::try_from(&public_coefficients).expect("Invalid size"),
             NumberOfNodes::from(size)
         );
-        public_keys.push(G2::random(&mut rng));
+        public_keys.push(PublicKey(G2Projective::generator().clone()));
     }
 }
 
@@ -39,7 +38,7 @@ fn public_coefficients_size_should_be_correct() {
 #[test]
 fn public_coefficients_bytes_size_should_be_correct() {
     let mut public_keys = Vec::new();
-    for size in 0 as NodeIndex..10 {
+    for size in 0_u32..10 {
         let public_coefficients = PublicCoefficientsBytes {
             coefficients: public_keys.clone(),
         };
@@ -58,7 +57,7 @@ fn public_coefficients_bytes_size_should_be_correct() {
 #[test]
 fn public_coefficients_from_polynomial_should_be_correct() {
     let mut rng = ChaChaRng::from_seed([1u8; 32]);
-    for size in 0 as usize..10 {
+    for size in 0_usize..10 {
         let polynomial = Polynomial::random(size, &mut rng);
         let public_coefficients = PublicCoefficients::from(polynomial);
         assert_eq!(size, public_coefficients.coefficients.len());
@@ -67,11 +66,11 @@ fn public_coefficients_from_polynomial_should_be_correct() {
 
 #[test]
 fn public_key_for_public_coefficients_should_be_correct() {
-    let mut test_vectors: Vec<(PublicCoefficients, G2)> = vec![(
+    let mut test_vectors: Vec<(PublicCoefficients, G2Projective)> = vec![(
         PublicCoefficients {
             coefficients: Vec::new(),
         },
-        G2::zero(),
+        G2Projective::identity(),
     )];
     let mut rng = ChaChaRng::from_seed([1u8; 32]);
     for _ in 0..3 {
@@ -92,7 +91,7 @@ fn public_key_for_empty_public_coefficients_should_be_zero() {
         coefficients: Vec::new(),
     };
     let public_key = PublicKey::from(&public_coefficients);
-    assert_eq!(G2::zero(), public_key.0);
+    assert_eq!(G2Projective::identity(), public_key.0);
 }
 
 /// Verifies that the public key for non-empty public coefficients is the first
@@ -132,7 +131,7 @@ fn public_key_from_empty_public_coefficients_bytes_should_be_zero() {
     };
     assert_eq!(
         PublicKey::try_from(&public_coefficients_bytes),
-        Ok(PublicKey(G2::zero()))
+        Ok(PublicKey(G2Projective::identity()))
     );
 }
 
@@ -187,9 +186,9 @@ fn test_stringifying_and_parsing_public_coefficients_should_produce_original(
 /// error
 #[test]
 fn test_parsing_invalid_public_coefficients_string_should_produce_error() {
-    let string = "base 64 has no spaces".to_string();
-    let parsed = PublicCoefficientsBytes::try_from(string.as_str());
-    assert!(parsed.is_err(), string);
+    let string = "base 64 has no spaces";
+    let parsed = PublicCoefficientsBytes::try_from(string);
+    assert!(parsed.is_err(), "{}", string);
 }
 
 proptest! {

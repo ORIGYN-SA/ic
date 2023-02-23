@@ -1,56 +1,59 @@
 use ic_config::execution_environment::Config;
-use ic_execution_environment::{HttpQueryHandlerImpl, Hypervisor};
-use ic_interfaces::execution_environment::QueryHandler;
+use ic_config::subnet_config::SubnetConfigs;
+use ic_error_types::ErrorCode;
+use ic_execution_environment::ExecutionServices;
 use ic_metrics::MetricsRegistry;
 use ic_registry_routing_table::{CanisterIdRange, RoutingTable};
 use ic_registry_subnet_type::SubnetType;
+use ic_replicated_state::page_map::TestPageAllocatorFileDescriptorImpl;
 use ic_replicated_state::ReplicatedState;
 use ic_test_utilities::{
     cycles_account_manager::CyclesAccountManagerBuilder,
+    state_manager::FakeStateManager,
     types::ids::{subnet_test_id, user_test_id},
-    with_test_replica_logger,
 };
-use ic_types::{messages::UserQuery, user_error::ErrorCode, CanisterId, NumBytes, SubnetId};
+use ic_test_utilities_logger::with_test_replica_logger;
+use ic_types::{messages::UserQuery, CanisterId, SubnetId};
 use maplit::btreemap;
-use std::{path::Path, sync::Arc};
+use std::{convert::TryFrom, sync::Arc};
 
-fn initial_state(path: &Path, subnet_id: SubnetId) -> ReplicatedState {
-    let routing_table = RoutingTable::new(btreemap! {
-        CanisterIdRange{ start: CanisterId::from(0), end: CanisterId::from(0xff) } => subnet_id,
-    });
-    let mut state =
-        ReplicatedState::new_rooted_at(subnet_id, SubnetType::Application, path.to_path_buf());
+fn initial_state(subnet_id: SubnetId) -> ReplicatedState {
+    let routing_table = Arc::new(
+        RoutingTable::try_from(btreemap! {
+            CanisterIdRange{ start: CanisterId::from(0), end: CanisterId::from(0xff) } => subnet_id,
+        })
+        .unwrap(),
+    );
+    let mut state = ReplicatedState::new(subnet_id, SubnetType::Application);
     state.metadata.network_topology.routing_table = routing_table;
     state
 }
 
-#[test]
-fn query_non_existent() {
+#[tokio::test]
+async fn query_non_existent() {
     with_test_replica_logger(|log| {
         let subnet_id = subnet_test_id(1);
         let subnet_type = SubnetType::Application;
-        let tmpdir = tempfile::Builder::new().prefix("test").tempdir().unwrap();
-        let state = initial_state(tmpdir.path(), subnet_id);
+        let subnet_config = SubnetConfigs::default().own_subnet_config(subnet_type);
+        let state = initial_state(subnet_id);
         let metrics_registry = MetricsRegistry::new();
         let cycles_account_manager = Arc::new(CyclesAccountManagerBuilder::new().build());
-        let hypervisor = Hypervisor::new(
-            Config::default(),
-            1,
+        let state_manager = Arc::new(FakeStateManager::new());
+
+        let execution_services = ExecutionServices::setup_execution(
+            log,
             &metrics_registry,
             subnet_id,
             subnet_type,
-            log.clone(),
+            subnet_config.scheduler_config,
+            Config::default(),
             cycles_account_manager,
+            state_manager,
+            Arc::new(TestPageAllocatorFileDescriptorImpl::new()),
         );
+
         let receiver = CanisterId::from(1234);
-        let query_handler = HttpQueryHandlerImpl::new(
-            log,
-            Arc::new(hypervisor),
-            subnet_id,
-            subnet_type,
-            NumBytes::from(std::u64::MAX),
-        );
-        match query_handler.query(
+        match execution_services.sync_query_handler.query(
             UserQuery {
                 source: user_test_id(2),
                 receiver,

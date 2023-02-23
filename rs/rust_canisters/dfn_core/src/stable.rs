@@ -14,6 +14,26 @@ const PAGE_SIZE: f64 = 64.0 * 1024.0;
 
 const LENGTH_BYTES: u32 = 4;
 
+pub fn stable64_size() -> u64 {
+    unsafe { ic0::stable64_size() }
+}
+
+pub fn stable64_grow(additional_pages: u64) -> i64 {
+    unsafe { ic0::stable64_grow(additional_pages) }
+}
+
+pub fn stable64_write(offset: u64, data: &[u8]) {
+    unsafe {
+        ic0::stable64_write(offset, data.as_ptr() as u64, data.len() as u64);
+    }
+}
+
+pub fn stable64_read(buf: &mut [u8], offset: u64, size: u64) {
+    unsafe {
+        ic0::stable64_read(buf.as_mut_ptr() as u64, offset, size);
+    }
+}
+
 /// Sets the contents of the stable memory
 pub fn set(content: &[u8]) {
     let len: u32 = content.len() as u32;
@@ -61,18 +81,15 @@ pub fn write(content: &[u8], offset: u32) {
 /// Gets the contents of the stable memory
 pub fn get() -> Vec<u8> {
     let len = length();
-    let mut out: Vec<u8> = vec![0; len as usize];
-    unsafe {
-        ic0::stable_read(out.as_mut_ptr() as u32, LENGTH_BYTES, len as u32);
-    }
-    out
+    read(0, len)
 }
 
 /// Reads `len` bytes from `offset` in stable memory
 pub fn read(offset: u32, len: u32) -> Vec<u8> {
-    let mut out: Vec<u8> = vec![0; len as usize];
+    let mut out: Vec<u8> = Vec::with_capacity(len as usize);
     unsafe {
         ic0::stable_read(out.as_mut_ptr() as u32, LENGTH_BYTES + offset, len);
+        out.set_len(len as usize);
     }
     out
 }
@@ -85,7 +102,8 @@ pub fn length() -> u32 {
     u32::from_le_bytes(len_bytes)
 }
 
-fn set_length(len: u32) {
+pub fn set_length(len: u32) {
+    ensure_capacity(LENGTH_BYTES);
     let len_bytes = len.to_le_bytes();
     unsafe { ic0::stable_write(0, len_bytes.as_ptr() as u32, LENGTH_BYTES) }
 }

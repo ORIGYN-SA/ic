@@ -1,12 +1,12 @@
 use crate::pb::v1::{AccountState, Gtc};
-use ic_crypto_sha256::Sha256;
+use ic_crypto_sha::Sha256;
 use ic_nns_common::pb::v1::NeuronId;
 use ic_nns_constants::GENESIS_TOKEN_CANISTER_ID;
 use ic_nns_governance::pb::v1::neuron::DissolveState;
 use ic_nns_governance::pb::v1::Neuron;
-use ledger_canister::ICPTs;
+use icp_ledger::Tokens;
 use rand::rngs::StdRng;
-use rand_core::{RngCore, SeedableRng};
+use rand::{RngCore, SeedableRng};
 use std::collections::HashMap;
 use std::time::SystemTime;
 
@@ -33,7 +33,7 @@ impl From<&Vec<Neuron>> for AccountState {
             .map(|neuron| neuron.cached_neuron_stake_e8s)
             .sum();
 
-        let icpts = ICPTs::from_e8s(e8s).get_icpts() as u32;
+        let icpts = Tokens::from_e8s(e8s).get_tokens() as u32;
 
         AccountState {
             neuron_ids,
@@ -49,7 +49,8 @@ pub struct GenesisTokenCanisterInitPayloadBuilder {
     pub total_alloc: u32,
     pub genesis_timestamp_seconds: u64,
     pub donate_account_recipient_neuron_id: Option<NeuronId>,
-    pub forward_all_unclaimed_accounts_recipient_neuron_id: Option<NeuronId>,
+    pub forward_whitelisted_unclaimed_accounts_recipient_neuron_id: Option<NeuronId>,
+    pub forward_unclaimed_accounts_whitelist: Vec<String>,
     pub sr_months_to_release: Option<u8>,
     pub ect_months_to_release: Option<u8>,
     pub rng: Option<StdRng>,
@@ -78,7 +79,7 @@ impl GenesisTokenCanisterInitPayloadBuilder {
 
         for (address, icpts) in sr_accounts.iter() {
             self.total_alloc += *icpts;
-            let icpts = ICPTs::from_icpts(*icpts as u64).unwrap();
+            let icpts = Tokens::from_tokens(*icpts as u64).unwrap();
             let sr_stakes = evenly_split_e8s(icpts.get_e8s(), sr_months_to_release);
             let aging_since_timestamp_seconds = self.aging_since_timestamp_seconds;
             let mut sr_neurons = make_neurons(
@@ -103,7 +104,7 @@ impl GenesisTokenCanisterInitPayloadBuilder {
 
         for (address, icpts) in ect_accounts.iter() {
             self.total_alloc += *icpts;
-            let icpts = ICPTs::from_icpts(*icpts as u64).unwrap();
+            let icpts = Tokens::from_tokens(*icpts as u64).unwrap();
             let ect_stakes = evenly_split_e8s(icpts.get_e8s(), ect_months_to_release);
             let aging_since_timestamp_seconds = self.aging_since_timestamp_seconds;
             let mut ect_neurons = make_neurons(
@@ -115,6 +116,13 @@ impl GenesisTokenCanisterInitPayloadBuilder {
             );
             let entry = self.gtc_neurons.entry(address.to_string()).or_default();
             entry.append(&mut ect_neurons);
+        }
+    }
+
+    pub fn add_forward_whitelist(&mut self, forward_whitelist: &[&str]) {
+        for address in forward_whitelist {
+            self.forward_unclaimed_accounts_whitelist
+                .push(address.to_string());
         }
     }
 
@@ -172,9 +180,10 @@ impl GenesisTokenCanisterInitPayloadBuilder {
             total_alloc: self.total_alloc,
             genesis_timestamp_seconds: self.genesis_timestamp_seconds,
             donate_account_recipient_neuron_id: self.donate_account_recipient_neuron_id.clone(),
-            forward_all_unclaimed_accounts_recipient_neuron_id: self
-                .forward_all_unclaimed_accounts_recipient_neuron_id
+            forward_whitelisted_unclaimed_accounts_recipient_neuron_id: self
+                .forward_whitelisted_unclaimed_accounts_recipient_neuron_id
                 .clone(),
+            whitelisted_accounts_to_forward: self.forward_unclaimed_accounts_whitelist.clone(),
         }
     }
 }
@@ -277,7 +286,7 @@ mod tests {
 
     #[test]
     fn test_evenly_split_e8s_over_12_months() {
-        let e8s = ICPTs::from_icpts(1000).unwrap().get_e8s();
+        let e8s = Tokens::from_tokens(1000).unwrap().get_e8s();
         let e8s1 = 8_333_333_333;
         let e8s2 = 8_333_333_337;
 
@@ -290,7 +299,7 @@ mod tests {
 
     #[test]
     fn test_evenly_split_e8s_over_48_months() {
-        let e8s = ICPTs::from_icpts(1000).unwrap().get_e8s();
+        let e8s = Tokens::from_tokens(1000).unwrap().get_e8s();
         let e8s1 = 2_083_333_333;
         let e8s2 = 2_083_333_349;
 

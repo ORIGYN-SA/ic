@@ -1,3 +1,5 @@
+#![allow(dead_code)]
+
 use super::types::*;
 use ic_logger::trace;
 use rand::seq::SliceRandom;
@@ -84,7 +86,7 @@ impl DeliveryStrategy for RandomReceive {
                 for other in instances.iter() {
                     if other.deps.replica_config.node_id != instance.deps.replica_config.node_id {
                         let mut in_queue = other.in_queue.borrow_mut();
-                        let delay = rng.gen_range(UNIT_TIME_STEP, self.max_delta);
+                        let delay = rng.gen_range(UNIT_TIME_STEP..self.max_delta);
                         let msg = Message {
                             message: x.message.clone(),
                             timestamp: x.timestamp + Duration::from_millis(delay),
@@ -198,7 +200,7 @@ fn random_graph<T: Rng>(num_nodes: usize, degree: usize, rng: &mut T) -> Vec<Vec
 
 /// Floyd–Warshall algorithm that computes the distance between all pairs of
 /// nodes. Return max distance (or diameter) if successful, or None otherwise.
-fn distance_vector(distances: &mut Vec<Vec<usize>>) -> Option<usize> {
+fn distance_vector(distances: &mut [Vec<usize>]) -> Option<usize> {
     let n = distances.len();
     for k in 0..n {
         for i in 0..n {

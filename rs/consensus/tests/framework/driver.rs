@@ -44,11 +44,11 @@ impl<'a> ConsensusDriver<'a> {
             consensus,
             dkg,
             certifier,
-            consensus_pool,
             logger,
+            consensus_pool,
+            certification_pool,
             ingress_pool,
             dkg_pool,
-            certification_pool,
         }
     }
 
@@ -60,10 +60,9 @@ impl<'a> ConsensusDriver<'a> {
     pub fn step(&self, time_source: &dyn TimeSource) -> Vec<InputMessage> {
         let mut to_deliver = Vec::new();
         loop {
-            let changeset = self.consensus.on_state_change(
-                &*self.consensus_pool.read().unwrap(),
-                &*self.ingress_pool.borrow(),
-            );
+            let changeset = self
+                .consensus
+                .on_state_change(&*self.consensus_pool.read().unwrap());
             if changeset.is_empty() {
                 break;
             }

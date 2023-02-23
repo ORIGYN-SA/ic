@@ -1,0 +1,10 @@
+(module
+  (import "ic0" "msg_cycles_available" (func (result i64)))
+  (import "ic0" "msg_cycles_accept" (func (param i64) (result i64)))
+  (memory (data "hi"))
+  (type (func (param i32)))
+  (start $foo)
+  (table 0 1 anyfunc)
+  (func $foo)
+  (func (drop (i32.const 42)))
+  (export "e" (func 1)))

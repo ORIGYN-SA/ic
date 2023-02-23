@@ -1,0 +1,31 @@
+load("@rules_rust//rust:defs.bzl", "rust_library")
+
+package(default_visibility = [
+    "//rs/p2p:__subpackages__",
+    "//rs/replica:__subpackages__",
+])
+
+rust_library(
+    name = "client",
+    srcs = glob(["src/**"]),
+    crate_name = "ic_btc_adapter_client",
+    version = "0.1.0",
+    deps = [
+        "//rs/async_utils",
+        "//rs/bitcoin/service",
+        "//rs/bitcoin/types/internal",
+        "//rs/config",
+        "//rs/interfaces/bitcoin_adapter_client",
+        "//rs/monitoring/adapter_metrics",
+        "//rs/monitoring/logger",
+        "//rs/monitoring/metrics",
+        "@crate_index//:bitcoin",
+        "@crate_index//:prometheus",
+        "@crate_index//:serde",
+        "@crate_index//:serde_bytes",
+        "@crate_index//:slog",
+        "@crate_index//:tokio",
+        "@crate_index//:tonic",
+        "@crate_index//:tower",
+    ],
+)

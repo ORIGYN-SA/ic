@@ -2,11 +2,11 @@ use super::*;
 use ic_crypto_internal_basic_sig_iccsa as iccsa;
 use ic_crypto_internal_basic_sig_iccsa::types::PublicKeyBytes;
 use ic_crypto_internal_basic_sig_iccsa::types::SignatureBytes;
-use ic_registry_client::client::ThresholdSigPublicKey;
-use ic_registry_client::helper::{crypto::CryptoRegistry, subnet::SubnetRegistry};
+use ic_registry_client_helpers::{crypto::CryptoRegistry, subnet::SubnetRegistry};
+use ic_types::crypto::threshold_sig::ThresholdSigPublicKey;
 
 pub fn verify_canister_sig<S: Signable>(
-    registry: Arc<dyn RegistryClient>,
+    registry: &dyn RegistryClient,
     signature: &CanisterSigOf<S>,
     message: &S,
     user_public_key: &UserPublicKey,
@@ -33,7 +33,7 @@ fn ensure_correct_algorithm_id(algorithm_id: AlgorithmId) -> CryptoResult<()> {
 }
 
 fn get_root_subnet_pubkey(
-    registry: Arc<dyn RegistryClient>,
+    registry: &dyn RegistryClient,
     registry_version: RegistryVersion,
 ) -> CryptoResult<ThresholdSigPublicKey> {
     let root_subnet_id = registry

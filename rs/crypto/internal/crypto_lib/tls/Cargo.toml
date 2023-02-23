@@ -1,13 +1,22 @@
 [package]
 name = "ic-crypto-internal-tls"
 version = "0.8.0"
-edition = "2018"
+edition = "2021"
 
 [dependencies]
+base64 = "0.11.0"
+ic-crypto-internal-basic-sig-ed25519 = { path = "../basic_sig/ed25519" }
+ic-crypto-secrets-containers = { path = "../../../secrets_containers" }
 ic-types = { path = "../../../../types/types" }
 openssl = "0.10.29"
+rand = "0.8"
 serde = { version = "1.0.99", features = [ "derive" ] }
 serde_bytes = "0.11"
-zeroize = { version = "1.1.0", features = ["zeroize_derive"] }
+zeroize = { version = "1.4.3", features = ["zeroize_derive"] }
 
 [dev-dependencies]
+assert_matches = "1.5.0"
+ic-crypto-test-utils = { path = "../../../test_utils" }
+ic-crypto-test-utils-reproducible-rng = { path = "../../../test_utils/reproducible_rng" }
+serde_cbor = "0.11.1"
+hex = "0.4"

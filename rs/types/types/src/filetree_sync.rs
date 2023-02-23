@@ -5,7 +5,6 @@ use crate::{
     chunkable::{
         ArtifactChunk, ArtifactChunkData, ArtifactErrorCode, ChunkId, Chunkable, ChunkableArtifact,
     },
-    crypto::CryptoHash,
 };
 use bincode::{deserialize, serialize};
 use serde::{Deserialize, Serialize};
@@ -107,11 +106,6 @@ impl Default for FileTreeSyncChunksTracker {
 const CHUNK_PREFIX: &str = "Chunk";
 
 impl Chunkable for FileTreeSyncChunksTracker {
-    fn get_artifact_hash(&self) -> CryptoHash {
-        // The hash should be the merkle root. Pending implementation
-        unimplemented!();
-    }
-
     fn chunks_to_download(&self) -> Box<dyn Iterator<Item = ChunkId>> {
         let v = match self.state {
             UnderConstructionState::WaitForManifest => {
@@ -127,10 +121,6 @@ impl Chunkable for FileTreeSyncChunksTracker {
             }
         };
         Box::new(v.into_iter())
-    }
-
-    fn get_artifact_identifier(&self) -> CryptoHash {
-        unimplemented!();
     }
 
     fn add_chunk(&mut self, artifact_chunk: ArtifactChunk) -> Result<Artifact, ArtifactErrorCode> {
@@ -168,11 +158,7 @@ impl Chunkable for FileTreeSyncChunksTracker {
 
         println!("Received Chunk {}", artifact_chunk.chunk_id);
         let mut chunk_path_buf = self.absolute_path.clone();
-        chunk_path_buf.push(format!(
-            "{}{}",
-            CHUNK_PREFIX,
-            artifact_chunk.chunk_id.to_string()
-        ));
+        chunk_path_buf.push(format!("{}{}", CHUNK_PREFIX, artifact_chunk.chunk_id));
         std::fs::File::create(chunk_path_buf.as_path())
             .map_err(|_| ArtifactErrorCode::ChunksMoreNeeded)?;
 
@@ -186,13 +172,5 @@ impl Chunkable for FileTreeSyncChunksTracker {
             id: Default::default(),
             absolute_path: self.absolute_path.clone(),
         }))
-    }
-
-    fn is_complete(&self) -> bool {
-        false
-    }
-
-    fn get_chunk_size(&self, _chunk_id: ChunkId) -> usize {
-        0
     }
 }

@@ -1,17 +1,20 @@
 use canister_test::*;
 use dfn_candid::candid;
-use on_wire::BytesS;
 
-#[ignore]
 #[test]
 fn candid_test() {
-    local_test_e(|r| async move {
-        let proj = Project::new(env!("CARGO_MANIFEST_DIR"));
+    local_test_e(|runtime| async move {
+        let mut canister = runtime
+            .create_canister_max_cycles_with_retries()
+            .await
+            .unwrap();
 
-        let canister = proj
-            .cargo_bin("wasm")
-            .install_(&r, BytesS(Vec::new()))
-            .await?;
+        let wasm = Project::cargo_bin_maybe_from_env("candid-test-canister", &[]);
+
+        let install = wasm
+            .install(&runtime)
+            .with_mode(CanisterInstallMode::Install);
+        install.install(&mut canister, Vec::new()).await.unwrap();
 
         let inp: (&str, u16) = ("David", 28);
         let res: String = canister.query_("greeting", candid, inp).await?;

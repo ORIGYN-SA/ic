@@ -1,36 +1,57 @@
 //! Data types used for encoding/decoding the Candid payloads of ic:00.
+mod http;
+mod provisional;
+
 use candid::{CandidType, Decode, Deserialize, Encode};
-use ic_base_types::{
-    CanisterId, CanisterInstallMode, CanisterStatusType, NodeId, NumBytes, PrincipalId,
-    RegistryVersion, SubnetId,
-};
+use ic_base_types::{CanisterId, NodeId, NumBytes, PrincipalId, RegistryVersion, SubnetId};
 use ic_error_types::{ErrorCode, UserError};
 use ic_protobuf::registry::crypto::v1::PublicKey;
-use ic_protobuf::registry::subnet::v1::InitialNiDkgTranscriptRecord;
+use ic_protobuf::registry::subnet::v1::{InitialIDkgDealings, InitialNiDkgTranscriptRecord};
+use ic_protobuf::{proxy::ProxyDecodeError, registry::crypto::v1 as pb_registry_crypto};
 use num_traits::cast::ToPrimitive;
-use std::{collections::BTreeSet, convert::TryFrom};
-use strum_macros::{EnumIter, EnumString, ToString};
+use serde::Serialize;
+use std::{collections::BTreeSet, convert::TryFrom, fmt, slice::Iter, str::FromStr};
+use strum_macros::{Display, EnumIter, EnumString};
 
 /// The id of the management canister.
 pub const IC_00: CanisterId = CanisterId::ic_00();
+pub const MAX_CONTROLLERS: usize = 10;
+pub use http::{
+    CanisterHttpRequestArgs, CanisterHttpResponsePayload, HttpHeader, HttpMethod, TransformArgs,
+    TransformContext, TransformFunc,
+};
+pub use provisional::{ProvisionalCreateCanisterWithCyclesArgs, ProvisionalTopUpCanisterArgs};
 
 /// Methods exported by ic:00.
-#[derive(Debug, EnumString, EnumIter, ToString, Copy, Clone)]
+#[derive(Debug, EnumString, EnumIter, Display, Copy, Clone)]
 #[strum(serialize_all = "snake_case")]
 pub enum Method {
     CanisterStatus,
     CreateCanister,
     DeleteCanister,
     DepositCycles,
-    DepositFunds,
+    HttpRequest,
+    ECDSAPublicKey,
     InstallCode,
     RawRand,
+    // SetController is deprecated and should not be used in new code
     SetController,
     SetupInitialDKG,
+    SignWithECDSA,
     StartCanister,
     StopCanister,
     UninstallCode,
     UpdateSettings,
+    ComputeInitialEcdsaDealings,
+
+    // Bitcoin Interface.
+    BitcoinGetBalance,
+    BitcoinGetUtxos,
+    BitcoinSendTransaction,
+    BitcoinGetCurrentFeePercentiles,
+    // Private APIs used exclusively by the bitcoin canisters.
+    BitcoinSendTransactionInternal, // API for sending transactions to the network.
+    BitcoinGetSuccessors,           // API for fetching blocks from the network.
 
     // These methods are added for the Mercury I release.
     // They should be removed afterwards.
@@ -52,7 +73,7 @@ pub trait Payload<'a>: Sized + CandidType + Deserialize<'a> {
 }
 
 /// Struct used for encoding/decoding `(record {canister_id})`.
-#[derive(CandidType, Deserialize, Debug)]
+#[derive(CandidType, Serialize, Deserialize, Debug)]
 pub struct CanisterIdRecord {
     canister_id: PrincipalId,
 }
@@ -74,6 +95,33 @@ impl From<CanisterId> for CanisterIdRecord {
     }
 }
 
+/// Struct used for encoding/decoding `(record {canister_id: canister_id, sender_canister_version: opt nat64})`.
+#[derive(CandidType, Serialize, Deserialize, Debug)]
+pub struct UninstallCodeArgs {
+    canister_id: PrincipalId,
+    sender_canister_version: Option<u64>,
+}
+
+impl UninstallCodeArgs {
+    pub fn new(canister_id: CanisterId, sender_canister_version: Option<u64>) -> Self {
+        Self {
+            canister_id: canister_id.into(),
+            sender_canister_version,
+        }
+    }
+
+    pub fn get_canister_id(&self) -> CanisterId {
+        // Safe as this was converted from CanisterId when Self was constructed.
+        CanisterId::new(self.canister_id).unwrap()
+    }
+
+    pub fn get_sender_canister_version(&self) -> Option<u64> {
+        self.sender_canister_version
+    }
+}
+
+impl Payload<'_> for UninstallCodeArgs {}
+
 /// Struct used for encoding/decoding
 /// `(record {
 ///     controller : principal;
@@ -83,6 +131,7 @@ impl From<CanisterId> for CanisterIdRecord {
 #[derive(CandidType, Deserialize, Debug, Eq, PartialEq)]
 pub struct DefiniteCanisterSettingsArgs {
     controller: PrincipalId,
+    controllers: Vec<PrincipalId>,
     compute_allocation: candid::Nat,
     memory_allocation: candid::Nat,
     freezing_threshold: candid::Nat,
@@ -91,6 +140,7 @@ pub struct DefiniteCanisterSettingsArgs {
 impl DefiniteCanisterSettingsArgs {
     pub fn new(
         controller: PrincipalId,
+        controllers: Vec<PrincipalId>,
         compute_allocation: u64,
         memory_allocation: Option<u64>,
         freezing_threshold: u64,
@@ -101,10 +151,15 @@ impl DefiniteCanisterSettingsArgs {
         };
         Self {
             controller,
+            controllers,
             compute_allocation: candid::Nat::from(compute_allocation),
             memory_allocation,
             freezing_threshold: candid::Nat::from(freezing_threshold),
         }
+    }
+
+    pub fn controllers(&self) -> Vec<PrincipalId> {
+        self.controllers.clone()
     }
 }
 
@@ -174,6 +229,7 @@ impl Payload<'_> for CanisterStatusResult {}
 ///     controller: principal;
 ///     memory_size: nat;
 ///     cycles: nat;
+///     idle_cycles_burned_per_day: nat;
 /// })`
 #[derive(CandidType, Debug, Deserialize, Eq, PartialEq)]
 pub struct CanisterStatusResultV2 {
@@ -186,6 +242,7 @@ pub struct CanisterStatusResultV2 {
     // this is for compat with Spec 0.12/0.13
     balance: Vec<(Vec<u8>, candid::Nat)>,
     freezing_threshold: candid::Nat,
+    idle_cycles_burned_per_day: candid::Nat,
 }
 
 impl CanisterStatusResultV2 {
@@ -194,11 +251,13 @@ impl CanisterStatusResultV2 {
         status: CanisterStatusType,
         module_hash: Option<Vec<u8>>,
         controller: PrincipalId,
+        controllers: Vec<PrincipalId>,
         memory_size: NumBytes,
         cycles: u128,
         compute_allocation: u64,
         memory_allocation: Option<u64>,
         freezing_threshold: u64,
+        idle_cycles_burned_per_day: u128,
     ) -> Self {
         Self {
             status,
@@ -211,11 +270,13 @@ impl CanisterStatusResultV2 {
             balance: vec![(vec![0], candid::Nat::from(cycles))],
             settings: DefiniteCanisterSettingsArgs::new(
                 controller,
+                controllers,
                 compute_allocation,
                 memory_allocation,
                 freezing_threshold,
             ),
             freezing_threshold: candid::Nat::from(freezing_threshold),
+            idle_cycles_burned_per_day: candid::Nat::from(idle_cycles_burned_per_day),
         }
     }
 
@@ -231,6 +292,10 @@ impl CanisterStatusResultV2 {
         PrincipalId::try_from(self.controller.as_slice()).unwrap()
     }
 
+    pub fn controllers(&self) -> Vec<PrincipalId> {
+        self.settings.controllers()
+    }
+
     pub fn memory_size(&self) -> NumBytes {
         NumBytes::from(self.memory_size.0.to_u64().unwrap())
     }
@@ -241,6 +306,100 @@ impl CanisterStatusResultV2 {
 
     pub fn freezing_threshold(&self) -> u64 {
         self.freezing_threshold.0.to_u64().unwrap()
+    }
+
+    pub fn idle_cycles_burned_per_day(&self) -> u128 {
+        self.idle_cycles_burned_per_day.0.to_u128().unwrap()
+    }
+}
+
+/// Indicates whether the canister is running, stopping, or stopped.
+///
+/// Unlike `CanisterStatus`, it contains no additional metadata.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize, CandidType)]
+pub enum CanisterStatusType {
+    #[serde(rename = "running")]
+    Running,
+    #[serde(rename = "stopping")]
+    Stopping,
+    #[serde(rename = "stopped")]
+    Stopped,
+}
+
+/// These strings are used to generate metrics -- changing any existing entries
+/// will invalidate monitoring dashboards.
+impl fmt::Display for CanisterStatusType {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            CanisterStatusType::Running => write!(f, "running"),
+            CanisterStatusType::Stopping => write!(f, "stopping"),
+            CanisterStatusType::Stopped => write!(f, "stopped"),
+        }
+    }
+}
+
+/// The mode with which a canister is installed.
+#[derive(
+    Clone, Debug, Deserialize, PartialEq, Serialize, Eq, EnumString, Hash, CandidType, Copy,
+)]
+pub enum CanisterInstallMode {
+    /// A fresh install of a new canister.
+    #[serde(rename = "install")]
+    #[strum(serialize = "install")]
+    Install,
+    /// Reinstalling a canister that was already installed.
+    #[serde(rename = "reinstall")]
+    #[strum(serialize = "reinstall")]
+    Reinstall,
+    /// Upgrade an existing canister.
+    #[serde(rename = "upgrade")]
+    #[strum(serialize = "upgrade")]
+    Upgrade,
+}
+
+impl Default for CanisterInstallMode {
+    fn default() -> Self {
+        CanisterInstallMode::Install
+    }
+}
+
+impl CanisterInstallMode {
+    pub fn iter() -> Iter<'static, CanisterInstallMode> {
+        static MODES: [CanisterInstallMode; 3] = [
+            CanisterInstallMode::Install,
+            CanisterInstallMode::Reinstall,
+            CanisterInstallMode::Upgrade,
+        ];
+        MODES.iter()
+    }
+}
+
+/// A type to represent an error that can occur when installing a canister.
+#[derive(Debug)]
+pub struct CanisterInstallModeError(pub String);
+
+impl TryFrom<String> for CanisterInstallMode {
+    type Error = CanisterInstallModeError;
+
+    fn try_from(mode: String) -> Result<Self, Self::Error> {
+        let mode = mode.as_str();
+        match mode {
+            "install" => Ok(CanisterInstallMode::Install),
+            "reinstall" => Ok(CanisterInstallMode::Reinstall),
+            "upgrade" => Ok(CanisterInstallMode::Upgrade),
+            _ => Err(CanisterInstallModeError(mode.to_string())),
+        }
+    }
+}
+
+impl From<CanisterInstallMode> for String {
+    fn from(mode: CanisterInstallMode) -> Self {
+        let res = match mode {
+            CanisterInstallMode::Install => "install",
+            CanisterInstallMode::Reinstall => "reinstall",
+            CanisterInstallMode::Upgrade => "upgrade",
+        };
+        res.to_string()
     }
 }
 
@@ -266,6 +425,7 @@ pub struct InstallCodeArgs {
     pub compute_allocation: Option<candid::Nat>,
     pub memory_allocation: Option<candid::Nat>,
     pub query_allocation: Option<candid::Nat>,
+    pub sender_canister_version: Option<u64>,
 }
 
 impl std::fmt::Display for InstallCodeArgs {
@@ -323,6 +483,7 @@ impl InstallCodeArgs {
             compute_allocation: compute_allocation.map(candid::Nat::from),
             memory_allocation: memory_allocation.map(candid::Nat::from),
             query_allocation: query_allocation.map(candid::Nat::from),
+            sender_canister_version: None,
         }
     }
 
@@ -330,20 +491,23 @@ impl InstallCodeArgs {
         // Safe as this was converted from CanisterId when Self was constructed.
         CanisterId::new(self.canister_id).unwrap()
     }
+
+    pub fn get_sender_canister_version(&self) -> Option<u64> {
+        self.sender_canister_version
+    }
 }
 
 /// Represents the empty blob.
 #[derive(CandidType, Deserialize)]
 pub struct EmptyBlob;
 
-// TODO(EXC-239): Implement the `Payload` interface.
-impl EmptyBlob {
-    pub fn encode() -> Vec<u8> {
+impl<'a> Payload<'a> for EmptyBlob {
+    fn encode(&self) -> Vec<u8> {
         Encode!().unwrap()
     }
 
-    pub fn decode(blob: &[u8]) -> Result<(), candid::Error> {
-        Decode!(blob)
+    fn decode(blob: &'a [u8]) -> Result<EmptyBlob, candid::Error> {
+        Decode!(blob).map(|_| EmptyBlob)
     }
 }
 
@@ -356,12 +520,25 @@ impl EmptyBlob {
 pub struct UpdateSettingsArgs {
     pub canister_id: PrincipalId,
     pub settings: CanisterSettingsArgs,
+    pub sender_canister_version: Option<u64>,
 }
 
 impl UpdateSettingsArgs {
+    pub fn new(canister_id: CanisterId, settings: CanisterSettingsArgs) -> Self {
+        Self {
+            canister_id: canister_id.into(),
+            settings,
+            sender_canister_version: None,
+        }
+    }
+
     pub fn get_canister_id(&self) -> CanisterId {
         // Safe as this was converted from CanisterId when Self was constructed.
         CanisterId::new(self.canister_id).unwrap()
+    }
+
+    pub fn get_sender_canister_version(&self) -> Option<u64> {
+        self.sender_canister_version
     }
 }
 
@@ -369,19 +546,43 @@ impl Payload<'_> for UpdateSettingsArgs {}
 
 /// Struct used for encoding/decoding
 /// `(record {
-///     controller : opt principal;
+///     controller: opt principal;
+///     controllers: opt vec principal;
 ///     compute_allocation: opt nat;
 ///     memory_allocation: opt nat;
 /// })`
 #[derive(Default, Clone, CandidType, Deserialize, Debug)]
 pub struct CanisterSettingsArgs {
-    pub controller: Option<PrincipalId>,
+    /// The field controller is deprecated and should not be used in new code.
+    controller: Option<PrincipalId>,
+    pub controllers: Option<Vec<PrincipalId>>,
     pub compute_allocation: Option<candid::Nat>,
     pub memory_allocation: Option<candid::Nat>,
     pub freezing_threshold: Option<candid::Nat>,
 }
 
 impl Payload<'_> for CanisterSettingsArgs {}
+
+impl CanisterSettingsArgs {
+    pub fn new(
+        controllers: Option<Vec<PrincipalId>>,
+        compute_allocation: Option<u64>,
+        memory_allocation: Option<u64>,
+        freezing_threshold: Option<u64>,
+    ) -> Self {
+        Self {
+            controller: None,
+            controllers,
+            compute_allocation: compute_allocation.map(candid::Nat::from),
+            memory_allocation: memory_allocation.map(candid::Nat::from),
+            freezing_threshold: freezing_threshold.map(candid::Nat::from),
+        }
+    }
+
+    pub fn get_controller(&self) -> Option<PrincipalId> {
+        self.controller
+    }
+}
 
 /// Struct used for encoding/decoding
 /// `(record {
@@ -390,6 +591,7 @@ impl Payload<'_> for CanisterSettingsArgs {}
 #[derive(Default, Clone, CandidType, Deserialize)]
 pub struct CreateCanisterArgs {
     pub settings: Option<CanisterSettingsArgs>,
+    pub sender_canister_version: Option<u64>,
 }
 
 impl CreateCanisterArgs {
@@ -410,8 +612,13 @@ impl CreateCanisterArgs {
             Ok(settings) => Ok(settings),
         }
     }
+
+    pub fn get_sender_canister_version(&self) -> Option<u64> {
+        self.sender_canister_version
+    }
 }
 
+/// This API is deprecated and should not be used in new code.
 /// Struct used for encoding/decoding
 /// `(record {
 ///     canister_id : principal;
@@ -421,16 +628,10 @@ impl CreateCanisterArgs {
 pub struct SetControllerArgs {
     canister_id: PrincipalId,
     new_controller: PrincipalId,
+    sender_canister_version: Option<u64>,
 }
 
 impl SetControllerArgs {
-    pub fn new(canister_id: CanisterId, controller: PrincipalId) -> Self {
-        Self {
-            canister_id: canister_id.into(),
-            new_controller: controller,
-        }
-    }
-
     pub fn get_canister_id(&self) -> CanisterId {
         // Safe as this was converted from CanisterId when Self was constructed.
         CanisterId::new(self.canister_id).unwrap()
@@ -438,6 +639,10 @@ impl SetControllerArgs {
 
     pub fn get_new_controller(&self) -> PrincipalId {
         self.new_controller
+    }
+
+    pub fn get_sender_canister_version(&self) -> Option<u64> {
+        self.sender_canister_version
     }
 }
 
@@ -512,7 +717,12 @@ impl SetupInitialDKGResponse {
     }
 
     pub fn decode(blob: &[u8]) -> Result<Self, UserError> {
-        let serde_encoded_transcript_records = Decode!(blob, Vec<u8>)?;
+        let serde_encoded_transcript_records = Decode!(blob, Vec<u8>).map_err(|err| {
+            UserError::new(
+                ErrorCode::CanisterContractViolation,
+                format!("Error decoding candid: {}", err),
+            )
+        })?;
         match serde_cbor::from_slice::<(
             InitialNiDkgTranscriptRecord,
             InitialNiDkgTranscriptRecord,
@@ -539,58 +749,302 @@ impl SetupInitialDKGResponse {
     }
 }
 
-/// Struct used for encoding/decoding `(record { amount : opt nat; })`
-#[derive(CandidType, Deserialize, Debug)]
-pub struct ProvisionalCreateCanisterWithCyclesArgs {
-    pub amount: Option<candid::Nat>,
-    pub settings: Option<CanisterSettingsArgs>,
+/// Types of curves that can be used for ECDSA signing.
+/// ```text
+/// (variant { secp256k1; })
+/// ```
+#[derive(
+    CandidType, Copy, Clone, Debug, PartialOrd, Ord, PartialEq, Eq, Serialize, Deserialize, Hash,
+)]
+pub enum EcdsaCurve {
+    #[serde(rename = "secp256k1")]
+    Secp256k1,
 }
 
-impl ProvisionalCreateCanisterWithCyclesArgs {
-    pub fn new(amount: Option<u64>) -> Self {
+impl TryFrom<pb_registry_crypto::EcdsaCurve> for EcdsaCurve {
+    type Error = ProxyDecodeError;
+
+    fn try_from(item: pb_registry_crypto::EcdsaCurve) -> Result<Self, Self::Error> {
+        match item {
+            pb_registry_crypto::EcdsaCurve::Secp256k1 => Ok(EcdsaCurve::Secp256k1),
+            pb_registry_crypto::EcdsaCurve::Unspecified => Err(ProxyDecodeError::ValueOutOfRange {
+                typ: "EcdsaCurve",
+                err: format!("Unable to convert {:?} to an EcdsaCurve", item),
+            }),
+        }
+    }
+}
+
+impl From<EcdsaCurve> for pb_registry_crypto::EcdsaCurve {
+    fn from(item: EcdsaCurve) -> Self {
+        match item {
+            EcdsaCurve::Secp256k1 => pb_registry_crypto::EcdsaCurve::Secp256k1,
+        }
+    }
+}
+
+impl std::fmt::Display for EcdsaCurve {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{:?}", self)
+    }
+}
+
+impl FromStr for EcdsaCurve {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "Secp256k1" => Ok(Self::Secp256k1),
+            _ => Err(format!("{} is not a recognized ECDSA curve", s)),
+        }
+    }
+}
+
+#[test]
+fn ecdsa_curve_round_trip() {
+    assert_eq!(
+        format!("{}", EcdsaCurve::Secp256k1)
+            .parse::<EcdsaCurve>()
+            .unwrap(),
+        EcdsaCurve::Secp256k1
+    );
+}
+
+/// Unique identifier for a key that can be used for ECDSA signatures. The name
+/// is just a identifier, but it may be used to convey some information about
+/// the key (e.g. that the key is meant to be used for testing purposes).
+/// ```text
+/// (record { curve: ecdsa_curve; name: text})
+/// ```
+#[derive(
+    CandidType, Clone, Debug, PartialOrd, Ord, PartialEq, Eq, Serialize, Deserialize, Hash,
+)]
+pub struct EcdsaKeyId {
+    pub curve: EcdsaCurve,
+    pub name: String,
+}
+
+impl TryFrom<pb_registry_crypto::EcdsaKeyId> for EcdsaKeyId {
+    type Error = ProxyDecodeError;
+    fn try_from(item: pb_registry_crypto::EcdsaKeyId) -> Result<Self, Self::Error> {
+        Ok(Self {
+            curve: EcdsaCurve::try_from(
+                pb_registry_crypto::EcdsaCurve::from_i32(item.curve).ok_or(
+                    ProxyDecodeError::ValueOutOfRange {
+                        typ: "EcdsaKeyId",
+                        err: format!("Unable to convert {} to an EcdsaCurve", item.curve),
+                    },
+                )?,
+            )?,
+            name: item.name,
+        })
+    }
+}
+
+impl From<&EcdsaKeyId> for pb_registry_crypto::EcdsaKeyId {
+    fn from(item: &EcdsaKeyId) -> Self {
         Self {
-            amount: amount.map(candid::Nat::from),
-            settings: None,
-        }
-    }
-
-    pub fn to_u64(&self) -> Option<u64> {
-        match &self.amount {
-            Some(amount) => amount.0.to_u64(),
-            None => None,
+            curve: pb_registry_crypto::EcdsaCurve::from(item.curve) as i32,
+            name: item.name.clone(),
         }
     }
 }
 
-impl Payload<'_> for ProvisionalCreateCanisterWithCyclesArgs {}
+impl std::fmt::Display for EcdsaKeyId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}:{}", self.curve, self.name)
+    }
+}
 
-/// Struct used for encoding/decoding
+impl FromStr for EcdsaKeyId {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let (curve, name) = s
+            .split_once(':')
+            .ok_or_else(|| format!("ECDSA key id {} does not contain a ':'", s))?;
+        Ok(EcdsaKeyId {
+            curve: curve.parse::<EcdsaCurve>()?,
+            name: name.to_string(),
+        })
+    }
+}
+
+#[test]
+fn ecdsa_key_id_round_trip() {
+    for name in ["secp256k1", "", "other_key", "other key", "other:key"] {
+        let key = EcdsaKeyId {
+            curve: EcdsaCurve::Secp256k1,
+            name: name.to_string(),
+        };
+        assert_eq!(format!("{}", key).parse::<EcdsaKeyId>().unwrap(), key);
+    }
+}
+
+/// Represents the argument of the sign_with_ecdsa API.
+/// ```text
+/// (record {
+///   message_hash : blob;
+///   derivation_path : vec blob;
+///   key_id : ecdsa_key_id;
+/// })
+/// ```
+#[derive(CandidType, Deserialize, Debug)]
+pub struct SignWithECDSAArgs {
+    pub message_hash: [u8; 32],
+    pub derivation_path: Vec<Vec<u8>>,
+    pub key_id: EcdsaKeyId,
+}
+
+impl Payload<'_> for SignWithECDSAArgs {}
+
+/// Struct used to return an ECDSA signature.
+#[derive(CandidType, Deserialize, Debug)]
+pub struct SignWithECDSAReply {
+    pub signature: Vec<u8>,
+}
+
+impl Payload<'_> for SignWithECDSAReply {}
+
+/// Represents the argument of the ecdsa_public_key API.
+/// ```text
+/// (record {
+///   canister_id : opt canister_id;
+///   derivation_path : vec blob;
+///   key_id : ecdsa_key_id;
+/// })
+/// ```
+#[derive(CandidType, Deserialize, Debug)]
+pub struct ECDSAPublicKeyArgs {
+    pub canister_id: Option<CanisterId>,
+    pub derivation_path: Vec<Vec<u8>>,
+    pub key_id: EcdsaKeyId,
+}
+
+impl Payload<'_> for ECDSAPublicKeyArgs {}
+
+/// Represents the response of the ecdsa_public_key API.
+/// ```text
+/// (record {
+///   public_key : blob;
+///   chain_code : blob;
+/// })
+/// ```
+#[derive(CandidType, Deserialize, Debug)]
+pub struct ECDSAPublicKeyResponse {
+    pub public_key: Vec<u8>,
+    pub chain_code: Vec<u8>,
+}
+
+impl Payload<'_> for ECDSAPublicKeyResponse {}
+
+/// Argument of the compute_initial_ecdsa_dealings API.
 /// `(record {
-///     canister_id : principal;
-///     amount: nat;
+///     key_id: ecdsa_key_id;
+///     subnet_id: principal;
+///     nodes: vec principal;
+///     registry_version: nat;
 /// })`
-#[derive(CandidType, Deserialize, Debug)]
-pub struct ProvisionalTopUpCanisterArgs {
-    canister_id: PrincipalId,
-    amount: candid::Nat,
+#[derive(CandidType, Deserialize, Debug, Eq, PartialEq)]
+pub struct ComputeInitialEcdsaDealingsArgs {
+    pub key_id: EcdsaKeyId,
+    pub subnet_id: SubnetId,
+    nodes: Vec<PrincipalId>,
+    registry_version: u64,
 }
 
-impl ProvisionalTopUpCanisterArgs {
-    pub fn new(canister_id: CanisterId, amount: u64) -> Self {
+impl ComputeInitialEcdsaDealingsArgs {
+    pub fn new(
+        key_id: EcdsaKeyId,
+        subnet_id: SubnetId,
+        nodes: BTreeSet<NodeId>,
+        registry_version: RegistryVersion,
+    ) -> Self {
         Self {
-            canister_id: canister_id.get(),
-            amount: candid::Nat::from(amount),
+            key_id,
+            subnet_id,
+            nodes: nodes.iter().map(|id| id.get()).collect(),
+            registry_version: registry_version.get(),
         }
     }
 
-    pub fn to_u64(&self) -> Option<u64> {
-        self.amount.0.to_u64()
+    pub fn get_set_of_nodes(&self) -> Result<BTreeSet<NodeId>, UserError> {
+        let mut set = BTreeSet::<NodeId>::new();
+        for node_id in self.nodes.iter() {
+            if !set.insert(NodeId::new(*node_id)) {
+                return Err(UserError::new(
+                    ErrorCode::CanisterContractViolation,
+                    format!(
+                        "Expected a set of NodeIds. The NodeId {} is repeated",
+                        node_id
+                    ),
+                ));
+            }
+        }
+        Ok(set)
     }
 
-    pub fn get_canister_id(&self) -> CanisterId {
-        // Safe as this was converted from CanisterId when Self was constructed.
-        CanisterId::new(self.canister_id).unwrap()
+    pub fn get_registry_version(&self) -> RegistryVersion {
+        RegistryVersion::new(self.registry_version)
     }
 }
 
-impl Payload<'_> for ProvisionalTopUpCanisterArgs {}
+impl Payload<'_> for ComputeInitialEcdsaDealingsArgs {}
+
+/// Struct used to return the xnet initial dealings.
+#[derive(Debug)]
+pub struct ComputeInitialEcdsaDealingsResponse {
+    pub initial_dkg_dealings: InitialIDkgDealings,
+}
+
+impl ComputeInitialEcdsaDealingsResponse {
+    pub fn encode(&self) -> Vec<u8> {
+        let serde_encoded_transcript_records = self.encode_with_serde_cbor();
+        Encode!(&serde_encoded_transcript_records).unwrap()
+    }
+
+    fn encode_with_serde_cbor(&self) -> Vec<u8> {
+        let transcript_records = (&self.initial_dkg_dealings,);
+        serde_cbor::to_vec(&transcript_records).unwrap()
+    }
+
+    pub fn decode(blob: &[u8]) -> Result<Self, UserError> {
+        let serde_encoded_transcript_records = Decode!(blob, Vec<u8>).map_err(|err| {
+            UserError::new(
+                ErrorCode::CanisterContractViolation,
+                format!("Error decoding candid: {}", err),
+            )
+        })?;
+        match serde_cbor::from_slice::<(InitialIDkgDealings,)>(&serde_encoded_transcript_records) {
+            Err(err) => Err(UserError::new(
+                ErrorCode::CanisterContractViolation,
+                format!("Payload deserialization error: '{}'", err),
+            )),
+            Ok((initial_dkg_dealings,)) => Ok(Self {
+                initial_dkg_dealings,
+            }),
+        }
+    }
+}
+
+// Export the bitcoin types.
+pub use ic_btc_types::{
+    GetBalanceRequest as BitcoinGetBalanceArgs,
+    GetCurrentFeePercentilesRequest as BitcoinGetCurrentFeePercentilesArgs,
+    GetUtxosRequest as BitcoinGetUtxosArgs, Network as BitcoinNetwork,
+    SendTransactionRequest as BitcoinSendTransactionArgs,
+};
+pub use ic_btc_types_internal::{
+    CanisterGetSuccessorsRequest as BitcoinGetSuccessorsArgs,
+    CanisterGetSuccessorsRequestInitial as BitcoinGetSuccessorsRequestInitial,
+    CanisterGetSuccessorsResponse as BitcoinGetSuccessorsResponse,
+    CanisterGetSuccessorsResponseComplete as BitcoinGetSuccessorsResponseComplete,
+    CanisterSendTransactionRequest as BitcoinSendTransactionInternalArgs,
+};
+
+impl Payload<'_> for BitcoinGetBalanceArgs {}
+impl Payload<'_> for BitcoinGetUtxosArgs {}
+impl Payload<'_> for BitcoinSendTransactionArgs {}
+impl Payload<'_> for BitcoinGetCurrentFeePercentilesArgs {}
+impl Payload<'_> for BitcoinGetSuccessorsArgs {}
+impl Payload<'_> for BitcoinGetSuccessorsResponse {}
+impl Payload<'_> for BitcoinSendTransactionInternalArgs {}

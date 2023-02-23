@@ -1,0 +1,147 @@
+docker-autobuild-protected:
+  extends: 
+    - .ubuntu-nix-docker
+    - .rules-protected-branch
+  image:
+    name: "dfinity/ic-build-nix:latest"
+  needs: []  # don't wait on other jobs
+  stage: test
+  tags:
+    - dfinity-launch
+  script:
+    - |
+      echo "Running docker autobuild protected"
+      set -euo pipefail
+
+      nix-collect-garbage -d
+
+      # image used in this revision
+      cd gitlab-ci/config
+      CI_IMAGE=$(grep registry.gitlab.com 00--common.yml | awk '{ print $2 }' | tr -d '"')
+      CI_IMAGE_NAME=$(echo "$CI_IMAGE" | cut -d':' -f1)
+      CI_IMAGE_TAG=$(echo "$CI_IMAGE" | cut -d':' -f2)
+      cd -
+      # short tag
+      TAG=$(cat ./gitlab-ci/docker/TAG)
+
+      # check if we have it in dockerhub
+      EXISTS=$(curl -s https://hub.docker.com/v2/repositories/dfinity/ic-build/tags | jq -r "[.results? | .[]? | .name == \"$TAG\"] | any")
+
+      if (docker images | grep "$CI_IMAGE_NAME" | grep -q "$CI_IMAGE_TAG"); then
+        # we have docker image present
+        echo "Image '$CI_IMAGE_NAME:$CI_IMAGE_TAG' already present!"
+      else
+        # no image on this protected runner
+        # build it and push it to dockerhub
+        echo -e "\e[0Ksection_start:$(date +%s):docker_build_script[collapsed=true]\r\e[0KClick here to see the docker_build_script"
+        ./gitlab-ci/docker/docker-build-local-image.sh --nix
+        echo -e "\e[0Ksection_end:$(date +%s):docker_build_script\r\e[0K"
+
+        # push new image to dockerhub
+        docker login -u "$DOCKER_HUB_USER" -p "$DOCKER_HUB_PASSWORD"
+        docker push dfinity/ic-build:"$TAG"
+        docker push dfinity/ic-build:latest
+        docker push dfinity/ic-build-nix:"$TAG"
+        docker push dfinity/ic-build-nix:latest
+        PUSHED=true
+      fi 
+
+      # case where pushing docker image on 1st try failed
+      if [ "$EXISTS" != "true" ] && [ "${PUSHED:-}" != "true" ]; then
+        docker login -u "$DOCKER_HUB_USER" -p "$DOCKER_HUB_PASSWORD"
+        docker push dfinity/ic-build:"$TAG"
+        docker push dfinity/ic-build-nix:"$TAG"
+      fi
+
+      echo -e "\e[0Ksection_start:$(date +%s):sys_info[collapsed=true]\r\e[0KClick here to see system info"
+      echo "SYS-INFO UPTIME"
+      uptime
+      echo "SYS-INFO DISK SPACE"
+      df -h
+      echo "SYS-INFO DOCKER IMAGES"
+      docker images
+      echo "SYS-INFO DOCKER CONTAINERS"
+      docker ps -a
+      echo -e "\e[0Ksection_end:$(date +%s):sys_info\r\e[0K"
+
+docker-autobuild-tests:
+  extends: 
+    - .ubuntu-nix-docker
+    - .rules-prs-only
+  needs: []  # don't wait on other jobs
+  stage: test
+  artifacts:
+    reports:
+      junit: test_report.xml
+    paths:
+      - gitlab-ci/src/htmlcov
+  script:
+    - |
+      # This job auto-pushes new commits to GitLab. 
+      echo "Running docker autobuild"
+      set -euo pipefail
+
+      git fetch origin master:master
+
+      export PYTHONPATH="${CI_PROJECT_DIR}/gitlab-ci/src"
+      if ! python3 "${CI_PROJECT_DIR}"/gitlab-ci/src/git_changes/git_changes.py --ci-config-changes ; then
+       echo "No changes to GitLab CI YML configs. Skip Docker autoupdate test and check."
+       exit 0
+      fi
+
+      COUNT=$(git rev-list --count "$(git merge-base HEAD master)"..HEAD)
+      LIMIT=256
+
+      # To prevent bugs or unexpected systems
+      # interactions, place a hard limit on the number of commits before these script
+      # gives up.
+  
+      echo "------------------------------------------------------------------"
+      echo "CHECKING FOR INFINITE PR COMMIT-PUSH LOOP"
+      echo "------------------------------------------------------------------"
+      if [ "$COUNT" -gt "$LIMIT" ]; then
+        echo "PR has over $LIMIT commits. Suspect infinite PR commit-push loop. Bailing out"
+        exit 1
+      else
+        echo "PR is NOT over $LIMIT commits. Continuing with tests."
+      fi
+
+      # This script ensures the build process works before pushing the image to the gitlab
+      # registry and the commits to gitlab
+      echo "------------------------------------------------------------------"
+      echo "RUNNING CHECK_IT_TESTS.SH - ENSURING DOCKER BUILDS WORK CORRECTLY"
+      echo "------------------------------------------------------------------"
+      ./gitlab-ci/src/docker_image_check/check_it_test.sh
+      echo "------------------------------------------------------------------"
+      echo "FINISHED RUNNING CHECK_IT_TESTS.SH"
+      echo "------------------------------------------------------------------"
+
+      # Need to check that the docker-build-local-image.sh script works correct.
+      # This script is run in a cronjob on the protected GitLab runners.
+      echo "------------------------------------------------------------------"
+      echo "RUNNING DOCKER-BUILD-LOCAL-IMAGE.SH - ENSURING PROTECTED RUNNER DOCKER BUILDS WORK CORRECTLY"
+      echo "------------------------------------------------------------------"
+      cd "${CI_PROJECT_DIR}"
+      echo -e "\e[0Ksection_start:$(date +%s):docker_build_script[collapsed=true]\r\e[0KClick here to see the docker_build_script"
+      ./gitlab-ci/docker/docker-build-local-image.sh
+      echo -e "\e[0Ksection_end:$(date +%s):docker_build_script\r\e[0K"
+      echo "------------------------------------------------------------------"
+      echo "FINISHED RUNNING DOCKER-BUILD-LOCAL-IMAGE.SH"
+      echo "------------------------------------------------------------------"
+
+      echo "------------------------------------------------------------------"
+      echo "RUNNING CHECK_IT.SH - FINAL CHECK, WITH GITLAB PUSH AND REGISTRY PUSH"
+      echo "------------------------------------------------------------------"
+      cd "${CI_PROJECT_DIR}"
+      ./gitlab-ci/src/docker_image_check/check_it.sh
+      echo "------------------------------------------------------------------"
+      echo "FINISHED RUNNING CHECK_IT.SH"
+      echo "------------------------------------------------------------------"
+
+      DISK_UTIL=$(df / | tail -1 | awk '{print 0+$5}')
+      if [ "$DISK_UTIL" -gt 80 ]; then 
+        df -h /
+        docker container prune -f
+        docker image prune -f
+      fi
+      df -h /

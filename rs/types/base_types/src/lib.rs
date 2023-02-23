@@ -1,18 +1,20 @@
 //! A crate containing various basic types that are especially useful when
 //! writing Rust canisters.
+
+use ic_protobuf::proxy::ProxyDecodeError;
+use ic_protobuf::types::v1 as pb;
+use phantom_newtype::{AmountOf, DisplayerOf, Id};
+use std::{convert::TryFrom, fmt};
+
 mod canister_id;
 mod pb_internal;
 mod principal_id;
 
-use candid::CandidType;
-pub use canister_id::{CanisterId, CanisterIdBlobParseError, CanisterIdError};
-use ic_protobuf::proxy::ProxyDecodeError;
-use ic_protobuf::types::v1 as pb;
-use phantom_newtype::{AmountOf, DisplayerOf, Id};
-pub use principal_id::{PrincipalId, PrincipalIdBlobParseError, PrincipalIdParseError};
-use serde::{Deserialize, Serialize};
-use std::{convert::TryFrom, fmt, slice::Iter};
-use strum_macros::EnumString;
+pub use canister_id::{CanisterId, CanisterIdError, CanisterIdError as CanisterIdBlobParseError};
+pub use principal_id::{
+    PrincipalId, PrincipalIdError, PrincipalIdError as PrincipalIdBlobParseError,
+    PrincipalIdError as PrincipalIdParseError,
+};
 
 pub struct RegistryVersionTag {}
 /// A type representing the registry's version.
@@ -54,96 +56,6 @@ impl DisplayerOf<NumBytes> for NumBytesTag {
     }
 }
 
-/// Indicates whether the canister is running, stopping, or stopped.
-///
-/// Unlike `CanisterStatus`, it contains no additional metadata.
-#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize, CandidType)]
-pub enum CanisterStatusType {
-    #[serde(rename = "running")]
-    Running,
-    #[serde(rename = "stopping")]
-    Stopping,
-    #[serde(rename = "stopped")]
-    Stopped,
-}
-
-/// These strings are used to generate metrics -- changing any existing entries
-/// will invalidate monitoring dashboards.
-impl fmt::Display for CanisterStatusType {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            CanisterStatusType::Running => write!(f, "running"),
-            CanisterStatusType::Stopping => write!(f, "stopping"),
-            CanisterStatusType::Stopped => write!(f, "stopped"),
-        }
-    }
-}
-
-/// The mode with which a canister is installed.
-#[derive(
-    Clone, Debug, Deserialize, PartialEq, Serialize, Eq, EnumString, Hash, CandidType, Copy,
-)]
-pub enum CanisterInstallMode {
-    /// A fresh install of a new canister.
-    #[serde(rename = "install")]
-    #[strum(serialize = "install")]
-    Install,
-    /// Reinstalling a canister that was already installed.
-    #[serde(rename = "reinstall")]
-    #[strum(serialize = "reinstall")]
-    Reinstall,
-    /// Upgrade an existing canister.
-    #[serde(rename = "upgrade")]
-    #[strum(serialize = "upgrade")]
-    Upgrade,
-}
-
-impl Default for CanisterInstallMode {
-    fn default() -> Self {
-        CanisterInstallMode::Install
-    }
-}
-
-impl CanisterInstallMode {
-    pub fn iter() -> Iter<'static, CanisterInstallMode> {
-        static MODES: [CanisterInstallMode; 3] = [
-            CanisterInstallMode::Install,
-            CanisterInstallMode::Reinstall,
-            CanisterInstallMode::Upgrade,
-        ];
-        MODES.iter()
-    }
-}
-
-/// A type to represent an error that can occur when installing a canister.
-#[derive(Debug)]
-pub struct CanisterInstallModeError(pub String);
-
-impl TryFrom<String> for CanisterInstallMode {
-    type Error = CanisterInstallModeError;
-
-    fn try_from(mode: String) -> Result<Self, Self::Error> {
-        let mode = mode.as_str();
-        match mode {
-            "install" => Ok(CanisterInstallMode::Install),
-            "reinstall" => Ok(CanisterInstallMode::Reinstall),
-            "upgrade" => Ok(CanisterInstallMode::Upgrade),
-            _ => Err(CanisterInstallModeError(mode.to_string())),
-        }
-    }
-}
-
-impl From<CanisterInstallMode> for String {
-    fn from(mode: CanisterInstallMode) -> Self {
-        let res = match mode {
-            CanisterInstallMode::Install => "install",
-            CanisterInstallMode::Reinstall => "reinstall",
-            CanisterInstallMode::Upgrade => "upgrade",
-        };
-        res.to_string()
-    }
-}
-
 /// Converts a SubnetId into its protobuf definition.  Normally, we would use
 /// `impl From<SubnetId> for pb::SubnetId` here however we cannot as both
 /// `Id` and `pb::SubnetId` are defined in other crates.
@@ -156,17 +68,17 @@ pub fn subnet_id_into_protobuf(id: SubnetId) -> pb::SubnetId {
 /// From its protobuf definition convert to a SubnetId.  Normally, we would
 /// use `impl TryFrom<pb::SubnetId> for SubnetId` here however we cannot as
 /// both `Id` and `pb::SubnetId` are defined in other crates.
-pub fn subnet_id_try_from_protobuf(
-    value: pb::SubnetId,
-) -> Result<SubnetId, PrincipalIdBlobParseError> {
-    // All fields in Protobuf definition are required hence they are encoded in
-    // `Option`.  We simply treat them as required here though.
-    let principal_id = PrincipalId::try_from(value.principal_id.unwrap())?;
+pub fn subnet_id_try_from_protobuf(value: pb::SubnetId) -> Result<SubnetId, ProxyDecodeError> {
+    let principal_id = PrincipalId::try_from(
+        value
+            .principal_id
+            .ok_or(ProxyDecodeError::MissingField("SubnetId::principal_id"))?,
+    )?;
     Ok(SubnetId::from(principal_id))
 }
 
-impl From<PrincipalIdBlobParseError> for ProxyDecodeError {
-    fn from(err: PrincipalIdBlobParseError) -> Self {
+impl From<PrincipalIdError> for ProxyDecodeError {
+    fn from(err: PrincipalIdError) -> Self {
         Self::InvalidPrincipalId(Box::new(err))
     }
 }

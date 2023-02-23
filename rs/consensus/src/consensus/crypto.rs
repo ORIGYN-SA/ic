@@ -1,7 +1,15 @@
 use crate::consensus::prelude::*;
 use ic_interfaces::{crypto::*, validation::ValidationResult};
-use ic_types::crypto::threshold_sig::ni_dkg::{DkgId, NiDkgId};
-use ic_types::crypto::CryptoError;
+use ic_types::crypto::canister_threshold_sig::idkg::{IDkgDealing, SignedIDkgDealing};
+use ic_types::{
+    canister_http::CanisterHttpResponseMetadata,
+    consensus::ecdsa::{EcdsaComplaintContent, EcdsaOpeningContent},
+    crypto::{
+        threshold_sig::ni_dkg::{DkgId, NiDkgId},
+        CryptoError,
+    },
+};
+use std::collections::BTreeMap;
 
 /// A trait that unifies the individual signing and verification interface for
 /// both threshold and multi signatures. It is parameterized by the following:
@@ -70,6 +78,7 @@ impl<Message: Signable, C: BasicSigner<Message> + BasicSigVerifier<Message>>
         self.sign_basic(message, signer, selector)
             .map(|signature| BasicSignature { signature, signer })
     }
+
     fn verify(
         &self,
         message: &Signed<Message, BasicSignature<Message>>,
@@ -78,6 +87,38 @@ impl<Message: Signable, C: BasicSigner<Message> + BasicSigVerifier<Message>>
         self.verify_basic_sig(
             &message.signature.signature,
             &message.content,
+            message.signature.signer,
+            selector,
+        )
+    }
+}
+
+// This allows us to use sign verify directly when we provide a hash value to
+// crypto instead of the actual message.
+impl<Message, C> SignVerify<Message, BasicSignature<CryptoHashOf<Message>>, RegistryVersion> for C
+where
+    Message: CryptoHashable,
+    CryptoHashOf<Message>: Signable,
+    C: BasicSigner<CryptoHashOf<Message>> + BasicSigVerifier<CryptoHashOf<Message>>,
+{
+    fn sign(
+        &self,
+        message: &Message,
+        signer: NodeId,
+        selector: RegistryVersion,
+    ) -> CryptoResult<BasicSignature<CryptoHashOf<Message>>> {
+        self.sign_basic(&ic_types::crypto::crypto_hash(message), signer, selector)
+            .map(|signature| BasicSignature { signature, signer })
+    }
+
+    fn verify(
+        &self,
+        message: &Signed<Message, BasicSignature<CryptoHashOf<Message>>>,
+        selector: RegistryVersion,
+    ) -> ValidationResult<CryptoError> {
+        self.verify_basic_sig(
+            &message.signature.signature,
+            &ic_types::crypto::crypto_hash(&message.content),
             message.signature.signer,
             selector,
         )
@@ -96,6 +137,7 @@ impl<Message: Signable, C: MultiSigner<Message> + MultiSigVerifier<Message>>
         self.sign_multi(message, signer, selector)
             .map(|signature| MultiSignatureShare { signature, signer })
     }
+
     fn verify(
         &self,
         message: &Signed<Message, MultiSignatureShare<Message>>,
@@ -104,6 +146,37 @@ impl<Message: Signable, C: MultiSigner<Message> + MultiSigVerifier<Message>>
         self.verify_multi_sig_individual(
             &message.signature.signature,
             &message.content,
+            message.signature.signer,
+            selector,
+        )
+    }
+}
+
+impl<Message, C> SignVerify<Message, MultiSignatureShare<CryptoHashOf<Message>>, RegistryVersion>
+    for C
+where
+    Message: CryptoHashable,
+    CryptoHashOf<Message>: Signable,
+    C: MultiSigner<CryptoHashOf<Message>> + MultiSigVerifier<CryptoHashOf<Message>>,
+{
+    fn sign(
+        &self,
+        message: &Message,
+        signer: NodeId,
+        selector: RegistryVersion,
+    ) -> CryptoResult<MultiSignatureShare<CryptoHashOf<Message>>> {
+        self.sign_multi(&ic_types::crypto::crypto_hash(message), signer, selector)
+            .map(|signature| MultiSignatureShare { signature, signer })
+    }
+
+    fn verify(
+        &self,
+        message: &Signed<Message, MultiSignatureShare<CryptoHashOf<Message>>>,
+        selector: RegistryVersion,
+    ) -> ValidationResult<CryptoError> {
+        self.verify_multi_sig_individual(
+            &message.signature.signature,
+            &ic_types::crypto::crypto_hash(&message.content),
             message.signature.signer,
             selector,
         )
@@ -122,6 +195,7 @@ impl<Message: Signable, C: ThresholdSigner<Message> + ThresholdSigVerifier<Messa
         self.sign_threshold(message, DkgId::NiDkgId(dkg_id))
             .map(|signature| ThresholdSignatureShare { signature, signer })
     }
+
     fn verify(
         &self,
         message: &Signed<Message, ThresholdSignatureShare<Message>>,
@@ -184,7 +258,7 @@ impl<Message: Signable, C: MultiSigner<Message> + MultiSigVerifier<Message>>
 
     fn aggregate(
         &self,
-        shares: Vec<&MultiSignatureShare<Message>>,
+        mut shares: Vec<&MultiSignatureShare<Message>>,
         selector: RegistryVersion,
     ) -> CryptoResult<MultiSignature<Message>> {
         let signer_share_map = shares
@@ -192,8 +266,10 @@ impl<Message: Signable, C: MultiSigner<Message> + MultiSigVerifier<Message>>
             .map(|share| (share.signer, share.signature.clone()))
             .collect();
         let signature = self.combine_multi_sig_individuals(signer_share_map, selector)?;
+        shares.sort_unstable_by_key(|s| s.signer);
+        shares.dedup_by_key(|s| s.signer);
         let signers = shares.iter().map(|share| share.signer).collect();
-        Ok(MultiSignature { signers, signature })
+        Ok(MultiSignature { signature, signers })
     }
 
     fn verify_aggregate(
@@ -204,6 +280,94 @@ impl<Message: Signable, C: MultiSigner<Message> + MultiSigVerifier<Message>>
         self.verify_multi_sig_combined(
             &message.signature.signature,
             &message.content,
+            message.signature.signers.iter().cloned().collect(),
+            selector,
+        )
+    }
+}
+
+impl<Message: Signable, C: BasicSigVerifier<Message>>
+    Aggregate<Message, BasicSignature<Message>, RegistryVersion, BasicSignatureBatch<Message>>
+    for C
+{
+    fn as_aggregate(
+        &self,
+    ) -> &dyn Aggregate<
+        Message,
+        BasicSignature<Message>,
+        RegistryVersion,
+        BasicSignatureBatch<Message>,
+    > {
+        self
+    }
+
+    fn aggregate(
+        &self,
+        shares: Vec<&BasicSignature<Message>>,
+        selector: RegistryVersion,
+    ) -> CryptoResult<BasicSignatureBatch<Message>> {
+        let mut signatures_map = BTreeMap::new();
+        for share in shares.into_iter() {
+            signatures_map.insert(share.signer, &share.signature);
+        }
+        self.combine_basic_sig(signatures_map, selector)
+    }
+
+    fn verify_aggregate(
+        &self,
+        message: &Signed<Message, BasicSignatureBatch<Message>>,
+        selector: RegistryVersion,
+    ) -> ValidationResult<CryptoError> {
+        self.verify_basic_sig_batch(&message.signature, &message.content, selector)
+    }
+}
+
+impl<Message, C: MultiSigner<CryptoHashOf<Message>> + MultiSigVerifier<CryptoHashOf<Message>>>
+    Aggregate<
+        Message,
+        MultiSignatureShare<CryptoHashOf<Message>>,
+        RegistryVersion,
+        MultiSignature<CryptoHashOf<Message>>,
+    > for C
+where
+    Message: CryptoHashable,
+    CryptoHashOf<Message>: Signable,
+{
+    fn as_aggregate(
+        &self,
+    ) -> &dyn Aggregate<
+        Message,
+        MultiSignatureShare<CryptoHashOf<Message>>,
+        RegistryVersion,
+        MultiSignature<CryptoHashOf<Message>>,
+    > {
+        self
+    }
+
+    fn aggregate(
+        &self,
+        mut shares: Vec<&MultiSignatureShare<CryptoHashOf<Message>>>,
+        selector: RegistryVersion,
+    ) -> CryptoResult<MultiSignature<CryptoHashOf<Message>>> {
+        let signer_share_map = shares
+            .iter()
+            .map(|share| (share.signer, share.signature.clone()))
+            .collect();
+        let signature = self.combine_multi_sig_individuals(signer_share_map, selector)?;
+        shares.sort_unstable_by_key(|s| s.signer);
+        shares.dedup_by_key(|s| s.signer);
+        let signers = shares.iter().map(|share| share.signer).collect();
+        Ok(MultiSignature { signature, signers })
+    }
+
+    fn verify_aggregate(
+        &self,
+        message: &Signed<Message, MultiSignature<CryptoHashOf<Message>>>,
+        selector: RegistryVersion,
+    ) -> ValidationResult<CryptoError> {
+        self.verify_multi_sig_combined(
+            &message.signature.signature,
+            &ic_types::crypto::crypto_hash(&message.content),
             message.signature.signers.iter().cloned().collect(),
             selector,
         )
@@ -263,10 +427,23 @@ pub trait ConsensusCrypto:
     SignVerify<HashedBlock, BasicSignature<Block>, RegistryVersion>
     + SignVerify<NotarizationContent, MultiSignatureShare<NotarizationContent>, RegistryVersion>
     + SignVerify<FinalizationContent, MultiSignatureShare<FinalizationContent>, RegistryVersion>
+    + SignVerify<SignedIDkgDealing, BasicSignature<SignedIDkgDealing>, RegistryVersion>
+    + SignVerify<IDkgDealing, BasicSignature<IDkgDealing>, RegistryVersion>
+    + SignVerify<EcdsaComplaintContent, BasicSignature<EcdsaComplaintContent>, RegistryVersion>
+    + SignVerify<EcdsaOpeningContent, BasicSignature<EcdsaOpeningContent>, RegistryVersion>
     + SignVerify<RandomBeaconContent, ThresholdSignatureShare<RandomBeaconContent>, NiDkgId>
     + SignVerify<RandomTapeContent, ThresholdSignatureShare<RandomTapeContent>, NiDkgId>
     + SignVerify<CatchUpContent, ThresholdSignatureShare<CatchUpContent>, NiDkgId>
-    + Aggregate<
+    + SignVerify<dkg::DealingContent, BasicSignature<dkg::DealingContent>, RegistryVersion>
+    + SignVerify<
+        CanisterHttpResponseMetadata,
+        BasicSignature<CanisterHttpResponseMetadata>,
+        RegistryVersion,
+    > + SignVerify<
+        CanisterHttpResponseMetadata,
+        BasicSignature<CanisterHttpResponseMetadata>,
+        RegistryVersion,
+    > + Aggregate<
         NotarizationContent,
         MultiSignatureShare<NotarizationContent>,
         RegistryVersion,
@@ -276,6 +453,11 @@ pub trait ConsensusCrypto:
         MultiSignatureShare<FinalizationContent>,
         RegistryVersion,
         MultiSignature<FinalizationContent>,
+    > + Aggregate<
+        SignedIDkgDealing,
+        BasicSignature<SignedIDkgDealing>,
+        RegistryVersion,
+        BasicSignatureBatch<SignedIDkgDealing>,
     > + Aggregate<
         RandomBeaconContent,
         ThresholdSignatureShare<RandomBeaconContent>,
@@ -291,11 +473,101 @@ pub trait ConsensusCrypto:
         ThresholdSignatureShare<CatchUpContent>,
         NiDkgId,
         ThresholdSignature<CatchUpContent>,
-    > + SignVerify<dkg::DealingContent, BasicSignature<dkg::DealingContent>, RegistryVersion>
-    + Crypto
+    > + Aggregate<
+        CanisterHttpResponseMetadata,
+        BasicSignature<CanisterHttpResponseMetadata>,
+        RegistryVersion,
+        BasicSignatureBatch<CanisterHttpResponseMetadata>,
+    > + Crypto
     + Send
     + Sync
 {
 }
 
 impl<C: Crypto + Send + Sync> ConsensusCrypto for C {}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeSet;
+
+    use super::*;
+    use ic_test_utilities::types::ids::node_test_id;
+    use ic_types::messages::MessageId;
+
+    struct AggregateImpl {}
+    /// Fake Aggregate implementation
+    impl MultiSigner<MessageId> for AggregateImpl {
+        fn sign_multi(
+            &self,
+            _message: &MessageId,
+            _signer: NodeId,
+            _registry_version: RegistryVersion,
+        ) -> CryptoResult<IndividualMultiSigOf<MessageId>> {
+            Ok(IndividualMultiSigOf::from(IndividualMultiSig(vec![])))
+        }
+    }
+    impl MultiSigVerifier<MessageId> for AggregateImpl {
+        fn verify_multi_sig_individual(
+            &self,
+            _signature: &IndividualMultiSigOf<MessageId>,
+            _message: &MessageId,
+            _signer: NodeId,
+            _registry_version: RegistryVersion,
+        ) -> CryptoResult<()> {
+            Ok(())
+        }
+        fn combine_multi_sig_individuals(
+            &self,
+            _signatures: BTreeMap<NodeId, IndividualMultiSigOf<MessageId>>,
+            _registry_version: RegistryVersion,
+        ) -> CryptoResult<CombinedMultiSigOf<MessageId>> {
+            Ok(CombinedMultiSigOf::from(CombinedMultiSig(vec![])))
+        }
+        fn verify_multi_sig_combined(
+            &self,
+            _signature: &CombinedMultiSigOf<MessageId>,
+            _message: &MessageId,
+            _signers: BTreeSet<NodeId>,
+            _registry_version: RegistryVersion,
+        ) -> CryptoResult<()> {
+            Ok(())
+        }
+    }
+
+    /// Assert that the MultiSignature in aggregate() does not
+    /// contain duplicate signers.
+    #[test]
+    fn test_deduplicate_signers_aggregate() {
+        let m: MessageId = [0u8; 32].into();
+        let s1 = fake_share(0, m.clone(), vec![1]);
+        let s2 = fake_share(0, m.clone(), vec![2]);
+        let s3 = fake_share(1, m, vec![1]);
+        // Block::new(id, payload, height, rank, context);
+
+        let x = AggregateImpl {};
+        let multisig = x
+            .aggregate(
+                vec![&s1.signature, &s2.signature, &s3.signature],
+                RegistryVersion::from(1),
+            )
+            .unwrap();
+
+        // the duplicate signers needed to be removed
+        assert_eq!(multisig.signers.len(), 2);
+        assert!(multisig.signers.contains(&s1.signature.signer));
+        assert!(multisig.signers.contains(&s2.signature.signer));
+    }
+
+    fn fake_share<C: Eq + Ord + Clone>(
+        signer_id: u64,
+        content: C,
+        sig: Vec<u8>,
+    ) -> Signed<C, MultiSignatureShare<C>> {
+        let signer = node_test_id(signer_id);
+        let signature = MultiSignatureShare {
+            signature: IndividualMultiSigOf::new(IndividualMultiSig(sig)),
+            signer,
+        };
+        Signed { content, signature }
+    }
+}

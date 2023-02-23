@@ -1,6 +1,9 @@
 use ic_metrics::buckets::{decimal_buckets, decimal_buckets_with_zero};
 use ic_metrics::MetricsRegistry;
-use prometheus::{histogram_opts, labels, opts, Histogram, HistogramVec, IntGauge};
+use prometheus::{
+    histogram_opts, labels, opts, Histogram, HistogramVec, IntCounter, IntCounterVec, IntGauge,
+    IntGaugeVec,
+};
 
 pub const LABEL_POOL: &str = "pool";
 pub const LABEL_POOL_TYPE: &str = "pool_type";
@@ -12,6 +15,7 @@ pub const POOL_TYPE_UNVALIDATED: &str = "unvalidated";
 pub struct PoolMetrics {
     pub op_duration: HistogramVec,
     pub received_artifact_bytes: Histogram,
+    received_duplicate_artifacts: IntCounter,
     pub pool_artifacts: IntGauge,
     pub pool_size_bytes: IntGauge,
 }
@@ -42,6 +46,14 @@ impl PoolMetrics {
                 ))
                 .unwrap(),
             ),
+            received_duplicate_artifacts: metrics_registry.register(
+                IntCounter::with_opts(opts!(
+                    "artifact_pool_received_duplicate_artifacts",
+                    "Duplicate artifacts received by the given pool",
+                    labels! {LABEL_POOL => pool, LABEL_POOL_TYPE => pool_type}
+                ))
+                .unwrap(),
+            ),
             pool_artifacts: metrics_registry.register(
                 IntGauge::with_opts(opts!(
                     "artifact_pool_artifacts",
@@ -69,8 +81,66 @@ impl PoolMetrics {
         self.pool_size_bytes.add(size_bytes as i64);
     }
 
+    pub fn observe_duplicate(&self, size_bytes: usize) {
+        self.received_duplicate_artifacts.inc();
+        self.pool_artifacts.dec();
+        self.pool_size_bytes.sub(size_bytes as i64);
+    }
+
     pub fn observe_remove(&self, size_bytes: usize) {
         self.pool_artifacts.dec();
         self.pool_size_bytes.sub(size_bytes as i64);
+    }
+}
+
+/// Metrics for ECDSA pool's validated/unvalidated section.
+#[derive(Clone)]
+pub struct EcdsaPoolMetrics {
+    pool_artifacts: IntGaugeVec,
+    persistence_errors: IntCounterVec,
+}
+
+impl EcdsaPoolMetrics {
+    pub fn new(metrics_registry: MetricsRegistry, pool: &str, pool_type: &str) -> Self {
+        Self {
+            pool_artifacts: metrics_registry.register(
+                IntGaugeVec::new(
+                    opts!(
+                        "ecdsa_pool_artifacts",
+                        "Current number of artifacts in the given pool, by artifact type",
+                        labels! {LABEL_POOL => pool, LABEL_POOL_TYPE => pool_type}
+                    ),
+                    &["artifact_type"],
+                )
+                .unwrap(),
+            ),
+            persistence_errors: metrics_registry.register(
+                IntCounterVec::new(
+                    opts!(
+                        "ecdsa_pool_persistence_errors",
+                        "ECDSA pool persistence related errors",
+                        labels! {LABEL_POOL => pool, LABEL_POOL_TYPE => pool_type}
+                    ),
+                    &["type"],
+                )
+                .unwrap(),
+            ),
+        }
+    }
+
+    pub fn observe_insert(&self, artifact_type: &str) {
+        self.pool_artifacts
+            .with_label_values(&[artifact_type])
+            .inc();
+    }
+
+    pub fn observe_remove(&self, artifact_type: &str) {
+        self.pool_artifacts
+            .with_label_values(&[artifact_type])
+            .dec();
+    }
+
+    pub fn persistence_error(&self, label: &str) {
+        self.persistence_errors.with_label_values(&[label]).inc();
     }
 }

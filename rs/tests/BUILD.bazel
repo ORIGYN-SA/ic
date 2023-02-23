@@ -1,0 +1,1151 @@
+load("@rules_rust//rust:defs.bzl", "rust_binary", "rust_library", "rust_test")
+load(":system_tests.bzl", "symlink_dir", "system_test", "uvm_config_image")
+load("//rs/tests:common.bzl", "DEPENDENCIES", "GRAFANA_RUNTIME_DEPS", "GUESTOS_RUNTIME_DEPS", "MACRO_DEPENDENCIES", "NNS_CANISTER_RUNTIME_DEPS", "UNIVERSAL_VM_RUNTIME_DEPS")
+
+package(default_visibility = ["//visibility:public"])
+
+exports_files([
+    "src/cow_safety.wasm",
+    "src/message.wasm",
+    "activate-systest-uvm-config",
+])
+
+ALIASES = {
+    "//rs/utils": "utils",
+}
+
+rust_library(
+    name = "tests",
+    srcs = glob(["src/**/*.rs"]),
+    aliases = ALIASES,
+    compile_data = [
+        "//ic-os/guestos:rootfs/opt/ic/share/ic.json5.template",
+        "src/consensus/cow_safety.wasm",
+        "src/message.wasm",
+        "src/counter.wat",
+        "src/ledger_tests/transaction_ledger_correctness.wasm",
+    ],
+    crate_name = "ic_tests",
+    proc_macro_deps = MACRO_DEPENDENCIES,
+    target_compatible_with = ["@platforms//os:linux"],  # requires libssh that does not build on Mac OS
+    deps = DEPENDENCIES,
+)
+
+rust_binary(
+    name = "prod-test-driver",
+    srcs = ["bin/prod_test_driver.rs"],
+    aliases = ALIASES,
+    proc_macro_deps = MACRO_DEPENDENCIES,
+    target_compatible_with = ["@platforms//os:linux"],  # requires libssh that does not build on Mac OS
+    deps = DEPENDENCIES + [":tests"],
+)
+
+rust_test(
+    name = "tests_test",
+    aliases = ALIASES,
+    crate = ":tests",
+    proc_macro_deps = MACRO_DEPENDENCIES,
+    target_compatible_with = ["@platforms//os:linux"],  # requires libssh that does not build on Mac OS
+    deps = DEPENDENCIES,
+)
+
+BOUNDARY_NODE_GUESTOS_RUNTIME_DEPS = [
+    "//ic-os/boundary-guestos/envs/dev:hash_and_upload_disk-img",
+    "//ic-os/boundary-guestos:scripts/build-bootstrap-config-image.sh",
+]
+
+BOUNDARY_NODE_GUESTOS_SEV_RUNTIME_DEPS = [
+    "//ic-os/boundary-guestos/envs/dev-sev:hash_and_upload_disk-img",
+]
+
+CKBTC_RUNTIME_DEPS = [
+    "//rs/rosetta-api/icrc1/ledger:ledger_canister",
+    "//rs/bitcoin/ckbtc/minter:ckbtc_minter_debug",
+    "@btc_canister//file",
+]
+
+BTC_RUNTIME_DEPS = [
+    "@btc_canister//file",
+]
+
+GUESTOS_MALICIOUS_RUNTIME_DEPS = [
+    "//ic-os/guestos/dev-malicious:hash_and_upload_disk-img",
+    "//ic-os/guestos/dev-malicious:hash_and_upload_update-img",
+    "//ic-os/guestos:scripts/build-bootstrap-config-image.sh",
+    "//bazel:version.txt",
+]
+
+exports_files([
+    "create-universal-vm-config-image.sh",
+])
+
+filegroup(
+    name = "grafana_dashboards",
+    srcs = glob(["dashboards/**/*"]),
+)
+
+sh_binary(
+    name = "create_universal_vm_config_image_sh",
+    srcs = ["create-universal-vm-config-image.sh"],
+)
+
+sh_binary(
+    name = "create_universal_vm_config_image_from_tar_sh",
+    srcs = ["create-universal-vm-config-image-from-tar.sh"],
+)
+
+symlink_dir(
+    name = "nns-canisters",
+    targets = {
+        "//rs/registry/canister:registry-canister": "registry-canister",
+        "//rs/nns/governance:governance-canister-test": "governance-canister_test",
+        "//rs/rosetta-api/icp_ledger/ledger:ledger-canister-wasm-notify-method": "ledger-canister_notify-method",
+        "//rs/nns/handlers/root:root-canister": "root-canister",
+        "//rs/nns/cmc:cycles-minting-canister": "cycles-minting-canister",
+        "//rs/nns/handlers/lifeline:lifeline_actor": "lifeline",
+        "//rs/nns/gtc:genesis-token-canister": "genesis-token-canister",
+        "//rs/nns/sns-wasm:sns-wasm-canister": "sns-wasm-canister",
+    },
+)
+
+symlink_dir(
+    name = "recovery/binaries",
+    targets = {
+        "//rs/registry/admin:ic-admin": "ic-admin",
+        "//rs/canister_sandbox/sandbox_launcher": "sandbox_launcher",
+        "//rs/canister_sandbox": "canister_sandbox",
+    },
+)
+
+SUBNET_RECOVERY_RUNTIME_DEPS = [":recovery/binaries"]
+
+symlink_dir(
+    name = "backup/binaries",
+    targets = {
+        "//rs/backup:ic-backup": "ic-backup",
+        "//rs/replay:ic-replay": "ic-replay",
+        "//rs/canister_sandbox/sandbox_launcher": "sandbox_launcher",
+        "//rs/canister_sandbox": "canister_sandbox",
+    },
+)
+
+BACKUP_RUNTIME_DEPS = [":backup/binaries"]
+
+MAINNET_REVISION_RUNTIME_DEPS = ["//testnet:mainnet_nns_revision"]
+
+rust_binary(
+    name = "test-driver-e2e-scenarios",
+    srcs = ["bin/test_driver_e2e_scenarios.rs"],
+    aliases = ALIASES,
+    proc_macro_deps = MACRO_DEPENDENCIES,
+    target_compatible_with = ["@platforms//os:linux"],  # requires libssh that does not build on Mac OS
+    deps = DEPENDENCIES + [":tests"],
+)
+
+py_binary(
+    name = "post_processing",
+    srcs = ["bin/bazel_test_postprocessing.py"],
+    main = ":bin/bazel_test_postprocessing.py",
+)
+
+rust_test(
+    name = "test_e2e_scenarios",
+    srcs = ["tests/test_driver_tests.rs"],
+    crate_root = "tests/test_driver_tests.rs",
+    deps = DEPENDENCIES + [":test-driver-e2e-scenarios"],
+)
+
+system_test(
+    name = "replica_determinism_test",
+    proc_macro_deps = MACRO_DEPENDENCIES,
+    target_compatible_with = ["@platforms//os:linux"],  # requires libssh that does not build on Mac OS
+    runtime_deps = GUESTOS_MALICIOUS_RUNTIME_DEPS,
+    deps = DEPENDENCIES + [":tests"],
+)
+
+system_test(
+    name = "max_ingress_payload_size_test",
+    proc_macro_deps = MACRO_DEPENDENCIES,
+    target_compatible_with = ["@platforms//os:linux"],  # requires libssh that does not build on Mac OS
+    runtime_deps = GUESTOS_RUNTIME_DEPS,
+    deps = DEPENDENCIES + [":tests"],
+)
+
+system_test(
+    name = "max_xnet_payload_size_test",
+    proc_macro_deps = MACRO_DEPENDENCIES,
+    target_compatible_with = ["@platforms//os:linux"],  # requires libssh that does not build on Mac OS
+    runtime_deps = GUESTOS_RUNTIME_DEPS,
+    deps = DEPENDENCIES + [":tests"],
+)
+
+system_test(
+    name = "dual_workload_test",
+    proc_macro_deps = MACRO_DEPENDENCIES,
+    tags = [
+        "allow_to_fail",
+    ],
+    target_compatible_with = ["@platforms//os:linux"],  # requires libssh that does not build on Mac OS
+    runtime_deps = GUESTOS_RUNTIME_DEPS,
+    deps = DEPENDENCIES + [":tests"],
+)
+
+system_test(
+    name = "catch_up_possible_test",
+    proc_macro_deps = MACRO_DEPENDENCIES,
+    tags = [
+        "system_test_hourly",
+    ],
+    target_compatible_with = ["@platforms//os:linux"],  # requires libssh that does not build on Mac OS
+    runtime_deps = GUESTOS_MALICIOUS_RUNTIME_DEPS + GRAFANA_RUNTIME_DEPS,
+    deps = DEPENDENCIES + [":tests"],
+)
+
+system_test(
+    name = "catch_up_loop_prevention_test",
+    proc_macro_deps = MACRO_DEPENDENCIES,
+    tags = [
+        "system_test_hourly",
+    ],
+    target_compatible_with = ["@platforms//os:linux"],  # requires libssh that does not build on Mac OS
+    runtime_deps = GUESTOS_MALICIOUS_RUNTIME_DEPS + GRAFANA_RUNTIME_DEPS,
+    deps = DEPENDENCIES + [":tests"],
+)
+
+system_test(
+    name = "node_assign_test",
+    proc_macro_deps = MACRO_DEPENDENCIES,
+    tags = [
+        "system_test_pre_master",
+    ],
+    target_compatible_with = ["@platforms//os:linux"],  # requires libssh that does not build on Mac OS
+    runtime_deps = GUESTOS_RUNTIME_DEPS + NNS_CANISTER_RUNTIME_DEPS,
+    deps = DEPENDENCIES + [":tests"],
+)
+
+system_test(
+    name = "node_reassignment_test",
+    proc_macro_deps = MACRO_DEPENDENCIES,
+    tags = [
+        "system_test_pre_master",
+    ],
+    target_compatible_with = ["@platforms//os:linux"],  # requires libssh that does not build on Mac OS
+    runtime_deps = GUESTOS_RUNTIME_DEPS + NNS_CANISTER_RUNTIME_DEPS,
+    deps = DEPENDENCIES + [":tests"],
+)
+
+system_test(
+    name = "ssh_access_to_nodes_test",
+    proc_macro_deps = MACRO_DEPENDENCIES,
+    tags = [
+        "system_test_pre_master",
+    ],
+    target_compatible_with = ["@platforms//os:linux"],  # requires libssh that does not build on Mac OS
+    runtime_deps = GUESTOS_RUNTIME_DEPS + NNS_CANISTER_RUNTIME_DEPS,
+    deps = DEPENDENCIES + [":tests"],
+)
+
+system_test(
+    name = "node_graceful_leaving_test",
+    proc_macro_deps = MACRO_DEPENDENCIES,
+    tags = [
+        "system_test_pre_master",
+    ],
+    target_compatible_with = ["@platforms//os:linux"],  # requires libssh that does not build on Mac OS
+    runtime_deps = GUESTOS_RUNTIME_DEPS + NNS_CANISTER_RUNTIME_DEPS,
+    deps = DEPENDENCIES + [":tests"],
+)
+
+system_test(
+    name = "liveness_with_equivocation_test",
+    proc_macro_deps = MACRO_DEPENDENCIES,
+    target_compatible_with = ["@platforms//os:linux"],  # requires libssh that does not build on Mac OS
+    runtime_deps = GUESTOS_MALICIOUS_RUNTIME_DEPS,
+    deps = DEPENDENCIES + [":tests"],
+)
+
+system_test(
+    name = "request_auth_malicious_replica_test",
+    proc_macro_deps = MACRO_DEPENDENCIES,
+    target_compatible_with = ["@platforms//os:linux"],  # requires libssh that does not build on Mac OS
+    runtime_deps = GUESTOS_MALICIOUS_RUNTIME_DEPS,
+    deps = DEPENDENCIES + [":tests"],
+)
+
+system_test(
+    name = "tecdsa_complaint_test",
+    proc_macro_deps = MACRO_DEPENDENCIES,
+    target_compatible_with = ["@platforms//os:linux"],  # requires libssh that does not build on Mac OS
+    runtime_deps = GUESTOS_MALICIOUS_RUNTIME_DEPS + NNS_CANISTER_RUNTIME_DEPS,
+    deps = DEPENDENCIES + [":tests"],
+)
+
+system_test(
+    name = "safety_test",
+    proc_macro_deps = MACRO_DEPENDENCIES,
+    target_compatible_with = ["@platforms//os:linux"],  # requires libssh that does not build on Mac OS
+    runtime_deps = GUESTOS_MALICIOUS_RUNTIME_DEPS,
+    deps = DEPENDENCIES + [":tests"],
+)
+
+system_test(
+    name = "cow_safety_test",
+    proc_macro_deps = MACRO_DEPENDENCIES,
+    target_compatible_with = ["@platforms//os:linux"],  # requires libssh that does not build on Mac OS
+    runtime_deps = GUESTOS_RUNTIME_DEPS,
+    deps = DEPENDENCIES + [":tests"],
+)
+
+system_test(
+    name = "system_subnets_test",
+    proc_macro_deps = MACRO_DEPENDENCIES,
+    target_compatible_with = ["@platforms//os:linux"],  # requires libssh that does not build on Mac OS
+    runtime_deps = GUESTOS_RUNTIME_DEPS,
+    deps = DEPENDENCIES + [":tests"],
+)
+
+system_test(
+    name = "node_registration_test",
+    proc_macro_deps = MACRO_DEPENDENCIES,
+    tags = [
+        "system_test_pre_master",
+    ],
+    target_compatible_with = ["@platforms//os:linux"],  # requires libssh that does not build on Mac OS
+    runtime_deps = GUESTOS_RUNTIME_DEPS + UNIVERSAL_VM_RUNTIME_DEPS + NNS_CANISTER_RUNTIME_DEPS,
+    deps = DEPENDENCIES + [":tests"],
+)
+
+system_test(
+    name = "basic_health_test",
+    flaky = False,  # remove after when PFOPS-3148 is resolved
+    proc_macro_deps = MACRO_DEPENDENCIES,
+    tags = [
+        "system_test_hourly",
+        "system_test_nightly",
+    ],
+    target_compatible_with = ["@platforms//os:linux"],  # requires libssh that does not build on Mac OS
+    runtime_deps = GUESTOS_RUNTIME_DEPS + GRAFANA_RUNTIME_DEPS,
+    deps = DEPENDENCIES + [":tests"],
+)
+
+system_test(
+    name = "workload_counter_canister_test",
+    flaky = False,  # remove after when PFOPS-3148 is resolved
+    proc_macro_deps = MACRO_DEPENDENCIES,
+    tags = [
+        "system_test_hourly",
+        "system_test_nightly",
+    ],
+    target_compatible_with = ["@platforms//os:linux"],  # requires libssh that does not build on Mac OS
+    runtime_deps = GUESTOS_RUNTIME_DEPS + NNS_CANISTER_RUNTIME_DEPS,
+    deps = DEPENDENCIES + [":tests"],
+)
+
+system_test(
+    name = "create_subnet_hourly_test",
+    flaky = False,  # remove after when PFOPS-3148 is resolved
+    proc_macro_deps = MACRO_DEPENDENCIES,
+    tags = [
+        "system_test_hourly",
+        "system_test_nightly",
+    ],
+    target_compatible_with = ["@platforms//os:linux"],  # requires libssh that does not build on Mac OS
+    runtime_deps = GUESTOS_RUNTIME_DEPS + NNS_CANISTER_RUNTIME_DEPS,
+    deps = DEPENDENCIES + [":tests"],
+)
+
+system_test(
+    name = "create_subnet_pre_master_test",
+    proc_macro_deps = MACRO_DEPENDENCIES,
+    target_compatible_with = ["@platforms//os:linux"],  # requires libssh that does not build on Mac OS
+    runtime_deps = GUESTOS_RUNTIME_DEPS + NNS_CANISTER_RUNTIME_DEPS,
+    deps = DEPENDENCIES + [":tests"],
+)
+
+system_test(
+    name = "system_api_security_test",
+    proc_macro_deps = MACRO_DEPENDENCIES,
+    target_compatible_with = ["@platforms//os:linux"],  # requires libssh that does not build on Mac OS
+    runtime_deps = GUESTOS_RUNTIME_DEPS,
+    deps = DEPENDENCIES + [":tests"],
+)
+
+system_test(
+    name = "rejoin_test",
+    flaky = False,  # remove after when PFOPS-3148 is resolved
+    proc_macro_deps = MACRO_DEPENDENCIES,
+    tags = [
+        "system_test_hourly",
+        "system_test_nightly",
+    ],
+    target_compatible_with = ["@platforms//os:linux"],  # requires libssh that does not build on Mac OS
+    runtime_deps = GUESTOS_RUNTIME_DEPS + NNS_CANISTER_RUNTIME_DEPS,
+    deps = DEPENDENCIES + [":tests"],
+)
+
+system_test(
+    name = "xnet_slo_3_subnets_test",
+    proc_macro_deps = MACRO_DEPENDENCIES,
+    tags = [
+        "system_test_nightly",
+    ],
+    target_compatible_with = ["@platforms//os:linux"],  # requires libssh that does not build on Mac OS
+    test_timeout = "long",
+    runtime_deps = GUESTOS_RUNTIME_DEPS + NNS_CANISTER_RUNTIME_DEPS + ["//rs/rust_canisters/xnet_test:xnet-test-canister"],
+    deps = DEPENDENCIES + [":tests"],
+)
+
+system_test(
+    name = "xnet_slo_29_subnets_test",
+    proc_macro_deps = MACRO_DEPENDENCIES,
+    tags = [
+        "system_test_nightly",
+    ],
+    target_compatible_with = ["@platforms//os:linux"],  # requires libssh that does not build on Mac OS
+    test_timeout = "eternal",
+    runtime_deps = GUESTOS_RUNTIME_DEPS + NNS_CANISTER_RUNTIME_DEPS + ["//rs/rust_canisters/xnet_test:xnet-test-canister"],
+    deps = DEPENDENCIES + [":tests"],
+)
+
+system_test(
+    name = "sr_app_same_nodes_test",
+    proc_macro_deps = MACRO_DEPENDENCIES,
+    tags = [
+        "subnet_recovery",
+        "system_test_pre_master",
+    ],
+    target_compatible_with = ["@platforms//os:linux"],  # requires libssh that does not build on Mac OS
+    runtime_deps = GUESTOS_RUNTIME_DEPS + NNS_CANISTER_RUNTIME_DEPS + SUBNET_RECOVERY_RUNTIME_DEPS,
+    deps = DEPENDENCIES + [":tests"],
+)
+
+system_test(
+    name = "sr_app_same_nodes_enable_tecdsa_test",
+    proc_macro_deps = MACRO_DEPENDENCIES,
+    tags = [
+        "subnet_recovery",
+        "system_test_hourly",
+    ],
+    target_compatible_with = ["@platforms//os:linux"],  # requires libssh that does not build on Mac OS
+    runtime_deps = GUESTOS_RUNTIME_DEPS + NNS_CANISTER_RUNTIME_DEPS + SUBNET_RECOVERY_RUNTIME_DEPS,
+    deps = DEPENDENCIES + [":tests"],
+)
+
+system_test(
+    name = "sr_app_same_nodes_with_tecdsa_test",
+    proc_macro_deps = MACRO_DEPENDENCIES,
+    tags = [
+        "subnet_recovery",
+        "system_test_hourly",
+    ],
+    target_compatible_with = ["@platforms//os:linux"],  # requires libssh that does not build on Mac OS
+    runtime_deps = GUESTOS_RUNTIME_DEPS + NNS_CANISTER_RUNTIME_DEPS + SUBNET_RECOVERY_RUNTIME_DEPS,
+    deps = DEPENDENCIES + [":tests"],
+)
+
+system_test(
+    name = "sr_app_failover_nodes_test",
+    proc_macro_deps = MACRO_DEPENDENCIES,
+    tags = [
+        "subnet_recovery",
+        "system_test_pre_master",
+    ],
+    target_compatible_with = ["@platforms//os:linux"],  # requires libssh that does not build on Mac OS
+    runtime_deps = GUESTOS_RUNTIME_DEPS + NNS_CANISTER_RUNTIME_DEPS + SUBNET_RECOVERY_RUNTIME_DEPS,
+    deps = DEPENDENCIES + [":tests"],
+)
+
+system_test(
+    name = "sr_app_failover_nodes_enable_tecdsa_test",
+    proc_macro_deps = MACRO_DEPENDENCIES,
+    tags = [
+        "subnet_recovery",
+        "system_test_hourly",
+    ],
+    target_compatible_with = ["@platforms//os:linux"],  # requires libssh that does not build on Mac OS
+    runtime_deps = GUESTOS_RUNTIME_DEPS + NNS_CANISTER_RUNTIME_DEPS + SUBNET_RECOVERY_RUNTIME_DEPS,
+    deps = DEPENDENCIES + [":tests"],
+)
+
+system_test(
+    name = "sr_app_failover_nodes_with_tecdsa_test",
+    proc_macro_deps = MACRO_DEPENDENCIES,
+    tags = [
+        "subnet_recovery",
+        "system_test_hourly",
+    ],
+    target_compatible_with = ["@platforms//os:linux"],  # requires libssh that does not build on Mac OS
+    runtime_deps = GUESTOS_RUNTIME_DEPS + NNS_CANISTER_RUNTIME_DEPS + SUBNET_RECOVERY_RUNTIME_DEPS,
+    deps = DEPENDENCIES + [":tests"],
+)
+
+system_test(
+    name = "sr_app_no_upgrade_test",
+    proc_macro_deps = MACRO_DEPENDENCIES,
+    tags = [
+        "subnet_recovery",
+        "system_test_pre_master",
+    ],
+    target_compatible_with = ["@platforms//os:linux"],  # requires libssh that does not build on Mac OS
+    runtime_deps = GUESTOS_RUNTIME_DEPS + NNS_CANISTER_RUNTIME_DEPS + SUBNET_RECOVERY_RUNTIME_DEPS,
+    deps = DEPENDENCIES + [":tests"],
+)
+
+system_test(
+    name = "sr_app_no_upgrade_enable_tecdsa_test",
+    proc_macro_deps = MACRO_DEPENDENCIES,
+    tags = [
+        "subnet_recovery",
+        "system_test_hourly",
+    ],
+    target_compatible_with = ["@platforms//os:linux"],  # requires libssh that does not build on Mac OS
+    runtime_deps = GUESTOS_RUNTIME_DEPS + NNS_CANISTER_RUNTIME_DEPS + SUBNET_RECOVERY_RUNTIME_DEPS,
+    deps = DEPENDENCIES + [":tests"],
+)
+
+system_test(
+    name = "sr_app_no_upgrade_with_tecdsa_test",
+    proc_macro_deps = MACRO_DEPENDENCIES,
+    tags = [
+        "subnet_recovery",
+        "system_test_hourly",
+    ],
+    target_compatible_with = ["@platforms//os:linux"],  # requires libssh that does not build on Mac OS
+    runtime_deps = GUESTOS_RUNTIME_DEPS + NNS_CANISTER_RUNTIME_DEPS + SUBNET_RECOVERY_RUNTIME_DEPS,
+    deps = DEPENDENCIES + [":tests"],
+)
+
+system_test(
+    name = "sr_nns_same_nodes_test",
+    proc_macro_deps = MACRO_DEPENDENCIES,
+    tags = [
+        "subnet_recovery",
+        "system_test_pre_master",
+    ],
+    target_compatible_with = ["@platforms//os:linux"],  # requires libssh that does not build on Mac OS
+    runtime_deps = GUESTOS_RUNTIME_DEPS + NNS_CANISTER_RUNTIME_DEPS + SUBNET_RECOVERY_RUNTIME_DEPS,
+    deps = DEPENDENCIES + [":tests"],
+)
+
+system_test(
+    name = "sr_nns_failover_nodes_test",
+    proc_macro_deps = MACRO_DEPENDENCIES,
+    tags = [
+        "subnet_recovery",
+        "system_test_pre_master",
+    ],
+    target_compatible_with = ["@platforms//os:linux"],  # requires libssh that does not build on Mac OS
+    runtime_deps =
+        GUESTOS_RUNTIME_DEPS +
+        UNIVERSAL_VM_RUNTIME_DEPS +
+        NNS_CANISTER_RUNTIME_DEPS +
+        SUBNET_RECOVERY_RUNTIME_DEPS + [
+            ":src/orchestrator/universal_vm_activation.sh",
+        ],
+    deps = DEPENDENCIES + [":tests"],
+)
+
+system_test(
+    name = "network_reliability_test",
+    proc_macro_deps = MACRO_DEPENDENCIES,
+    tags = [
+        "system_test_nightly",
+    ],
+    target_compatible_with = ["@platforms//os:linux"],  # requires libssh that does not build on Mac OS
+    runtime_deps = GUESTOS_RUNTIME_DEPS + NNS_CANISTER_RUNTIME_DEPS + [":src/counter.wat"],
+    deps = DEPENDENCIES + [":tests"],
+)
+
+system_test(
+    name = "rotate_ecdsa_idkg_key_test",
+    proc_macro_deps = MACRO_DEPENDENCIES,
+    target_compatible_with = ["@platforms//os:linux"],  # requires libssh that does not build on Mac OS
+    runtime_deps = GUESTOS_RUNTIME_DEPS + NNS_CANISTER_RUNTIME_DEPS,
+    deps = DEPENDENCIES + [":tests"],
+)
+
+system_test(
+    name = "tecdsa_add_nodes_test",
+    proc_macro_deps = MACRO_DEPENDENCIES,
+    target_compatible_with = ["@platforms//os:linux"],  # requires libssh that does not build on Mac OS
+    runtime_deps = GUESTOS_RUNTIME_DEPS + NNS_CANISTER_RUNTIME_DEPS,
+    deps = DEPENDENCIES + [":tests"],
+)
+
+system_test(
+    name = "tecdsa_remove_nodes_test",
+    proc_macro_deps = MACRO_DEPENDENCIES,
+    target_compatible_with = ["@platforms//os:linux"],  # requires libssh that does not build on Mac OS
+    runtime_deps = GUESTOS_RUNTIME_DEPS + NNS_CANISTER_RUNTIME_DEPS,
+    deps = DEPENDENCIES + [":tests"],
+)
+
+system_test(
+    name = "tecdsa_key_rotation_test",
+    proc_macro_deps = MACRO_DEPENDENCIES,
+    target_compatible_with = ["@platforms//os:linux"],  # requires libssh that does not build on Mac OS
+    runtime_deps = GUESTOS_RUNTIME_DEPS + NNS_CANISTER_RUNTIME_DEPS,
+    deps = DEPENDENCIES + [":tests"],
+)
+
+system_test(
+    name = "tecdsa_signature_fails_without_cycles_test",
+    proc_macro_deps = MACRO_DEPENDENCIES,
+    tags = [
+        "system_test_hourly",
+        "system_test_nightly",
+    ],
+    target_compatible_with = ["@platforms//os:linux"],  # requires libssh that does not build on Mac OS
+    runtime_deps = GUESTOS_RUNTIME_DEPS + NNS_CANISTER_RUNTIME_DEPS,
+    deps = DEPENDENCIES + [":tests"],
+)
+
+system_test(
+    name = "tecdsa_signature_from_nns_without_cycles_test",
+    proc_macro_deps = MACRO_DEPENDENCIES,
+    tags = [
+        "system_test_hourly",
+        "system_test_nightly",
+    ],
+    target_compatible_with = ["@platforms//os:linux"],  # requires libssh that does not build on Mac OS
+    runtime_deps = GUESTOS_RUNTIME_DEPS + NNS_CANISTER_RUNTIME_DEPS,
+    deps = DEPENDENCIES + [":tests"],
+)
+
+system_test(
+    name = "tecdsa_signature_from_other_subnet_test",
+    proc_macro_deps = MACRO_DEPENDENCIES,
+    tags = [
+        "system_test_hourly",
+        "system_test_nightly",
+    ],
+    target_compatible_with = ["@platforms//os:linux"],  # requires libssh that does not build on Mac OS
+    runtime_deps = GUESTOS_RUNTIME_DEPS + NNS_CANISTER_RUNTIME_DEPS,
+    deps = DEPENDENCIES + [":tests"],
+)
+
+system_test(
+    name = "tecdsa_signature_life_cycle_test",
+    # Remove when CON-937 is resolved
+    flaky = True,
+    proc_macro_deps = MACRO_DEPENDENCIES,
+    tags = [
+        "allow_to_fail",
+    ],
+    target_compatible_with = ["@platforms//os:linux"],  # requires libssh that does not build on Mac OS
+    runtime_deps = GUESTOS_RUNTIME_DEPS + NNS_CANISTER_RUNTIME_DEPS,
+    deps = DEPENDENCIES + [":tests"],
+)
+
+system_test(
+    name = "tecdsa_signature_same_subnet_test",
+    proc_macro_deps = MACRO_DEPENDENCIES,
+    tags = [
+        "system_test_hourly",
+        "system_test_nightly",
+    ],
+    target_compatible_with = ["@platforms//os:linux"],  # requires libssh that does not build on Mac OS
+    runtime_deps = GUESTOS_RUNTIME_DEPS + NNS_CANISTER_RUNTIME_DEPS,
+    deps = DEPENDENCIES + [":tests"],
+)
+
+system_test(
+    name = "tecdsa_signature_timeout_test",
+    proc_macro_deps = MACRO_DEPENDENCIES,
+    target_compatible_with = ["@platforms//os:linux"],  # requires libssh that does not build on Mac OS
+    runtime_deps = GUESTOS_RUNTIME_DEPS + NNS_CANISTER_RUNTIME_DEPS,
+    deps = DEPENDENCIES + [":tests"],
+)
+
+system_test(
+    name = "btc_get_balance_test",
+    proc_macro_deps = MACRO_DEPENDENCIES,
+    target_compatible_with = ["@platforms//os:linux"],  # requires libssh that does not build on Mac OS
+    runtime_deps =
+        GUESTOS_RUNTIME_DEPS +
+        UNIVERSAL_VM_RUNTIME_DEPS +
+        NNS_CANISTER_RUNTIME_DEPS +
+        BTC_RUNTIME_DEPS,
+    deps = DEPENDENCIES + [":tests"],
+)
+
+system_test(
+    name = "downgrade_app_subnet_with_ecdsa_test",
+    proc_macro_deps = MACRO_DEPENDENCIES,
+    target_compatible_with = ["@platforms//os:linux"],  # requires libssh that does not build on Mac OS
+    runtime_deps =
+        GUESTOS_RUNTIME_DEPS +
+        UNIVERSAL_VM_RUNTIME_DEPS +
+        NNS_CANISTER_RUNTIME_DEPS +
+        MAINNET_REVISION_RUNTIME_DEPS,
+    deps = DEPENDENCIES + [":tests"],
+)
+
+system_test(
+    name = "upgrade_downgrade_app_subnet_test",
+    proc_macro_deps = MACRO_DEPENDENCIES,
+    target_compatible_with = ["@platforms//os:linux"],  # requires libssh that does not build on Mac OS
+    runtime_deps =
+        GUESTOS_RUNTIME_DEPS +
+        UNIVERSAL_VM_RUNTIME_DEPS +
+        NNS_CANISTER_RUNTIME_DEPS +
+        MAINNET_REVISION_RUNTIME_DEPS,
+    deps = DEPENDENCIES + [":tests"],
+)
+
+system_test(
+    name = "backup_manager_test",
+    proc_macro_deps = MACRO_DEPENDENCIES,
+    target_compatible_with = ["@platforms//os:linux"],  # requires libssh that does not build on Mac OS
+    runtime_deps =
+        GUESTOS_RUNTIME_DEPS +
+        UNIVERSAL_VM_RUNTIME_DEPS +
+        NNS_CANISTER_RUNTIME_DEPS +
+        MAINNET_REVISION_RUNTIME_DEPS +
+        BACKUP_RUNTIME_DEPS,
+    deps = DEPENDENCIES + [":tests"],
+)
+
+system_test(
+    name = "upgrade_downgrade_nns_subnet_test",
+    proc_macro_deps = MACRO_DEPENDENCIES,
+    target_compatible_with = ["@platforms//os:linux"],  # requires libssh that does not build on Mac OS
+    runtime_deps =
+        GUESTOS_RUNTIME_DEPS +
+        UNIVERSAL_VM_RUNTIME_DEPS +
+        NNS_CANISTER_RUNTIME_DEPS +
+        MAINNET_REVISION_RUNTIME_DEPS,
+    deps = DEPENDENCIES + [":tests"],
+)
+
+filegroup(
+    name = "rosetta_workspace",
+    srcs = glob(["rosetta_workspace/*"]),
+)
+
+system_test(
+    name = "rosetta_test",
+    proc_macro_deps = MACRO_DEPENDENCIES,
+    target_compatible_with = ["@platforms//os:linux"],  # requires libssh that does not build on Mac OS
+    runtime_deps =
+        GUESTOS_RUNTIME_DEPS +
+        NNS_CANISTER_RUNTIME_DEPS + [
+            ":rosetta_workspace",
+            "//rs/rosetta-api:ic-rosetta-api",
+            "@rosetta-cli//:rosetta-cli",
+        ],
+    deps = DEPENDENCIES + [":tests"],
+)
+
+system_test(
+    name = "rosetta_split_test",
+    proc_macro_deps = MACRO_DEPENDENCIES,
+    tags = [
+        "allow_to_fail",
+    ],
+    target_compatible_with = ["@platforms//os:linux"],  # requires libssh that does not build on Mac OS
+    runtime_deps =
+        GUESTOS_RUNTIME_DEPS +
+        UNIVERSAL_VM_RUNTIME_DEPS +
+        NNS_CANISTER_RUNTIME_DEPS + [
+            ":rosetta_workspace",
+            "//rs/rosetta-api:ic-rosetta-api",
+            "//rs/rosetta-api:rosetta_image.tar",
+            "@rosetta-cli//:rosetta-cli",
+        ],
+    deps = DEPENDENCIES + [":tests"],
+)
+
+system_test(
+    name = "ckbtc_minter_basics_test",
+    proc_macro_deps = MACRO_DEPENDENCIES,
+    target_compatible_with = ["@platforms//os:linux"],  # requires libssh that does not build on Mac OS
+    runtime_deps =
+        GUESTOS_RUNTIME_DEPS +
+        UNIVERSAL_VM_RUNTIME_DEPS +
+        NNS_CANISTER_RUNTIME_DEPS +
+        CKBTC_RUNTIME_DEPS,
+    deps = DEPENDENCIES + [":tests"],
+)
+
+system_test(
+    name = "ckbtc_minter_batching",
+    proc_macro_deps = MACRO_DEPENDENCIES,
+    target_compatible_with = ["@platforms//os:linux"],  # requires libssh that does not build on Mac OS
+    runtime_deps =
+        GUESTOS_RUNTIME_DEPS +
+        UNIVERSAL_VM_RUNTIME_DEPS +
+        NNS_CANISTER_RUNTIME_DEPS +
+        CKBTC_RUNTIME_DEPS,
+    deps = DEPENDENCIES + [":tests"],
+)
+
+system_test(
+    name = "ckbtc_minter_heartbeat",
+    proc_macro_deps = MACRO_DEPENDENCIES,
+    target_compatible_with = ["@platforms//os:linux"],  # requires libssh that does not build on Mac OS
+    runtime_deps =
+        GUESTOS_RUNTIME_DEPS +
+        UNIVERSAL_VM_RUNTIME_DEPS +
+        NNS_CANISTER_RUNTIME_DEPS +
+        CKBTC_RUNTIME_DEPS,
+    deps = DEPENDENCIES + [":tests"],
+)
+
+system_test(
+    name = "ckbtc_minter_update_balance",
+    proc_macro_deps = MACRO_DEPENDENCIES,
+    target_compatible_with = ["@platforms//os:linux"],  # requires libssh that does not build on Mac OS
+    runtime_deps =
+        GUESTOS_RUNTIME_DEPS +
+        UNIVERSAL_VM_RUNTIME_DEPS +
+        NNS_CANISTER_RUNTIME_DEPS +
+        CKBTC_RUNTIME_DEPS,
+    deps = DEPENDENCIES + [":tests"],
+)
+
+system_test(
+    name = "ckbtc_minter_retrieve_btc",
+    proc_macro_deps = MACRO_DEPENDENCIES,
+    target_compatible_with = ["@platforms//os:linux"],  # requires libssh that does not build on Mac OS
+    runtime_deps =
+        GUESTOS_RUNTIME_DEPS +
+        UNIVERSAL_VM_RUNTIME_DEPS +
+        NNS_CANISTER_RUNTIME_DEPS +
+        CKBTC_RUNTIME_DEPS,
+    deps = DEPENDENCIES + [":tests"],
+)
+
+system_test(
+    name = "icrc1_agent_test",
+    proc_macro_deps = MACRO_DEPENDENCIES,
+    target_compatible_with = ["@platforms//os:linux"],  # requires libssh that does not build on Mac OS
+    runtime_deps =
+        GUESTOS_RUNTIME_DEPS + [
+            "//rs/rosetta-api/icrc1/ledger:ledger_canister",
+        ],
+    deps = DEPENDENCIES + [":tests"],
+)
+
+exports_files([
+    "src/canister_http/universal_vm_activation.sh",
+])
+
+CANISTER_HTTP_RUNTIME_DEPS = [
+    ":src/canister_http/universal_vm_activation.sh",
+    "//ic-os/guestos:rootfs/dev-certs/canister_http_test_ca.cert",
+    "//ic-os/guestos:rootfs/dev-certs/canister_http_test_ca.key",
+]
+
+system_test(
+    name = "canister_http_test",
+    proc_macro_deps = MACRO_DEPENDENCIES,
+    target_compatible_with = ["@platforms//os:linux"],  # requires libssh that does not build on Mac OS
+    runtime_deps =
+        GUESTOS_RUNTIME_DEPS +
+        UNIVERSAL_VM_RUNTIME_DEPS +
+        NNS_CANISTER_RUNTIME_DEPS +
+        CANISTER_HTTP_RUNTIME_DEPS + [
+            "//rs/rust_canisters/proxy_canister:proxy_canister",
+        ],
+    deps = DEPENDENCIES + [":tests"],
+)
+
+system_test(
+    name = "canister_http_correctness_test",
+    proc_macro_deps = MACRO_DEPENDENCIES,
+    tags = [
+        "system_test_hourly",
+        "system_test_nightly",
+    ],
+    target_compatible_with = ["@platforms//os:linux"],  # requires libssh that does not build on Mac OS
+    runtime_deps =
+        GUESTOS_RUNTIME_DEPS +
+        UNIVERSAL_VM_RUNTIME_DEPS +
+        NNS_CANISTER_RUNTIME_DEPS +
+        CANISTER_HTTP_RUNTIME_DEPS + [
+            "//rs/rust_canisters/proxy_canister:proxy_canister",
+        ],
+    deps = DEPENDENCIES + [":tests"],
+)
+
+system_test(
+    name = "canister_http_fault_tolerance_test",
+    proc_macro_deps = MACRO_DEPENDENCIES,
+    tags = [
+        "manual",
+    ],
+    target_compatible_with = ["@platforms//os:linux"],  # requires libssh that does not build on Mac OS
+    runtime_deps =
+        GUESTOS_RUNTIME_DEPS +
+        UNIVERSAL_VM_RUNTIME_DEPS +
+        NNS_CANISTER_RUNTIME_DEPS +
+        CANISTER_HTTP_RUNTIME_DEPS + [
+            "//rs/rust_canisters/proxy_canister:proxy_canister",
+        ],
+    deps = DEPENDENCIES + [":tests"],
+)
+
+symlink_dir(
+    name = "ic-hs",
+    targets = {
+        "@ic-hs//:build/ic-ref-test": "ic-ref-test",
+        "@ic-hs//:test-data/universal-canister.wasm": "universal-canister.wasm",
+    },
+)
+
+IC_HS_RUNTIME_DEPS = [
+    ":ic-hs",
+]
+
+system_test(
+    name = "spec_compliance_application_test",
+    proc_macro_deps = MACRO_DEPENDENCIES,
+    tags = [
+        "system_test_pre_master",
+    ],
+    target_compatible_with = ["@platforms//os:linux"],  # requires libssh that does not build on Mac OS
+    runtime_deps = GUESTOS_RUNTIME_DEPS + UNIVERSAL_VM_RUNTIME_DEPS + CANISTER_HTTP_RUNTIME_DEPS + IC_HS_RUNTIME_DEPS,
+    deps = DEPENDENCIES + [":tests"],
+)
+
+system_test(
+    name = "spec_compliance_system_test",
+    proc_macro_deps = MACRO_DEPENDENCIES,
+    tags = [
+        "system_test_pre_master",
+    ],
+    target_compatible_with = ["@platforms//os:linux"],  # requires libssh that does not build on Mac OS
+    runtime_deps = GUESTOS_RUNTIME_DEPS + UNIVERSAL_VM_RUNTIME_DEPS + CANISTER_HTTP_RUNTIME_DEPS + IC_HS_RUNTIME_DEPS,
+    deps = DEPENDENCIES + [":tests"],
+)
+
+system_test(
+    name = "two_third_latency_test",
+    proc_macro_deps = MACRO_DEPENDENCIES,
+    tags = [
+        "system_test_nightly",
+    ],
+    target_compatible_with = ["@platforms//os:linux"],  # requires libssh that does not build on Mac OS
+    runtime_deps = GUESTOS_RUNTIME_DEPS + NNS_CANISTER_RUNTIME_DEPS,
+    deps = DEPENDENCIES + [":tests"],
+)
+
+system_test(
+    name = "query_workload_long_test",
+    flaky = False,
+    proc_macro_deps = MACRO_DEPENDENCIES,
+    tags = [
+        "system_test_nightly",
+    ],
+    target_compatible_with = ["@platforms//os:linux"],  # requires libssh that does not build on Mac OS
+    test_timeout = "eternal",
+    runtime_deps = GUESTOS_RUNTIME_DEPS + NNS_CANISTER_RUNTIME_DEPS + GRAFANA_RUNTIME_DEPS + [":src/counter.wat"],
+    deps = DEPENDENCIES + [":tests"],
+)
+
+system_test(
+    name = "update_workload_long_test",
+    flaky = False,
+    proc_macro_deps = MACRO_DEPENDENCIES,
+    tags = [
+        "system_test_nightly",
+    ],
+    target_compatible_with = ["@platforms//os:linux"],  # requires libssh that does not build on Mac OS
+    test_timeout = "eternal",
+    runtime_deps = GUESTOS_RUNTIME_DEPS + NNS_CANISTER_RUNTIME_DEPS + GRAFANA_RUNTIME_DEPS + [":src/counter.wat"],
+    deps = DEPENDENCIES + [":tests"],
+)
+
+system_test(
+    name = "update_workload_large_payload",
+    flaky = False,
+    proc_macro_deps = MACRO_DEPENDENCIES,
+    tags = [
+        "system_test_nightly",
+    ],
+    target_compatible_with = ["@platforms//os:linux"],  # requires libssh that does not build on Mac OS
+    test_timeout = "eternal",
+    runtime_deps = GUESTOS_RUNTIME_DEPS + NNS_CANISTER_RUNTIME_DEPS + GRAFANA_RUNTIME_DEPS + [":src/counter.wat"],
+    deps = DEPENDENCIES + [":tests"],
+)
+
+system_test(
+    name = "boundary_node_integration_test",
+    proc_macro_deps = MACRO_DEPENDENCIES,
+    tags = [],
+    target_compatible_with = ["@platforms//os:linux"],  # requires libssh that does not build on Mac OS
+    runtime_deps = BOUNDARY_NODE_GUESTOS_RUNTIME_DEPS + GUESTOS_RUNTIME_DEPS + NNS_CANISTER_RUNTIME_DEPS + [
+        "//rs/tests/test_canisters/http_counter",
+        "//rs/tests/test_canisters/kv_store",
+    ],
+    deps = DEPENDENCIES + [":tests"],
+)
+
+system_test(
+    name = "boundary_node_integration_on_playnet_test",
+    proc_macro_deps = MACRO_DEPENDENCIES,
+    tags = [
+        "system_test_hourly",
+    ],
+    target_compatible_with = ["@platforms//os:linux"],  # requires libssh that does not build on Mac OS
+    runtime_deps = BOUNDARY_NODE_GUESTOS_RUNTIME_DEPS + GUESTOS_RUNTIME_DEPS + NNS_CANISTER_RUNTIME_DEPS + [
+        "//rs/tests/test_canisters/http_counter",
+        "//rs/tests/test_canisters/kv_store",
+    ],
+    deps = DEPENDENCIES + [":tests"],
+)
+
+system_test(
+    name = "boundary_nodes_snp_test",
+    proc_macro_deps = MACRO_DEPENDENCIES,
+    tags = [],
+    target_compatible_with = ["@platforms//os:linux"],  # requires libssh that does not build on Mac OS
+    runtime_deps = BOUNDARY_NODE_GUESTOS_RUNTIME_DEPS + BOUNDARY_NODE_GUESTOS_SEV_RUNTIME_DEPS + GUESTOS_RUNTIME_DEPS + NNS_CANISTER_RUNTIME_DEPS,
+    deps = DEPENDENCIES + [":tests"],
+)
+
+system_test(
+    name = "boundary_node_update_workload_test",
+    flaky = False,
+    proc_macro_deps = MACRO_DEPENDENCIES,
+    tags = [
+        "system_test_hourly",
+    ],
+    target_compatible_with = ["@platforms//os:linux"],  # requires libssh that does not build on Mac OS
+    test_timeout = "long",
+    runtime_deps = BOUNDARY_NODE_GUESTOS_RUNTIME_DEPS + GUESTOS_RUNTIME_DEPS + NNS_CANISTER_RUNTIME_DEPS + GRAFANA_RUNTIME_DEPS + [":src/counter.wat"],
+    deps = DEPENDENCIES + [":tests"],
+)
+
+system_test(
+    name = "general_execution_test",
+    proc_macro_deps = MACRO_DEPENDENCIES,
+    target_compatible_with = ["@platforms//os:linux"],  # requires libssh that does not build on Mac OS
+    runtime_deps = GUESTOS_RUNTIME_DEPS,
+    deps = DEPENDENCIES + [":tests"],
+)
+
+system_test(
+    name = "mainnet_test",
+    flaky = False,  # remove after when PFOPS-3148 is resolved
+    proc_macro_deps = MACRO_DEPENDENCIES,
+    tags = [
+        "manual",
+    ],
+    target_compatible_with = ["@platforms//os:linux"],  # requires libssh that does not build on Mac OS
+    runtime_deps = GUESTOS_RUNTIME_DEPS + UNIVERSAL_VM_RUNTIME_DEPS,
+    deps = DEPENDENCIES + [":tests"],
+)
+
+system_test(
+    name = "upgrade_with_alternative_urls",
+    proc_macro_deps = MACRO_DEPENDENCIES,
+    tags = [
+        "system_test_hourly",
+    ],
+    target_compatible_with = ["@platforms//os:linux"],
+    runtime_deps = GUESTOS_RUNTIME_DEPS + UNIVERSAL_VM_RUNTIME_DEPS + NNS_CANISTER_RUNTIME_DEPS,
+    deps = DEPENDENCIES + [":tests"],
+)
+
+system_test(
+    name = "unstuck_subnet_test",
+    proc_macro_deps = MACRO_DEPENDENCIES,
+    tags = [
+        "system_test_hourly",
+    ],
+    target_compatible_with = ["@platforms//os:linux"],
+    runtime_deps = GUESTOS_RUNTIME_DEPS + UNIVERSAL_VM_RUNTIME_DEPS + NNS_CANISTER_RUNTIME_DEPS,
+    deps = DEPENDENCIES + [":tests"],
+)
+
+system_test(
+    name = "unassigned_node_upgrade_test",
+    proc_macro_deps = MACRO_DEPENDENCIES,
+    tags = [
+        "system_test_hourly",
+    ],
+    target_compatible_with = ["@platforms//os:linux"],
+    runtime_deps = GUESTOS_RUNTIME_DEPS + UNIVERSAL_VM_RUNTIME_DEPS + NNS_CANISTER_RUNTIME_DEPS,
+    deps = DEPENDENCIES + [":tests"],
+)
+
+system_test(
+    name = "ii_delegation_test",
+    flaky = False,  # remove after when PFOPS-3148 is resolved
+    proc_macro_deps = MACRO_DEPENDENCIES,
+    tags = [
+        "system_test_hourly",
+        "system_test_nightly",
+    ],
+    target_compatible_with = ["@platforms//os:linux"],  # requires libssh that does not build on Mac OS
+    runtime_deps = GUESTOS_RUNTIME_DEPS + [
+        ":src/counter.wat",
+        "@ii_test_canister//file",
+    ],
+    deps = DEPENDENCIES + [":tests"],
+)
+
+# Replicable tests
+
+# The target is used for testing the following scenarios:
+# Scenario A: running the test directly
+#    bazel test //rs/tests:replicable_mock_test --test_tag_filters="system_test"
+# Scanario B: Runs the test via Docker
+# 1. bazel build //rs/tests:replicable_mock_test_image.tar # Dockerizes the test
+# 2. docker load -i bazel-out/.../bin/rs/tests/replicable_mock_test_image.tar # Loads the Docker image
+# 3. docker run -it bazel/rs/tests:replicable_mock_test_image
+system_test(
+    name = "replicable_mock_test",
+    flaky = False,  # remove after when PFOPS-3148 is resolved
+    proc_macro_deps = MACRO_DEPENDENCIES,
+    target_compatible_with = ["@platforms//os:linux"],  # requires libssh that does not build on Mac OS
+    deps = DEPENDENCIES + [":tests"],
+)
+
+system_test(
+    name = "remote_replicable_mock_test",
+    flaky = False,  # remove after when PFOPS-3148 is resolved
+    proc_macro_deps = MACRO_DEPENDENCIES,
+    tags = [
+        "manual",
+    ],
+    target_compatible_with = ["@platforms//os:linux"],  # requires libssh that does not build on Mac OS
+    runtime_deps = UNIVERSAL_VM_RUNTIME_DEPS + [":replicable_mock_test_uvm_config_image"],
+    deps = DEPENDENCIES + [":tests"],
+)
+
+uvm_config_image(
+    name = "nns_dapp_specs_uvm_config_image",
+    srcs = [
+        ":activate-systest-uvm-config",
+        "//rs/tests/replicated_tests:nns_dapp_specs_image.tar",
+    ],
+    mode = "664",
+    modes = {
+        "activate": "775",
+    },
+    remap_paths = {
+        "/activate-systest-uvm-config": "/activate",
+    },
+    tags = ["manual"],  # this target will be built if required as a dependency of another target
+)
+
+system_test(
+    name = "distributed_test",
+    flaky = False,  # remove after when PFOPS-3148 is resolved
+    proc_macro_deps = MACRO_DEPENDENCIES,
+    tags = [
+        "manual",
+    ],
+    target_compatible_with = ["@platforms//os:linux"],  # requires libssh that does not build on Mac OS
+    runtime_deps =
+        # BOUNDARY_NODE_GUESTOS_RUNTIME_DEPS +
+        GUESTOS_RUNTIME_DEPS +
+        UNIVERSAL_VM_RUNTIME_DEPS +
+        NNS_CANISTER_RUNTIME_DEPS + [
+            "nns_dapp_specs_uvm_config_image",
+        ],
+    deps = DEPENDENCIES + [":tests"],
+)

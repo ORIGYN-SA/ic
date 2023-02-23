@@ -1,6 +1,5 @@
 use bytes::{Buf, BytesMut};
 use serde::de::DeserializeOwned;
-use serde_cbor::Deserializer;
 use std::marker::PhantomData;
 
 /// Incremental decoder for stream of data. Splits frames preceded by
@@ -50,15 +49,7 @@ impl<Message: DeserializeOwned + Clone> FrameDecoder<Message> {
                     } else {
                         let frame = data.split_to(size);
                         self.state = FrameDecoderState::NoLength;
-                        let frame = frame.clone();
-                        let mut deserializer = Deserializer::from_slice(&frame);
-                        let value: Result<Message, _> =
-                            serde::de::Deserialize::deserialize(&mut deserializer);
-
-                        if value.is_err() {
-                            continue;
-                        }
-                        let value = value.unwrap();
+                        let value = bincode::deserialize(&frame).unwrap();
                         return Some(value);
                     }
                 }

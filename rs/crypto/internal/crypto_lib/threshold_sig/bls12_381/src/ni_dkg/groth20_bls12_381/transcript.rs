@@ -7,23 +7,21 @@ use super::dealing::{
 use super::encryption::decrypt;
 use crate::api::ni_dkg_errors;
 use crate::crypto::x_for_index;
-use crate::ni_dkg::groth20_bls12_381::types::FsEncryptionSecretKey;
+use crate::ni_dkg::fs_ni_dkg::forward_secure::SecretKey as ForwardSecureSecretKey;
 use crate::types as threshold_types;
-use ff::{Field, PrimeField};
-use ic_crypto_internal_bls12381_common::fr_from_bytes;
 use ic_crypto_internal_types::sign::threshold_sig::ni_dkg::ni_dkg_groth20_bls12_381 as g20;
 use ic_types::{NodeIndex, NumberOfNodes};
-use pairing::bls12_381::Fr;
 use std::collections::BTreeMap;
 use std::convert::TryFrom;
+use std::ops::{AddAssign, MulAssign};
 
 // Code reuse
 use crate::api::ni_dkg_errors::{
     CspDkgCreateReshareTranscriptError, CspDkgCreateTranscriptError, InvalidArgumentError,
     SizeError,
 };
+
 use crate::types::public_coefficients::conversions::pub_key_bytes_from_pub_coeff_bytes;
-use ic_crypto_internal_types::curves::bls12_381::Fr as FrBytes;
 use ic_crypto_internal_types::sign::threshold_sig::ni_dkg::ni_dkg_groth20_bls12_381::PublicCoefficientsBytes;
 
 /// Creates an NiDKG transcript.
@@ -33,8 +31,10 @@ use ic_crypto_internal_types::sign::threshold_sig::ni_dkg::ni_dkg_groth20_bls12_
 ///   dealers may provide receivers with invalid shares.
 ///
 /// # Errors
-/// * `CspDkgCreateTranscriptError::SizeError` if the threshold is too large for
-///   this machine.
+/// * `CspDkgCreateTranscriptError::SizeError` if `collection_threshold`  is
+///   too large for this machine.
+/// * `CspDkgCreateTranscriptError::InsufficientDealingsError` if `csp_dealings`
+///   contains less than `collection_threshold` dealings.
 /// * `CspDkgCreateTranscriptError::InvalidThresholdError` if the threshold is
 ///   either zero, or larger than the `number_of_receivers`.
 /// * `CspDkgCreateTranscriptError::InvalidDealingError` if `csp_dealings` is
@@ -46,15 +46,30 @@ pub fn create_transcript(
     threshold: NumberOfNodes,
     number_of_receivers: NumberOfNodes,
     csp_dealings: &BTreeMap<NodeIndex, g20::Dealing>,
+    collection_threshold: NumberOfNodes,
 ) -> Result<g20::Transcript, CspDkgCreateTranscriptError> {
-    let min_num_dealings = usize::try_from(threshold.get()).map_err(|_| {
+    let collection_threshold_usize = usize::try_from(collection_threshold.get()).map_err(|_| {
         CspDkgCreateTranscriptError::SizeError(SizeError {
-            message: format!("Threshold is too large for this machine: {}", threshold),
+            message: format!(
+                "collection threshold is too large for this machine: {}",
+                collection_threshold
+            ),
         })
     })?;
+    if csp_dealings.len() < collection_threshold_usize {
+        return Err(CspDkgCreateTranscriptError::InsufficientDealingsError(
+            InvalidArgumentError {
+                message: format!(
+                    "Insufficient dealings to create the transcript: found {} but required {} (=collection threshold).",
+                    csp_dealings.len(),
+                    collection_threshold_usize
+                ),
+            },
+        ));
+    }
     let csp_dealings = csp_dealings
         .iter()
-        .take(min_num_dealings)
+        .take(collection_threshold_usize)
         .map(|(index, dealing)| (*index, dealing))
         .collect();
     compute_transcript(threshold, number_of_receivers, &csp_dealings)
@@ -168,8 +183,10 @@ fn compute_transcript(
     > = csp_dealings
         .iter()
         .map(|(dealer_index, dealing)| {
-            // Type conversion from crypto internal type:
-            threshold_types::PublicCoefficients::try_from(&dealing.public_coefficients)
+            // Type conversion from crypto internal type.
+            // The dealings have already been verified,
+            // so we can trust the serialized coefficients.
+            threshold_types::PublicCoefficients::from_trusted_bytes(&dealing.public_coefficients)
                 .map(|public_coefficients| (*dealer_index, public_coefficients))
                 .map_err(|crypto_error| {
                     let error = InvalidArgumentError {
@@ -234,7 +251,7 @@ fn compute_transcript(
 pub fn compute_threshold_signing_key(
     transcript: &g20::Transcript,
     receiver_index: NodeIndex,
-    fs_secret_key: &FsEncryptionSecretKey,
+    fs_secret_key: &ForwardSecureSecretKey,
     epoch: g20::Epoch,
 ) -> Result<threshold_types::SecretKeyBytes, ni_dkg_errors::CspDkgLoadPrivateKeyError> {
     // Get my shares
@@ -243,24 +260,31 @@ pub fn compute_threshold_signing_key(
             .receiver_data
             .iter()
             .map(|(dealer_index, encrypted_shares)| {
-                let fs_plaintext = decrypt(encrypted_shares, fs_secret_key, receiver_index, epoch,&dealer_index.to_be_bytes())
-                    .map_err(|error| {
+                let secret_key = decrypt(
+                    encrypted_shares,
+                    fs_secret_key,
+                    receiver_index,
+                    epoch,
+                    &dealer_index.to_be_bytes(),
+                )
+                .map_err(|error| match error {
+                    ni_dkg_errors::DecryptError::EpochTooOld {
+                        ciphertext_epoch,
+                        secret_key_epoch,
+                    } => ni_dkg_errors::CspDkgLoadPrivateKeyError::EpochTooOldError {
+                        ciphertext_epoch,
+                        secret_key_epoch,
+                    },
+                    error => {
                         let message = format!(
-                            "Dealing #{}: could not get share for receiver #{}.\n  {:#?}\n  Transcript: {}\n  Epoch: {}",
-                            dealer_index, receiver_index, error, serde_json::to_string(&transcript).expect("Could not serialise transcript."), epoch.get()
+                            "Dealing #{}: could not get share for receiver #{}.\n {:#?}",
+                            dealer_index, receiver_index, error
                         );
                         let error = InvalidArgumentError { message };
                         ni_dkg_errors::CspDkgLoadPrivateKeyError::InvalidTranscriptError(error)
-                    })?;
-                let secret_key = FrBytes::from(&fs_plaintext);
-                let secret_key = Fr::from_repr(fr_from_bytes(&secret_key.0)).map_err(|_| {
-                    let message = format!(
-                        "Dealing #{}: has invalid share for receiver #{}.\n  Transcript: {}\n  Epoch: {}",
-                        dealer_index, receiver_index, serde_json::to_string(&transcript).expect("Could not serialise transcript."), epoch.get()
-                    );
-                    let error = InvalidArgumentError { message };
-                    ni_dkg_errors::CspDkgLoadPrivateKeyError::InvalidTranscriptError(error)
+                    }
                 })?;
+
                 Ok((*dealer_index, secret_key))
             })
             .collect();

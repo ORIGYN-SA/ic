@@ -28,72 +28,77 @@
 // Note [Scheduler and AccumulatedPriority]
 // ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 //
-// Public Specification of IC describes compute allocation. Each canister is
-// initiated with an accumulated priority of 0. The scheduler uses these values
+// Public Specification of IC describes `compute_allocation`. Each canister is
+// initiated with an `accumulated_priority` of 0. The scheduler uses these values
 // while calculating the priority of a canister at each round. The canisters
 // are scheduled at each round in the following way:
 //
-// * For each canister, we compute the round priority of that canister as the
-// sum of its accumulated priority and the multiplication of its compute
-// allocation with the multiplier (see the scheduler).
+// * For each canister, we compute the `round_priority` of that canister as the
+// sum of its `accumulated_priority` and the multiplication of its
+// `compute_allocation` with the `multiplier` (see the scheduler).
 // * We distribute the free capacity equally to all the canisters.
-// * We sort the canisters according to their round priorities in descending
-// order.
-// * The first scheduler_cores many canisters are given the top priority in
+// * For new executions:
+//   - We sort the canisters according to their round priorities in
+//     descending order.
+// * For pending long executions:
+//   - Sort the canisters first according to their execution mode,
+//     and then round priorities.
+//   - Calculate how many scheduler cores we dedicate for long executions
+//     in this round using compute allocations of these long executions.
+//   - The first `long_execution_cores` many canisters are given the top
+//     priority in this round and get into the prioritized long execution mode.
+//   - The rest of the long executions are given an opportunity to be executed
+//     by scheduling them at the very end.
+// * The first `scheduler_cores` many canisters are given the top priority in
 // this round. Therefore, they are expected to be executed as the first of
 // their threads.
-// * As the last step, we update the accumulated priorities of all canisters.
-// Canisters which did not get the top priority in this round, have their
-// accumulated priority replaced with the value of their round_priority. The
-// top scheduler_cores many canisters' accumulated priority is updated with
-// the value of their round priorities subtracted by (the sum of compute
-// allocations of all canisters times multiplier divided by the number of
-// canisters that are given top priority in this round.
+// * As the last step, we credit the first `scheduler_cores` canisters
+//   with the sum of compute allocations of all canisters times `multiplier`
+//   divided by the number of canisters that are given top priority in
+//   this round. This `priority_credit` will be subtracted from the
+//   `accumulated_priority` at the end of the execution or at the checkpoint.
 //
-// As a result, at each round, the sum of accumulated priorities remains 0.
+// As a result, at each round, the sum of accumulated priorities minus
+// the sum of priority credits remains 0.
 // Similarly, the sum of all round priorities equals to the multiplication of
 // the sum of all compute allocations with the multiplier.
 
 pub mod artifact;
+pub mod artifact_kind;
 pub mod batch;
+pub mod canister_http;
 pub mod chunkable;
 pub mod consensus;
 pub mod crypto;
 pub mod filetree_sync;
 pub mod funds;
-pub mod ic00;
 pub mod ingress;
 pub mod malicious_behaviour;
 pub mod malicious_flags;
 pub mod messages;
 pub mod methods;
 pub mod nominal_cycles;
+pub mod onchain_observability;
 pub mod p2p;
 pub mod registry;
 pub mod replica_config;
 pub mod replica_version;
+pub mod signature;
+pub mod single_chunked;
 pub mod state_sync;
 pub mod time;
-pub mod transport;
-pub mod user_error;
 pub mod xnet;
 
-use crate::messages::CanisterInstallMode;
 pub use crate::replica_version::ReplicaVersion;
 pub use crate::time::Time;
-pub use funds::icp::{ICPError, ICP};
 pub use funds::*;
-use ic_base_types::NumSeconds;
 pub use ic_base_types::{
     subnet_id_into_protobuf, subnet_id_try_from_protobuf, CanisterId, CanisterIdBlobParseError,
-    CanisterIdError, CanisterStatusType, NodeId, NodeTag, NumBytes, PrincipalId,
-    PrincipalIdBlobParseError, PrincipalIdParseError, RegistryVersion, SubnetId,
+    NodeId, NodeTag, NumBytes, PrincipalId, PrincipalIdBlobParseError, PrincipalIdParseError,
+    RegistryVersion, SubnetId,
 };
 pub use ic_crypto_internal_types::NodeIndex;
-use ic_error_types::{ErrorCode, UserError};
-use ic_ic00_types::InstallCodeArgs;
 use ic_protobuf::types::v1 as pb;
-use num_traits::cast::ToPrimitive;
 use phantom_newtype::{AmountOf, Id};
 use serde::{Deserialize, Serialize};
 use std::convert::TryFrom;
@@ -179,10 +184,13 @@ pub struct NumInstructionsTag;
 /// respective amount of `Cycles` on a canister's balance for message execution.
 pub type NumInstructions = AmountOf<NumInstructionsTag, u64>;
 
-pub struct QueueIndexTag;
-/// Index into a queue; used in the context of `InputQueue` / `OutputQueue` to
-/// define message order.
-pub type QueueIndex = AmountOf<QueueIndexTag, u64>;
+pub struct NumMessagesTag;
+/// Represents the number of messages.
+pub type NumMessages = AmountOf<NumMessagesTag, u64>;
+
+pub struct NumSlicesTag;
+/// Represents the number of slices.
+pub type NumSlices = AmountOf<NumSlicesTag, u64>;
 
 pub struct RandomnessTag;
 /// Randomness produced by Consensus which is used in the
@@ -203,32 +211,23 @@ pub enum CanonicalStateTag {}
 /// A cryptographic hash of a full canonical replicated state at some height.
 pub type CryptoHashOfState = crypto::CryptoHashOf<CanonicalStateTag>;
 
+pub enum NumPagesTag {}
+/// A number of OS-sized pages.
+pub type NumPages = AmountOf<NumPagesTag, u64>;
+
 /// `AccumulatedPriority` is a part of the SchedulerState. It is the value by
 /// which we prioritize canisters for execution. It is reset to 0 in the round
 /// where a canister is scheduled and incremented by the canister allocation in
 /// each round where the canister is not scheduled.
 // Note [Scheduler and AccumulatedPriority]
-#[derive(Copy, Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-pub struct AccumulatedPriority(i64);
+pub enum AccumulatedPriorityTag {}
+pub type AccumulatedPriority = AmountOf<AccumulatedPriorityTag, i64>;
 
-impl AccumulatedPriority {
-    pub fn value(self) -> i64 {
-        self.0
-    }
-}
-
-// The initial accumulated priority is 0.
-impl Default for AccumulatedPriority {
-    fn default() -> Self {
-        AccumulatedPriority(0)
-    }
-}
-
-impl From<i64> for AccumulatedPriority {
-    fn from(value: i64) -> Self {
-        AccumulatedPriority(value)
-    }
-}
+pub struct CpuComplexityTag;
+/// Represents a CPU complexity of an execution. The CPU complexity is not used
+/// to charge the canister, but can be used to deterministically abort
+/// a very complex canister execution or round.
+pub type CpuComplexity = AmountOf<CpuComplexityTag, i64>;
 
 #[derive(Copy, Clone, Debug, Deserialize, Eq, PartialEq, PartialOrd, Ord, Serialize, Hash)]
 /// Type to track how much budget the IC can spend on executing queries on
@@ -240,11 +239,6 @@ impl QueryAllocation {
     /// Returns a 0 `QueryAllocation`.
     pub fn zero() -> QueryAllocation {
         QueryAllocation(0)
-    }
-
-    /// Returns the maximum allowed query allocation per message.
-    pub fn max_per_message() -> QueryAllocation {
-        QueryAllocation(10_000_000_000)
     }
 
     pub fn get(&self) -> u64 {
@@ -274,9 +268,9 @@ impl std::ops::Sub for QueryAllocation {
     }
 }
 
-impl Into<NumInstructions> for QueryAllocation {
-    fn into(self) -> NumInstructions {
-        NumInstructions::from(self.0)
+impl From<QueryAllocation> for NumInstructions {
+    fn from(val: QueryAllocation) -> Self {
+        NumInstructions::from(val.0)
     }
 }
 
@@ -344,6 +338,7 @@ impl ComputeAllocation {
 }
 
 // The default `ComputeAllocation` is 0: https://sdk.dfinity.org/docs/interface-spec/index.html#ic-install_code.
+#[allow(clippy::derivable_impls)]
 impl Default for ComputeAllocation {
     fn default() -> Self {
         ComputeAllocation(0)
@@ -354,33 +349,33 @@ impl Default for ComputeAllocation {
 /// [`ComputeAllocation`].
 #[derive(Clone, Debug)]
 pub struct InvalidComputeAllocationError {
-    min: u64,
-    max: u64,
-    given: u64,
+    min: candid::Nat,
+    max: candid::Nat,
+    given: candid::Nat,
 }
 
 const MIN_COMPUTE_ALLOCATION: u64 = 0;
 const MAX_COMPUTE_ALLOCATION: u64 = 100;
 
 impl InvalidComputeAllocationError {
-    pub fn new(given: u64) -> Self {
+    pub fn new(given: candid::Nat) -> Self {
         Self {
-            min: MIN_COMPUTE_ALLOCATION,
-            max: MAX_COMPUTE_ALLOCATION,
+            min: candid::Nat::from(MIN_COMPUTE_ALLOCATION),
+            max: candid::Nat::from(MAX_COMPUTE_ALLOCATION),
             given,
         }
     }
 
-    pub fn min(&self) -> u64 {
-        self.min
+    pub fn min(&self) -> candid::Nat {
+        self.min.clone()
     }
 
-    pub fn max(&self) -> u64 {
-        self.max
+    pub fn max(&self) -> candid::Nat {
+        self.max.clone()
     }
 
-    pub fn given(&self) -> u64 {
-        self.given
+    pub fn given(&self) -> candid::Nat {
+        self.given.clone()
     }
 }
 
@@ -395,7 +390,9 @@ impl TryFrom<u64> for ComputeAllocation {
     // the expected range.
     fn try_from(percent: u64) -> Result<Self, Self::Error> {
         if percent > MAX_COMPUTE_ALLOCATION {
-            return Err(InvalidComputeAllocationError::new(percent));
+            return Err(InvalidComputeAllocationError::new(candid::Nat::from(
+                percent,
+            )));
         }
         Ok(ComputeAllocation(percent))
     }
@@ -421,21 +418,115 @@ fn display_canister_id() {
     );
 }
 
-/// `MemoryAllocation` is a number of bytes between 0 and 2^48 inclusively that
-/// represents the memory allocation requested by a user during a canister
-/// installation/upgrade.
+/// Represents Canister timer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize)]
+pub enum CanisterTimer {
+    /// The canister timer is not set.
+    Inactive,
+    /// The canister timer is set at the specific time.
+    Active(Time),
+}
+
+impl CanisterTimer {
+    /// Convert this canister timer to time.
+    pub fn to_time(&self) -> Time {
+        match self {
+            CanisterTimer::Inactive => time::UNIX_EPOCH,
+            CanisterTimer::Active(time) => *time,
+        }
+    }
+
+    /// Create a canister timer from time.
+    pub fn from_time(time: Time) -> Self {
+        if time == time::UNIX_EPOCH {
+            CanisterTimer::Inactive
+        } else {
+            CanisterTimer::Active(time)
+        }
+    }
+
+    /// Returns true if timer has reached the deadline.
+    pub fn has_reached_deadline(&self, now: Time) -> bool {
+        match self {
+            CanisterTimer::Inactive => false,
+            CanisterTimer::Active(time) => now >= *time,
+        }
+    }
+
+    /// Convert this canister timer to nanoseconds since Unix epoch option.
+    pub fn to_nanos_since_unix_epoch(&self) -> Option<u64> {
+        match self {
+            CanisterTimer::Inactive => None,
+            CanisterTimer::Active(time) => Some(time.as_nanos_since_unix_epoch()),
+        }
+    }
+
+    /// Create a canister timer from nanoseconds since Unix epoch option.
+    pub fn from_nanos_since_unix_epoch(nanos: Option<u64>) -> Self {
+        match nanos {
+            None => CanisterTimer::Inactive,
+            Some(nanos) => CanisterTimer::Active(Time::from_nanos_since_unix_epoch(nanos)),
+        }
+    }
+}
+
+/// Represents scheduling strategy for Canisters with long execution in progress.
+/// All long execution start in the Opportunistic mode, and then the scheduler
+/// prioritizes top `long_execution_cores` some of them. This is to enforce FIFO
+/// behavior, and guarantee the progress for long executions.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, PartialOrd, Ord, Serialize, Hash)]
+pub enum LongExecutionMode {
+    /// The long execution might be opportunistically scheduled on the new execution cores,
+    /// so its progress depends on the number of new messages to execute.
+    Opportunistic = 0,
+    /// The long execution is prioritized to be scheduled on the long execution cores,
+    /// so it's quite likely the execution will be finished with no aborts.
+    Prioritized = 1,
+}
+
+impl Default for LongExecutionMode {
+    fn default() -> Self {
+        LongExecutionMode::Opportunistic
+    }
+}
+
+/// Represents the memory allocation of a canister.
 #[derive(Copy, Clone, Debug, Deserialize, Eq, PartialEq, Serialize, Hash)]
-pub struct MemoryAllocation(NumBytes);
+pub enum MemoryAllocation {
+    /// A reserved number of bytes between 0 and 2^48 inclusively that is
+    /// guaranteed to be available to the canister. Charging happens based on
+    /// the reserved amount of memory, regardless of how much of it is in use.
+    Reserved(NumBytes),
+    /// Memory growth of the canister happens dynamically and is subject to the
+    /// available memory of the subnet. The canister will be charged for the
+    /// memory it's using at any given time.
+    BestEffort,
+}
 
 impl MemoryAllocation {
-    pub fn get(&self) -> NumBytes {
-        self.0
+    /// Returns the number of bytes associated with this memory allocation.
+    pub fn bytes(&self) -> NumBytes {
+        match self {
+            MemoryAllocation::Reserved(bytes) => *bytes,
+            // A best-effort memory allocation is equivalent to a zero memory allocation per the
+            // interface spec.
+            MemoryAllocation::BestEffort => NumBytes::from(0),
+        }
     }
 }
 
 impl fmt::Display for MemoryAllocation {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}B", self.0.get())
+        match self {
+            MemoryAllocation::Reserved(bytes) => write!(f, "{}", bytes.display()),
+            MemoryAllocation::BestEffort => write!(f, "best-effort"),
+        }
+    }
+}
+
+impl Default for MemoryAllocation {
+    fn default() -> Self {
+        MemoryAllocation::BestEffort
     }
 }
 
@@ -443,19 +534,32 @@ impl fmt::Display for MemoryAllocation {
 /// [`MemoryAllocation`].
 #[derive(Clone, Debug)]
 pub struct InvalidMemoryAllocationError {
-    pub min: NumBytes,
-    pub max: NumBytes,
-    pub given: NumBytes,
+    pub min: candid::Nat,
+    pub max: candid::Nat,
+    pub given: candid::Nat,
 }
 
+const GB: u64 = 1024 * 1024 * 1024;
+
+/// The upper limit on the stable memory size.
+/// This constant is used by other crates to define other constants, that's why
+/// it is public and `u64` (`NumBytes` cannot be used in const expressions).
+pub const MAX_STABLE_MEMORY_IN_BYTES: u64 = 48 * GB;
+
+/// The upper limit on the Wasm memory size.
+/// This constant is used by other crates to define other constants, that's why
+/// it is public and `u64` (`NumBytes` cannot be used in const expressions).
+pub const MAX_WASM_MEMORY_IN_BYTES: u64 = 4 * GB;
+
 const MIN_MEMORY_ALLOCATION: NumBytes = NumBytes::new(0);
-const MAX_MEMORY_ALLOCATION: NumBytes = NumBytes::new(8 * 1024 * 1024 * 1024);
+pub const MAX_MEMORY_ALLOCATION: NumBytes =
+    NumBytes::new(MAX_STABLE_MEMORY_IN_BYTES + MAX_WASM_MEMORY_IN_BYTES);
 
 impl InvalidMemoryAllocationError {
-    pub fn new(given: NumBytes) -> Self {
+    pub fn new(given: candid::Nat) -> Self {
         Self {
-            min: MIN_MEMORY_ALLOCATION,
-            max: MAX_MEMORY_ALLOCATION,
+            min: candid::Nat::from(MIN_MEMORY_ALLOCATION.get()),
+            max: candid::Nat::from(MAX_MEMORY_ALLOCATION.get()),
             given,
         }
     }
@@ -466,125 +570,17 @@ impl TryFrom<NumBytes> for MemoryAllocation {
 
     fn try_from(bytes: NumBytes) -> Result<Self, Self::Error> {
         if bytes > MAX_MEMORY_ALLOCATION {
-            return Err(InvalidMemoryAllocationError::new(bytes));
+            return Err(InvalidMemoryAllocationError::new(candid::Nat::from(
+                bytes.get(),
+            )));
         }
-        Ok(MemoryAllocation(bytes))
-    }
-}
-
-#[derive(Clone, Debug)]
-pub struct InstallCodeContext {
-    pub sender: PrincipalId,
-    pub mode: CanisterInstallMode,
-    pub canister_id: CanisterId,
-    pub wasm_module: Vec<u8>,
-    pub arg: Vec<u8>,
-    pub compute_allocation: Option<ComputeAllocation>,
-    pub memory_allocation: Option<MemoryAllocation>,
-    pub query_allocation: QueryAllocation,
-}
-
-/// Errors that can occur when converting from (sender, [`InstallCodeArgs`]) to
-/// an [`InstallCodeContext`].
-#[derive(Debug)]
-pub enum InstallCodeContextError {
-    ComputeAllocation(InvalidComputeAllocationError),
-    MemoryAllocation(InvalidMemoryAllocationError),
-    QueryAllocation(InvalidQueryAllocationError),
-    InvalidCanisterId(String),
-}
-
-impl From<InstallCodeContextError> for UserError {
-    fn from(err: InstallCodeContextError) -> Self {
-        match err {
-            InstallCodeContextError::ComputeAllocation(err) => UserError::new(
-                ErrorCode::CanisterContractViolation,
-                format!(
-                    "ComputeAllocation expected to be in the range [{}..{}], got {}",
-                    err.min(),
-                    err.max(),
-                    err.given()
-                ),
-            ),
-            InstallCodeContextError::QueryAllocation(err) => UserError::new(
-                ErrorCode::CanisterContractViolation,
-                format!(
-                    "QueryAllocation expected to be in the range [{}..{}], got {}",
-                    err.min, err.max, err.given
-                ),
-            ),
-            InstallCodeContextError::MemoryAllocation(err) => UserError::new(
-                ErrorCode::CanisterContractViolation,
-                format!(
-                    "MemoryAllocation expected to be in the range [{}..{}], got {}",
-                    err.min, err.max, err.given
-                ),
-            ),
-            InstallCodeContextError::InvalidCanisterId(bytes) => UserError::new(
-                ErrorCode::CanisterContractViolation,
-                format!(
-                    "Specified canister id is not a valid principal id {}",
-                    hex::encode(&bytes[..])
-                ),
-            ),
+        // A memory allocation of 0 means that the canister's memory growth will be
+        // best-effort.
+        if bytes.get() == 0 {
+            Ok(MemoryAllocation::BestEffort)
+        } else {
+            Ok(MemoryAllocation::Reserved(bytes))
         }
-    }
-}
-
-impl From<InvalidComputeAllocationError> for InstallCodeContextError {
-    fn from(err: InvalidComputeAllocationError) -> Self {
-        Self::ComputeAllocation(err)
-    }
-}
-
-impl From<InvalidQueryAllocationError> for InstallCodeContextError {
-    fn from(err: InvalidQueryAllocationError) -> Self {
-        Self::QueryAllocation(err)
-    }
-}
-
-impl From<InvalidMemoryAllocationError> for InstallCodeContextError {
-    fn from(err: InvalidMemoryAllocationError) -> Self {
-        Self::MemoryAllocation(err)
-    }
-}
-
-impl TryFrom<(PrincipalId, InstallCodeArgs)> for InstallCodeContext {
-    type Error = InstallCodeContextError;
-
-    fn try_from(input: (PrincipalId, InstallCodeArgs)) -> Result<Self, Self::Error> {
-        let (sender, args) = input;
-        let canister_id = CanisterId::new(args.canister_id).map_err(|err| {
-            InstallCodeContextError::InvalidCanisterId(format!(
-                "Converting canister id {} failed with {}",
-                args.canister_id, err
-            ))
-        })?;
-        let compute_allocation = match args.compute_allocation {
-            Some(ca) => Some(ComputeAllocation::try_from(ca.0.to_u64().unwrap())?),
-            None => None,
-        };
-        let memory_allocation = match args.memory_allocation {
-            Some(ma) => Some(MemoryAllocation::try_from(NumBytes::from(
-                ma.0.to_u64().unwrap(),
-            ))?),
-            None => None,
-        };
-        let query_allocation = match args.query_allocation {
-            Some(qa) => QueryAllocation::try_from(qa.0.to_u64().unwrap())?,
-            None => QueryAllocation::default(),
-        };
-
-        Ok(InstallCodeContext {
-            sender,
-            mode: args.mode,
-            canister_id,
-            wasm_module: args.wasm_module,
-            arg: args.arg,
-            compute_allocation,
-            memory_allocation,
-            query_allocation,
-        })
     }
 }
 
@@ -599,20 +595,4 @@ impl CountBytes for Time {
     fn count_bytes(&self) -> usize {
         8
     }
-}
-
-/// Figure out how many cycles a canister should have so that it can support the
-/// given amount of storage for the given amount of time, given the storage fee.
-pub fn freeze_threshold_cycles(
-    freeze_threshold: NumSeconds,
-    gib_storage_per_second_fee: Cycles,
-    expected_canister_size: NumBytes,
-) -> Cycles {
-    let one_gib = 1024 * 1024 * 1024;
-    Cycles::from(
-        expected_canister_size.get() as u128
-            * gib_storage_per_second_fee.get()
-            * freeze_threshold.get() as u128
-            / one_gib,
-    )
 }

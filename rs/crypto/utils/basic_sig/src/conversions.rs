@@ -1,7 +1,10 @@
 //! Conversion of keys into various formats
+use ic_base_types::{NodeId, PrincipalId};
 use ic_crypto_internal_basic_sig_der_utils as der_utils;
+use ic_crypto_internal_basic_sig_ed25519 as ed25519;
 use ic_crypto_internal_types::sign::eddsa::ed25519 as internal_types;
-use simple_asn1::{BigUint, OID};
+use ic_protobuf::registry::crypto::v1::PublicKey as PublicKeyProto;
+use simple_asn1::{oid, OID};
 use std::convert::TryFrom;
 pub mod pem;
 
@@ -64,7 +67,7 @@ pub enum Ed25519DerParseError {
     IncorrectPublicKeyLength(internal_types::PublicKeyByteConversionError),
     IncorrectSecretKeyLength(internal_types::SecretKeyByteConversionError),
     OidExtractionError(String),
-    OidValueError(simple_asn1::OID),
+    OidValueError(OID),
     MissingPublicKey(),
 }
 
@@ -76,26 +79,19 @@ pub enum Ed25519PemParseError {
 
 impl Ed25519Conversions for internal_types::PublicKey {
     fn to_der(&self) -> Vec<u8> {
-        // Prefixing the following bytes to the key is sufficient to DER-encode it.
-        let mut der_pk = vec![
-            48, 42, // A sequence of 42 bytes follows.
-            48, 5, // An element of 5 bytes follows.
-            6, 3, 43, 101, 112, // The OID
-            3, 33, // A bitstring of 33 bytes follows.
-            0,  // The bitstring (32 bytes) is divisible by 8
-        ];
-        der_pk.extend_from_slice(&self.0);
-        der_pk
+        let key = ed25519::types::PublicKeyBytes(self.0);
+
+        ed25519::public_key_to_der(key)
     }
 
     fn from_der(pk_der: &[u8]) -> Result<Self, Ed25519DerParseError>
     where
         Self: Sized,
     {
-        let (oid, pk_bytes) = der_utils::oid_and_public_key_bytes_from_der(pk_der)
+        let (algo_id, pk_bytes) = der_utils::algo_id_and_public_key_bytes_from_der(pk_der)
             .map_err(|e| Ed25519DerParseError::OidExtractionError(e.internal_error))?;
-        if correct_oid() != oid {
-            return Err(Ed25519DerParseError::OidValueError(oid));
+        if ed25519_oid() != algo_id.oid {
+            return Err(Ed25519DerParseError::OidValueError(algo_id.oid));
         }
         internal_types::PublicKey::try_from(&pk_bytes[..])
             .map_err(Ed25519DerParseError::IncorrectPublicKeyLength)
@@ -147,12 +143,13 @@ impl Ed25519SecretKeyConversions for internal_types::SecretKey {
     {
         let key_data = der_utils::oid_and_key_pair_bytes_from_der(sk_der)
             .map_err(|e| Ed25519DerParseError::OidExtractionError(e.internal_error))?;
-        if correct_oid() != key_data.oid {
-            return Err(Ed25519DerParseError::OidValueError(key_data.oid));
+        if ed25519_oid() != key_data.oid {
+            return Err(Ed25519DerParseError::OidValueError(key_data.oid.clone()));
         }
 
         let pk_bytes = key_data
             .pk_bytes
+            .clone()
             .ok_or_else(Ed25519DerParseError::MissingPublicKey)?;
 
         let sk = internal_types::SecretKey::try_from(&*key_data.sk_bytes)
@@ -177,9 +174,68 @@ impl Ed25519SecretKeyConversions for internal_types::SecretKey {
     }
 }
 
-/// The correct DER OID for Ed25519
+/// The ASN.1 OID for Ed25519
 ///
 /// OID for Ed25519 is 1.3.101.112, see https://tools.ietf.org/html/rfc8410
-fn correct_oid() -> simple_asn1::OID {
-    simple_asn1::oid!(1, 3, 101, 112)
+fn ed25519_oid() -> OID {
+    oid!(1, 3, 101, 112)
+}
+
+#[derive(Debug, Copy, Clone, Eq, PartialEq)]
+pub enum InvalidDalekKey {
+    InvalidPublicKey,
+    InvalidSecretKey,
+}
+
+/// Return the unencrypted PKCS#8 v2 encoding of an Ed25519 dalek keypair
+///
+/// This is useful when one needs to export a key from dalek to some other
+/// library such as ring. The exported PKCS8 package contains both the public
+/// and private keys.
+///
+/// # Returns
+/// * The key in PKCS8 v2 format, using binary DER encoding
+pub fn pkcs8_of_ed25519_consensus_key(
+    signing_key: &ed25519_consensus::SigningKey,
+) -> Result<Vec<u8>, InvalidDalekKey> {
+    let private_key = internal_types::SecretKey::try_from(signing_key.as_bytes().as_ref())
+        .map_err(|_| InvalidDalekKey::InvalidSecretKey)?;
+    let public_key =
+        internal_types::PublicKey::try_from(signing_key.verification_key().as_bytes().as_ref())
+            .map_err(|_| InvalidDalekKey::InvalidPublicKey)?;
+    Ok(private_key.to_der(&public_key))
+}
+
+#[test]
+fn should_be_able_to_generate_pkcs8_of_ed25519_consensus_key() {
+    let bytes = [0x23; 32];
+    let signing_key = ed25519_consensus::SigningKey::from(bytes);
+    let pkcs8 = pkcs8_of_ed25519_consensus_key(&signing_key).expect("PKCS8 encoding failed");
+
+    assert_eq!(hex::encode(pkcs8),
+               "3053020101300506032b6570042204202323232323232323232323232323232323232323232323232323232323232323a12303210074f85cda34d1c27c4621484731e91579c3d9c6cfc0d94b281aa11e9162058aa9");
+}
+
+#[derive(Debug, Clone)]
+pub enum InvalidNodePublicKey {
+    MalformedRawBytes { internal_error: String },
+}
+
+/// Computes the NodeId associated to the given (Protobuf-serialized) public key
+///
+/// # Errors
+/// * `InvalidNodePublicKey::MalformedRawBytes` if the provided key is not a
+///   proper Ed25519 public key
+///
+/// # Returns
+/// * The NodeId associated to the key
+pub fn derive_node_id(node_signing_pk: &PublicKeyProto) -> Result<NodeId, InvalidNodePublicKey> {
+    let raw_key = &node_signing_pk.key_value;
+    let pk_bytes = internal_types::PublicKey::try_from(&raw_key[..]).map_err(|e| {
+        InvalidNodePublicKey::MalformedRawBytes {
+            internal_error: format!("{:?}", e),
+        }
+    })?;
+    let der_pk = pk_bytes.to_der();
+    Ok(NodeId::from(PrincipalId::new_self_authenticating(&der_pk)))
 }

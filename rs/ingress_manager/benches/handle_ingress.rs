@@ -16,34 +16,37 @@
 use criterion::{criterion_group, criterion_main, Criterion};
 use ic_artifact_pool::ingress_pool::IngressPoolImpl;
 use ic_config::artifact_pool::ArtifactPoolConfig;
+use ic_constants::MAX_INGRESS_TTL;
 use ic_ingress_manager::IngressManager;
 use ic_interfaces::{
     artifact_pool::UnvalidatedArtifact, ingress_manager::IngressHandler,
-    ingress_pool::MutableIngressPool, registry::RegistryClient, state_manager::Labeled,
-    time_source::TimeSource,
+    ingress_pool::MutableIngressPool, time_source::TimeSource,
 };
-use ic_logger::ReplicaLogger;
+use ic_interfaces_registry::RegistryClient;
+use ic_interfaces_state_manager::Labeled;
+use ic_interfaces_state_manager_mocks::MockStateManager;
+use ic_logger::{replica_logger::no_op_logger, ReplicaLogger};
 use ic_metrics::MetricsRegistry;
 use ic_registry_client::client::RegistryClientImpl;
-use ic_registry_common::proto_registry_data_provider::ProtoRegistryDataProvider;
 use ic_registry_keys::make_subnet_record_key;
+use ic_registry_proto_data_provider::ProtoRegistryDataProvider;
 use ic_registry_subnet_type::SubnetType;
-use ic_replicated_state::{CanisterQueues, ReplicatedState, SystemMetadata};
+use ic_replicated_state::{BitcoinState, CanisterQueues, ReplicatedState, SystemMetadata};
 use ic_test_utilities::{
     consensus::MockConsensusCache,
     crypto::temp_crypto_component_with_fake_registry,
     cycles_account_manager::CyclesAccountManagerBuilder,
     history::MockIngressHistory,
     mock_time,
-    registry::test_subnet_record,
     state::ReplicatedStateBuilder,
-    state_manager::MockStateManager,
     types::ids::{canister_test_id, node_test_id, subnet_test_id, user_test_id},
     types::messages::SignedIngressBuilder,
     FastForwardTimeSource,
 };
+use ic_test_utilities_registry::test_subnet_record;
 use ic_types::{
-    ingress::{IngressStatus, MAX_INGRESS_TTL},
+    ingress::{IngressState, IngressStatus},
+    malicious_flags::MaliciousFlags,
     messages::{MessageId, SignedIngress},
     Height, RegistryVersion, SubnetId, Time,
 };
@@ -81,11 +84,13 @@ impl SimulatedIngressHistory {
                     if set.1.contains(ingress_id) {
                         IngressStatus::Unknown
                     } else {
-                        IngressStatus::Completed {
+                        IngressStatus::Known {
                             receiver: canister_test_id(0).get(),
                             user_id: user_test_id(0),
-                            result: ic_types::ingress::WasmResult::Reply(vec![]),
                             time: mock_time(),
+                            state: IngressState::Completed(ic_types::ingress::WasmResult::Reply(
+                                vec![],
+                            )),
                         }
                     }
                 })
@@ -159,13 +164,11 @@ where
         &mut IngressManager,
     ),
 {
-    ic_test_utilities::with_test_replica_logger(|log| {
+    ic_test_utilities_logger::with_test_replica_logger(|log| {
         ic_test_utilities::artifact_pool_config::with_test_pool_config(|pool_config| {
             let time_source = FastForwardTimeSource::new();
             // Set initial time to non-zero
-            time_source
-                .set_time(mock_time() + Duration::from_secs(1))
-                .unwrap();
+            time_source.advance_time(Duration::from_secs(1));
             let (history, ingress_hist_reader) = SimulatedIngressHistory::new(time_source.clone());
             let history = Arc::new(history);
             let history_cl = history.clone();
@@ -179,13 +182,12 @@ where
                 metadata.batch_time = history_cl.batch_time();
                 Labeled::new(
                     Height::from(1),
-                    Arc::new(ReplicatedState {
-                        canister_states: BTreeMap::new(),
+                    Arc::new(ReplicatedState::new_from_checkpoint(
+                        BTreeMap::new(),
                         metadata,
-                        subnet_queues: CanisterQueues::default(),
-                        consensus_queue: Vec::new(),
-                        root: std::path::PathBuf::new(),
-                    }),
+                        CanisterQueues::default(),
+                        BitcoinState::default(),
+                    )),
                 )
             });
 
@@ -201,24 +203,34 @@ where
                 node_test_id(VALIDATOR_NODE_ID),
             ));
             let mut state_manager = MockStateManager::new();
-            state_manager.expect_get_state_at().return_const(Ok(
-                ic_interfaces::state_manager::Labeled::new(
+            state_manager
+                .expect_get_state_at()
+                .return_const(Ok(Labeled::new(
                     Height::new(0),
                     Arc::new(ReplicatedStateBuilder::default().build()),
-                ),
-            ));
+                )));
+
+            let metrics_registry = MetricsRegistry::new();
+            let ingress_pool = Arc::new(RwLock::new(IngressPoolImpl::new(
+                pool_config.clone(),
+                metrics_registry.clone(),
+                no_op_logger(),
+            )));
+
             let cycles_account_manager = Arc::new(CyclesAccountManagerBuilder::new().build());
             let runtime = tokio::runtime::Runtime::new().unwrap();
             let mut ingress_manager = IngressManager::new(
                 Arc::new(consensus_pool_cache),
                 Box::new(ingress_hist_reader),
+                ingress_pool,
                 setup_registry(subnet_id, runtime.handle().clone()),
                 ingress_signature_crypto,
-                MetricsRegistry::new(),
+                metrics_registry,
                 subnet_id,
                 log.clone(),
                 Arc::new(state_manager),
                 cycles_account_manager,
+                MaliciousFlags::default(),
             );
             test(
                 time_source,
@@ -239,9 +251,8 @@ fn prepare(time_source: &dyn TimeSource, duration: Duration, num: usize) -> Vec<
     let mut rng = rand::thread_rng();
     (0..num)
         .map(|i| {
-            let expiry = std::time::Duration::from_millis(
-                rng.gen::<u64>() % ((max_expiry - now).as_millis() as u64),
-            );
+            let expiry =
+                Duration::from_millis(rng.gen::<u64>() % ((max_expiry - now).as_millis() as u64));
             SignedIngressBuilder::new()
                 .method_payload(vec![0; PAYLOAD_SIZE])
                 .nonce(i as u64)
@@ -325,9 +336,7 @@ fn handle_ingress(criterion: &mut Criterion) {
                                 if now >= start + time_span {
                                     break;
                                 }
-                                time_source
-                                    .set_time(now + Duration::from_millis(200))
-                                    .unwrap();
+                                time_source.advance_time(Duration::from_millis(200));
                             }
                             elapsed += bench_start.elapsed();
                         }

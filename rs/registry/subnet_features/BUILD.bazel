@@ -1,0 +1,21 @@
+load("@rules_rust//rust:defs.bzl", "rust_library", "rust_test")
+
+package(default_visibility = ["//visibility:public"])
+
+rust_library(
+    name = "subnet_features",
+    srcs = glob(["src/**"]),
+    crate_name = "ic_registry_subnet_features",
+    version = "0.8.0",
+    deps = [
+        "//rs/protobuf",
+        "//rs/types/ic00_types",
+        "@crate_index//:candid",
+        "@crate_index//:serde",
+    ],
+)
+
+rust_test(
+    name = "subnet_features_test",
+    crate = ":subnet_features",
+)

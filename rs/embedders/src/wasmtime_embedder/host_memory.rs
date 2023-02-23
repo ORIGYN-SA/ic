@@ -1,7 +1,8 @@
+use anyhow::bail;
+use ic_types::MAX_STABLE_MEMORY_IN_BYTES;
 use wasmtime::MemoryType;
-use wasmtime_environ::{WASM_MAX_PAGES, WASM_PAGE_SIZE};
+use wasmtime_environ::{WASM32_MAX_PAGES, WASM_PAGE_SIZE};
 
-use crate::ICMemoryCreator;
 use crate::LinearMemory;
 
 use ic_sys::PAGE_SIZE;
@@ -11,78 +12,82 @@ use libc::MAP_FAILED;
 use libc::{mmap, munmap};
 use libc::{MAP_ANON, MAP_PRIVATE, PROT_NONE};
 
-use std::cell::RefCell;
+use std::collections::HashMap;
 use std::io::Error;
+use std::ops::Deref;
 use std::ptr;
+use std::sync::{
+    atomic::{AtomicUsize, Ordering},
+    Arc, Mutex,
+};
 
 pub fn round_up_to_page_size(size: usize, page_size: usize) -> usize {
     (size + (page_size - 1)) & !(page_size - 1)
 }
 
 fn round_up_to_os_page_size(size: usize) -> usize {
-    round_up_to_page_size(size, *PAGE_SIZE)
+    round_up_to_page_size(size, PAGE_SIZE)
 }
 
 fn wasm_max_mem_size_in_bytes() -> usize {
-    WASM_MAX_PAGES as usize * WASM_PAGE_SIZE as usize
+    WASM32_MAX_PAGES as usize * WASM_PAGE_SIZE as usize
 }
 
-#[derive(Default)]
-pub struct WasmtimeMemoryCreator<C: ICMemoryCreator>
-where
-    <C as ICMemoryCreator>::Mem: 'static,
-{
-    raw_creator: C,
-}
+#[derive(Hash, PartialEq, Eq)]
+pub(crate) struct MemoryStart(pub(crate) usize);
 
-impl<C: ICMemoryCreator> WasmtimeMemoryCreator<C> {
-    pub fn new(raw_creator: C) -> Self {
-        Self { raw_creator }
+pub(crate) struct MemoryPageSize(Arc<AtomicUsize>);
+
+impl Deref for MemoryPageSize {
+    type Target = Arc<AtomicUsize>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
     }
 }
 
-unsafe impl<C: ICMemoryCreator + Send + Sync> wasmtime::MemoryCreator for WasmtimeMemoryCreator<C> {
+pub struct WasmtimeMemoryCreator {
+    created_memories: Arc<Mutex<HashMap<MemoryStart, MemoryPageSize>>>,
+}
+
+impl WasmtimeMemoryCreator {
+    pub(crate) fn new(created_memories: Arc<Mutex<HashMap<MemoryStart, MemoryPageSize>>>) -> Self {
+        Self { created_memories }
+    }
+}
+
+unsafe impl wasmtime::MemoryCreator for WasmtimeMemoryCreator {
     fn new_memory(
         &self,
         ty: MemoryType,
-        reserved_size_in_bytes: Option<u64>,
-        guard_size: u64,
-    ) -> Result<Box<dyn wasmtime::LinearMemory>, String> {
-        unsafe {
-            //Wasmtime 'guarantees' that these values are <= WASM_MAX_PAGES
-            //and has asserts for that in its Memory implementation
-            //but let's just clip to that without panicking in case they change
-            // something...
-            let min = std::cmp::min(ty.limits().min(), WASM_MAX_PAGES);
-            let max = ty.limits().max().unwrap_or(WASM_MAX_PAGES);
-            let max = std::cmp::min(max, WASM_MAX_PAGES);
-
-            let mem_size =
-                reserved_size_in_bytes.unwrap_or(wasm_max_mem_size_in_bytes() as u64) as usize;
-            let guard_size = guard_size as usize;
-
-            let mem = self
-                .raw_creator
-                .new_memory(mem_size, guard_size, 0, min, Some(max));
-
-            Ok(Box::new(WasmtimeMemory::new(mem, min, max)))
-        }
-    }
-}
-
-pub(crate) struct MmapMemoryCreator {}
-
-impl ICMemoryCreator for MmapMemoryCreator {
-    type Mem = MmapMemory;
-    fn new_memory(
-        &self,
-        mem_size: usize,
+        _minimum: usize,
+        _maximum: Option<usize>,
+        reserved_size_in_bytes: Option<usize>,
         guard_size: usize,
-        _instance_heap_offset: usize,
-        _min_pages: u32,
-        _max_pages: Option<u32>,
-    ) -> MmapMemory {
-        unsafe { MmapMemory::new(mem_size, guard_size) }
+    ) -> Result<Box<dyn wasmtime::LinearMemory>, String> {
+        let max_pages = if ty.is_64() {
+            MAX_STABLE_MEMORY_IN_BYTES / (WASM_PAGE_SIZE as u64)
+        } else {
+            WASM32_MAX_PAGES
+        };
+        let min = std::cmp::min(ty.minimum(), max_pages) as usize;
+        let max = std::cmp::min(ty.maximum().unwrap_or(max_pages), max_pages) as usize;
+
+        let mem_size = reserved_size_in_bytes.unwrap_or_else(wasm_max_mem_size_in_bytes);
+
+        let mem = MmapMemory::new(mem_size, guard_size);
+
+        match self.created_memories.lock() {
+            Err(err) => Err(format!("Error locking map of created memories: {:?}", err)),
+            Ok(mut created_memories) => {
+                let new_memory = WasmtimeMemory::new(mem, min, max);
+                created_memories.insert(
+                    MemoryStart(wasmtime::LinearMemory::as_ptr(&new_memory) as usize),
+                    MemoryPageSize(Arc::clone(&new_memory.used)),
+                );
+                Ok(Box::new(new_memory))
+            }
+        }
     }
 }
 
@@ -91,26 +96,33 @@ pub struct MmapMemory {
     mem_size: usize,
 }
 
+/// SAFETY: This type is not actually Send/Sync but this it is only used
+/// internally by `wasmtime` where they should be synchronizing access to the
+/// pointers themselves.
 unsafe impl Send for MmapMemory {}
+unsafe impl Sync for MmapMemory {}
 
 impl MmapMemory {
-    /// # Safety
-    /// It calls libc::mmap is if arguments don't make sense it can fail
-    pub unsafe fn new(mem_size_in_bytes: usize, guard_size_in_bytes: usize) -> Self {
+    pub fn new(mem_size_in_bytes: usize, guard_size_in_bytes: usize) -> Self {
         let mem_size = round_up_to_os_page_size(mem_size_in_bytes + guard_size_in_bytes);
 
+        // SAFETY: These are valid arguments to `mmap`. Only `mem_size` is non-constant,
+        // but any `usize` will result in a valid call.
+        //
         // It is important to reserve the memory with PROT_NONE. Otherwise,
         // depending on the overcommit strategy configured in the kernel, the
         // call to mmap may fail. See:
         // https://www.kernel.org/doc/Documentation/vm/overcommit-accounting
-        let mem = mmap(
-            ptr::null_mut(),
-            mem_size,
-            PROT_NONE,
-            MAP_PRIVATE | MAP_ANON,
-            -1,
-            0,
-        );
+        let mem = unsafe {
+            mmap(
+                ptr::null_mut(),
+                mem_size,
+                PROT_NONE,
+                MAP_PRIVATE | MAP_ANON,
+                -1,
+                0,
+            )
+        };
         assert_ne!(
             mem,
             MAP_FAILED,
@@ -119,10 +131,6 @@ impl MmapMemory {
             Error::last_os_error()
         );
 
-        Self { mem, mem_size }
-    }
-
-    pub fn from_raw(mem: *mut c_void, mem_size: usize) -> Self {
         Self { mem, mem_size }
     }
 }
@@ -141,52 +149,66 @@ impl Drop for MmapMemory {
 }
 
 pub struct WasmtimeMemory<M: LinearMemory> {
-    pub mem: RefCell<M>,
-    maximum: u32,
-    used: RefCell<u32>,
+    mem: M,
+    maximum: usize,
+    used: MemoryPageSize,
 }
 
-impl<M: LinearMemory> WasmtimeMemory<M> {
-    unsafe fn new(mem: M, min: u32, maximum: u32) -> Self {
+impl<M: LinearMemory + Send> WasmtimeMemory<M> {
+    fn new(mem: M, min: usize, maximum: usize) -> Self {
         Self {
-            mem: RefCell::new(mem),
+            mem,
             maximum,
-            used: RefCell::new(min),
+            used: MemoryPageSize(Arc::new(AtomicUsize::new(min))),
         }
     }
 }
 
-unsafe impl<M: LinearMemory> wasmtime::LinearMemory for WasmtimeMemory<M> {
+fn convert_pages_to_bytes(pages: usize) -> usize {
+    let (result, overflow) = pages.overflowing_mul(WASM_PAGE_SIZE as usize);
+    if overflow {
+        panic!("Unable to convert memory page size {} to bytes", pages)
+    }
+    result
+}
+
+unsafe impl<M: LinearMemory + Send + Sync + 'static> wasmtime::LinearMemory for WasmtimeMemory<M> {
     /// Returns the number of allocated wasm pages.
-    fn size(&self) -> u32 {
-        *self.used.borrow()
+    fn byte_size(&self) -> usize {
+        convert_pages_to_bytes(self.used.load(Ordering::SeqCst))
     }
 
-    fn grow(&self, delta: u32) -> Option<u32> {
-        let prev_pages: u32 = *self.used.borrow();
-        let new_pages = match prev_pages.checked_add(delta) {
-            Some(x) => x,
-            None => return None,
-        };
+    fn maximum_byte_size(&self) -> Option<usize> {
+        Some(convert_pages_to_bytes(self.maximum))
+    }
 
-        if new_pages > self.maximum {
-            return None;
+    fn grow_to(&mut self, new_size: usize) -> anyhow::Result<()> {
+        if new_size % WASM_PAGE_SIZE as usize != 0 {
+            bail!(
+                "Requested wasm page size increase wasn't a multiple of the wasm page size: {}",
+                new_size
+            )
         }
-
-        self.mem.borrow().grow_mem_to(new_pages);
-
-        *self.used.borrow_mut() = new_pages;
-        Some(prev_pages)
+        let new_pages = new_size / WASM_PAGE_SIZE as usize;
+        match self
+            .used
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |prev_pages| {
+                if new_pages <= prev_pages || new_pages > self.maximum {
+                    None
+                } else {
+                    Some(new_pages)
+                }
+            }) {
+            Ok(_) => Ok(()),
+            Err(prev_pages) => bail!(
+                "Unable to grow wasm memory from {} pages to {} pages",
+                prev_pages,
+                new_pages
+            ),
+        }
     }
 
     fn as_ptr(&self) -> *mut u8 {
-        let mem = self.mem.borrow_mut();
-        mem.as_ptr() as *mut u8
-    }
-}
-
-impl<M: LinearMemory> LinearMemory for WasmtimeMemory<M> {
-    fn as_ptr(&self) -> *mut c_void {
-        <Self as wasmtime::LinearMemory>::as_ptr(&self) as *mut c_void
+        self.mem.as_ptr() as *mut _
     }
 }

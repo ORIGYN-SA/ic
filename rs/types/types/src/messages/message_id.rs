@@ -1,6 +1,6 @@
 use super::RawHttpRequestVal;
 use crate::{crypto::SignedBytesWithoutDomainSeparator, CountBytes};
-use ic_crypto_sha256::Sha256;
+use ic_crypto_sha::Sha256;
 use ic_protobuf::proxy::ProxyDecodeError;
 use serde::{de::Deserializer, ser::Serializer, Deserialize, Serialize};
 use std::{
@@ -10,7 +10,7 @@ use std::{
     fmt,
 };
 
-/// The length of a [`MessageId`] is 32: https://sdk.dfinity.org/docs/interface-spec/index.html#api-request-id)
+/// The length of a [`MessageId`] is 32: `<https://sdk.dfinity.org/docs/interface-spec/index.html#api-request-id>`
 pub const EXPECTED_MESSAGE_ID_LENGTH: usize = 32;
 
 /// The ID used to uniquely identify a user's ingress message.
@@ -74,7 +74,7 @@ impl SignedBytesWithoutDomainSeparator for MessageId {
 
 impl fmt::Display for MessageId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "0x{}", hex::encode(&self.0))
+        write!(f, "0x{}", hex::encode(self.0))
     }
 }
 
@@ -84,7 +84,7 @@ impl TryFrom<&[u8]> for MessageId {
     fn try_from(bytes: &[u8]) -> Result<Self, Self::Error> {
         if bytes.len() == EXPECTED_MESSAGE_ID_LENGTH {
             let mut array = [0; EXPECTED_MESSAGE_ID_LENGTH];
-            array.copy_from_slice(&bytes);
+            array.copy_from_slice(bytes);
             Ok(MessageId(array))
         } else {
             Err(MessageIdError::InvalidLength {
@@ -166,8 +166,6 @@ fn hash_key_val(key: String, val: RawHttpRequestVal) -> Vec<u8> {
 }
 
 /// Describes `hash_of_map` as specified in the public spec.
-// TODO(EXC-234): Generalize this method and move to a more appropriate
-// location.
 pub(crate) fn hash_of_map<S: ToString>(map: &BTreeMap<S, RawHttpRequestVal>) -> [u8; 32] {
     let mut hashes: Vec<Vec<u8>> = Vec::new();
     for (key, val) in map.iter() {
@@ -242,7 +240,7 @@ impl From<MessageIdError> for ProxyDecodeError {
 #[cfg(test)]
 mod tests {
     use super::super::{
-        Blob, HttpCanisterUpdate, HttpRequestEnvelope, HttpSubmitContent, RawHttpRequestVal,
+        Blob, HttpCallContent, HttpCanisterUpdate, HttpRequestEnvelope, RawHttpRequestVal,
         SignedIngress,
     };
     use super::*;
@@ -435,8 +433,8 @@ mod tests {
             ingress_expiry: expiry_time.as_nanos_since_unix_epoch(),
             nonce: None,
         };
-        let content = HttpSubmitContent::Call { update };
-        let envelope = HttpRequestEnvelope::<HttpSubmitContent> {
+        let content = HttpCallContent::Call { update };
+        let envelope = HttpRequestEnvelope::<HttpCallContent> {
             content,
             sender_pubkey: Some(Blob(sender_pubkey)),
             sender_sig: Some(Blob(sender_sig)),

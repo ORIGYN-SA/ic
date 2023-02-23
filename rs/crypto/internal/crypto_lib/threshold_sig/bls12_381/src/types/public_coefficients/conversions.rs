@@ -2,7 +2,7 @@
 
 use crate::crypto::public_key_from_secret_key;
 use crate::types::{Polynomial, PublicCoefficients, PublicKey};
-use group::CurveProjective;
+use ic_crypto_internal_bls12_381_type::G2Projective;
 use ic_crypto_internal_types::sign::threshold_sig::ni_dkg::ni_dkg_groth20_bls12_381::PublicCoefficientsBytes;
 pub use ic_crypto_internal_types::sign::threshold_sig::public_coefficients::bls12_381::PublicCoefficientsBytes as InternalPublicCoefficients;
 use ic_crypto_internal_types::sign::threshold_sig::public_coefficients::CspPublicCoefficients;
@@ -11,7 +11,6 @@ use ic_crypto_internal_types::sign::threshold_sig::public_key::bls12_381::{
 };
 use ic_types::crypto::{CryptoError, CryptoResult};
 use ic_types::{NodeIndex, NumberOfNodes};
-use pairing::bls12_381::G2;
 use std::convert::TryFrom;
 
 #[cfg(test)]
@@ -56,7 +55,7 @@ pub fn try_number_of_nodes_from_csp_pub_coeffs(
 ) -> CryptoResult<NumberOfNodes> {
     match value {
         CspPublicCoefficients::Bls12_381(public_coefficients) => {
-            try_number_of_nodes_from_pub_coeff_bytes(public_coefficients).map_err(|e| e)
+            try_number_of_nodes_from_pub_coeff_bytes(public_coefficients)
         }
     }
 }
@@ -86,8 +85,8 @@ impl From<&PublicCoefficients> for PublicKey {
         public_coefficients
             .coefficients
             .get(0)
-            .copied()
-            .unwrap_or_else(|| PublicKey(G2::zero()))
+            .cloned()
+            .unwrap_or_else(|| PublicKey(G2Projective::identity()))
     }
 }
 
@@ -100,7 +99,7 @@ impl TryFrom<&PublicCoefficientsBytes> for PublicKey {
             .coefficients
             .get(0)
             .map(PublicKey::try_from)
-            .unwrap_or_else(|| Ok(PublicKey(G2::zero())))?)
+            .unwrap_or_else(|| Ok(PublicKey(G2Projective::identity())))?)
     }
 }
 
@@ -115,7 +114,7 @@ pub fn pub_key_bytes_from_pub_coeff_bytes(
         .coefficients
         .get(0)
         .cloned()
-        .unwrap_or_else(|| PublicKeyBytes::from(PublicKey(G2::zero())))
+        .unwrap_or_else(|| PublicKeyBytes::from(PublicKey(G2Projective::identity())))
 }
 
 // The internal PublicCoefficients are a duplicate of InternalPublicCoefficients
@@ -135,6 +134,26 @@ impl From<PublicCoefficients> for InternalPublicCoefficients {
         InternalPublicCoefficients::from(&public_coefficients)
     }
 }
+impl PublicCoefficients {
+    /// Deserializes a `PublicCoefficients` from a *trusted* source.
+    ///
+    /// # Security Notice
+    /// This uses the "unchecked" G2 deserialization (no subgroup check),
+    /// so should only be used on `InternalPublicCoefficients` obtained
+    /// from a known, trusted source.
+    pub fn from_trusted_bytes(
+        bytes: &InternalPublicCoefficients,
+    ) -> Result<PublicCoefficients, CryptoError> {
+        let coefficients: Result<Vec<PublicKey>, ThresholdSigPublicKeyBytesConversionError> = bytes
+            .coefficients
+            .iter()
+            .map(PublicKey::from_trusted_bytes)
+            .collect();
+        let coefficients = coefficients?;
+        Ok(PublicCoefficients { coefficients })
+    }
+}
+
 impl TryFrom<&InternalPublicCoefficients> for PublicCoefficients {
     type Error = CryptoError;
     fn try_from(bytes: &InternalPublicCoefficients) -> Result<PublicCoefficients, CryptoError> {

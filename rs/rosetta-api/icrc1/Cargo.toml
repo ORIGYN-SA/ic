@@ -1,0 +1,21 @@
+[package]
+name = "ic-icrc1"
+version = "0.8.0"
+authors = ["The Internet Computer Project Developers"]
+description = "ICRC-1 compliant ledger library."
+edition = "2021"
+
+[dependencies]
+candid = "0.8.1"
+ciborium = "0.2"
+hex = "0.4.2"
+ic-base-types = { path = "../../types/base_types" }
+ic-crypto-sha = { path = "../../crypto/sha" }
+ic-ledger-canister-core = { path = "../ledger_canister_core" }
+ic-ledger-core = { path = "../ledger_core" }
+num-traits = "0.2.12"
+serde = "1.0"
+serde_bytes = "0.11"
+
+[dev-dependencies]
+leb128 = "0.2.4"

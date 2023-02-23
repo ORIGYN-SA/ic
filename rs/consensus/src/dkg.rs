@@ -2,45 +2,52 @@
 //! component into the consensus algorithm that is implemented within this
 //! crate.
 
-use crate::consensus::{crypto::ConsensusCrypto, pool_reader::PoolReader};
-use ic_crypto::crypto_hash;
+use crate::consensus::{
+    crypto::ConsensusCrypto, dkg_key_manager::DkgKeyManager, pool_reader::PoolReader,
+};
+use crate::ecdsa::{
+    make_bootstrap_summary, payload_builder::get_ecdsa_config_if_enabled,
+    utils::inspect_ecdsa_initializations,
+};
 use ic_interfaces::{
     consensus_pool::ConsensusPoolCache,
     dkg::{ChangeAction, ChangeSet, Dkg, DkgGossip, DkgPool},
-    registry::RegistryClient,
-    state_manager::{StateManager, StateManagerError},
     validation::{ValidationError, ValidationResult},
 };
-use ic_logger::{error, warn, ReplicaLogger};
+use ic_interfaces_registry::RegistryClient;
+use ic_interfaces_state_manager::{StateManager, StateManagerError};
+use ic_logger::{error, info, warn, ReplicaLogger};
 use ic_metrics::buckets::{decimal_buckets, linear_buckets};
 use ic_protobuf::registry::subnet::v1::CatchUpPackageContents;
-use ic_registry_client::helper::{
+use ic_registry_client_helpers::{
     crypto::{initial_ni_dkg_transcript_from_registry_record, DkgTranscripts},
     subnet::SubnetRegistry,
 };
 use ic_replicated_state::ReplicatedState;
-use ic_types::batch::ValidationContext;
-use ic_types::consensus::get_faults_tolerated;
 use ic_types::{
     artifact::{DkgMessageAttribute, DkgMessageId, Priority, PriorityFn},
+    batch::ValidationContext,
     consensus::{
         dkg,
         dkg::{DealingContent, Message, Summary},
-        Block, BlockPayload, CatchUpContent, CatchUpPackage, HashedBlock, HashedRandomBeacon,
-        Payload, RandomBeaconContent, Rank, ThresholdSignature,
+        get_faults_tolerated, Block, BlockPayload, CatchUpContent, CatchUpPackage, HashedBlock,
+        HashedRandomBeacon, Payload, RandomBeaconContent, Rank,
     },
     crypto::{
+        crypto_hash,
         threshold_sig::ni_dkg::{
             config::{errors::NiDkgConfigValidationError, NiDkgConfig, NiDkgConfigData},
             errors::{
                 create_transcript_error::DkgCreateTranscriptError,
                 verify_dealing_error::DkgVerifyDealingError,
             },
-            NiDkgDealing, NiDkgId, NiDkgTag, NiDkgTargetSubnet, NiDkgTranscript,
+            NiDkgDealing, NiDkgId, NiDkgTag, NiDkgTargetId, NiDkgTargetSubnet, NiDkgTranscript,
         },
         CryptoError, Signed,
     },
+    messages::CallbackId,
     registry::RegistryClientError,
+    signature::ThresholdSignature,
     Height, NodeId, NumberOfNodes, RegistryVersion, SubnetId, Time,
 };
 
@@ -48,13 +55,21 @@ use ic_types::crypto::{CombinedThresholdSig, CombinedThresholdSigOf, CryptoHash}
 use phantom_newtype::Id;
 use prometheus::{Histogram, IntCounterVec};
 use rayon::prelude::*;
-use std::collections::BTreeSet;
-use std::collections::{BTreeMap, HashMap, HashSet};
-use std::sync::{Arc, RwLock};
-use std::time::Duration;
+use std::{
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
+    sync::{Arc, Mutex, RwLock},
+    time::Duration,
+};
 
 // The maximal number of DKGs for other subnets we want to run in one interval.
 const MAX_REMOTE_DKGS_PER_INTERVAL: usize = 1;
+
+// The maximum number of intervals during which an initial DKG request is
+// attempted.
+const MAX_REMOTE_DKG_ATTEMPTS: u32 = 5;
+
+// Generic error string for failed remote DKG requests.
+const REMOTE_DKG_REPEATED_FAILURE_ERROR: &str = "Attemtps to run this DKG repeatedly failed";
 
 // Currently we assume that we run DKGs for all of these tags.
 const TAGS: [NiDkgTag; 2] = [NiDkgTag::LowThreshold, NiDkgTag::HighThreshold];
@@ -62,6 +77,7 @@ const TAGS: [NiDkgTag; 2] = [NiDkgTag::LowThreshold, NiDkgTag::HighThreshold];
 /// Transient Dkg message validation errors.
 #[allow(missing_docs)]
 #[derive(Debug)]
+#[allow(clippy::large_enum_variant)]
 pub enum PermanentError {
     CryptoError(CryptoError),
     DkgCreateTranscriptError(DkgCreateTranscriptError),
@@ -154,6 +170,7 @@ pub struct DkgImpl {
     node_id: NodeId,
     crypto: Arc<dyn ConsensusCrypto>,
     consensus_cache: Arc<dyn ConsensusPoolCache>,
+    dkg_key_manager: Arc<Mutex<DkgKeyManager>>,
     logger: ReplicaLogger,
     metrics: Metrics,
 }
@@ -167,6 +184,7 @@ impl DkgImpl {
         node_id: NodeId,
         crypto: Arc<dyn ConsensusCrypto>,
         consensus_cache: Arc<dyn ConsensusPoolCache>,
+        dkg_key_manager: Arc<Mutex<DkgKeyManager>>,
         metrics_registry: ic_metrics::MetricsRegistry,
         logger: ReplicaLogger,
     ) -> Self {
@@ -174,6 +192,7 @@ impl DkgImpl {
             crypto,
             consensus_cache,
             node_id,
+            dkg_key_manager,
             logger,
             metrics: Metrics {
                 on_state_change_duration: metrics_registry.histogram(
@@ -205,11 +224,38 @@ impl DkgImpl {
             return None;
         }
 
+        // If the transcript is being loaded at the moment, we return early.
+        // The transcript will be available at a later point in time.
+        if let Some(transcript) = config.resharing_transcript() {
+            if !self
+                .dkg_key_manager
+                .lock()
+                .unwrap()
+                .is_transcript_loaded(&transcript.dkg_id)
+            {
+                return None;
+            }
+        }
+
         let content =
             match ic_interfaces::crypto::NiDkgAlgorithm::create_dealing(&*self.crypto, config) {
                 Ok(dealing) => DealingContent::new(dealing, config.dkg_id()),
                 Err(err) => {
-                    error!(self.logger, "Couldn't create a DKG dealing: {:?}", err);
+                    match config.dkg_id().target_subnet {
+                        NiDkgTargetSubnet::Local => error!(
+                            self.logger,
+                            "Couldn't create a DKG dealing at height {:?}: {:?}",
+                            config.dkg_id().start_block_height,
+                            err
+                        ),
+                        // NOTE: In rare cases, we might hit this case.
+                        NiDkgTargetSubnet::Remote(_) => info!(
+                            self.logger,
+                            "Waiting for Remote DKG dealing at height {:?}: {:?}",
+                            config.dkg_id().start_block_height,
+                            err
+                        ),
+                    };
                     return None;
                 }
             };
@@ -218,7 +264,7 @@ impl DkgImpl {
             .crypto
             .sign(&content, self.node_id, config.registry_version())
         {
-            Ok(signature) => Some(ChangeAction::AddToValidated(Signed { signature, content })),
+            Ok(signature) => Some(ChangeAction::AddToValidated(Signed { content, signature })),
             Err(err) => {
                 error!(self.logger, "Couldn't sign a DKG dealing: {:?}", err);
                 None
@@ -226,55 +272,35 @@ impl DkgImpl {
         }
     }
 
-    // Validates the DKG messages against the provided config. If multiple messages
-    // are found for the same dealer, we deduplicate them and — if multiple messages
-    // remain — we invalidate all of them, because the dealer is considered as
-    // faulty or malicious. If only one message remains, we validate it.
+    // Validates the DKG messages against the provided config.
     //
     // Invalidates the message if:
     // - no DKG config among onging DKGs was found,
     // - the dealer is not on the list of dealers wrt. DKG config,
-    // - the validated DKG pool already contains a dealing from this dealer,
     // - the dealing signature is invalid,
     // - the dealing is invalid.
     //
-    // We skip the validation if an error occurs during the signature or dealing
-    // verification.
-    fn validate_dealings(
+    // We simply remove the message from the pool if we already have a dealing
+    // from the dealer of the the message, because it is possible for honest
+    // dealers to provide multiple, non-identical dealings in certain
+    // situations. We skip the validation if an error occurs during the
+    // signature or dealing verification.
+    fn validate_dealings_for_dealer(
         &self,
         dkg_pool: &dyn DkgPool,
         configs: &BTreeMap<NiDkgId, NiDkgConfig>,
         dkg_start_height: Height,
         messages: Vec<&Message>,
     ) -> ChangeSet {
-        // Deduplicate all messages.
-        let unique_messages = &messages
-            .iter()
-            .collect::<HashSet<_>>()
-            .into_iter()
-            .collect::<Vec<_>>();
-
-        // Look at the remaining messages after the deduplication.
-        let message = match unique_messages.as_slice() {
-            [] => return ChangeSet::new(),
-            // If there exactly one message remained, we validate it.
-            [message] => message,
-            // Otherwise, this dealer must have produced multiple distinguishable
-            // dealings, so we discard all of them as invalid.
-            _ => {
-                return messages
-                    .iter()
-                    .map(|invalid_message| {
-                        get_handle_invalid_change_action(
-                            invalid_message,
-                            format!(
-                                "The replica with Id={:?} produced multiple dealings.",
-                                &invalid_message.signature.signer
-                            ),
-                        )
-                    })
-                    .collect()
-            }
+        // Because dealing generation is not entirely deterministic, it is
+        // actually possible to recieve multiple dealings from an honest dealer.
+        // As such, we simply try validating the first message in the list, and
+        // get a result for that message. Other messages will be dealt with by
+        // subsequent calls to this function.
+        let message = if let Some(message) = messages.first() {
+            message
+        } else {
+            return ChangeSet::new();
         };
 
         let message_dkg_id = message.content.dkg_id;
@@ -304,12 +330,12 @@ impl DkgImpl {
         let dealer_id = &message.signature.signer;
 
         // If the validated pool already contains this exact message, we skip it.
-        if dkg_pool.get_validated().any(|item| item.eq(&message)) {
+        if dkg_pool.get_validated().any(|item| item.eq(message)) {
             return ChangeSet::new();
         }
 
         // If the dealing comes from a non-dealer, reject it.
-        if !config.dealers().get().contains(&dealer_id) {
+        if !config.dealers().get().contains(dealer_id) {
             return get_handle_invalid_change_action(
                 message,
                 format!("Replica with Id={:?} is not a dealer.", dealer_id),
@@ -317,17 +343,14 @@ impl DkgImpl {
             .into();
         }
 
-        // If there exists another validated dealing from this dealer and DKG id, reject
-        // it.
+        // If we already have a dealing from this dealer, we simply remove the
+        // message from the pool. Multiple distinguishable valid dealings can be
+        // created by an honest node because dkg dealings are not deterministic,
+        // and in the case of a restart it is possible it might forget that it
+        // has already sent out a dealing. See
+        // https://dfinity.atlassian.net/browse/CON-534 for more details.
         if contains_dkg_messages(dkg_pool, config, *dealer_id) {
-            return get_handle_invalid_change_action(
-                message,
-                format!(
-                    "A dealing from replica with Id={:?} is already validated.",
-                    dealer_id
-                ),
-            )
-            .into();
+            return ChangeSet::from(ChangeAction::RemoveFromUnvalidated((*message).clone()));
         }
 
         // Verify the signature and reject if it's invalid, or skip, if there was an
@@ -358,13 +381,13 @@ impl DkgImpl {
         // reject, if it was rejected, or skip, if there was an error.
         match ic_interfaces::crypto::NiDkgAlgorithm::verify_dealing(
             &*self.crypto,
-            &config,
+            config,
             *dealer_id,
             &message.content.dealing,
         )
         .map_err(DkgMessageValidationError::from)
         {
-            Ok(()) => ChangeAction::MoveToValidated((**message).clone()).into(),
+            Ok(()) => ChangeAction::MoveToValidated((*message).clone()).into(),
             Err(ValidationError::Permanent(err)) => get_handle_invalid_change_action(
                 message,
                 format!("Dealing verification failed: {:?}", err),
@@ -382,9 +405,9 @@ fn get_dealers_from_chain(
     pool_reader: &PoolReader<'_>,
     block: &Block,
 ) -> HashMap<NiDkgId, HashSet<NodeId>> {
-    get_dkg_dealings(pool_reader, &block)
+    get_dkg_dealings(pool_reader, block)
         .into_iter()
-        .map(|(dkg_id, dealings)| (dkg_id, dealings.into_iter().map(|(key, _)| key).collect()))
+        .map(|(dkg_id, dealings)| (dkg_id, dealings.into_keys().collect()))
         .collect()
 }
 
@@ -395,7 +418,10 @@ fn contains_dkg_messages(dkg_pool: &dyn DkgPool, config: &NiDkgConfig, replica_i
 }
 
 fn get_handle_invalid_change_action<T: AsRef<str>>(message: &Message, reason: T) -> ChangeAction {
-    ChangeAction::HandleInvalid(ic_crypto::crypto_hash(message), reason.as_ref().to_string())
+    ChangeAction::HandleInvalid(
+        ic_types::crypto::crypto_hash(message),
+        reason.as_ref().to_string(),
+    )
 }
 
 /// Validates the DKG payload. The parent block is expected to be a valid block.
@@ -417,10 +443,12 @@ pub fn validate_payload(
         // We expect the parent to be valid, so there will be _always_ a DKG start block on the
         // chain.
         .expect("No DKG start block found for the parent block.");
-    let last_summary = BlockPayload::from(last_summary_block.payload).into_summary();
+    let last_dkg_summary = BlockPayload::from(last_summary_block.payload)
+        .into_summary()
+        .dkg;
 
     let current_height = parent.height.increment();
-    let is_dkg_start_height = last_summary.get_next_start_height() == current_height;
+    let is_dkg_start_height = last_dkg_summary.get_next_start_height() == current_height;
 
     if payload.is_summary() {
         if !is_dkg_start_height {
@@ -434,18 +462,17 @@ pub fn validate_payload(
             registry_client,
             crypto,
             pool_reader,
-            last_summary,
+            last_dkg_summary,
             &parent,
             registry_version,
             state_manager,
             validation_context,
             ic_logger::replica_logger::no_op_logger(),
         )?;
-        let expected_payload = expected_summary.into();
-        if payload != &expected_payload {
+        if payload.as_summary().dkg != expected_summary {
             return Err(PermanentError::MismatchedDkgSummary(
-                expected_payload.as_summary().clone(),
-                payload.as_summary().clone(),
+                expected_summary,
+                payload.as_summary().dkg.clone(),
             )
             .into());
         }
@@ -458,9 +485,9 @@ pub fn validate_payload(
             crypto,
             pool_reader,
             dkg_pool,
-            &last_summary,
+            &last_dkg_summary,
             payload.dkg_interval_start_height(),
-            &payload.as_dealings().messages,
+            &payload.as_data().dealings.messages,
             &parent,
             metrics,
         )
@@ -478,7 +505,7 @@ pub fn create_payload(
     crypto: &dyn ConsensusCrypto,
     pool_reader: &PoolReader<'_>,
     dkg_pool: Arc<RwLock<dyn DkgPool>>,
-    parent: Block,
+    parent: &Block,
     state_manager: &dyn StateManager<State = ReplicatedState>,
     validation_context: &ValidationContext,
     logger: ReplicaLogger,
@@ -488,20 +515,22 @@ pub fn create_payload(
     let height = parent.height.increment();
     // Get the last summary from the chain.
     let last_summary_block = pool_reader
-        .dkg_summary_block(&parent)
-        .ok_or_else(|| TransientError::MissingDkgStartBlock)?;
-    let last_summary = BlockPayload::from(last_summary_block.payload).into_summary();
+        .dkg_summary_block(parent)
+        .ok_or(TransientError::MissingDkgStartBlock)?;
+    let last_dkg_summary = BlockPayload::from(last_summary_block.payload)
+        .into_summary()
+        .dkg;
 
-    if last_summary.get_next_start_height() == height {
+    if last_dkg_summary.get_next_start_height() == height {
         // Since `height` corresponds to the start of a new DKG interval, we create a
         // new summary.
         return create_summary_payload(
             subnet_id,
             registry_client,
-            &*crypto,
+            crypto,
             pool_reader,
-            last_summary,
-            &parent,
+            last_dkg_summary,
+            parent,
             last_summary_block.context.registry_version,
             state_manager,
             validation_context,
@@ -513,7 +542,7 @@ pub fn create_payload(
     // If the height is not a start height, create a payload with new dealings.
 
     // Get all dealer ids from the chain.
-    let dealers_from_chain = get_dealers_from_chain(pool_reader, &parent);
+    let dealers_from_chain = get_dealers_from_chain(pool_reader, parent);
     let age_threshold = Duration::from_millis(dealing_age_threshold_ms);
     // Filter from the validated pool all dealings whose dealer has no dealing on
     // the chain yet.
@@ -523,7 +552,7 @@ pub fn create_payload(
         .get_validated_older_than(age_threshold)
         .filter(|msg| {
             // Make sure the message relates to one of the ongoing DKGs.
-            last_summary.configs.contains_key(&msg.content.dkg_id) &&
+            last_dkg_summary.configs.contains_key(&msg.content.dkg_id) &&
                     // The message is from a unique dealer.
                     match dealers_from_chain.get(&msg.content.dkg_id) {
                         // If no list of dealers for the given DKG id was found, this must be the
@@ -603,63 +632,41 @@ fn create_summary_payload(
     }
 
     let height = parent.height.increment();
-    let mut config_groups = Vec::new();
 
-    // In this loop we go over all still open requests for DKGs for other subnets.
-    // We check for both (high & low) configs if we have computed transcripts for
-    // them. If we did, we move these transcripts into the new summary. If not,
-    // we create a new configs group, consisting the remaining outstanding
-    // transcripts (at most two).
-    for low_high_threshold_configs in get_configs_for_new_subnets(
+    let (mut configs, transcripts_for_new_subnets, initial_dkg_attempts) = compute_remote_dkg_data(
         subnet_id,
         height,
         registry_client,
         state_manager,
         validation_context,
-    )? {
-        let mut expected_configs = Vec::new();
-        for config in low_high_threshold_configs {
-            let dkg_id = config.dkg_id();
-            // Check if we have a transcript in the previous summary for this config, and
-            // if we do, move it to the new summary.
-            if let Some((id, transcript)) = last_summary
-                .transcripts_for_new_subnets()
-                .iter()
-                .find(|(id, _)| eq_sans_height(id, &dkg_id))
-            {
-                transcripts_for_new_subnets.insert(*id, transcript.clone());
-            }
-            // If not, we check if we computed a transcript for this config in the last round. And
-            // if not, we move the config into the new summary so that we try again in
-            // the next round.
-            else if !transcripts_for_new_subnets
-                .iter()
-                .any(|(id, _)| eq_sans_height(id, &dkg_id))
-            {
-                expected_configs.push(config)
-            }
-        }
-        config_groups.push(expected_configs);
-    }
-
-    // Retain not more than `MAX_REMOTE_DKGS_PER_INTERVAL` config groups, each
-    // containing at most two configs: for high and low thresholds.
-    let mut configs: Vec<_> = config_groups
-        [0..MAX_REMOTE_DKGS_PER_INTERVAL.min(config_groups.len())]
-        .to_vec()
-        .into_iter()
-        .flatten()
-        .collect();
+        transcripts_for_new_subnets,
+        &last_summary
+            .transcripts_for_new_subnets_with_callback_ids
+            .iter()
+            .map(|(id, _, result)| (*id, result.clone()))
+            .collect(),
+        &last_summary.initial_dkg_attempts,
+        &logger,
+    )?;
 
     let interval_length = last_summary.next_interval_length;
     let next_interval_length =
         get_dkg_interval_length(registry_client, registry_version, subnet_id)?;
     // Current transcripts come from next transcripts of the last_summary.
     let current_transcripts = last_summary.into_next_transcripts();
+
     // If the config for the currently computed DKG intervals requires a transcript
     // resharing (currently for high-threshold DKG only), we are going to re-share
-    // the _current_ transcripts, as they are the newest ones, which are finalized.
-    let reshared_transcripts = &current_transcripts;
+    // the next transcripts, as they are the newest ones.
+    // If `next_transcripts` does not contain the required transcripts (due to
+    // failed DKGs in the past interval) we reshare the current transcripts.
+    let reshared_transcripts = if next_transcripts.contains_key(&NiDkgTag::LowThreshold)
+        && next_transcripts.contains_key(&NiDkgTag::HighThreshold)
+    {
+        &next_transcripts
+    } else {
+        &current_transcripts
+    };
 
     configs.append(&mut get_configs_for_local_transcripts(
         subnet_id,
@@ -678,6 +685,7 @@ fn create_summary_payload(
         interval_length,
         next_interval_length,
         height,
+        initial_dkg_attempts,
     ))
 }
 
@@ -699,7 +707,7 @@ fn create_transcript(
     let no_dealings = BTreeMap::new();
     let dealings = all_dealings.get(&config.dkg_id()).unwrap_or(&no_dealings);
     let transcript =
-        ic_interfaces::crypto::NiDkgAlgorithm::create_transcript(crypto, &config, dealings)?;
+        ic_interfaces::crypto::NiDkgAlgorithm::create_transcript(crypto, config, dealings)?;
     Ok(transcript)
 }
 
@@ -737,7 +745,7 @@ fn validate_dealings_payload(
     }
 
     // Get a list of all dealers, who created a dealing already, indexed by DKG id.
-    let dealers_from_chain = get_dealers_from_chain(pool_reader, &parent);
+    let dealers_from_chain = get_dealers_from_chain(pool_reader, parent);
 
     // Check that all messages have a valid DKG config from the summary and the
     // dealer is valid, then verify each dealing.
@@ -778,7 +786,7 @@ fn validate_dealings_payload(
                 // Verify the dealing.
                 ic_interfaces::crypto::NiDkgAlgorithm::verify_dealing(
                     crypto,
-                    &config,
+                    config,
                     message.signature.signer,
                     &message.content.dealing,
                 )?;
@@ -855,32 +863,214 @@ pub fn get_configs_for_local_transcripts(
     Ok(new_configs)
 }
 
-// Creates DKG configs for new subnets for the next round. Returns configs
-// grouped by the subnet (two configs per subnet: for low and high thresholds).
-fn get_configs_for_new_subnets(
-    this_subnet_id: SubnetId,
-    start_block_height: Height,
+#[allow(clippy::type_complexity)]
+#[allow(clippy::too_many_arguments)]
+fn compute_remote_dkg_data(
+    subnet_id: SubnetId,
+    height: Height,
     registry_client: &dyn RegistryClient,
     state_manager: &dyn StateManager<State = ReplicatedState>,
     validation_context: &ValidationContext,
-) -> Result<Vec<Vec<NiDkgConfig>>, TransientError> {
-    let mut new_configs = Vec::new();
+    mut new_transcripts: BTreeMap<NiDkgId, Result<NiDkgTranscript, String>>,
+    previous_transcripts: &BTreeMap<NiDkgId, Result<NiDkgTranscript, String>>,
+    previous_attempts: &BTreeMap<NiDkgTargetId, u32>,
+    logger: &ReplicaLogger,
+) -> Result<
+    (
+        Vec<NiDkgConfig>,
+        Vec<(NiDkgId, CallbackId, Result<NiDkgTranscript, String>)>,
+        BTreeMap<NiDkgTargetId, u32>,
+    ),
+    TransientError,
+> {
     let state = state_manager
         .get_state_at(validation_context.certified_height)
         .map_err(TransientError::StateManagerError)?;
-    let contexts = &state
-        .get_ref()
+    let (context_configs, errors, valid_target_ids) = process_subnet_call_context(
+        subnet_id,
+        height,
+        registry_client,
+        state.get_ref(),
+        validation_context,
+        logger,
+    )?;
+
+    let mut config_groups = Vec::new();
+    // In this loop we go over all still open requests for DKGs for other subnets.
+    // We check for both (high & low) configs if we have computed transcripts for
+    // them. If we did, we move these transcripts into the new summary. If not,
+    // we create a new configs group, consisting the remaining outstanding
+    // transcripts (at most two).
+    for low_high_threshold_configs in context_configs {
+        let mut expected_configs = Vec::new();
+        for config in low_high_threshold_configs {
+            let dkg_id = config.dkg_id();
+            // Check if we have a transcript in the previous summary for this config, and
+            // if we do, move it to the new summary.
+            if let Some((id, transcript)) = previous_transcripts
+                .iter()
+                .find(|(id, _)| eq_sans_height(id, &dkg_id))
+            {
+                new_transcripts.insert(*id, transcript.clone());
+            }
+            // If not, we check if we computed a transcript for this config in the last round. And
+            // if not, we move the config into the new summary so that we try again in
+            // the next round.
+            else if !new_transcripts
+                .iter()
+                .any(|(id, _)| eq_sans_height(id, &dkg_id))
+            {
+                expected_configs.push(config)
+            }
+        }
+
+        // If some configs are added into the expected_configs in the end, add this
+        // group of config(s) into the config_groups.
+        if !expected_configs.is_empty() {
+            config_groups.push(expected_configs);
+        }
+    }
+
+    // Remove the data regarding old targets.
+    let mut attempts = previous_attempts
+        .clone()
+        .into_iter()
+        .filter(|(target_id, _)| valid_target_ids.contains(target_id))
+        .collect::<BTreeMap<_, _>>();
+
+    // Get the target ids that are attempted at least MAX_REMOTE_DKG_ATTEMPTS times.
+    let failed_target_ids = attempts
+        .iter()
+        .filter_map(
+            |(target_id, attempt_no)| match *attempt_no >= MAX_REMOTE_DKG_ATTEMPTS {
+                true => Some(*target_id),
+                false => None,
+            },
+        )
+        .collect::<Vec<_>>();
+
+    // Add errors into 'new_transcripts' for repeatedly failed configs and do not
+    // attempt to create transcripts for them any more.
+    //
+    // TODO: use drain_filter once it's stable.
+    config_groups.retain(|config_group| {
+        let target = config_group
+            .first()
+            .map(|config| config.dkg_id().target_subnet);
+        if let Some(NiDkgTargetSubnet::Remote(id)) = target {
+            if failed_target_ids.contains(&id) {
+                for config in config_group.iter() {
+                    new_transcripts.insert(
+                        config.dkg_id(),
+                        Err(REMOTE_DKG_REPEATED_FAILURE_ERROR.to_string()),
+                    );
+                }
+                return false;
+            }
+        }
+        true
+    });
+
+    // Retain not more than `MAX_REMOTE_DKGS_PER_INTERVAL` config groups, each
+    // containing at most two configs: for high and low thresholds.
+    let selected_config_groups: Vec<_> =
+        config_groups[0..MAX_REMOTE_DKGS_PER_INTERVAL.min(config_groups.len())].to_vec();
+
+    for config_group in selected_config_groups.iter() {
+        let target = config_group
+            .first()
+            .map(|config| config.dkg_id().target_subnet);
+        if let Some(NiDkgTargetSubnet::Remote(id)) = target {
+            *attempts.entry(id).or_insert(0) += 1;
+        }
+    }
+
+    let configs = selected_config_groups.into_iter().flatten().collect();
+
+    // Add the errors returned during the config generation.
+    for (dkg_id, err_str) in errors.into_iter() {
+        new_transcripts.insert(dkg_id, Err(err_str));
+    }
+
+    let new_transcripts_vec =
+        add_callback_ids_to_transcript_results(new_transcripts, state.get_ref(), logger);
+
+    Ok((configs, new_transcripts_vec, attempts))
+}
+
+fn add_callback_ids_to_transcript_results(
+    new_transcripts: BTreeMap<NiDkgId, Result<NiDkgTranscript, String>>,
+    state: &ReplicatedState,
+    log: &ReplicaLogger,
+) -> Vec<(NiDkgId, CallbackId, Result<NiDkgTranscript, String>)> {
+    let setup_initial_dkg_contexts = &state
         .metadata
         .subnet_call_context_manager
-        .contexts;
-    for (_callback_id, context) in contexts.iter() {
-        use ic_replicated_state::metadata_state::SubnetCallContext;
+        .setup_initial_dkg_contexts;
 
-        let SubnetCallContext::SetupInitialDKGContext {
+    new_transcripts
+        .into_iter()
+        .filter_map(|(id, result)| {
+            if let Some(callback_id) = setup_initial_dkg_contexts
+                .iter()
+                .filter_map(|(callback_id, context)| {
+                    if NiDkgTargetSubnet::Remote(context.target_id) == id.target_subnet {
+                        Some(*callback_id)
+                    } else {
+                        None
+                    }
+                })
+                .last()
+            {
+                Some((id, callback_id, result))
+            } else {
+                error!(
+                    log,
+                    "Unable to find callback id associated with remote dkg id {}, this should not happen",
+                    id
+                );
+                None
+            }
+        })
+        .collect()
+}
+
+// Reads the SubnetCallContext and attempts to create DKG configs for new
+// subnets for the next round. An Ok return value contains:
+// * configs grouped by subnet (low and high threshold configs per subnet)
+// * errors produced while generating the configs.
+#[allow(clippy::type_complexity)]
+fn process_subnet_call_context(
+    this_subnet_id: SubnetId,
+    start_block_height: Height,
+    registry_client: &dyn RegistryClient,
+    state: &ReplicatedState,
+    validation_context: &ValidationContext,
+    logger: &ReplicaLogger,
+) -> Result<
+    (
+        Vec<Vec<NiDkgConfig>>,
+        Vec<(NiDkgId, String)>,
+        Vec<NiDkgTargetId>,
+    ),
+    TransientError,
+> {
+    let mut new_configs = Vec::new();
+    let mut errors = Vec::new();
+    let mut valid_target_ids = Vec::new();
+    let contexts = &state
+        .metadata
+        .subnet_call_context_manager
+        .setup_initial_dkg_contexts;
+    for (_callback_id, context) in contexts.iter() {
+        use ic_replicated_state::metadata_state::subnet_call_context_manager::SetupInitialDkgContext;
+
+        let SetupInitialDkgContext {
             request: _,
             nodes_in_target_subnet,
             target_id,
             registry_version,
+            time: _,
         } = context;
 
         // if we haven't reached the required registry version yet, skip this context
@@ -888,41 +1078,104 @@ fn get_configs_for_new_subnets(
             continue;
         }
 
+        // Dealers must be in the same registry_version.
         let dealers = get_node_list(this_subnet_id, registry_client, *registry_version)?;
 
-        let low_and_high_threshold_configs = TAGS
-            .iter()
-            .map(|tag| {
-                let dkg_id = NiDkgId {
-                    start_block_height,
-                    dealer_subnet: this_subnet_id,
-                    dkg_tag: *tag,
-                    target_subnet: NiDkgTargetSubnet::Remote(*target_id),
-                };
-                match NiDkgConfig::new(NiDkgConfigData {
-                    dkg_id,
-                    max_corrupt_dealers: NumberOfNodes::from(
-                        get_faults_tolerated(dealers.len()) as u32
-                    ),
-                    max_corrupt_receivers: NumberOfNodes::from(get_faults_tolerated(
-                        nodes_in_target_subnet.len(),
-                    ) as u32),
-                    dealers: dealers.clone(),
-                    receivers: nodes_in_target_subnet.clone(),
-                    threshold: NumberOfNodes::from(
-                        tag.threshold_for_subnet_of_size(nodes_in_target_subnet.len()) as u32,
-                    ),
-                    registry_version: *registry_version,
-                    resharing_transcript: None,
-                }) {
-                    Ok(config) => config,
-                    Err(err) => unreachable!("Failed to create a DKG config: {:?}", err),
-                }
-            })
-            .collect();
-        new_configs.push(low_and_high_threshold_configs);
+        match create_remote_dkg_configs(
+            start_block_height,
+            this_subnet_id,
+            NiDkgTargetSubnet::Remote(*target_id),
+            &dealers,
+            nodes_in_target_subnet,
+            registry_version,
+            logger,
+        ) {
+            Ok((config0, config1)) => {
+                new_configs.push(vec![config0, config1]);
+                valid_target_ids.push(*target_id);
+            }
+            Err(mut err_vec) => errors.append(&mut err_vec),
+        };
     }
-    Ok(new_configs)
+    Ok((new_configs, errors, valid_target_ids))
+}
+
+// This function is called for each entry on the SubnetCallContext. It returns
+// either the created high and low configs for the entry or returns two errors
+// identified by the NiDkgId.
+fn create_remote_dkg_configs(
+    start_block_height: Height,
+    dealer_subnet: SubnetId,
+    target_subnet: NiDkgTargetSubnet,
+    dealers: &BTreeSet<NodeId>,
+    receivers: &BTreeSet<NodeId>,
+    registry_version: &RegistryVersion,
+    logger: &ReplicaLogger,
+) -> Result<(NiDkgConfig, NiDkgConfig), Vec<(NiDkgId, String)>> {
+    let low_thr_dkg_id = NiDkgId {
+        start_block_height,
+        dealer_subnet,
+        dkg_tag: NiDkgTag::LowThreshold,
+        target_subnet,
+    };
+
+    let high_thr_dkg_id = NiDkgId {
+        start_block_height,
+        dealer_subnet,
+        dkg_tag: NiDkgTag::HighThreshold,
+        target_subnet,
+    };
+
+    let low_thr_config =
+        do_create_remote_dkg_config(&low_thr_dkg_id, dealers, receivers, registry_version);
+    let high_thr_config =
+        do_create_remote_dkg_config(&high_thr_dkg_id, dealers, receivers, registry_version);
+    let sibl_err = String::from("Failed to create the sibling config");
+    match (low_thr_config, high_thr_config) {
+        (Ok(config0), Ok(config1)) => Ok((config0, config1)),
+        (Err(err0), Err(err1)) => {
+            error!(logger, "Failled to create a remote DKG config {}", err0);
+            error!(logger, "Failled to create a remote DKG config {}", err1);
+            Err(vec![
+                (low_thr_dkg_id, err0.to_string()),
+                (high_thr_dkg_id, err1.to_string()),
+            ])
+        }
+        (Ok(_), Err(err1)) => {
+            error!(logger, "Failled to create a remote DKG config {}", err1);
+            Err(vec![
+                (low_thr_dkg_id, sibl_err),
+                (high_thr_dkg_id, err1.to_string()),
+            ])
+        }
+        (Err(err0), Ok(_)) => {
+            error!(logger, "Failled to create a remote DKG config {}", err0);
+            Err(vec![
+                (low_thr_dkg_id, err0.to_string()),
+                (high_thr_dkg_id, sibl_err),
+            ])
+        }
+    }
+}
+
+fn do_create_remote_dkg_config(
+    dkg_id: &NiDkgId,
+    dealers: &BTreeSet<NodeId>,
+    receivers: &BTreeSet<NodeId>,
+    registry_version: &RegistryVersion,
+) -> Result<NiDkgConfig, NiDkgConfigValidationError> {
+    NiDkgConfig::new(NiDkgConfigData {
+        dkg_id: *dkg_id,
+        max_corrupt_dealers: NumberOfNodes::from(get_faults_tolerated(dealers.len()) as u32),
+        max_corrupt_receivers: NumberOfNodes::from(get_faults_tolerated(receivers.len()) as u32),
+        dealers: dealers.clone(),
+        receivers: receivers.clone(),
+        threshold: NumberOfNodes::from(
+            dkg_id.dkg_tag.threshold_for_subnet_of_size(receivers.len()) as u32,
+        ),
+        registry_version: *registry_version,
+        resharing_transcript: None,
+    })
 }
 
 // Starts with the given block and creates a nested mapping from the DKG Id to
@@ -937,7 +1190,8 @@ fn get_dkg_dealings(
         .take_while(|block| !block.payload.is_summary())
         .fold(Default::default(), |mut acc, block| {
             BlockPayload::from(block.payload)
-                .into_dealings()
+                .into_data()
+                .dealings
                 .messages
                 .into_iter()
                 .for_each(|msg| {
@@ -959,7 +1213,7 @@ impl Dkg for DkgImpl {
         // it's dropped.
         let _timer = self.metrics.on_state_change_duration.start_timer();
         let dkg_summary_block = self.consensus_cache.summary_block();
-        let dkg_summary = dkg_summary_block.payload.as_ref().as_summary();
+        let dkg_summary = &dkg_summary_block.payload.as_ref().as_summary().dkg;
         let start_height = dkg_summary_block.height;
 
         if start_height > dkg_pool.get_current_start_height() {
@@ -994,7 +1248,7 @@ impl Dkg for DkgImpl {
         let changeset = dealings
             .par_iter()
             .map(|dealings| {
-                self.validate_dealings(
+                self.validate_dealings_for_dealer(
                     dkg_pool,
                     &dkg_summary.configs,
                     start_height,
@@ -1023,7 +1277,7 @@ impl DkgGossip for DkgGossipImpl {
             use std::cmp::Ordering;
             match attribute.interval_start_height.cmp(&start_height) {
                 Ordering::Equal => Priority::Fetch,
-                Ordering::Greater => Priority::Later,
+                Ordering::Greater => Priority::Stash,
                 Ordering::Less => Priority::Drop,
             }
         })
@@ -1045,44 +1299,13 @@ pub fn make_genesis_summary(
             Ok(versioned_record) => {
                 let registry_version = versioned_record.version;
                 let summary_registry_version =
-                    registry_version_to_put_in_summary.unwrap_or_else(|| registry_version);
+                    registry_version_to_put_in_summary.unwrap_or(registry_version);
                 let cup_contents = versioned_record.value.expect("Missing CUP contents");
-                let cup_height = Height::new(cup_contents.height);
-
-                let transcripts = get_dkg_transcripts_from_cup_contents(cup_contents);
-                let transcripts = vec![
-                    (NiDkgTag::LowThreshold, transcripts.low_threshold),
-                    (NiDkgTag::HighThreshold, transcripts.high_threshold),
-                ]
-                .into_iter()
-                .collect();
-
-                let committee = get_node_list(subnet_id, registry, registry_version)
-                    .expect("Could not retrieve committee list");
-
-                let configs = get_configs_for_local_transcripts(
+                return get_dkg_summary_from_cup_contents(
+                    cup_contents,
                     subnet_id,
-                    committee,
-                    cup_height,
-                    &transcripts,
-                    registry_version,
-                )
-                .expect("Couldn't generate configs for the genesis summary");
-                // For the first 2 intervals we use the length value contained in the
-                // genesis subnet record.
-                let interval_length =
-                    get_dkg_interval_length(registry, registry_version, subnet_id)
-                        .expect("Could not retieve the interval length for the genesis summary.");
-                let next_interval_length = interval_length;
-                return Summary::new(
-                    configs,
-                    transcripts,
-                    BTreeMap::new(), // next transcripts
-                    BTreeMap::new(), // transcripts for other subnets
+                    registry,
                     summary_registry_version,
-                    interval_length,
-                    next_interval_length,
-                    cup_height,
                 );
             }
             _ => {
@@ -1096,8 +1319,19 @@ pub fn make_genesis_summary(
     }
 }
 
-fn get_dkg_transcripts_from_cup_contents(cup_contents: CatchUpPackageContents) -> DkgTranscripts {
-    DkgTranscripts {
+fn get_dkg_summary_from_cup_contents(
+    cup_contents: CatchUpPackageContents,
+    subnet_id: SubnetId,
+    registry: &dyn RegistryClient,
+    registry_version: RegistryVersion,
+) -> Summary {
+    // If we're in a NNS subnet recovery case with failover nodes, we extract the registry of the
+    // NNS we're recovering.
+    let registry_version_of_original_registry = cup_contents
+        .registry_store_uri
+        .as_ref()
+        .map(|v| RegistryVersion::from(v.registry_version));
+    let mut transcripts = DkgTranscripts {
         low_threshold: cup_contents
             .initial_ni_dkg_transcript_low_threshold
             .map(initial_ni_dkg_transcript_from_registry_record)
@@ -1106,65 +1340,197 @@ fn get_dkg_transcripts_from_cup_contents(cup_contents: CatchUpPackageContents) -
             .initial_ni_dkg_transcript_high_threshold
             .map(initial_ni_dkg_transcript_from_registry_record)
             .expect("Missing initial high-threshold DKG transcript"),
+    };
+
+    // If we're in a NNS subnet recovery with failover nodes, we set the transcript versions to the
+    // registry version of the recovered NNS, otherwise the oldest registry version used in a CUP is
+    // computed incorrectly.
+    if let Some(version) = registry_version_of_original_registry {
+        transcripts.low_threshold.registry_version = version;
+        transcripts.high_threshold.registry_version = version;
     }
+
+    let transcripts = vec![
+        (NiDkgTag::LowThreshold, transcripts.low_threshold),
+        (NiDkgTag::HighThreshold, transcripts.high_threshold),
+    ]
+    .into_iter()
+    .collect();
+
+    let committee = get_node_list(subnet_id, registry, registry_version)
+        .expect("Could not retrieve committee list");
+
+    let height = Height::from(cup_contents.height);
+    let configs = get_configs_for_local_transcripts(
+        subnet_id,
+        committee,
+        height,
+        &transcripts,
+        // If we are in a NNS subnet recovery with failover nodes, we use the registry version of
+        // the recovered NNS so that the DKG configs point to the correct registry version and new
+        // dealings can be created in the first DKG interval.
+        registry_version_of_original_registry.unwrap_or(registry_version),
+    )
+    .expect("Couldn't generate configs for the genesis summary");
+    // For the first 2 intervals we use the length value contained in the
+    // genesis subnet record.
+    let interval_length = get_dkg_interval_length(registry, registry_version, subnet_id)
+        .expect("Could not retieve the interval length for the genesis summary.");
+    let next_interval_length = interval_length;
+    Summary::new(
+        configs,
+        transcripts,
+        BTreeMap::new(), // next transcripts
+        Vec::new(),      // transcripts for other subnets
+        // If we are in a NNS subnet recovery with failover nodes, we use the registry version of
+        // the recovered NNS as a DKG summary version which is used as the CUP version.
+        registry_version_of_original_registry.unwrap_or(registry_version),
+        interval_length,
+        next_interval_length,
+        height,
+        BTreeMap::new(), // initial_dkg_attempts
+    )
 }
 
-/// Construcs a genesis/recovery CUP from the CUP contents associated with the
+/// Constructs a genesis/recovery CUP from the CUP contents associated with the
 /// given subnet
 pub fn make_registry_cup(
     registry: &dyn RegistryClient,
     subnet_id: SubnetId,
+    logger: Option<&ReplicaLogger>,
 ) -> Option<CatchUpPackage> {
-    match registry.get_cup_contents(subnet_id, registry.get_latest_version()) {
-        Ok(versioned_record) => {
-            let cup_contents = versioned_record.value.expect("Missing CUP contents");
-            let registry_version = if let Some(registry_info) = cup_contents.registry_store_uri {
-                RegistryVersion::from(registry_info.registry_version)
-            } else {
-                versioned_record.version
-            };
-            let dkg_summary = make_genesis_summary(registry, subnet_id, Some(registry_version));
-            let cup_height = Height::new(cup_contents.height);
-
-            let low_dkg_id = dkg_summary
-                .current_transcript(&NiDkgTag::LowThreshold)
-                .dkg_id;
-            let high_dkg_id = dkg_summary
-                .current_transcript(&NiDkgTag::HighThreshold)
-                .dkg_id;
-            let block = Block::new(
-                Id::from(CryptoHash(Vec::new())),
-                Payload::new(crypto_hash, dkg_summary.into()),
-                cup_height,
-                Rank(0),
-                ValidationContext {
-                    certified_height: cup_height,
-                    registry_version,
-                    time: Time::from_nanos_since_unix_epoch(cup_contents.time),
-                },
+    let no_op_logger = ic_logger::replica_logger::no_op_logger();
+    let logger = logger.unwrap_or(&no_op_logger);
+    let versioned_record = match registry.get_cup_contents(subnet_id, registry.get_latest_version())
+    {
+        Ok(versioned_record) => versioned_record,
+        Err(e) => {
+            warn!(
+                logger,
+                "Failed to retrieve versioned record from the registry {:?}", e,
             );
-            let random_beacon = Signed {
-                content: RandomBeaconContent::new(cup_height, Id::from(CryptoHash(Vec::new()))),
-                signature: ThresholdSignature {
-                    signer: low_dkg_id,
-                    signature: CombinedThresholdSigOf::new(CombinedThresholdSig(vec![])),
-                },
-            };
-            Some(CatchUpPackage {
-                content: CatchUpContent::new(
-                    HashedBlock::new(crypto_hash, block),
-                    HashedRandomBeacon::new(crypto_hash, random_beacon),
-                    Id::from(CryptoHash(cup_contents.state_hash)),
-                ),
-                signature: ThresholdSignature {
-                    signer: high_dkg_id,
-                    signature: CombinedThresholdSigOf::new(CombinedThresholdSig(vec![])),
-                },
-            })
+            return None;
         }
+    };
 
-        _ => None,
-    }
+    let cup_contents = versioned_record.value.expect("Missing CUP contents");
+    make_registry_cup_from_cup_contents(
+        registry,
+        subnet_id,
+        cup_contents,
+        versioned_record.version,
+        logger,
+    )
+}
+
+/// Constructs a genesis/recovery CUP from the CUP contents associated with the
+/// given subnet from the provided CUP contents
+pub fn make_registry_cup_from_cup_contents(
+    registry: &dyn RegistryClient,
+    subnet_id: SubnetId,
+    cup_contents: CatchUpPackageContents,
+    registry_version: RegistryVersion,
+    logger: &ReplicaLogger,
+) -> Option<CatchUpPackage> {
+    let replica_version = match registry.get_replica_version(subnet_id, registry_version) {
+        Ok(Some(replica_version)) => replica_version,
+        err => {
+            warn!(
+                logger,
+                "Failed to retrieve subnet replica version at registry version {:?}: {:?}",
+                registry_version,
+                err
+            );
+            return None;
+        }
+    };
+    let dkg_summary = get_dkg_summary_from_cup_contents(
+        cup_contents.clone(),
+        subnet_id,
+        registry,
+        registry_version,
+    );
+    let cup_height = Height::new(cup_contents.height);
+
+    let ecdsa_init = match inspect_ecdsa_initializations(&cup_contents.ecdsa_initializations) {
+        Ok(Some((key_id, dealings))) => Some((key_id, Some(dealings))),
+        Ok(None) => {
+            match get_ecdsa_config_if_enabled(subnet_id, registry_version, registry, logger) {
+                Ok(Some(ecdsa_config)) => Some((ecdsa_config.key_ids[0].clone(), None)),
+                _ => None,
+            }
+        }
+        Err(err) => {
+            warn!(logger, "{}", err);
+            None
+        }
+    };
+    let ecdsa_summary = ecdsa_init.and_then(|(key_id, dealings)| {
+        match make_bootstrap_summary(subnet_id, key_id, cup_height, dealings, logger) {
+            Ok(summary) => {
+                info!(
+                    logger,
+                    "Making CUP with ecdsa_summary with key_id {:?}",
+                    summary.as_ref().map(|x| &x.key_transcript.key_id)
+                );
+                summary
+            }
+            Err(err) => {
+                warn!(logger, "{:?}", err);
+                None
+            }
+        }
+    });
+
+    let low_dkg_id = dkg_summary
+        .current_transcript(&NiDkgTag::LowThreshold)
+        .dkg_id;
+    let high_dkg_id = dkg_summary
+        .current_transcript(&NiDkgTag::HighThreshold)
+        .dkg_id;
+
+    // In a NNS subnet recovery case the block validation context needs to reference a registry
+    // version of the NNS to be recovered. Otherwise the validation context points to a registry
+    // version without the NNS subnet record.
+    let block_registry_version = cup_contents
+        .registry_store_uri
+        .as_ref()
+        .map(|v| RegistryVersion::from(v.registry_version))
+        .unwrap_or(registry_version);
+    let block = Block::new_with_replica_version(
+        replica_version.clone(),
+        Id::from(CryptoHash(Vec::new())),
+        Payload::new(crypto_hash, (dkg_summary, ecdsa_summary).into()),
+        cup_height,
+        Rank(0),
+        ValidationContext {
+            certified_height: cup_height,
+            registry_version: block_registry_version,
+            time: Time::from_nanos_since_unix_epoch(cup_contents.time),
+        },
+    );
+    let random_beacon = Signed {
+        content: RandomBeaconContent::new_with_replica_version(
+            replica_version,
+            cup_height,
+            Id::from(CryptoHash(Vec::new())),
+        ),
+        signature: ThresholdSignature {
+            signer: low_dkg_id,
+            signature: CombinedThresholdSigOf::new(CombinedThresholdSig(vec![])),
+        },
+    };
+    Some(CatchUpPackage {
+        content: CatchUpContent::new(
+            HashedBlock::new(crypto_hash, block),
+            HashedRandomBeacon::new(crypto_hash, random_beacon),
+            Id::from(CryptoHash(cup_contents.state_hash)),
+        ),
+        signature: ThresholdSignature {
+            signer: high_dkg_id,
+            signature: CombinedThresholdSigOf::new(CombinedThresholdSig(vec![])),
+        },
+    })
 }
 
 #[cfg(test)]
@@ -1174,28 +1540,39 @@ mod tests {
         dependencies, dependencies_with_subnet_params,
         dependencies_with_subnet_records_with_raw_state_manager, Dependencies,
     };
+    use assert_matches::assert_matches;
     use ic_artifact_pool::dkg_pool::DkgPoolImpl;
     use ic_interfaces::{
         artifact_pool::UnvalidatedArtifact, consensus_pool::ConsensusPool, dkg::MutableDkgPool,
     };
+    use ic_interfaces_registry::RegistryVersionedRecord;
+    use ic_logger::replica_logger::no_op_logger;
     use ic_metrics::MetricsRegistry;
-    use ic_replicated_state::metadata_state::SubnetCallContext;
+    use ic_protobuf::registry::subnet::v1::{
+        CatchUpPackageContents, InitialNiDkgTranscriptRecord, SubnetRecord,
+    };
+    use ic_replicated_state::metadata_state::subnet_call_context_manager::SetupInitialDkgContext;
+    use ic_test_artifact_pool::consensus_pool::TestConsensusPool;
     use ic_test_utilities::{
+        consensus::fake::FakeContentSigner,
         crypto::CryptoReturningOk,
-        registry::{add_subnet_record, SubnetRecordBuilder},
+        mock_time,
         state_manager::RefMockStateManager,
         types::ids::{node_test_id, subnet_test_id},
         types::messages::RequestBuilder,
-        with_test_replica_logger,
     };
+    use ic_test_utilities_logger::with_test_replica_logger;
+    use ic_test_utilities_registry::{add_subnet_record, SubnetRecordBuilder};
     use ic_types::{
+        batch::BatchPayload,
+        consensus::{ecdsa, DataPayload, HasVersion},
         crypto::threshold_sig::ni_dkg::{
             NiDkgDealing, NiDkgId, NiDkgTag, NiDkgTargetId, NiDkgTargetSubnet,
         },
         time::UNIX_EPOCH,
-        RegistryVersion,
+        PrincipalId, RegistryVersion, ReplicaVersion,
     };
-    use std::collections::BTreeSet;
+    use std::{collections::BTreeSet, convert::TryFrom, ops::Deref};
 
     #[test]
     // In this test we test the creation of dealing payloads.
@@ -1224,15 +1601,19 @@ mod tests {
 
                 // Now we instantiate the DKG component for node Id = 1, who is a dealer.
                 let replica_1 = node_test_id(1);
+                let dkg_key_manager =
+                    new_dkg_key_manager(crypto.clone(), logger.clone(), &PoolReader::new(&pool));
                 let dkg = DkgImpl::new(
                     replica_1,
                     crypto.clone(),
                     pool.get_cache(),
+                    dkg_key_manager.clone(),
                     MetricsRegistry::new(),
                     logger.clone(),
                 );
 
                 // Creates two dealings for both thresholds and add them to the pool.
+                sync_dkg_key_manager(&dkg_key_manager, &pool);
                 let change_set = dkg.on_state_change(&*dkg_pool.read().unwrap());
                 assert_eq!(change_set.len(), 2);
                 dkg_pool.write().unwrap().apply_changes(change_set);
@@ -1241,7 +1622,7 @@ mod tests {
                 // into the block.
                 pool.advance_round_normal_operation();
                 let block = pool.get_cache().finalized_block();
-                let dealings = BlockPayload::from(block.payload).into_dealings();
+                let dealings = BlockPayload::from(block.payload).into_data().dealings;
                 if dealings.start_height != Height::from(0) {
                     panic!(
                         "Expected start height in dealings {:?}, but found {:?}",
@@ -1260,7 +1641,7 @@ mod tests {
                 // block anymore.
                 pool.advance_round_normal_operation();
                 let block = pool.get_cache().finalized_block();
-                let dealings = BlockPayload::from(block.payload).into_dealings();
+                let dealings = BlockPayload::from(block.payload).into_data().dealings;
                 assert_eq!(dealings.messages.len(), 0);
 
                 // Now we empty the dkg pool, add new dealings from this dealer and make sure
@@ -1281,20 +1662,24 @@ mod tests {
                 // Advance the pool and make sure the dealing are not included.
                 pool.advance_round_normal_operation();
                 let block = pool.get_cache().finalized_block();
-                let dealings = BlockPayload::from(block.payload).into_dealings();
+                let dealings = BlockPayload::from(block.payload).into_data().dealings;
                 assert_eq!(dealings.messages.len(), 0);
 
                 // Create another dealer and add his dealings into the unvalidated pool of
                 // replica 1.
                 let replica_2 = node_test_id(2);
+                let dkg_key_manager_2 =
+                    new_dkg_key_manager(crypto.clone(), logger.clone(), &PoolReader::new(&pool));
                 let dkg_2 = DkgImpl::new(
                     replica_2,
                     crypto,
                     pool.get_cache(),
+                    dkg_key_manager_2.clone(),
                     MetricsRegistry::new(),
                     logger,
                 );
                 let dkg_pool_2 = DkgPoolImpl::new(MetricsRegistry::new());
+                sync_dkg_key_manager(&dkg_key_manager_2, &pool);
                 match &dkg_2.on_state_change(&dkg_pool_2).as_slice() {
                     &[ChangeAction::AddToValidated(message), ChangeAction::AddToValidated(message2)] =>
                     {
@@ -1325,7 +1710,7 @@ mod tests {
                 // Now we create a new block and make sure, the dealings made into the payload.
                 pool.advance_round_normal_operation();
                 let block = pool.get_cache().finalized_block();
-                let dealings = BlockPayload::from(block.payload).into_dealings();
+                let dealings = BlockPayload::from(block.payload).into_data().dealings;
                 if dealings.start_height != Height::from(0) {
                     panic!(
                         "Expected start height in dealings {:?}, but found {:?}",
@@ -1371,12 +1756,10 @@ mod tests {
             // This first block is expected to contain the genesis summary.
             match BlockPayload::from(block.payload) {
                 BlockPayload::Summary(summary) => {
-                    assert_eq!(summary, genesis_summary, "Unexpected genesis summary.");
+                    assert_eq!(summary.dkg, genesis_summary, "Unexpected genesis summary.");
                 }
                 _ => panic!("Unexpected DKG payload."),
             };
-
-            let mut prev_summary: Option<Summary> = None;
 
             // Simulate 3 intervals
             for interval in 0..3 {
@@ -1389,20 +1772,24 @@ mod tests {
 
                 // Advance one more time and get the summary block.
                 pool.advance_round_normal_operation();
-                let summary =
-                    BlockPayload::from(pool.get_cache().finalized_block().payload).into_summary();
+                let dkg_summary = BlockPayload::from(pool.get_cache().finalized_block().payload)
+                    .into_summary()
+                    .dkg;
 
                 assert_eq!(
-                    summary.registry_version,
+                    dkg_summary.registry_version,
                     RegistryVersion::from(initial_registry_version)
                 );
                 let expected_height = interval * (dkg_interval_len + 1) + dkg_interval_len + 1;
-                assert_eq!(summary.height, Height::from(expected_height));
-                assert_eq!(summary.interval_length, Height::from(dkg_interval_len));
-                assert_eq!(summary.next_interval_length, Height::from(dkg_interval_len));
+                assert_eq!(dkg_summary.height, Height::from(expected_height));
+                assert_eq!(dkg_summary.interval_length, Height::from(dkg_interval_len));
+                assert_eq!(
+                    dkg_summary.next_interval_length,
+                    Height::from(dkg_interval_len)
+                );
 
                 for tag in TAGS.iter() {
-                    let (id, conf) = summary
+                    let (id, conf) = dkg_summary
                         .configs
                         .iter()
                         .find(|(id, _)| id.dkg_tag == *tag)
@@ -1446,9 +1833,8 @@ mod tests {
                     if interval > 0 {
                         if tag == &NiDkgTag::HighThreshold {
                             assert_eq!(
-                                prev_summary
+                                dkg_summary
                                     .clone()
-                                    .unwrap()
                                     .next_transcript(&NiDkgTag::HighThreshold)
                                     .unwrap(),
                                 &conf.resharing_transcript().clone().unwrap()
@@ -1458,7 +1844,92 @@ mod tests {
                         }
                     }
                 }
-                prev_summary = Some(summary);
+            }
+        });
+    }
+
+    /// Tests, which transcripts get reshared, when DKG succeded or failed.
+    #[test]
+    fn test_transcript_resharing() {
+        ic_test_utilities::artifact_pool_config::with_test_pool_config(|pool_config| {
+            let nodes: Vec<_> = (7..14).map(node_test_id).collect();
+            let dkg_interval_len = 3;
+            let subnet_id = subnet_test_id(222);
+            let initial_registry_version = 112;
+            let Dependencies {
+                crypto,
+                registry,
+                mut pool,
+                state_manager,
+                ..
+            } = dependencies_with_subnet_params(
+                pool_config,
+                subnet_id,
+                vec![(
+                    initial_registry_version,
+                    SubnetRecordBuilder::from(&nodes)
+                        .with_dkg_interval_length(dkg_interval_len)
+                        .build(),
+                )],
+            );
+            let mut genesis_summary = make_genesis_summary(&*registry, subnet_id, None);
+
+            // Let's ensure we have no summaries for the whole DKG interval.
+            for _ in 0..dkg_interval_len {
+                pool.advance_round_normal_operation();
+                let block = pool.get_cache().finalized_block();
+                assert!(!BlockPayload::from(block.payload).is_summary());
+            }
+
+            let latest_block = pool.get_cache().finalized_block();
+            let create_summary_payload = |last_summary: &Summary| {
+                create_summary_payload(
+                    subnet_test_id(222),
+                    registry.as_ref(),
+                    crypto.as_ref(),
+                    &PoolReader::new(&pool),
+                    last_summary.clone(),
+                    &latest_block,
+                    RegistryVersion::from(112),
+                    state_manager.as_ref(),
+                    &ValidationContext {
+                        registry_version: RegistryVersion::from(112),
+                        certified_height: Height::from(3),
+                        time: mock_time(),
+                    },
+                    no_op_logger(),
+                )
+                .unwrap()
+            };
+
+            // Test the regular case (Both DKGs succeeded)
+            let next_summary = create_summary_payload(&genesis_summary);
+            for (_, conf) in next_summary.configs.iter() {
+                if conf.dkg_id().dkg_tag == NiDkgTag::HighThreshold {
+                    assert_eq!(
+                        next_summary
+                            .clone()
+                            .next_transcript(&NiDkgTag::HighThreshold)
+                            .unwrap(),
+                        &conf.resharing_transcript().clone().unwrap()
+                    )
+                }
+            }
+
+            // Remove configs from `genesis_summary`. This emulates the
+            // behaviour of DKG failing validations.
+            // In this case, the `current_transcripts` are being reshared.
+            genesis_summary.configs.clear();
+            let next_summary = create_summary_payload(&genesis_summary);
+            for (_, conf) in next_summary.configs.iter() {
+                if conf.dkg_id().dkg_tag == NiDkgTag::HighThreshold {
+                    assert_eq!(
+                        next_summary
+                            .clone()
+                            .current_transcript(&NiDkgTag::HighThreshold),
+                        &conf.resharing_transcript().clone().unwrap()
+                    )
+                }
             }
         });
     }
@@ -1471,6 +1942,7 @@ mod tests {
             prev_committee.clone(),
             NiDkgTag::HighThreshold,
             NiDkgTag::HighThreshold.threshold_for_subnet_of_size(prev_committee.len()) as u32,
+            888,
         ));
         let receivers: BTreeSet<_> = (3..8).map(node_test_id).collect();
         let start_block_height = Height::from(777);
@@ -1637,25 +2109,32 @@ mod tests {
                 } = dependencies(pool_config.clone(), 2);
                 let mut dkg_pool = DkgPoolImpl::new(MetricsRegistry::new());
                 // Let's check that replica 3, who's not a dealer, does not produce dealings.
+                let dkg_key_manager =
+                    new_dkg_key_manager(crypto.clone(), logger.clone(), &PoolReader::new(&pool));
                 let dkg = DkgImpl::new(
                     node_test_id(3),
                     crypto.clone(),
                     pool.get_cache(),
+                    dkg_key_manager,
                     MetricsRegistry::new(),
                     logger.clone(),
                 );
                 assert!(dkg.on_state_change(&dkg_pool).is_empty());
 
                 // Now we instantiate the DKG component for node Id = 1, who is a dealer.
+                let dkg_key_manager =
+                    new_dkg_key_manager(crypto.clone(), logger.clone(), &PoolReader::new(&pool));
                 let dkg = DkgImpl::new(
                     node_test_id(1),
                     crypto,
                     pool.get_cache(),
+                    dkg_key_manager.clone(),
                     MetricsRegistry::new(),
                     logger,
                 );
 
                 // Make sure the replica creates two dealings for both thresholds.
+                sync_dkg_key_manager(&dkg_key_manager, &pool);
                 let change_set = dkg.on_state_change(&dkg_pool);
                 match &change_set.as_slice() {
                     &[ChangeAction::AddToValidated(_), ChangeAction::AddToValidated(_)] => {}
@@ -1709,20 +2188,25 @@ mod tests {
         let nodes_in_target_subnet = node_ids.into_iter().map(node_test_id).collect();
 
         if let Some(target_id) = target {
-            state.metadata.subnet_call_context_manager.push(
-                SubnetCallContext::SetupInitialDKGContext {
+            state
+                .metadata
+                .subnet_call_context_manager
+                .push_setup_initial_dkg_request(SetupInitialDkgContext {
                     request: RequestBuilder::new().build(),
                     nodes_in_target_subnet,
                     target_id,
                     registry_version,
-                },
-            );
+                    time: state.time(),
+                });
         }
 
         let mut mock = state_manager.get_mut();
-        let expectation = mock.expect_get_state_at().return_const(Ok(
-            ic_interfaces::state_manager::Labeled::new(Height::new(0), Arc::new(state)),
-        ));
+        let expectation =
+            mock.expect_get_state_at()
+                .return_const(Ok(ic_interfaces_state_manager::Labeled::new(
+                    Height::new(0),
+                    Arc::new(state),
+                )));
         if let Some(times) = times {
             expectation.times(times);
         }
@@ -1763,10 +2247,13 @@ mod tests {
                 );
 
                 // Now we instantiate the DKG component for node Id = 1, who is a dealer.
+                let dkg_key_manager =
+                    new_dkg_key_manager(crypto.clone(), logger.clone(), &PoolReader::new(&pool));
                 let dkg = DkgImpl::new(
                     node_test_id(1),
                     crypto,
                     pool.get_cache(),
+                    dkg_key_manager.clone(),
                     MetricsRegistry::new(),
                     logger,
                 );
@@ -1775,6 +2262,7 @@ mod tests {
                 // are not added to a summary block yet. That's why we see two dealings for
                 // local thresholds.
                 let mut dkg_pool = DkgPoolImpl::new(MetricsRegistry::new());
+                sync_dkg_key_manager(&dkg_key_manager, &pool);
                 let change_set = dkg.on_state_change(&dkg_pool);
                 match &change_set.as_slice() {
                     &[ChangeAction::AddToValidated(a), ChangeAction::AddToValidated(b)] => {
@@ -1832,7 +2320,94 @@ mod tests {
         });
     }
 
-    fn run_validation_test(f: &dyn Fn(DkgPoolImpl, DkgPoolImpl, DkgImpl, DkgImpl, NodeId)) {
+    #[test]
+    fn test_config_generation_failures_are_added_to_the_summary() {
+        ic_test_utilities::artifact_pool_config::with_test_pool_config(|pool_config| {
+            use ic_types::crypto::threshold_sig::ni_dkg::*;
+            let node_ids = vec![node_test_id(0), node_test_id(1)];
+            let dkg_interval_length = 99;
+            let subnet_id = subnet_test_id(0);
+            let Dependencies {
+                mut pool,
+                registry,
+                state_manager,
+                ..
+            } = dependencies_with_subnet_records_with_raw_state_manager(
+                pool_config,
+                subnet_id,
+                vec![(
+                    10,
+                    SubnetRecordBuilder::from(&node_ids)
+                        .with_dkg_interval_length(dkg_interval_length)
+                        .build(),
+                )],
+            );
+
+            let target_id = NiDkgTargetId::new([0u8; 32]);
+            complement_state_manager_with_remote_dkg_requests(
+                state_manager,
+                registry.get_latest_version(),
+                vec![], // an erroneous request with no nodes.
+                None,
+                Some(target_id),
+            );
+
+            // Advance _past_ the new summary to make sure the replicas attempt to create
+            // the configs for remote transcripts.
+            pool.advance_round_normal_operation_n(dkg_interval_length + 1);
+
+            // Verify that the first summary block contains only two local configs and the
+            // two errors for the remote DKG request.
+            let block: Block = PoolReader::new(&pool).get_highest_summary_block();
+            if let BlockPayload::Summary(summary) = block.payload.as_ref() {
+                assert_eq!(
+                    summary.dkg.configs.len(),
+                    2,
+                    "Configs: {:?}",
+                    summary.dkg.configs
+                );
+                for (dkg_id, _) in summary.dkg.configs.iter() {
+                    assert_eq!(dkg_id.target_subnet, NiDkgTargetSubnet::Local);
+                }
+                assert_eq!(
+                    summary
+                        .dkg
+                        .transcripts_for_new_subnets_with_callback_ids
+                        .len(),
+                    2
+                );
+                for (dkg_id, _, result) in summary
+                    .dkg
+                    .transcripts_for_new_subnets_with_callback_ids
+                    .iter()
+                {
+                    assert_eq!(dkg_id.target_subnet, NiDkgTargetSubnet::Remote(target_id));
+                    assert!(result.is_err());
+                }
+            } else {
+                panic!(
+                    "block at height {} is not a summary block",
+                    block.height.get()
+                );
+            }
+        });
+    }
+
+    /// These components are used for the validation tests.
+    struct ValidationTestComponents {
+        dkg: DkgImpl,
+        dkg_pool: DkgPoolImpl,
+        dkg_key_manager: Arc<Mutex<DkgKeyManager>>,
+        pool: TestConsensusPool,
+    }
+
+    impl ValidationTestComponents {
+        fn sync_key_manager(&self) {
+            sync_dkg_key_manager(&self.dkg_key_manager, &self.pool);
+        }
+    }
+
+    fn run_validation_test(f: &dyn Fn(ValidationTestComponents, ValidationTestComponents, NodeId)) {
         ic_test_utilities::artifact_pool_config::with_test_pool_config(|pool_config_1| {
             ic_test_utilities::artifact_pool_config::with_test_pool_config(|pool_config_2| {
                 let crypto = Arc::new(CryptoReturningOk::default());
@@ -1846,21 +2421,48 @@ mod tests {
 
                 with_test_replica_logger(|logger| {
                     // We instantiate the DKG component for node Id = 1 nd Id = 2.
+                    let dkg_key_manager_1 = new_dkg_key_manager(
+                        crypto.clone(),
+                        logger.clone(),
+                        &PoolReader::new(&consensus_pool_1),
+                    );
                     let dkg_1 = DkgImpl::new(
                         node_id_1,
                         crypto.clone(),
                         consensus_pool_1.get_cache(),
+                        dkg_key_manager_1.clone(),
                         MetricsRegistry::new(),
                         logger.clone(),
                     );
+
+                    let dkg_key_manager_2 = new_dkg_key_manager(
+                        crypto.clone(),
+                        logger.clone(),
+                        &PoolReader::new(&consensus_pool_2),
+                    );
                     let dkg_2 = DkgImpl::new(
                         node_id_2,
-                        crypto,
+                        crypto.clone(),
                         consensus_pool_2.get_cache(),
+                        dkg_key_manager_2.clone(),
                         MetricsRegistry::new(),
                         logger,
                     );
-                    f(dkg_pool_1, dkg_pool_2, dkg_1, dkg_2, node_id_1);
+                    f(
+                        ValidationTestComponents {
+                            dkg: dkg_1,
+                            dkg_pool: dkg_pool_1,
+                            dkg_key_manager: dkg_key_manager_1,
+                            pool: consensus_pool_1,
+                        },
+                        ValidationTestComponents {
+                            dkg: dkg_2,
+                            dkg_pool: dkg_pool_2,
+                            dkg_key_manager: dkg_key_manager_2,
+                            pool: consensus_pool_2,
+                        },
+                        node_id_1,
+                    );
                 });
             });
         });
@@ -1870,23 +2472,22 @@ mod tests {
     // validated section.
     #[test]
     fn test_validate_dealing_works_1() {
-        run_validation_test(&|dkg_pool_1: DkgPoolImpl,
-                              mut dkg_pool_2: DkgPoolImpl,
-                              dkg_1: DkgImpl,
-                              dkg_2: DkgImpl,
+        run_validation_test(&|node_1: ValidationTestComponents,
+                              mut node_2: ValidationTestComponents,
                               node_id_1| {
             // Make sure the replica 1 creates two dealings, which we insert as unvalidated
             // message into the pool of replica 2 and save one of them for later.
             let valid_dealing_message = {
-                match &dkg_1.on_state_change(&dkg_pool_1).as_slice() {
+                node_1.sync_key_manager();
+                match &node_1.dkg.on_state_change(&node_1.dkg_pool).as_slice() {
                     &[ChangeAction::AddToValidated(message), ChangeAction::AddToValidated(message2)] =>
                     {
-                        dkg_pool_2.insert(UnvalidatedArtifact {
+                        node_2.dkg_pool.insert(UnvalidatedArtifact {
                             message: message.clone(),
                             peer_id: node_id_1,
                             timestamp: UNIX_EPOCH,
                         });
-                        dkg_pool_2.insert(UnvalidatedArtifact {
+                        node_2.dkg_pool.insert(UnvalidatedArtifact {
                             message: message2.clone(),
                             peer_id: node_id_1,
                             timestamp: UNIX_EPOCH,
@@ -1898,24 +2499,25 @@ mod tests {
             };
 
             // Let replica 2 create its dealings for L/H thresholds.
-            let change_set = dkg_2.on_state_change(&dkg_pool_2);
+            node_2.sync_key_manager();
+            let change_set = node_2.dkg.on_state_change(&node_2.dkg_pool);
             match &change_set.as_slice() {
                 &[ChangeAction::AddToValidated(_), ChangeAction::AddToValidated(_)] => {}
                 val => panic!("Unexpected change set: {:?}", val),
             };
-            dkg_pool_2.apply_changes(change_set);
+            node_2.dkg_pool.apply_changes(change_set);
 
             // Make sure both dealings from replica 1 is successfully validated and apply
             // the changes.
-            let change_set = dkg_2.on_state_change(&dkg_pool_2);
+            let change_set = node_2.dkg.on_state_change(&node_2.dkg_pool);
             match &change_set.as_slice() {
                 &[ChangeAction::MoveToValidated(_), ChangeAction::MoveToValidated(_)] => {}
                 val => panic!("Unexpected change set: {:?}", val),
             };
-            dkg_pool_2.apply_changes(change_set);
+            node_2.dkg_pool.apply_changes(change_set);
 
             // Now we try to add another identical dealing from replica 1.
-            dkg_pool_2.insert(UnvalidatedArtifact {
+            node_2.dkg_pool.insert(UnvalidatedArtifact {
                 message: valid_dealing_message,
                 peer_id: node_id_1,
                 timestamp: UNIX_EPOCH,
@@ -1923,7 +2525,7 @@ mod tests {
 
             // This dealing is identical to the one in the validated section, so we just
             // ignore it.
-            assert!(dkg_2.on_state_change(&dkg_pool_2).is_empty());
+            assert!(node_2.dkg.on_state_change(&node_2.dkg_pool).is_empty());
         });
     }
 
@@ -1932,23 +2534,22 @@ mod tests {
     // dealer already exists.
     #[test]
     fn test_validate_dealing_works_2() {
-        run_validation_test(&|dkg_pool_1: DkgPoolImpl,
-                              mut dkg_pool_2: DkgPoolImpl,
-                              dkg_1: DkgImpl,
-                              dkg_2: DkgImpl,
+        run_validation_test(&|node_1: ValidationTestComponents,
+                              mut node_2: ValidationTestComponents,
                               node_id_1| {
             // Make sure the replica 1 creates two dealings, which we insert as unvalidated
             // messages into the pool of replica 2 and save one of them for later.
             let valid_dealing_message = {
-                match &dkg_1.on_state_change(&dkg_pool_1).as_slice() {
+                node_1.sync_key_manager();
+                match &node_1.dkg.on_state_change(&node_1.dkg_pool).as_slice() {
                     &[ChangeAction::AddToValidated(message), ChangeAction::AddToValidated(message2)] =>
                     {
-                        dkg_pool_2.insert(UnvalidatedArtifact {
+                        node_2.dkg_pool.insert(UnvalidatedArtifact {
                             message: message2.clone(),
                             peer_id: node_id_1,
                             timestamp: UNIX_EPOCH,
                         });
-                        dkg_pool_2.insert(UnvalidatedArtifact {
+                        node_2.dkg_pool.insert(UnvalidatedArtifact {
                             message: message.clone(),
                             peer_id: node_id_1,
                             timestamp: UNIX_EPOCH,
@@ -1960,26 +2561,27 @@ mod tests {
             };
 
             // Let replica 2 create its dealings for L/H thresholds.
-            let change_set = dkg_2.on_state_change(&dkg_pool_2);
+            node_2.sync_key_manager();
+            let change_set = node_2.dkg.on_state_change(&node_2.dkg_pool);
             match &change_set.as_slice() {
                 &[ChangeAction::AddToValidated(_), ChangeAction::AddToValidated(_)] => {}
                 val => panic!("Unexpected change set: {:?}", val),
             };
-            dkg_pool_2.apply_changes(change_set);
+            node_2.dkg_pool.apply_changes(change_set);
 
             // Make sure both dealings from replica 1 is successfully validated and apply
             // the changes.
-            let change_set = dkg_2.on_state_change(&dkg_pool_2);
+            let change_set = node_2.dkg.on_state_change(&node_2.dkg_pool);
             match &change_set.as_slice() {
                 &[ChangeAction::MoveToValidated(_), ChangeAction::MoveToValidated(_)] => {}
                 val => panic!("Unexpected change set: {:?}", val),
             };
-            dkg_pool_2.apply_changes(change_set);
+            node_2.dkg_pool.apply_changes(change_set);
 
             // Now we try to add a different dealing but still from replica 1.
             let mut invalid_dealing_message = valid_dealing_message.clone();
             invalid_dealing_message.content.dealing = NiDkgDealing::dummy_dealing_for_tests(1);
-            dkg_pool_2.insert(UnvalidatedArtifact {
+            node_2.dkg_pool.insert(UnvalidatedArtifact {
                 message: invalid_dealing_message,
                 peer_id: node_id_1,
                 timestamp: UNIX_EPOCH,
@@ -1987,20 +2589,12 @@ mod tests {
 
             // We expect that this dealing will be invalidated, since we have a valid one
             // from that dealer already.
-            let change_set = dkg_2.on_state_change(&dkg_pool_2);
+            let change_set = node_2.dkg.on_state_change(&node_2.dkg_pool);
             match &change_set.as_slice() {
-                &[ChangeAction::HandleInvalid(_, reason)] => {
-                    assert_eq!(
-                        reason,
-                        &format!(
-                            "A dealing from replica with Id={:?} is already validated.",
-                            node_id_1
-                        )
-                    );
-                }
+                &[ChangeAction::RemoveFromUnvalidated(_)] => {}
                 val => panic!("Unexpected change set: {:?}", val),
             };
-            dkg_pool_2.apply_changes(change_set);
+            node_2.dkg_pool.apply_changes(change_set);
 
             // Now we create a message with an unknown Dkg id and verify
             // that it gets rejected.
@@ -2009,13 +2603,13 @@ mod tests {
             let mut invalid_dealing_message = valid_dealing_message.clone();
             invalid_dealing_message.content.dkg_id = invalid_dkg_id;
 
-            dkg_pool_2.insert(UnvalidatedArtifact {
+            node_2.dkg_pool.insert(UnvalidatedArtifact {
                 message: invalid_dealing_message.clone(),
                 peer_id: node_id_1,
                 timestamp: UNIX_EPOCH,
             });
 
-            let change_set = dkg_2.on_state_change(&dkg_pool_2);
+            let change_set = node_2.dkg.on_state_change(&node_2.dkg_pool);
             match &change_set.as_slice() {
                 &[ChangeAction::HandleInvalid(_, reason)] => {
                     assert_eq!(
@@ -2028,20 +2622,20 @@ mod tests {
                 }
                 val => panic!("Unexpected change set: {:?}", val),
             };
-            dkg_pool_2.apply_changes(change_set);
+            node_2.dkg_pool.apply_changes(change_set);
 
             // Now we create a message from a non-dealer and verify it gets marked as
             // invalid.
             let mut invalid_dealing_message = valid_dealing_message.clone();
             invalid_dealing_message.signature.signer = node_test_id(101);
 
-            dkg_pool_2.insert(UnvalidatedArtifact {
+            node_2.dkg_pool.insert(UnvalidatedArtifact {
                 message: invalid_dealing_message.clone(),
                 peer_id: node_id_1,
                 timestamp: UNIX_EPOCH,
             });
 
-            let change_set = dkg_2.on_state_change(&dkg_pool_2);
+            let change_set = node_2.dkg.on_state_change(&node_2.dkg_pool);
             match &change_set.as_slice() {
                 &[ChangeAction::HandleInvalid(_, reason)] => {
                     assert_eq!(
@@ -2054,7 +2648,7 @@ mod tests {
                 }
                 val => panic!("Unexpected change set: {:?}", val),
             };
-            dkg_pool_2.apply_changes(change_set);
+            node_2.dkg_pool.apply_changes(change_set);
 
             // Now we create a message, which refers a DKG interval above our finalized
             // height and make sure we skip it.
@@ -2067,38 +2661,37 @@ mod tests {
             let mut dealing_message_from_future = valid_dealing_message;
             dealing_message_from_future.content.dkg_id = dkg_id_from_future;
 
-            dkg_pool_2.insert(UnvalidatedArtifact {
+            node_2.dkg_pool.insert(UnvalidatedArtifact {
                 message: dealing_message_from_future,
                 peer_id: node_id_1,
                 timestamp: UNIX_EPOCH,
             });
 
-            assert!(dkg_2.on_state_change(&dkg_pool_2).is_empty());
+            assert!(node_2.dkg.on_state_change(&node_2.dkg_pool).is_empty());
         });
     }
 
-    // Creates two distiguishable dealings from one dealer and makes sure they both
-    // get invalidated.
+    // Creates two distiguishable dealings from one dealer and makes sure that
+    // one is still accepted
     #[test]
     fn test_validate_dealing_works_3() {
-        run_validation_test(&|dkg_pool_1: DkgPoolImpl,
-                              mut dkg_pool_2: DkgPoolImpl,
-                              dkg_1: DkgImpl,
-                              dkg_2: DkgImpl,
+        run_validation_test(&|node_1: ValidationTestComponents,
+                              mut node_2: ValidationTestComponents,
                               node_id_1| {
             // Make sure the replica 1 creates dealing for H/L thresholds, which we insert
             // as unvalidated messages into the pool of replica 2 and save one of them
             // for later.
             let valid_dealing_message = {
-                match &dkg_1.on_state_change(&dkg_pool_1).as_slice() {
+                node_1.sync_key_manager();
+                match &node_1.dkg.on_state_change(&node_1.dkg_pool).as_slice() {
                     &[ChangeAction::AddToValidated(message), ChangeAction::AddToValidated(message2)] =>
                     {
-                        dkg_pool_2.insert(UnvalidatedArtifact {
+                        node_2.dkg_pool.insert(UnvalidatedArtifact {
                             message: message.clone(),
                             peer_id: node_id_1,
                             timestamp: UNIX_EPOCH,
                         });
-                        dkg_pool_2.insert(UnvalidatedArtifact {
+                        node_2.dkg_pool.insert(UnvalidatedArtifact {
                             message: message2.clone(),
                             peer_id: node_id_1,
                             timestamp: UNIX_EPOCH,
@@ -2112,32 +2705,26 @@ mod tests {
             // Now we try to add a different dealing but still from replica 1.
             let mut dealing_message_2 = valid_dealing_message;
             dealing_message_2.content.dealing = NiDkgDealing::dummy_dealing_for_tests(1);
-            dkg_pool_2.insert(UnvalidatedArtifact {
+            node_2.dkg_pool.insert(UnvalidatedArtifact {
                 message: dealing_message_2,
                 peer_id: node_id_1,
                 timestamp: UNIX_EPOCH,
             });
 
             // Let replica 2 create dealings for L/H thresholds.
-            let change_set = dkg_2.on_state_change(&dkg_pool_2);
+            node_2.sync_key_manager();
+            let change_set = node_2.dkg.on_state_change(&node_2.dkg_pool);
             match &change_set.as_slice() {
                 &[ChangeAction::AddToValidated(_), ChangeAction::AddToValidated(_)] => {}
                 val => panic!("Unexpected change set: {:?}", val),
             };
-            dkg_pool_2.apply_changes(change_set);
+            node_2.dkg_pool.apply_changes(change_set);
 
             // Make sure we validate one dealing, and handle another two as invalid.
-            let change_set = dkg_2.on_state_change(&dkg_pool_2);
+            node_2.sync_key_manager();
+            let change_set = node_2.dkg.on_state_change(&node_2.dkg_pool);
             match &change_set.as_slice() {
-                &[ChangeAction::HandleInvalid(_, reason1), ChangeAction::HandleInvalid(_, reason2), ChangeAction::MoveToValidated(_)] =>
-                {
-                    let expected_reason = format!(
-                        "The replica with Id={} produced multiple dealings.",
-                        node_id_1
-                    );
-                    assert_eq!(*reason1, expected_reason);
-                    assert_eq!(*reason2, expected_reason);
-                }
+                &[ChangeAction::MoveToValidated(_), ChangeAction::MoveToValidated(_)] => {}
                 val => panic!("Unexpected change set: {:?}", val),
             };
         });
@@ -2146,21 +2733,20 @@ mod tests {
     // Creates two dealings for both thresholds and make sure they get validated.
     #[test]
     fn test_validate_dealing_works_4() {
-        run_validation_test(&|dkg_pool_1: DkgPoolImpl,
-                              mut dkg_pool_2: DkgPoolImpl,
-                              dkg_1: DkgImpl,
-                              dkg_2: DkgImpl,
+        run_validation_test(&|node_1: ValidationTestComponents,
+                              mut node_2: ValidationTestComponents,
                               node_id_1| {
             // Make sure the replica 1 creates two dealings for L/H thresholds, which we
             // insert as unvalidated messages into the pool of replica 2.
-            match &dkg_1.on_state_change(&dkg_pool_1).as_slice() {
+            node_1.sync_key_manager();
+            match &node_1.dkg.on_state_change(&node_1.dkg_pool).as_slice() {
                 &[ChangeAction::AddToValidated(message), ChangeAction::AddToValidated(message2)] => {
-                    dkg_pool_2.insert(UnvalidatedArtifact {
+                    node_2.dkg_pool.insert(UnvalidatedArtifact {
                         message: message.clone(),
                         peer_id: node_id_1,
                         timestamp: UNIX_EPOCH,
                     });
-                    dkg_pool_2.insert(UnvalidatedArtifact {
+                    node_2.dkg_pool.insert(UnvalidatedArtifact {
                         message: message2.clone(),
                         peer_id: node_id_1,
                         timestamp: UNIX_EPOCH,
@@ -2170,15 +2756,16 @@ mod tests {
             }
 
             // Make sure the replica produces its dealings.
-            let change_set = dkg_2.on_state_change(&dkg_pool_2);
+            node_2.sync_key_manager();
+            let change_set = node_2.dkg.on_state_change(&node_2.dkg_pool);
             match &change_set.as_slice() {
                 &[ChangeAction::AddToValidated(_), ChangeAction::AddToValidated(_)] => {}
                 val => panic!("Unexpected change set: {:?}", val),
             };
-            dkg_pool_2.apply_changes(change_set);
+            node_2.dkg_pool.apply_changes(change_set);
 
             // Make sure we validate both dealings from replica 1
-            let change_set = dkg_2.on_state_change(&dkg_pool_2);
+            let change_set = node_2.dkg.on_state_change(&node_2.dkg_pool);
             match &change_set.as_slice() {
                 &[ChangeAction::MoveToValidated(_), ChangeAction::MoveToValidated(_)] => {}
                 val => panic!("Unexpected change set: {:?}", val),
@@ -2252,8 +2839,8 @@ mod tests {
                     pool_2.advance_round_normal_operation_n(dkg_interval_length + 1);
                     let block: Block = PoolReader::new(&pool_1).get_highest_summary_block();
                     if let BlockPayload::Summary(summary) = block.payload.as_ref() {
-                        assert_eq!(summary.configs.len(), 2);
-                        for (dkg_id, _) in summary.configs.iter() {
+                        assert_eq!(summary.dkg.configs.len(), 2);
+                        for (dkg_id, _) in summary.dkg.configs.iter() {
                             assert_eq!(dkg_id.target_subnet, NiDkgTargetSubnet::Local);
                         }
                     } else {
@@ -2270,7 +2857,7 @@ mod tests {
                     pool_2.advance_round_normal_operation_n(dkg_interval_length + 1);
                     let block: Block = PoolReader::new(&pool_1).get_highest_summary_block();
                     if let BlockPayload::Summary(summary) = block.payload.as_ref() {
-                        assert_eq!(summary.configs.len(), 4);
+                        assert_eq!(summary.dkg.configs.len(), 4);
                     } else {
                         panic!(
                             "block at height {} is not a summary block",
@@ -2279,17 +2866,25 @@ mod tests {
                     }
 
                     // Now we instantiate the DKG components. Node Id = 1 is a dealer.
+                    let dgk_key_manager_1 = new_dkg_key_manager(
+                        crypto_1.clone(),
+                        logger.clone(),
+                        &PoolReader::new(&pool_1),
+                    );
                     let dkg_1 = DkgImpl::new(
                         node_test_id(1),
                         crypto_1,
                         pool_1.get_cache(),
+                        dgk_key_manager_1.clone(),
                         MetricsRegistry::new(),
                         logger.clone(),
                     );
+
                     let dkg_2 = DkgImpl::new(
                         node_test_id(2),
-                        crypto_2,
+                        crypto_2.clone(),
                         pool_2.get_cache(),
+                        new_dkg_key_manager(crypto_2, logger.clone(), &PoolReader::new(&pool_2)),
                         MetricsRegistry::new(),
                         logger,
                     );
@@ -2304,6 +2899,7 @@ mod tests {
                         val => panic!("Unexpected change set: {:?}", val),
                     };
                     dkg_pool_1.apply_changes(change_set);
+                    sync_dkg_key_manager(&dgk_key_manager_1, &pool_1);
 
                     // The last summary contains two local and two remote configs.
                     // dkg.on_state_change should create 4 dealings for those
@@ -2428,20 +3024,21 @@ mod tests {
                 .content
                 .into_inner();
             if block.payload.as_ref().is_summary() {
-                let summary = block.payload.as_ref().as_summary();
-                assert_eq!(summary.configs.len(), 4);
+                let dkg_summary = &block.payload.as_ref().as_summary().dkg;
+                assert_eq!(dkg_summary.configs.len(), 4);
                 assert_eq!(
-                    summary
+                    dkg_summary
                         .configs
                         .keys()
                         .filter(|id| id.target_subnet == NiDkgTargetSubnet::Remote(target_id))
                         .count(),
                     2
                 );
-                assert!(summary.transcripts_for_new_subnets().is_empty());
+                assert!(dkg_summary
+                    .transcripts_for_new_subnets_with_callback_ids
+                    .is_empty());
             } else {
-                assert!(
-                    false,
+                panic!(
                     "block at height {} is not a summary block",
                     block.height.get()
                 );
@@ -2458,10 +3055,10 @@ mod tests {
                 .content
                 .into_inner();
             if block.payload.as_ref().is_summary() {
-                let summary = block.payload.as_ref().as_summary();
-                assert_eq!(summary.configs.len(), 2);
+                let dkg_summary = &block.payload.as_ref().as_summary().dkg;
+                assert_eq!(dkg_summary.configs.len(), 2);
                 assert_eq!(
-                    summary
+                    dkg_summary
                         .configs
                         .keys()
                         .filter(|id| id.target_subnet == NiDkgTargetSubnet::Remote(target_id))
@@ -2469,20 +3066,357 @@ mod tests {
                     0
                 );
                 assert_eq!(
-                    summary
-                        .transcripts_for_new_subnets()
-                        .keys()
-                        .filter(|id| id.target_subnet == NiDkgTargetSubnet::Remote(target_id))
+                    dkg_summary
+                        .transcripts_for_new_subnets_with_callback_ids
+                        .iter()
+                        .filter(
+                            |(id, _, _)| id.target_subnet == NiDkgTargetSubnet::Remote(target_id)
+                        )
                         .count(),
                     2
                 );
             } else {
-                assert!(
-                    false,
+                panic!(
                     "block at height {} is not a summary block",
                     block.height.get()
                 );
             }
+        })
+    }
+
+    fn mock_metrics() -> IntCounterVec {
+        MetricsRegistry::new().int_counter_vec(
+            "consensus_dkg_validator",
+            "DKG validator counter",
+            &["type"],
+        )
+    }
+
+    #[test]
+    fn test_return_errors_for_repeatedly_failing_remote_dkg_requests() {
+        ic_test_utilities::artifact_pool_config::with_test_pool_config(|pool_config| {
+            use ic_types::crypto::threshold_sig::ni_dkg::*;
+            with_test_replica_logger(|logger| {
+                let node_ids = vec![node_test_id(0), node_test_id(1)];
+                let dkg_interval_length = 99;
+                let subnet_id = subnet_test_id(0);
+                let Dependencies {
+                    registry,
+                    state_manager,
+                    ..
+                } = dependencies_with_subnet_records_with_raw_state_manager(
+                    pool_config,
+                    subnet_id,
+                    vec![(
+                        10,
+                        SubnetRecordBuilder::from(&node_ids)
+                            .with_dkg_interval_length(dkg_interval_length)
+                            .build(),
+                    )],
+                );
+
+                let target_id = NiDkgTargetId::new([0u8; 32]);
+                // The first two times, the context will have a request for the given target and
+                // not afterwards.
+                complement_state_manager_with_remote_dkg_requests(
+                    state_manager.clone(),
+                    registry.get_latest_version(),
+                    vec![10, 11, 12],
+                    // XXX: This is a very brittle way to set up this test since
+                    // it will cause issues if we access the state manager more
+                    // than once in any call.
+                    Some(2),
+                    Some(target_id),
+                );
+                complement_state_manager_with_remote_dkg_requests(
+                    state_manager.clone(),
+                    registry.get_latest_version(),
+                    vec![],
+                    None,
+                    None,
+                );
+
+                // Any validation_context
+                let validation_context = ValidationContext {
+                    registry_version: registry.get_latest_version(),
+                    certified_height: Height::from(0),
+                    time: ic_test_utilities::mock_time(),
+                };
+
+                // STEP 1;
+                // Call compute_remote_dkg_data for the first time with this target.
+                let (configs, _, mut initial_dkg_attempts) = compute_remote_dkg_data(
+                    subnet_id,
+                    Height::from(0),
+                    registry.as_ref(),
+                    state_manager.as_ref(),
+                    &validation_context,
+                    BTreeMap::new(),
+                    &BTreeMap::new(),
+                    &BTreeMap::new(),
+                    &logger,
+                )
+                .unwrap();
+
+                // Two configs are created for this remote target.
+                assert_eq!(
+                    configs
+                        .iter()
+                        .filter(|config| config.dkg_id().target_subnet
+                            == NiDkgTargetSubnet::Remote(target_id))
+                        .count(),
+                    2,
+                    "{:?}",
+                    configs
+                );
+
+                // This is the first attempt to run DKG for this remote target.
+                assert_eq!(initial_dkg_attempts.get(&target_id), Some(&1u32));
+
+                // STEP 2:
+                // Call compute_remote_dkg_data again, but this time with an indicator that we
+                // have already attempted to run remote DKG for this target
+                // MAX_REMOTE_DKG_ATTEMPTS times.
+                initial_dkg_attempts.insert(target_id, MAX_REMOTE_DKG_ATTEMPTS);
+                let (configs, transcripts_for_new_subnets, initial_dkg_attempts) =
+                    compute_remote_dkg_data(
+                        subnet_id,
+                        Height::from(0),
+                        registry.as_ref(),
+                        state_manager.as_ref(),
+                        &validation_context,
+                        BTreeMap::new(),
+                        &BTreeMap::new(),
+                        &initial_dkg_attempts,
+                        &logger,
+                    )
+                    .unwrap();
+
+                // No configs are created for this remote target any more.
+                assert_eq!(
+                    configs
+                        .iter()
+                        .filter(|config| config.dkg_id().target_subnet
+                            == NiDkgTargetSubnet::Remote(target_id))
+                        .count(),
+                    0
+                );
+
+                // We rather respond with errors for this target.
+                assert_eq!(
+                    transcripts_for_new_subnets
+                        .iter()
+                        .filter(|(dkg_id, _, result)| dkg_id.target_subnet
+                            == NiDkgTargetSubnet::Remote(target_id)
+                            && *result == Err(REMOTE_DKG_REPEATED_FAILURE_ERROR.to_string()))
+                        .count(),
+                    2
+                );
+                // The attempt counter is still kept and unchanged.
+                assert_eq!(
+                    initial_dkg_attempts.get(&target_id),
+                    Some(&MAX_REMOTE_DKG_ATTEMPTS)
+                );
+
+                // STEP 3:
+                // Call compute_remote_dkg_data the last time, with an empty call context.
+                // (As arranged in the initialization of the state manager...)
+                let (configs, transcripts_for_new_subnets, initial_dkg_attempts) =
+                    compute_remote_dkg_data(
+                        subnet_id,
+                        Height::from(0),
+                        registry.as_ref(),
+                        state_manager.as_ref(),
+                        &validation_context,
+                        BTreeMap::new(),
+                        &BTreeMap::new(),
+                        &initial_dkg_attempts,
+                        &logger,
+                    )
+                    .unwrap();
+
+                // No configs are created for this remote target any more.
+                assert_eq!(configs.len(), 0);
+                // No transcripts or errors are returned for this target.
+                assert_eq!(transcripts_for_new_subnets.len(), 0);
+                // The corresponding entry is removed from the counter.
+                assert_eq!(initial_dkg_attempts.len(), 0);
+            });
+        });
+    }
+
+    /// This tests the `validate_payload` function.
+    /// It sets up a subnet with 4 nodes and a dkg interval of 4.
+    /// Then, it calls `validate_payload` on the 4th (batch) and 5th (summary)
+    /// block, expecting both to succeed.
+    #[test]
+    fn test_validate_payload() {
+        ic_test_utilities::artifact_pool_config::with_test_pool_config(|pool_config| {
+            let dkg_interval_length = 4;
+            let committee = (0..4).map(node_test_id).collect::<Vec<_>>();
+            let Dependencies {
+                crypto,
+                mut pool,
+                registry,
+                state_manager,
+                dkg_pool,
+                ..
+            } = dependencies_with_subnet_params(
+                pool_config,
+                subnet_test_id(0),
+                vec![(
+                    5,
+                    SubnetRecordBuilder::from(&committee)
+                        .with_dkg_interval_length(dkg_interval_length)
+                        .build(),
+                )],
+            );
+
+            let context = ValidationContext {
+                registry_version: RegistryVersion::from(5),
+                certified_height: Height::from(0),
+                time: ic_test_utilities::mock_time(),
+            };
+
+            // Advance the blockchain to height `dkg_interval_length - 1`
+            pool.advance_round_normal_operation_n(dkg_interval_length - 1);
+            let parent_block = PoolReader::new(&pool).get_finalized_tip();
+            // This will be a regular block, since we are not at dkg_interval_length height
+            let block = Block::from(pool.make_next_block());
+            let block_payload = BlockPayload::from(block.payload);
+
+            assert!(validate_payload(
+                subnet_test_id(0),
+                registry.as_ref(),
+                crypto.as_ref(),
+                &PoolReader::new(&pool),
+                dkg_pool.read().unwrap().deref(),
+                parent_block,
+                &block_payload,
+                state_manager.as_ref(),
+                &context,
+                &mock_metrics(),
+            )
+            .is_ok());
+
+            // Advance the blockchain by one block to height `dkg_interval_length`
+            pool.advance_round_normal_operation();
+            let parent_block = PoolReader::new(&pool).get_finalized_tip();
+            // This will be a summary block, since we are at dkg_interval_length height
+            let block = Block::from(pool.make_next_block());
+            let summary = BlockPayload::from(block.payload);
+
+            assert!(validate_payload(
+                subnet_test_id(0),
+                registry.as_ref(),
+                crypto.as_ref(),
+                &PoolReader::new(&pool),
+                dkg_pool.read().unwrap().deref(),
+                parent_block,
+                &summary,
+                state_manager.as_ref(),
+                &context,
+                &mock_metrics(),
+            )
+            .is_ok());
+        })
+    }
+
+    #[test]
+    fn test_validate_dealings_payload() {
+        ic_test_utilities::artifact_pool_config::with_test_pool_config(|pool_config| {
+            let Dependencies {
+                crypto,
+                pool,
+                dkg_pool,
+                ..
+            } = dependencies(pool_config, 1);
+
+            let parent = Block::from(pool.make_next_block());
+            let last_summary_block = PoolReader::new(&pool).dkg_summary_block(&parent).unwrap();
+            let last_summary = BlockPayload::from(last_summary_block.payload).into_summary();
+
+            let validate_dealings_payload = |messages, parent| {
+                validate_dealings_payload(
+                    crypto.as_ref(),
+                    &PoolReader::new(&pool),
+                    dkg_pool.read().unwrap().deref(),
+                    &last_summary.dkg,
+                    Height::from(0),
+                    messages,
+                    parent,
+                    &mock_metrics(),
+                )
+            };
+
+            // Construct a dealing content that passes
+            let valid_dealing_content = DealingContent::new(
+                NiDkgDealing::dummy_dealing_for_tests(0),
+                NiDkgId {
+                    start_block_height: Height::from(0),
+                    dealer_subnet: subnet_test_id(0),
+                    dkg_tag: NiDkgTag::HighThreshold,
+                    target_subnet: NiDkgTargetSubnet::Local,
+                },
+            );
+            let messages = vec![Message::fake(
+                valid_dealing_content.clone(),
+                node_test_id(0),
+            )];
+            assert!(validate_dealings_payload(&messages, &parent).is_ok());
+
+            // Construct a dealing with invalid `start_block_height` such that no config can
+            // be found and `MissingDkgConfigForDealing` is returned
+            let wrong_height_dealing_content = DealingContent::new(
+                NiDkgDealing::dummy_dealing_for_tests(0),
+                NiDkgId {
+                    start_block_height: Height::from(1),
+                    dealer_subnet: subnet_test_id(0),
+                    dkg_tag: NiDkgTag::HighThreshold,
+                    target_subnet: NiDkgTargetSubnet::Local,
+                },
+            );
+            let messages = vec![Message::fake(wrong_height_dealing_content, node_test_id(0))];
+            let result = validate_dealings_payload(&messages, &parent);
+            assert_matches!(
+                result,
+                Err(ValidationError::Permanent(
+                    PermanentError::MissingDkgConfigForDealing
+                ))
+            );
+
+            // Use a valid dealing but invalid signer, such that `InvalidDealer` is returned
+            let messages = vec![Message::fake(
+                valid_dealing_content.clone(),
+                node_test_id(1),
+            )];
+            let result = validate_dealings_payload(&messages, &parent);
+            assert_matches!(
+                result,
+                Err(ValidationError::Permanent(PermanentError::InvalidDealer(_)))
+            );
+
+            // Use valid message and valid signer but add messges to parent block as well.
+            // Now the message is already in the blockchain, and `DealerAlreadyDealt` error
+            // is returned.
+            let messages = vec![Message::fake(valid_dealing_content, node_test_id(0))];
+            let payload = Payload::new(
+                ic_types::crypto::crypto_hash,
+                BlockPayload::Data(DataPayload {
+                    batch: BatchPayload::default(),
+                    dealings: dkg::Dealings::new(Height::from(0), messages.clone()),
+                    ecdsa: ecdsa::Payload::default(),
+                }),
+            );
+            let mut parent = Block::from(pool.make_next_block());
+            parent.payload = payload;
+            let result = validate_dealings_payload(&messages, &parent);
+            assert_matches!(
+                result,
+                Err(ValidationError::Permanent(
+                    PermanentError::DealerAlreadyDealt(_)
+                ))
+            );
         })
     }
 
@@ -2588,10 +3522,15 @@ mod tests {
                 "The latest available version was used for the summary block."
             );
             let summary = BlockPayload::from(dkg_block.payload).into_summary();
-            assert_eq!(summary.registry_version, RegistryVersion::from(5));
-            assert_eq!(summary.height, Height::from(0));
+            let dkg_summary = &summary.dkg;
+            assert_eq!(dkg_summary.registry_version, RegistryVersion::from(5));
+            assert_eq!(dkg_summary.height, Height::from(0));
+            assert_eq!(
+                summary.get_oldest_registry_version_in_use(),
+                RegistryVersion::from(5)
+            );
             for tag in TAGS.iter() {
-                let current_transcript = summary.current_transcript(tag);
+                let current_transcript = dkg_summary.current_transcript(tag);
                 assert_eq!(
                     current_transcript.dkg_id.start_block_height,
                     Height::from(0)
@@ -2602,7 +3541,7 @@ mod tests {
                 );
                 // The genesis summary cannot have next transcripts, instead we'll reuse in
                 // round 1 the active transcripts from round 0.
-                assert!(summary.next_transcript(tag).is_none());
+                assert!(dkg_summary.next_transcript(tag).is_none());
             }
 
             // Advance for one round and update the registry to version 6 with new
@@ -2629,18 +3568,23 @@ mod tests {
                 "The newest registry version is used."
             );
             let summary = BlockPayload::from(dkg_block.payload).into_summary();
+            let dkg_summary = &summary.dkg;
             // This registry version corresponds to the registry version from the block
             // context of the previous summary.
-            assert_eq!(summary.registry_version, RegistryVersion::from(5));
-            assert_eq!(summary.height, Height::from(5));
+            assert_eq!(dkg_summary.registry_version, RegistryVersion::from(5));
+            assert_eq!(dkg_summary.height, Height::from(5));
+            assert_eq!(
+                summary.get_oldest_registry_version_in_use(),
+                RegistryVersion::from(5)
+            );
             for tag in TAGS.iter() {
                 // We reused the transcript.
-                let current_transcript = summary.current_transcript(tag);
+                let current_transcript = dkg_summary.current_transcript(tag);
                 assert_eq!(
                     current_transcript.dkg_id.start_block_height,
                     Height::from(0)
                 );
-                let (_, conf) = summary
+                let (_, conf) = dkg_summary
                     .configs
                     .iter()
                     .find(|(id, _)| id.dkg_tag == *tag)
@@ -2675,12 +3619,17 @@ mod tests {
                 "The newest registry version is used."
             );
             let summary = BlockPayload::from(dkg_block.payload).into_summary();
+            let dkg_summary = &summary.dkg;
             // This registry version corresponds to the registry version from the block
             // context of the previous summary.
-            assert_eq!(summary.registry_version, RegistryVersion::from(6));
-            assert_eq!(summary.height, Height::from(10));
+            assert_eq!(dkg_summary.registry_version, RegistryVersion::from(6));
+            assert_eq!(dkg_summary.height, Height::from(10));
+            assert_eq!(
+                summary.get_oldest_registry_version_in_use(),
+                RegistryVersion::from(5)
+            );
             for tag in TAGS.iter() {
-                let (_, conf) = summary
+                let (_, conf) = dkg_summary
                     .configs
                     .iter()
                     .find(|(id, _)| id.dkg_tag == *tag)
@@ -2689,12 +3638,12 @@ mod tests {
                     conf.receivers().get(),
                     &committee2.clone().into_iter().collect::<BTreeSet<_>>()
                 );
-                let current_transcript = summary.current_transcript(tag);
+                let current_transcript = dkg_summary.current_transcript(tag);
                 assert_eq!(
                     current_transcript.dkg_id.start_block_height,
                     Height::from(0)
                 );
-                let next_transcript = summary.next_transcript(tag).unwrap();
+                let next_transcript = dkg_summary.next_transcript(tag).unwrap();
                 // The DKG id start height refers to height 0, where we started computing this
                 // DKG.
                 assert_eq!(next_transcript.dkg_id.start_block_height, Height::from(5));
@@ -2709,12 +3658,17 @@ mod tests {
                 "The latest registry version is used."
             );
             let summary = BlockPayload::from(dkg_block.payload).into_summary();
+            let dkg_summary = &summary.dkg;
             // This registry version corresponds to the registry version from the block
             // context of the previous summary.
-            assert_eq!(summary.registry_version, RegistryVersion::from(10));
-            assert_eq!(summary.height, Height::from(15));
+            assert_eq!(dkg_summary.registry_version, RegistryVersion::from(10));
+            assert_eq!(dkg_summary.height, Height::from(15));
+            assert_eq!(
+                summary.get_oldest_registry_version_in_use(),
+                RegistryVersion::from(5)
+            );
             for tag in TAGS.iter() {
-                let (_, conf) = summary
+                let (_, conf) = dkg_summary
                     .configs
                     .iter()
                     .find(|(id, _)| id.dkg_tag == *tag)
@@ -2723,14 +3677,222 @@ mod tests {
                     conf.receivers().get(),
                     &committee3.clone().into_iter().collect::<BTreeSet<_>>()
                 );
-                let current_transcript = summary.current_transcript(tag);
+                let current_transcript = dkg_summary.current_transcript(tag);
                 assert_eq!(
                     current_transcript.dkg_id.start_block_height,
                     Height::from(5)
                 );
-                let next_transcript = summary.next_transcript(tag).unwrap();
+                let next_transcript = dkg_summary.next_transcript(tag).unwrap();
                 assert_eq!(next_transcript.dkg_id.start_block_height, Height::from(10));
             }
+
+            // Skip till the next DKG round
+            pool.advance_round_normal_operation_n(dkg_interval_length + 1);
+            let dkg_block = PoolReader::new(&pool).get_highest_summary_block();
+            assert_eq!(
+                dkg_block.context.registry_version,
+                RegistryVersion::from(10),
+                "The latest registry version is used."
+            );
+            let summary = BlockPayload::from(dkg_block.payload).into_summary();
+            let dkg_summary = &summary.dkg;
+            // This registry version corresponds to the registry version from the block
+            // context of the previous summary.
+            assert_eq!(dkg_summary.registry_version, RegistryVersion::from(10));
+            assert_eq!(dkg_summary.height, Height::from(20));
+            assert_eq!(
+                summary.get_oldest_registry_version_in_use(),
+                // The current DKGs finally use `RegistryVersion` 6
+                RegistryVersion::from(6)
+            );
+            for tag in TAGS.iter() {
+                let (_, conf) = dkg_summary
+                    .configs
+                    .iter()
+                    .find(|(id, _)| id.dkg_tag == *tag)
+                    .unwrap();
+                assert_eq!(
+                    conf.receivers().get(),
+                    &committee3.clone().into_iter().collect::<BTreeSet<_>>()
+                );
+                let current_transcript = dkg_summary.current_transcript(tag);
+                assert_eq!(
+                    current_transcript.dkg_id.start_block_height,
+                    Height::from(10)
+                );
+                let next_transcript = dkg_summary.next_transcript(tag).unwrap();
+                assert_eq!(next_transcript.dkg_id.start_block_height, Height::from(15));
+            }
         });
+    }
+
+    /// `RegistryClient` implementation that allows to provide a custom function
+    /// to provide a `get_versioned_value`.
+    struct MockRegistryClient<F>
+    where
+        F: Fn(&str, RegistryVersion) -> Option<Vec<u8>>,
+    {
+        latest_registry_version: RegistryVersion,
+        get_versioned_value_fun: F,
+    }
+
+    impl<F> MockRegistryClient<F>
+    where
+        F: Fn(&str, RegistryVersion) -> Option<Vec<u8>>,
+    {
+        fn new(latest_registry_version: RegistryVersion, get_versioned_value_fun: F) -> Self {
+            Self {
+                latest_registry_version,
+                get_versioned_value_fun,
+            }
+        }
+    }
+
+    impl<F> RegistryClient for MockRegistryClient<F>
+    where
+        F: Fn(&str, RegistryVersion) -> Option<Vec<u8>> + Send + Sync,
+    {
+        fn get_versioned_value(
+            &self,
+            key: &str,
+            version: RegistryVersion,
+        ) -> ic_interfaces_registry::RegistryClientVersionedResult<Vec<u8>> {
+            let value = (self.get_versioned_value_fun)(key, version);
+            Ok(RegistryVersionedRecord {
+                key: key.to_string(),
+                version,
+                value,
+            })
+        }
+
+        // Not needed for this test
+        fn get_key_family(
+            &self,
+            _: &str,
+            _: RegistryVersion,
+        ) -> Result<Vec<String>, RegistryClientError> {
+            Ok(vec![])
+        }
+
+        fn get_latest_version(&self) -> RegistryVersion {
+            self.latest_registry_version
+        }
+
+        // Not needed for this test
+        fn get_version_timestamp(&self, _: RegistryVersion) -> Option<Time> {
+            None
+        }
+    }
+
+    /// Creates a Protobuf `InitialNiDkgTranscriptRecord`. Used in the test
+    /// below.
+    fn dummy_initial_dkg_transcript(
+        committee: Vec<NodeId>,
+        tag: NiDkgTag,
+    ) -> InitialNiDkgTranscriptRecord {
+        let threshold = committee.len() as u32 / 3 + 1;
+        let transcript =
+            NiDkgTranscript::dummy_transcript_for_tests_with_params(committee, tag, threshold, 0);
+        InitialNiDkgTranscriptRecord {
+            id: Some(transcript.dkg_id.into()),
+            threshold: transcript.threshold.get().get(),
+            committee: transcript
+                .committee
+                .iter()
+                .map(|(_, c)| c.get().to_vec())
+                .collect(),
+            registry_version: 1,
+            internal_csp_transcript: serde_cbor::to_vec(&transcript.internal_csp_transcript)
+                .unwrap(),
+        }
+    }
+
+    #[test]
+    fn test_make_registry_cup() {
+        let registry_client = MockRegistryClient::new(RegistryVersion::from(12345), |key, _| {
+            use prost::Message;
+            if key.starts_with("catch_up_package_contents_") {
+                // Build a dummy cup
+                let committee = vec![NodeId::from(PrincipalId::new_node_test_id(0))];
+                let cup =
+                    CatchUpPackageContents {
+                        initial_ni_dkg_transcript_low_threshold: Some(
+                            dummy_initial_dkg_transcript(committee.clone(), NiDkgTag::LowThreshold),
+                        ),
+                        initial_ni_dkg_transcript_high_threshold: Some(
+                            dummy_initial_dkg_transcript(committee, NiDkgTag::HighThreshold),
+                        ),
+                        height: 54321,
+                        time: 1,
+                        state_hash: vec![1, 2, 3, 4, 5],
+                        registry_store_uri: None,
+                        ecdsa_initializations: vec![],
+                    };
+
+                // Encode the cup to protobuf
+                let mut value = Vec::with_capacity(cup.encoded_len());
+                cup.encode(&mut value).unwrap();
+                Some(value)
+            } else if key.starts_with("subnet_record_") {
+                // Build a dummy subnet record. The only value used from this are the
+                // `membership` and `dkg_interval_length` fields.
+                let subnet_record = SubnetRecord {
+                    membership: vec![PrincipalId::new_subnet_test_id(1).to_vec()],
+                    dkg_interval_length: 99,
+                    replica_version_id: "TestID".to_string(),
+                    ..SubnetRecord::default()
+                };
+
+                // Encode the `SubnetRecord` to protobuf
+                let mut value = Vec::with_capacity(subnet_record.encoded_len());
+                subnet_record.encode(&mut value).unwrap();
+                Some(value)
+            } else {
+                None
+            }
+        });
+        let result = make_registry_cup(&registry_client, subnet_test_id(0), None).unwrap();
+        assert_eq!(
+            result.content.state_hash.get_ref(),
+            &CryptoHash(vec![1, 2, 3, 4, 5])
+        );
+        assert_eq!(
+            result.content.block.get_value().context.registry_version,
+            RegistryVersion::from(12345)
+        );
+        assert_eq!(
+            result.content.block.get_value().context.certified_height,
+            Height::from(54321)
+        );
+        assert_eq!(
+            result.content.version(),
+            &ReplicaVersion::try_from("TestID").unwrap()
+        );
+        assert_eq!(result.signature.signer.dealer_subnet, subnet_test_id(0));
+    }
+
+    fn new_dkg_key_manager(
+        crypto: Arc<dyn ConsensusCrypto>,
+        logger: ReplicaLogger,
+        pool_reader: &PoolReader<'_>,
+    ) -> Arc<Mutex<DkgKeyManager>> {
+        Arc::new(Mutex::new(DkgKeyManager::new(
+            MetricsRegistry::new(),
+            crypto,
+            logger,
+            pool_reader,
+        )))
+    }
+
+    // Since the `DkgKeyManager` component is not running, we need to allow it to
+    // make progess occasionally.
+    //
+    // This function calls on_state_change and sync, to allow the transcripts to be
+    // loaded.
+    fn sync_dkg_key_manager(mngr: &Arc<Mutex<DkgKeyManager>>, pool: &TestConsensusPool) {
+        let mut mngr = mngr.lock().unwrap();
+
+        mngr.on_state_change(&PoolReader::new(pool));
+        mngr.sync();
     }
 }

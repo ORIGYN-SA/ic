@@ -2,6 +2,10 @@ syntax = "proto3";
 package state.canister_state_bits.v1;
 import "types/v1/types.proto";
 import "state/queues/v1/queues.proto";
+import "state/ingress/v1/ingress.proto";
+import "state/v1/metadata.proto";
+
+import "google/protobuf/wrappers.proto";
 
 message CallContext {
   message Ingress {
@@ -12,18 +16,20 @@ message CallContext {
     types.v1.CanisterId canister_id = 1;
     uint64 callback_id = 2;
   }
-  message Heartbeat { }
+  // System task is either a Heartbeat or a GlobalTimer.
+  message SystemTask {}
 
   oneof call_origin {
     Ingress ingress = 1;
     CanisterUpdateOrQuery canister_update = 2;
     types.v1.UserId query = 3;
     CanisterUpdateOrQuery canister_query = 4;
-    Heartbeat heartbeat = 7;
+    SystemTask system_task = 7;
   }
   bool responded = 5;
   state.queues.v1.Funds available_funds = 6;
   bool deleted = 8;
+  optional uint64 time_nanos = 9;
 }
 
 message CallContextEntry {
@@ -42,6 +48,10 @@ message Callback {
   WasmClosure on_reject = 3;
   WasmClosure on_cleanup = 4;
   state.queues.v1.Cycles cycles_sent = 5;
+  types.v1.CanisterId originator = 6;
+  types.v1.CanisterId respondent = 7;
+  state.queues.v1.Cycles prepayment_for_response_execution = 8;
+  state.queues.v1.Cycles prepayment_for_response_transmission = 9;
 }
 
 message CallbackEntry {
@@ -57,7 +67,7 @@ message CallContextManager {
 }
 
 message CyclesAccount {
-  // Cycle balance is store as u128::to_bytes_le()
+  // Cycle balance is stored as u128::to_bytes_le()
   bytes cycles_balance = 1;
   reserved 2;
   reserved "max_exec_cycles";
@@ -82,12 +92,30 @@ message WasmMethod {
     SYSTEM_METHOD_CANISTER_INSPECT_MESSAGE = 5;
     SYSTEM_METHOD_CANISTER_HEARTBEAT = 6;
     SYSTEM_METHOD_EMPTY = 7;
+    SYSTEM_METHOD_CANISTER_GLOBAL_TIMER = 8;
   }
   oneof wasm_method {
     string update = 1;
     string query = 2;
     SystemMethod system = 3;
+    string composite_query = 4;
   }
+}
+
+enum CustomSectionType {
+    CUSTOM_SECTION_TYPE_UNSPECIFIED = 0;
+    CUSTOM_SECTION_TYPE_PUBLIC = 1;
+    CUSTOM_SECTION_TYPE_PRIVATE = 2;
+}
+
+message WasmCustomSection {
+    CustomSectionType visibility = 1;
+    bytes content = 2;
+    optional bytes hash = 3;
+}
+
+message WasmMetadata {
+    map<string, WasmCustomSection> custom_sections = 1;
 }
 
 message ExecutionStateBits {
@@ -95,6 +123,8 @@ message ExecutionStateBits {
   uint32 heap_size = 2;
   repeated WasmMethod exports = 3;
   uint64 last_executed_round = 4;
+  WasmMetadata metadata = 5;
+  optional bytes binary_hash = 6;
 }
 
 message StopCanisterContext {
@@ -107,6 +137,7 @@ message StopCanisterContext {
     types.v1.CanisterId sender = 1;
     uint64 reply_callback = 2;
     state.queues.v1.Funds funds = 3;
+    state.queues.v1.Cycles cycles = 4;
   }
 
   oneof context {
@@ -124,17 +155,56 @@ message CanisterStatusStopping {
 
 message CanisterStatusStopped {}
 
+message ExecutionTask {
+  enum CanisterTask {
+    CANISTER_TASK_UNSPECIFIED = 0;
+    CANISTER_TASK_HEARTBEAT = 1;
+    CANISTER_TASK_TIMER = 2;
+  }
+
+  message AbortedExecution {
+    oneof input {
+      state.queues.v1.Request request = 1;
+      state.queues.v1.Response response = 2;
+      ingress.v1.Ingress ingress = 3;
+      CanisterTask task = 5;
+    }
+    // The execution cost that has already been charged from the canister.
+    // Retried execution does not have to pay for it again.
+    state.queues.v1.Cycles prepaid_execution_cycles = 4;
+  }
+
+  message AbortedInstallCode {
+    oneof message {
+      state.queues.v1.Request request = 1;
+      ingress.v1.Ingress ingress = 2;
+    }
+    // The execution cost that has already been charged from the canister.
+    // Retried execution does not have to pay for it again.
+    state.queues.v1.Cycles prepaid_execution_cycles = 3;
+  }
+
+  oneof task {
+    AbortedExecution aborted_execution = 1;
+    AbortedInstallCode aborted_install_code = 2;
+  }
+}
+
 message CanisterStateBits {
-  types.v1.PrincipalId controller = 1;
+  reserved 1;
+  reserved "controller";
   uint64 last_full_execution_round = 2;
   CallContextManager call_context_manager = 3;
   uint64 compute_allocation = 4;
   int64 accumulated_priority = 5;
-  uint64 query_allocation = 6;
+  reserved 6;
+  reserved "query_allocation";
   ExecutionStateBits execution_state_bits = 7;
   uint64 memory_allocation = 8;
-  CyclesAccount cycles_account = 9;
-  uint64 icp_balance = 10;
+  reserved 9;
+  reserved "cycles_account";
+  reserved 10;
+  reserved "icp_balance";
   oneof canister_status {
     CanisterStatusRunning running = 11;
     CanisterStatusStopping stopping = 12;
@@ -150,9 +220,31 @@ message CanisterStateBits {
   uint64 executed = 18;
   reserved 19;
   reserved "executed_and_exhausted_its_messages";
-  bytes certified_data = 20; 
+  bytes certified_data = 20;
   uint64 interruped_during_execution = 21;
   types.v1.NominalCycles consumed_cycles_since_replica_started = 22;
   uint64 freeze_threshold = 23;
-  uint32 stable_memory_size = 24;
+  reserved 24;
+  reserved "stable_memory_size";
+  repeated types.v1.PrincipalId controllers = 25;
+  state.queues.v1.Cycles cycles_balance = 26;
+  // The size of the canister's stable memory in bytes.
+  uint64 stable_memory_size64 = 27;
+  // The memory delta debit of this canister. This is tracked for the purposes
+  // of rate limiting the amount of memory delta generated per round.
+  uint64 heap_delta_debit = 28;
+  // The instruction debit for install_code messages of this canister. This is
+  // tracked for the purposes of rate limiting the install_code messages.
+  uint64 install_code_debit = 29;
+  // Contains tasks that need to be executed before processing any input of the
+  // canister.
+  repeated ExecutionTask task_queue = 30;
+  // Time of last charge for resource allocations.
+  google.protobuf.UInt64Value time_of_last_allocation_charge_nanos = 31;
+  // Postponed charges that are not applied to `cycles_balance` yet.
+  state.queues.v1.Cycles cycles_debit = 32;
+  // Canister global timer, in nanoseconds since Unix epoch.
+  optional uint64 global_timer_nanos = 33;
+  // Canister version.
+  uint64 canister_version = 34;
 }

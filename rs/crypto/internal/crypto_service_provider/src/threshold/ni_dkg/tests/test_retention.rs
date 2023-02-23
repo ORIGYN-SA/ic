@@ -1,14 +1,12 @@
 #![allow(clippy::unwrap_used)]
 use super::fixtures::cache::STATE_WITH_TRANSCRIPT;
 use crate::api::NiDkgCspClient;
-use crate::secret_key_store::volatile_store::VolatileSecretKeyStore;
 use crate::threshold::ni_dkg::tests::fixtures::StateWithTranscript;
 use crate::threshold::ThresholdSignatureCspClient;
 use crate::types as csp_types;
 use crate::Csp;
 use ic_crypto_internal_types::sign::threshold_sig::ni_dkg::ni_dkg_groth20_bls12_381::PublicCoefficientsBytes;
 use ic_types::crypto::AlgorithmId;
-use rand_chacha::ChaCha20Rng;
 use std::collections::BTreeSet;
 
 /// Verifies that precisely the expected keys are retained.
@@ -43,9 +41,7 @@ fn test_retention() {
     let internal_public_coefficients = state.transcript.public_coefficients();
 
     // We will apply our tests to just one CSP:
-    fn get_one_csp<'a>(
-        state: &'a mut StateWithTranscript,
-    ) -> &'a mut Csp<ChaCha20Rng, VolatileSecretKeyStore> {
+    fn get_one_csp(state: &mut StateWithTranscript) -> &mut Csp {
         &mut state
             .network
             .nodes_by_node_id
@@ -74,7 +70,8 @@ fn test_retention() {
             vec![internal_public_coefficients.clone()]
                 .into_iter()
                 .collect();
-        csp.retain_threshold_keys_if_present(active_keys);
+        csp.retain_threshold_keys_if_present(active_keys)
+            .expect("Retaining threshold keys failed");
 
         // The key should still be there:
         csp.threshold_sign(
@@ -94,7 +91,8 @@ fn test_retention() {
             "Public coefficients should be different - the different one has no entries after all!"
         );
         let active_keys = vec![different_public_coefficients].into_iter().collect();
-        csp.retain_threshold_keys_if_present(active_keys);
+        csp.retain_threshold_keys_if_present(active_keys)
+            .expect("Retaining threshold keys failed");
 
         // The key should be unavailable
         csp.threshold_sign(

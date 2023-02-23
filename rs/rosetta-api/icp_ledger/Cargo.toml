@@ -1,0 +1,58 @@
+[package]
+name = "icp-ledger"
+version = "0.8.0"
+authors = ["The Internet Computer Project Developers"]
+description = "Like an accountant, but on the blockchain!"
+edition = "2021"
+
+[dependencies]
+candid = "0.8.1"
+comparable = { version = "0.5", features = ["derive"] }
+crc32fast = "1.2.0"
+dfn_candid = {path = "../../rust_canisters/dfn_candid"}
+dfn_core = {path = "../../rust_canisters/dfn_core"}
+dfn_http = {path = "../../rust_canisters/dfn_http"}
+dfn_http_metrics = {path = "../../rust_canisters/dfn_http_metrics"}
+dfn_protobuf = {path = "../../rust_canisters/dfn_protobuf"}
+hex = {version = "0.4.2", features = ["serde"] }
+ic-base-types = { path="../../types/base_types" }
+ic-canisters-http-types = { path = "../../rust_canisters/http_types" }
+ic-crypto-sha = { path = "../../crypto/sha/" }
+ic-icrc1 = { path = "../icrc1" }
+ic-ledger-canister-core = { path = "../ledger_canister_core" }
+ic-ledger-core = { path = "../ledger_core" }
+lazy_static = "1.4.0"
+on_wire = {path = "../../rust_canisters/on_wire"}
+prost = "0.11.0"
+prost-derive = "0.11"
+serde = "1.0"
+serde_bytes = "0.11"
+serde_cbor = "0.11"
+strum = "0.24"
+strum_macros = "0.24"
+
+[dev-dependencies]
+canister-test = {path = "../../rust_canisters/canister_test"}
+ic-canister-client-sender = {path = "../../canister_client/sender"}
+ic-test-utilities-compare-dirs = { path = "../../test_utilities/compare_dirs" }
+ledger-canister-protobuf-generator = { path = "./protobuf_generator" }
+proptest = "1"
+rand = "0.8"
+rand_chacha = "0.3"
+tempfile = "3.1.0"
+
+[[test]]
+name = "test"
+path = "test/test.rs"
+
+[[test]]
+name = "check_generated_files"
+path = "test/check_generated_files.rs"
+
+[[test]]
+name = "protobuf_encoding"
+path = "test/protobuf_encoding.rs"
+
+[[bin]]
+name = "test-notified"
+path = "test/notified.rs"

@@ -1,59 +1,39 @@
 //! Filesystem-backed secret key store
 #![allow(clippy::unwrap_used)]
-use crate::secret_key_store::{Scope, SecretKeyStore, SecretKeyStoreError};
-use crate::threshold::ni_dkg::{NIDKG_FS_SCOPE, NIDKG_THRESHOLD_SCOPE};
+use crate::canister_threshold::IDKG_MEGA_SCOPE;
+use crate::key_id::KeyId;
+use crate::secret_key_store::{
+    Scope, SecretKeyStore, SecretKeyStoreError, SecretKeyStorePersistenceError,
+};
 use crate::types::CspSecretKey;
+use hex::{FromHex, ToHex};
+use ic_config::crypto::CryptoConfig;
 use ic_crypto_internal_threshold_sig_bls12381::ni_dkg::groth20_bls12_381::types::convert_keyset_to_keyset_with_pop;
 use ic_crypto_internal_threshold_sig_bls12381::ni_dkg::types::CspFsEncryptionKeySet;
-use ic_logger::{replica_logger::no_op_logger, warn, ReplicaLogger};
-use ic_types::crypto::KeyId;
+use ic_logger::{info, replica_logger::no_op_logger, ReplicaLogger};
 use parking_lot::RwLock;
 use prost::Message;
 use std::borrow::{Borrow, BorrowMut};
 use std::collections::HashMap;
-use std::convert::TryInto;
 use std::fs;
 use std::io::ErrorKind;
-use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::Arc;
 
-const SKS_DATA_FILENAME: &str = "sks_data.pb";
-const TEMP_SKS_DATA_FILENAME: &str = "sks_data.pb.temp";
-const CURRENT_SKS_VERSION: u32 = 2;
+#[cfg(test)]
+mod tests;
 
-// TODO(CRP-523): turn this to FromStr-trait once KeyId is not public.
-const KEY_ID_PREFIX: &str = "KeyId(0x";
-const KEY_ID_SUFFIX: &str = ")";
-fn key_id_from_display_string(s: &str) -> KeyId {
-    if s.starts_with(KEY_ID_PREFIX) && s.ends_with(KEY_ID_SUFFIX) {
-        let key_id_hex = s
-            .get(KEY_ID_PREFIX.len()..s.len() - KEY_ID_SUFFIX.len())
-            .unwrap_or_else(|| panic!("Invalid display string for KeyId: {}", s));
-        key_id_from_hex(key_id_hex)
-    } else {
-        panic!("Invalid display string for KeyId: {}", s)
-    }
-}
-
-fn key_id_to_hex(key_id: &KeyId) -> String {
-    hex::encode(key_id.0)
-}
+const CURRENT_SKS_VERSION: u32 = 3;
 
 fn key_id_from_hex(key_id_hex: &str) -> KeyId {
-    let parsed = hex::decode(key_id_hex)
-        .unwrap_or_else(|e| panic!("Error parsing hex KeyId {}: {}", key_id_hex, e));
-    let bytes: [u8; 32] = parsed[..]
-        .try_into()
-        .unwrap_or_else(|_| panic!("KeyId {} should have 32 bytes", key_id_hex));
-    KeyId::from(bytes)
+    KeyId::from_hex(key_id_hex).unwrap_or_else(|_| panic!("Error parsing hex KeyId {}", key_id_hex))
 }
 
 /// The secret key store protobuf definitions
 // Include the prost-build generated registry protos.
+#[allow(clippy::all)]
 #[path = "../../gen/ic.crypto.v1.rs"]
-#[rustfmt::skip]
 pub mod pb;
 
 type SecretKeys = HashMap<KeyId, (CspSecretKey, Option<Scope>)>;
@@ -68,9 +48,10 @@ pub struct ProtoSecretKeyStore {
 
 impl ProtoSecretKeyStore {
     /// Creates a database instance.
-    pub fn open(dir: &Path, logger: Option<ReplicaLogger>) -> Self {
-        Self::check_path(dir);
-        let proto_file = dir.join(SKS_DATA_FILENAME);
+    pub fn open(dir: &Path, file_name: &str, logger: Option<ReplicaLogger>) -> Self {
+        CryptoConfig::check_dir_has_required_permissions(dir)
+            .expect("wrong crypto root permissions");
+        let proto_file = dir.join(file_name);
         let secret_keys = match Self::read_sks_data_from_disk(&proto_file) {
             Some(sks_proto) => sks_proto,
             None => SecretKeys::new(),
@@ -80,6 +61,11 @@ impl ProtoSecretKeyStore {
             keys: Arc::new(RwLock::new(secret_keys)),
             logger: logger.unwrap_or_else(no_op_logger),
         }
+    }
+
+    /// Returns the path to the protobuf file storing the keys.
+    pub fn proto_file_path(&self) -> &Path {
+        self.proto_file.as_path()
     }
 
     fn read_sks_data_from_disk(sks_data_file: &Path) -> Option<SecretKeys> {
@@ -99,67 +85,19 @@ impl ProtoSecretKeyStore {
         }
     }
 
-    // TODO(CRP-532): remove support for the legacy format in a few weeks after
-    // merging.
     fn migrate_to_current_version(sks_proto: pb::SecretKeyStore) -> SecretKeys {
         match sks_proto.version {
             CURRENT_SKS_VERSION => ProtoSecretKeyStore::sks_proto_to_secret_keys(&sks_proto),
-            0 => {
-                let mut secret_keys = SecretKeys::new();
-                for (key_id_string, key_bytes) in sks_proto.key_id_to_csp_secret_key.iter() {
-                    let key_id = key_id_from_display_string(&key_id_string);
-                    let mut csp_key: CspSecretKey = serde_cbor::from_slice(&key_bytes)
-                        .unwrap_or_else(|e| {
-                            panic!("Error deserializing key with ID {}: {}", key_id, e)
-                        });
-                    if let CspSecretKey::FsEncryption(CspFsEncryptionKeySet::Groth20_Bls12_381(
-                        key_set,
-                    )) = csp_key
-                    {
-                        let key_set_with_pop = convert_keyset_to_keyset_with_pop(key_set);
-                        csp_key = CspSecretKey::FsEncryption(
-                            CspFsEncryptionKeySet::Groth20WithPop_Bls12_381(key_set_with_pop),
-                        );
-                    }
-                    let maybe_scope: Option<Scope> = match csp_key {
-                        CspSecretKey::FsEncryption(_) => Some(NIDKG_FS_SCOPE),
-                        CspSecretKey::ThresBls12_381(_) => Some(NIDKG_THRESHOLD_SCOPE),
-                        _ => None,
-                    };
-                    secret_keys.insert(key_id, (csp_key, maybe_scope));
-                }
-                secret_keys
+            2 => {
+                let secret_keys_from_disk =
+                    ProtoSecretKeyStore::sks_proto_to_secret_keys(&sks_proto);
+                Self::migrate_sks_from_v2_to_v3(secret_keys_from_disk)
             }
-
             1 => {
-                let mut secret_keys = SecretKeys::new();
-                for (key_id_hex, sk_proto) in sks_proto.key_id_to_secret_key_v1.iter() {
-                    let key_id = key_id_from_hex(&key_id_hex);
-                    let mut csp_key = serde_cbor::from_slice(&sk_proto.csp_secret_key)
-                        .unwrap_or_else(|e| {
-                            panic!("Error deserializing key with ID {}: {}", key_id, e)
-                        });
-
-                    if let CspSecretKey::FsEncryption(CspFsEncryptionKeySet::Groth20_Bls12_381(
-                        key_set,
-                    )) = csp_key
-                    {
-                        let key_set_with_pop = convert_keyset_to_keyset_with_pop(key_set);
-                        csp_key = CspSecretKey::FsEncryption(
-                            CspFsEncryptionKeySet::Groth20WithPop_Bls12_381(key_set_with_pop),
-                        );
-                    }
-                    let maybe_scope = if sk_proto.scope.is_empty() {
-                        None
-                    } else {
-                        Some(
-                            Scope::from_str(&sk_proto.scope)
-                                .unwrap_or_else(|_| panic!("Unknown scope: {}", sk_proto.scope)),
-                        )
-                    };
-                    secret_keys.insert(key_id, (csp_key, maybe_scope));
-                }
-                secret_keys
+                let secret_keys_from_disk =
+                    ProtoSecretKeyStore::sks_proto_to_secret_keys(&sks_proto);
+                let sks_v2 = Self::migrate_sks_from_v1_to_v2(secret_keys_from_disk);
+                Self::migrate_sks_from_v2_to_v3(sks_v2)
             }
             _ => panic!(
                 "Unsupported SecretKeyStore-proto version: {}",
@@ -168,38 +106,85 @@ impl ProtoSecretKeyStore {
         }
     }
 
-    fn sks_proto_to_secret_keys(sks_proto: &pb::SecretKeyStore) -> SecretKeys {
-        if sks_proto.version != CURRENT_SKS_VERSION {
-            panic!(
-                "Unexpected SecretKeyStore-proto version: {}",
-                sks_proto.version
+    fn migrate_sks_from_v2_to_v3(existing_secret_keys: SecretKeys) -> SecretKeys {
+        let mut migrated_secret_keys = SecretKeys::new();
+        for (key_id, (csp_key, scope)) in existing_secret_keys.into_iter() {
+            let migrated_scope = match &csp_key {
+                CspSecretKey::MEGaEncryptionK256(_) => Some(IDKG_MEGA_SCOPE),
+                _ => scope,
+            };
+            migrated_secret_keys.insert(key_id, (csp_key, migrated_scope));
+        }
+        migrated_secret_keys
+    }
+
+    fn migrate_sks_from_v1_to_v2(existing_secret_keys: SecretKeys) -> SecretKeys {
+        let mut migrated_secret_keys = SecretKeys::new();
+        for (key_id, (csp_key, scope)) in existing_secret_keys.into_iter() {
+            let migrated_secret_key = match &csp_key {
+                CspSecretKey::FsEncryption(CspFsEncryptionKeySet::Groth20_Bls12_381(key_set)) => {
+                    let key_set_with_pop = convert_keyset_to_keyset_with_pop(key_set.clone());
+                    CspSecretKey::FsEncryption(CspFsEncryptionKeySet::Groth20WithPop_Bls12_381(
+                        key_set_with_pop,
+                    ))
+                }
+                _ => csp_key,
+            };
+            migrated_secret_keys.insert(key_id, (migrated_secret_key, scope));
+        }
+        migrated_secret_keys
+    }
+
+    fn parse_csp_secret_key(key_bytes: &[u8], key_id: &KeyId) -> CspSecretKey {
+        serde_cbor::from_slice(key_bytes)
+            .unwrap_or_else(|e| panic!("Error deserializing key with ID {}: {}", key_id, e))
+    }
+
+    fn parse_scope(scope_proto: &str) -> Option<Scope> {
+        if scope_proto.is_empty() {
+            None
+        } else {
+            Some(
+                Scope::from_str(scope_proto)
+                    .unwrap_or_else(|_| panic!("Unknown scope: {}", scope_proto)),
             )
         }
+    }
+
+    fn sks_proto_to_secret_keys(sks_proto: &pb::SecretKeyStore) -> SecretKeys {
+        Self::ensure_version_is_supported(sks_proto.version);
         let mut secret_keys = SecretKeys::new();
         for (key_id_hex, sk_proto) in sks_proto.key_id_to_secret_key_v1.iter() {
-            let key_id = key_id_from_hex(&key_id_hex);
-            let csp_key = serde_cbor::from_slice(&sk_proto.csp_secret_key)
-                .unwrap_or_else(|e| panic!("Error deserializing key with ID {}: {}", key_id, e));
-            let maybe_scope = if sk_proto.scope.is_empty() {
-                None
-            } else {
-                Some(
-                    Scope::from_str(&sk_proto.scope)
-                        .unwrap_or_else(|_| panic!("Unknown scope: {}", sk_proto.scope)),
-                )
-            };
+            let key_id = key_id_from_hex(key_id_hex);
+            let csp_key = Self::parse_csp_secret_key(&sk_proto.csp_secret_key, &key_id);
+            let maybe_scope = Self::parse_scope(&sk_proto.scope);
             secret_keys.insert(key_id, (csp_key, maybe_scope));
         }
         secret_keys
     }
 
-    fn secret_keys_to_sks_proto(secret_keys: &SecretKeys) -> pb::SecretKeyStore {
-        let mut sks_proto = pb::SecretKeyStore::default();
-        sks_proto.version = CURRENT_SKS_VERSION;
+    fn ensure_version_is_supported(version: u32) {
+        let supported_versions = vec![1, 2, CURRENT_SKS_VERSION];
+        if !supported_versions.contains(&version) {
+            panic!("Unexpected SecretKeyStore-proto version: {}", version)
+        }
+    }
+
+    fn secret_keys_to_sks_proto(
+        secret_keys: &SecretKeys,
+    ) -> Result<pb::SecretKeyStore, SecretKeyStorePersistenceError> {
+        let mut sks_proto = pb::SecretKeyStore {
+            version: CURRENT_SKS_VERSION,
+            ..Default::default()
+        };
         for (key_id, (csp_key, maybe_scope)) in secret_keys {
-            let key_id_hex = key_id_to_hex(key_id);
-            let key_as_cbor = serde_cbor::to_vec(&csp_key)
-                .unwrap_or_else(|_| panic!("Error serializing key with ID {}", key_id));
+            let key_id_hex = key_id.encode_hex();
+            let key_as_cbor = serde_cbor::to_vec(&csp_key).map_err(|_| {
+                SecretKeyStorePersistenceError::SerializationError(format!(
+                    "Error serializing key with ID {}",
+                    key_id
+                ))
+            })?;
             let sk_pb = match maybe_scope {
                 Some(scope) => pb::SecretKeyV1 {
                     csp_secret_key: key_as_cbor,
@@ -212,57 +197,20 @@ impl ProtoSecretKeyStore {
             };
             sks_proto.key_id_to_secret_key_v1.insert(key_id_hex, sk_pb);
         }
-        sks_proto
+        Ok(sks_proto)
     }
 
-    fn write_secret_keys_to_disk(sks_data_file: &Path, secret_keys: &SecretKeys) {
-        let mut tmp_data_file = sks_data_file.to_owned();
-        tmp_data_file.set_file_name(TEMP_SKS_DATA_FILENAME);
-        let sks_proto = ProtoSecretKeyStore::secret_keys_to_sks_proto(secret_keys);
-        let mut buf = Vec::new();
-        match sks_proto.encode(&mut buf) {
-            Ok(_) => match fs::write(&tmp_data_file, &buf) {
-                Ok(_) => {
-                    fs::rename(&tmp_data_file, sks_data_file).expect("Could not update SKS file.")
-                }
-                Err(err) => panic!("IO error {}", err),
-            },
-            Err(err) => panic!("Error serializing data: {}", err),
-        }
-    }
-
-    fn check_path(path: &Path) {
-        if path.is_file() {
-            panic!(
-                "Path {} should specify a directory, not a file",
-                &path.display()
-            );
-        }
-        let metadata = Self::check_path_exists(path);
-        Self::check_not_readable_by_others(path, metadata);
-    }
-
-    fn check_path_exists(path: &Path) -> fs::Metadata {
-        fs::metadata(path).unwrap_or_else(|e| {
-            panic!(
-                "Path {} does not exist or its metadata cannot be retrieved: {}",
-                &path.display(),
+    fn write_secret_keys_to_disk(
+        sks_data_file: &Path,
+        secret_keys: &SecretKeys,
+    ) -> Result<(), SecretKeyStorePersistenceError> {
+        let sks_proto = ProtoSecretKeyStore::secret_keys_to_sks_proto(secret_keys)?;
+        ic_utils::fs::write_protobuf_using_tmp_file(sks_data_file, &sks_proto).map_err(|e| {
+            SecretKeyStorePersistenceError::IoError(format!(
+                "Secret key store internal error writing protobuf using tmp file: {}",
                 e
-            )
+            ))
         })
-    }
-
-    fn check_not_readable_by_others(path: &Path, metadata: fs::Metadata) {
-        let permissions = metadata.permissions();
-        let unix_permission_bits = permissions.mode();
-        let non_user_permissions = unix_permission_bits & 0o77;
-        if non_user_permissions != 0 {
-            panic!(
-                "crypto keystore path {} has permissions {:#o}, allowing reading by others",
-                &path.display(),
-                unix_permission_bits
-            );
-        }
     }
 }
 
@@ -273,20 +221,25 @@ impl SecretKeyStore for ProtoSecretKeyStore {
         key: CspSecretKey,
         scope: Option<Scope>,
     ) -> Result<(), SecretKeyStoreError> {
-        with_write_lock(&self.keys, |keys| match keys.get(&id) {
-            Some(_) => Err(SecretKeyStoreError::DuplicateKeyId(id)),
-            None => {
-                keys.insert(id, (key, scope));
-                ProtoSecretKeyStore::write_secret_keys_to_disk(&self.proto_file, keys);
-                Ok(())
-            }
-        })
+        let inserted: Result<bool, SecretKeyStorePersistenceError> =
+            with_write_lock(&self.keys, |keys| match keys.get(&id) {
+                Some(_) => Ok(false),
+                None => {
+                    keys.insert(id, (key, scope));
+                    ProtoSecretKeyStore::write_secret_keys_to_disk(&self.proto_file, keys)?;
+                    Ok(true)
+                }
+            });
+        match inserted {
+            Ok(false) => Err(SecretKeyStoreError::DuplicateKeyId(id)),
+            Ok(true) => Ok(()),
+            Err(e) => Err(SecretKeyStoreError::PersistenceError(e)),
+        }
     }
 
     fn get(&self, id: &KeyId) -> Option<CspSecretKey> {
-        with_read_lock(&self.keys, |keys| match keys.get(id) {
-            Some((csp_key, _)) => Some(csp_key.to_owned()),
-            None => None,
+        with_read_lock(&self.keys, |keys| {
+            keys.get(id).map(|(csp_key, _)| csp_key.to_owned())
         })
     }
 
@@ -294,19 +247,18 @@ impl SecretKeyStore for ProtoSecretKeyStore {
         self.get(id).is_some()
     }
 
-    fn remove(&mut self, id: &KeyId) -> bool {
-        let result = with_write_lock(&self.keys, |keys| match keys.get(id) {
+    fn remove(&mut self, id: &KeyId) -> Result<bool, SecretKeyStorePersistenceError> {
+        with_write_lock(&self.keys, |keys| match keys.get(id) {
             Some(_) => {
                 keys.remove(id);
-                ProtoSecretKeyStore::write_secret_keys_to_disk(&self.proto_file, keys);
+                ProtoSecretKeyStore::write_secret_keys_to_disk(&self.proto_file, keys)?;
                 Ok(true)
             }
             None => Ok(false),
-        });
-        result.expect("lambda unexpectedly returned Err")
+        })
     }
 
-    fn retain<F>(&mut self, filter: F, scope: Scope)
+    fn retain<F>(&mut self, filter: F, scope: Scope) -> Result<(), SecretKeyStorePersistenceError>
     where
         F: Fn(&KeyId, &CspSecretKey) -> bool,
     {
@@ -318,25 +270,24 @@ impl SecretKeyStore for ProtoSecretKeyStore {
                 if maybe_scope != Some(scope) || filter(&key_id, &csp_key) {
                     keys.insert(key_id, (csp_key, maybe_scope));
                 } else {
-                    warn!(
+                    info!(
                         self.logger,
-                        "WARNING: deleting key with ID {} with scope {}", key_id, scope
+                        "Deleting key with ID {} with scope {}", key_id, scope
                     );
                 }
             }
             if keys.len() < orig_keys_count {
-                ProtoSecretKeyStore::write_secret_keys_to_disk(&self.proto_file, keys);
+                ProtoSecretKeyStore::write_secret_keys_to_disk(&self.proto_file, keys)?;
             }
             Ok(())
         })
-        .unwrap_or_else(|e| panic!("retain failed for scope {} with error {}", scope, e));
     }
 }
 
-fn with_write_lock<T, I, R, F>(v: T, f: F) -> Result<R, SecretKeyStoreError>
+fn with_write_lock<T, I, R, F>(v: T, f: F) -> Result<R, SecretKeyStorePersistenceError>
 where
     T: AsRef<RwLock<I>>,
-    F: FnOnce(&mut I) -> Result<R, SecretKeyStoreError>,
+    F: FnOnce(&mut I) -> Result<R, SecretKeyStorePersistenceError>,
 {
     let mut lock_result = v.as_ref().write();
     f(lock_result.borrow_mut())
@@ -349,82 +300,4 @@ where
 {
     let lock_result = v.as_ref().read();
     f(lock_result.borrow())
-}
-
-#[cfg(test)]
-pub mod tests {
-    use super::super::test_utils;
-    use super::*;
-    use crate::secret_key_store::test_utils::TempSecretKeyStore;
-    use ic_crypto_internal_csp_test_utils::files::mk_temp_dir_with_permissions;
-    use proptest::prelude::*;
-    use tempfile::tempdir as tempdir_deleted_at_end_of_scope;
-
-    // TODO(CRP-351): add tests that SKS updates hit the disk.
-    #[test]
-    #[should_panic]
-    fn path_check_should_panic_for_paths_that_do_not_exist() {
-        let dir_path = {
-            let dir = tempdir_deleted_at_end_of_scope().unwrap();
-            format!("{}", dir.path().display())
-        };
-        ProtoSecretKeyStore::check_path(Path::new(&dir_path));
-    }
-
-    #[test]
-    #[should_panic]
-    fn path_check_should_panic_for_paths_that_are_widely_readable() {
-        let dir = mk_temp_dir_with_permissions(0o744);
-        ProtoSecretKeyStore::check_path(dir.path());
-    }
-
-    proptest! {
-        #[test]
-        fn should_retrieve_inserted_key(seed1: u64, seed2: u64) {
-            test_utils::should_retrieve_inserted_key(seed1, seed2, proto_key_store());
-        }
-
-        #[test]
-        fn should_contain_existing_key(seed1: u64, seed2: u64) {
-            test_utils::should_contain_existing_key(seed1, seed2, proto_key_store());
-        }
-
-        #[test]
-        fn should_not_contain_nonexisting_key(seed1: u64) {
-            test_utils::should_not_contain_nonexisting_key(seed1, proto_key_store());
-        }
-
-        #[test]
-        fn should_remove_existing_key(seed1: u64, seed2: u64) {
-            test_utils::should_remove_existing_key(seed1, seed2, proto_key_store());
-        }
-
-        #[test]
-        fn should_not_remove_nonexisting_key(seed1: u64) {
-            test_utils::should_not_remove_nonexisting_key(seed1, proto_key_store());
-        }
-
-        #[test]
-        fn deleting_twice_should_return_false(seed1: u64, seed2: u64) {
-            test_utils::deleting_twice_should_return_false(seed1, seed2, proto_key_store());
-        }
-
-        #[test]
-        fn no_overwrites(seed1: u64, seed2: u64, seed3: u64) {
-            test_utils::no_overwrites(seed1, seed2, seed3, proto_key_store());
-        }
-
-        ////////////////////////////////////////////////////////////////////////////////////////
-        // If you add tests here, remember to also add them for the VolatileSecretKeyStore
-        ////////////////////////////////////////////////////////////////////////////////////////
-    }
-
-    #[test]
-    fn should_retain_expected_keys() {
-        test_utils::should_retain_expected_keys(proto_key_store());
-    }
-
-    fn proto_key_store() -> TempSecretKeyStore {
-        TempSecretKeyStore::new()
-    }
 }

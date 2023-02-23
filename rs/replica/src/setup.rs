@@ -1,28 +1,27 @@
 use crate::args::ReplicaArgs;
-use ic_config::{crypto::CryptoConfig, Config, ConfigSource, SAMPLE_CONFIG};
+use clap::Parser;
+use ic_config::{
+    crypto::CryptoConfig, registry_client::DataProviderConfig, Config, ConfigSource, SAMPLE_CONFIG,
+};
 use ic_crypto::CryptoComponent;
-use ic_crypto_utils_threshold_sig::parse_threshold_sig_key;
-use ic_interfaces::registry::RegistryClient;
-use ic_logger::{fatal, info, new_replica_logger, warn, LoggerImpl, ReplicaLogger};
+use ic_interfaces_registry::RegistryClient;
+use ic_logger::{fatal, info, warn, ReplicaLogger};
 use ic_metrics::MetricsRegistry;
 use ic_protobuf::types::v1 as pb;
-use ic_registry_client::client::{create_data_provider, RegistryClientImpl};
-use ic_registry_client::helper::subnet::{SubnetListRegistry, SubnetRegistry};
-use ic_registry_common::proto_registry_data_provider::ProtoRegistryDataProvider;
+use ic_registry_client::client::RegistryClientImpl;
+use ic_registry_client_helpers::subnet::{SubnetListRegistry, SubnetRegistry};
+use ic_registry_local_store::LocalStoreImpl;
 use ic_registry_subnet_type::SubnetType;
 use ic_types::consensus::catchup::{CUPWithOriginalProtobuf, CatchUpPackage};
 use ic_types::{NodeId, RegistryVersion, ReplicaVersion, SubnetId};
-use slog_async::AsyncGuard;
 use std::convert::TryFrom;
 use std::env;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
-use structopt::clap;
-use structopt::StructOpt;
 
 /// Parse command-line args into `ReplicaArgs`
 pub fn parse_args() -> Result<ReplicaArgs, clap::Error> {
-    let args_result = ReplicaArgs::from_iter_safe(env::args());
+    let args_result = ReplicaArgs::try_parse_from(env::args());
 
     args_result.map(|args| {
         if args.print_sample_config {
@@ -64,9 +63,9 @@ pub fn get_catch_up_package(
             pb::CatchUpPackage::read_from_file(args.catch_up_package.clone()?)
                 .and_then(|protobuf| {
                     CatchUpPackage::try_from(&protobuf)
-                        .map(|cup| CUPWithOriginalProtobuf { protobuf, cup })
+                        .map(|cup| CUPWithOriginalProtobuf { cup, protobuf })
                 })
-                .map_err(|e| panic!(format!("Failed to load CUP at startup {:?}", e)))
+                .map_err(|e| panic!("Failed to load CUP at startup {:?}", e))
                 .unwrap(),
         ),
         Err(_) => {
@@ -83,10 +82,10 @@ pub fn get_catch_up_package(
 ///
 /// First attempts to look up the node's subnet ID in the registry.
 ///
-/// Panic if this fails after some retries. The node manager should
+/// Panic if this fails after some retries. The orchestrator should
 /// never have booted a replica if our node ID is not assigned to a subntwork
 /// yet.
-pub async fn get_subnet_id(
+pub fn get_subnet_id(
     node_id: NodeId,
     registry_client: &dyn RegistryClient,
     cup: Option<&CatchUpPackage>,
@@ -104,7 +103,7 @@ pub async fn get_subnet_id(
             .get_subnet_ids(registry_version)
             .ok()
             .flatten()
-            .unwrap_or_else(Vec::new);
+            .unwrap_or_default();
         info!(logger, "Found subnets {:?}", subnet_ids);
 
         for subnet_id in subnet_ids {
@@ -112,7 +111,7 @@ pub async fn get_subnet_id(
                 .get_node_ids_on_subnet(subnet_id, registry_version)
                 .ok()
                 .flatten()
-                .unwrap_or_else(Vec::new);
+                .unwrap_or_default();
 
             info!(
                 logger,
@@ -131,12 +130,12 @@ pub async fn get_subnet_id(
                 node_id, registry_version
             );
         }
-        tokio::time::delay_for(std::time::Duration::from_millis(10)).await;
+        std::thread::sleep(std::time::Duration::from_millis(10));
     }
 }
 
 /// Return the subnet type of the given subnet.
-pub async fn get_subnet_type(
+pub fn get_subnet_type(
     registry: &dyn RegistryClient,
     subnet_id: SubnetId,
     registry_version: RegistryVersion,
@@ -147,7 +146,15 @@ pub async fn get_subnet_type(
             Ok(subnet_record) => {
                 break match subnet_record {
                     Some(record) => match SubnetType::try_from(record.subnet_type) {
-                        Ok(subnet_type) => subnet_type,
+                        Ok(subnet_type) => {
+                            info!(
+                                logger,
+                                "{{subnet_record: Registry subnet record {:?}, subnet_id: {}}}",
+                                record,
+                                subnet_id
+                            );
+                            subnet_type
+                        }
                         Err(e) => fatal!(logger, "Could not parse SubnetType: {}", e),
                     },
                     // This can only happen if the registry is corrupted, so better to crash.
@@ -164,7 +171,7 @@ pub async fn get_subnet_type(
                     "Unable to read the subnet record: {}\nTrying again...",
                     err.to_string(),
                 );
-                tokio::time::delay_for(std::time::Duration::from_millis(10)).await;
+                std::thread::sleep(std::time::Duration::from_millis(10));
             }
         }
     }
@@ -181,17 +188,6 @@ pub fn get_config_source(replica_args: &Result<ReplicaArgs, clap::Error>) -> Con
     }
 }
 
-/// Return a `ReplicaLogger` and its `AsyncGuard`
-///
-/// Note: Do not drop the `AsyncGuard`! If it is dropped, all async logs
-/// (typically logs below level `Error`) will not be logged.
-pub fn get_replica_logger(config: &Config) -> (ReplicaLogger, AsyncGuard) {
-    let base_logger = LoggerImpl::new(&config.logger, "replica".to_string());
-    let logger = new_replica_logger(base_logger.root.clone(), &config.logger);
-
-    (logger, base_logger.async_log_guard)
-}
-
 /// Create the consensus pool directory (if none exists)
 pub fn create_consensus_pool_dir(config: &Config) {
     std::fs::create_dir_all(&config.artifact_pool.consensus_pool_path).unwrap_or_else(|err| {
@@ -205,54 +201,32 @@ pub fn create_consensus_pool_dir(config: &Config) {
 
 pub fn setup_crypto_registry(
     config: Config,
+    tokio_runtime_handle: tokio::runtime::Handle,
     metrics_registry: Option<&MetricsRegistry>,
-    optional_nns_public_key_file: Option<&Path>,
     logger: ReplicaLogger,
-    prepare_registry_data_provider: impl FnOnce(&CryptoComponent, ProtoRegistryDataProvider),
 ) -> (std::sync::Arc<RegistryClientImpl>, CryptoComponent) {
-    // TODO(OR4-61)
-    let (crypto, registry) = if config.registry_client.data_provider.is_none() {
-        let data_provider = ProtoRegistryDataProvider::new();
-        let registry = Arc::new(RegistryClientImpl::new(
-            Arc::new(data_provider.clone()),
-            metrics_registry,
-        ));
-        let crypto = setup_crypto_provider(
-            &config.crypto,
-            Arc::clone(&registry) as Arc<dyn RegistryClient>,
-            logger,
-            metrics_registry,
-        );
-        // callback to manipulate the mutable data provider
-        prepare_registry_data_provider(&crypto, data_provider);
-        (crypto, registry)
-    } else {
-        if config.registry_client.data_provider.is_none() {
-            panic!("No data provider was provided in the registry client configuration.")
-        }
-
-        let optional_nns_public_key = optional_nns_public_key_file
-            .map(|path| parse_threshold_sig_key(path).expect("failed to parse NNS PK file"));
-
-        let data_provider = create_data_provider(
-            &config.registry_client.data_provider.as_ref().unwrap(),
-            optional_nns_public_key,
-        );
-
-        let registry = Arc::new(RegistryClientImpl::new(data_provider, metrics_registry));
-        // TODO(RPL-49): pass in registry_client
-        let crypto = setup_crypto_provider(
-            &config.crypto,
-            Arc::clone(&registry) as Arc<dyn RegistryClient>,
-            logger,
-            metrics_registry,
-        );
-        (crypto, registry)
+    let data_provider = match config
+        .registry_client
+        .data_provider
+        .expect("No data provider was provided in the registry client configuration.")
+    {
+        DataProviderConfig::LocalStore(path) => Arc::new(LocalStoreImpl::new(path)),
     };
+    let registry = Arc::new(RegistryClientImpl::new(data_provider, metrics_registry));
 
+    // The registry must be initialized before setting up the crypto component
     if let Err(e) = registry.fetch_and_start_polling() {
         panic!("fetch_and_start_polling failed: {}", e);
     }
+
+    // TODO(RPL-49): pass in registry_client
+    let crypto = setup_crypto_provider(
+        &config.crypto,
+        tokio_runtime_handle,
+        Arc::clone(&registry) as Arc<dyn RegistryClient>,
+        logger,
+        metrics_registry,
+    );
 
     (registry, crypto)
 }
@@ -317,42 +291,17 @@ Examples:
 /// created.
 pub fn setup_crypto_provider(
     config: &CryptoConfig,
+    tokio_runtime_handle: tokio::runtime::Handle,
     registry: Arc<dyn RegistryClient>,
     replica_logger: ReplicaLogger,
     metrics_registry: Option<&MetricsRegistry>,
 ) -> CryptoComponent {
-    std::fs::create_dir_all(&config.crypto_root).unwrap_or_else(|err| {
-        panic!(
-            "Failed to create crypto root directory {}: {}",
-            config.crypto_root.display(),
-            err
-        )
-    });
-    CryptoConfig::set_dir_with_required_permission(&config.crypto_root).unwrap();
-    CryptoComponent::new(config, registry, replica_logger, metrics_registry)
-}
-
-/// Similarly to `setup_crypto_provider` sets up a cryptographic
-/// functionality provider. The difference is we indicate a particular
-/// node id (`NodeId`).
-///
-/// # Panics
-///
-/// Panics when no root directory for the cryptography storage can be
-/// created.
-pub fn setup_crypto_provider_with_node_id(
-    config: &CryptoConfig,
-    registry: Arc<dyn RegistryClient>,
-    node_id: NodeId,
-    replica_logger: ReplicaLogger,
-) -> CryptoComponent {
-    std::fs::create_dir_all(&config.crypto_root).unwrap_or_else(|err| {
-        panic!(
-            "Failed to create crypto root directory {}: {}",
-            config.crypto_root.display(),
-            err
-        )
-    });
-    CryptoConfig::set_dir_with_required_permission(&config.crypto_root).unwrap();
-    CryptoComponent::new_with_fake_node_id(config, registry, node_id, replica_logger)
+    CryptoConfig::check_dir_has_required_permissions(&config.crypto_root).unwrap();
+    CryptoComponent::new(
+        config,
+        Some(tokio_runtime_handle),
+        registry,
+        replica_logger,
+        metrics_registry,
+    )
 }

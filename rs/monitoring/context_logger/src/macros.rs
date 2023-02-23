@@ -101,6 +101,11 @@ macro_rules! debug {
             log!($logger, slog::Level::Debug, $message $(,$args)* ; $( $field $( . $sub_field)* => $value ),*)
         }
     }};
+    (every_n_seconds => $seconds:expr, $logger:expr, $message:expr $(,$args:expr)* ; $( $field:ident $( . $sub_field:ident)* => $value:expr ),* $(,)*) => {{
+        if $logger.is_n_seconds($seconds, log_metadata!(slog::Level::Debug)) {
+            log!($logger, slog::Level::Debug, $message $(,$args)* ; $( $field $( . $sub_field)* => $value ),*)
+        }
+    }};
     ($logger:expr, $message:expr $(,$args:expr)* ; $( $field:ident $( . $sub_field:ident)* => $value:expr ),* $(,)*) => {{
         log!($logger, slog::Level::Debug, $message $(,$args)* ; $( $field $( . $sub_field)* => $value ),*)
     }};
@@ -109,6 +114,11 @@ macro_rules! debug {
     }};
     (tag => $tag:expr, $logger:expr, $message:expr $(,$args:expr)* $(,)*) => {{
         if $logger.is_tag_enabled($tag.to_owned()) {
+            log!($logger, slog::Level::Debug, $message $(,$args)*)
+        }
+    }};
+    (every_n_seconds => $seconds:expr, $logger:expr, $message:expr $(,$args:expr)* $(,)*) => {{
+        if $logger.is_n_seconds($seconds, log_metadata!(slog::Level::Debug)) {
             log!($logger, slog::Level::Debug, $message $(,$args)*)
         }
     }};
@@ -123,6 +133,11 @@ macro_rules! debug {
 /// Log an info-level log, with context fields if given
 #[macro_export(local_inner_macros)]
 macro_rules! info {
+    (every_n_seconds => $seconds:expr, $logger:expr, $message:expr $(,$args:expr)* ; $( $field:ident $( . $sub_field:ident)* => $value:expr ),* $(,)*) => {{
+        if $logger.is_n_seconds($seconds, log_metadata!(slog::Level::Info)) {
+            log!($logger, slog::Level::Info, $message $(,$args)* ; $( $field $( . $sub_field)* => $value ),*)
+        }
+    }};
     (tag => $tag:expr, $logger:expr, $message:expr $(,$args:expr)* ; $( $field:ident $( . $sub_field:ident)* => $value:expr ),* $(,)*) => {{
         if $logger.is_tag_enabled($tag.to_owned()) {
             log!($logger, slog::Level::Info, $message $(,$args)* ; $( $field $( . $sub_field)* => $value ),*)
@@ -130,6 +145,16 @@ macro_rules! info {
     }};
     ($logger:expr, $message:expr $(,$args:expr)* ; $( $field:ident $( . $sub_field:ident)* => $value:expr ),* $(,)*) => {{
         log!($logger, slog::Level::Info, $message $(,$args)* ; $( $field $( . $sub_field)* => $value ),*)
+    }};
+    (every_n_seconds => $seconds:expr, $logger:expr, $message:expr $(,$args:expr)* ) => {{
+        if $logger.is_n_seconds($seconds, log_metadata!(slog::Level::Info)) {
+            log!($logger, slog::Level::Info, $message $(,$args)*)
+        }
+    }};
+    (every_n_seconds => $seconds:expr, $logger:expr ; $( $field:ident $( . $sub_field:ident)* => $value:expr ),* $(,)*) => {{
+        if $logger.is_n_seconds($seconds, log_metadata!(slog::Level::Info)) {
+            log!($logger, slog::Level::Info ; $( $field $( . $sub_field)* => $value ),*)
+        }
     }};
     ($logger:expr ; $( $field:ident $( . $sub_field:ident)* => $value:expr ),* $(,)*) => {{
         log!($logger, slog::Level::Info ; $( $field $( . $sub_field)* => $value ),*)
@@ -160,7 +185,7 @@ macro_rules! warn {
     }};
     (every_n_seconds => $seconds:expr, $logger:expr ; $( $field:ident $( . $sub_field:ident)* => $value:expr ),* $(,)*) => {{
         if $logger.is_n_seconds($seconds, log_metadata!(slog::Level::Warning)) {
-            log!($logger, slog::Level::Warning, $( $field $( . $sub_field)* => $value ),*)
+            log!($logger, slog::Level::Warning ; $( $field $( . $sub_field)* => $value ),*)
         }
     }};
     ($logger:expr ; $( $field:ident $( . $sub_field:ident)* => $value:expr ),* $(,)*) => {{

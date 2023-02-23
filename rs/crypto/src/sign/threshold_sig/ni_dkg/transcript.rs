@@ -27,7 +27,7 @@ mod creation {
     ) -> Result<NiDkgTranscript, DkgCreateTranscriptError> {
         let verified_dealings = NiDkgDealings::new(verified_dealings.clone())?;
         ensure_sufficiently_many_dealings(config, &verified_dealings)?;
-        ensure_dealing_node_ids_in_dealers(&config.dealers(), &verified_dealings);
+        ensure_dealing_node_ids_in_dealers(config.dealers(), &verified_dealings);
         let csp_transcript = create_csp_transcript(ni_dkg_csp_client, config, &verified_dealings)?;
         Ok(NiDkgTranscript {
             dkg_id: config.dkg_id(),
@@ -42,25 +42,15 @@ mod creation {
         config: &NiDkgConfig,
         verified_dealings: &NiDkgDealings,
     ) -> Result<(), DkgCreateTranscriptError> {
-        if verified_dealings.count() <= config.max_corrupt_dealers() {
-            return Err(DkgCreateTranscriptError::InsufficientDealings(
-                InvalidArgumentError { message:
-                    format!("Too few dealings: got {}, need more than {} (the maximum number of corrupt dealers).", verified_dealings.count(), config.max_corrupt_dealers()),
-                }
-            ));
-        }
-        Ok(())
-    }
-
-    fn ensure_sufficiently_many_dealings_for_resharing(
-        verified_dealings: &NiDkgDealings,
-        resharing_transcript: &NiDkgTranscript,
-    ) -> Result<(), DkgCreateTranscriptError> {
-        if verified_dealings.count() < resharing_transcript.threshold.get() {
+        if verified_dealings.count() < config.collection_threshold() {
             return Err(DkgCreateTranscriptError::InsufficientDealings(
                 InvalidArgumentError {
-                    message: format!("Too few dealings for resharing: got {}, need at least {} (threshold in re-sharing transcript).", verified_dealings.count(), resharing_transcript.threshold.get()),
-                }
+                    message: format!(
+                        "Too few dealings: got {}, need at least {} (=collection threshold).",
+                        verified_dealings.count(),
+                        config.collection_threshold()
+                    ),
+                },
             ));
         }
         Ok(())
@@ -93,22 +83,14 @@ mod creation {
         verified_dealings: &NiDkgDealings,
     ) -> Result<CspNiDkgTranscript, DkgCreateTranscriptError> {
         if let Some(resharing_transcript) = &config.resharing_transcript() {
-            ensure_sufficiently_many_dealings_for_resharing(
-                verified_dealings,
-                &resharing_transcript,
-            )?;
-            return Ok(convert_dealings_and_call_create_resharing_transcript(
+            return convert_dealings_and_call_create_resharing_transcript(
                 ni_dkg_csp_client,
                 config,
                 verified_dealings,
-                &resharing_transcript,
-            )?);
+                resharing_transcript,
+            );
         }
-        Ok(convert_dealings_and_call_create_transcript(
-            ni_dkg_csp_client,
-            config,
-            verified_dealings,
-        )?)
+        convert_dealings_and_call_create_transcript(ni_dkg_csp_client, config, verified_dealings)
     }
 
     fn convert_dealings_and_call_create_resharing_transcript<C: NiDkgCspClient>(
@@ -160,6 +142,7 @@ mod creation {
             config.threshold().get(),
             config.receivers().count(),
             csp_dealings,
+            config.collection_threshold(),
         )?)
     }
 
@@ -231,6 +214,7 @@ mod loading {
     use crate::sign::threshold_sig::ni_dkg::utils::epoch;
     use ic_crypto_internal_threshold_sig_bls12381::api::ni_dkg_errors::CspDkgLoadPrivateKeyError;
     use ic_crypto_internal_types::sign::threshold_sig::ni_dkg::CspNiDkgTranscript;
+    use ic_interfaces::crypto::LoadTranscriptResult;
     use ic_logger::info;
     use ic_types::crypto::threshold_sig::ni_dkg::config::receivers::NiDkgReceivers;
     use ic_types::crypto::threshold_sig::ni_dkg::NiDkgId;
@@ -241,27 +225,80 @@ mod loading {
         ni_dkg_csp_client: &C,
         transcript: &NiDkgTranscript,
         logger: &ReplicaLogger,
-    ) -> Result<(), DkgLoadTranscriptError> {
+    ) -> Result<LoadTranscriptResult, DkgLoadTranscriptError> {
         let csp_transcript = CspNiDkgTranscript::from(transcript);
-        if let Some(self_index_in_committee) = transcript.committee.position(*self_node_id) {
-            csp_load_threshold_signing_key(
-                ni_dkg_csp_client,
-                transcript,
-                &csp_transcript,
-                self_index_in_committee,
-            )
-            .or_else(|error|
-                // If the decryption key was not found, the threshold signing key was not loaded.
-                // This is legal, but this node will not be able to threshold sign.
-                map_decryption_key_not_found_error_to_ok_and_log(error, logger))?;
-        }
+
+        let result = attempt_to_load_signing_key(
+            self_node_id,
+            ni_dkg_csp_client,
+            transcript,
+            &csp_transcript,
+            logger,
+        )?;
+
         insert_transcript_data_into_store(
             lockable_threshold_sig_data_store,
             &csp_transcript,
             transcript.dkg_id,
             &transcript.committee,
         );
-        Ok(())
+        Ok(result)
+    }
+
+    fn attempt_to_load_signing_key<C: NiDkgCspClient>(
+        self_node_id: &NodeId,
+        ni_dkg_csp_client: &C,
+        transcript: &NiDkgTranscript,
+        csp_transcript: &CspNiDkgTranscript,
+        logger: &ReplicaLogger,
+    ) -> Result<LoadTranscriptResult, CspDkgLoadPrivateKeyError> {
+        if let Some(self_index_in_committee) = transcript.committee.position(*self_node_id) {
+            let load_private_key_result = csp_load_threshold_signing_key(
+                ni_dkg_csp_client,
+                transcript,
+                csp_transcript,
+                self_index_in_committee,
+            );
+
+            // If the decryption key was not found, or if the decryption key's epoch is
+            // newer than the ciphertext in the transcript, then the threshold
+            // signing key was not loaded. This is legal, but this node will not
+            // be able to threshold sign.
+            match load_private_key_result {
+                Ok(()) => Ok(LoadTranscriptResult::SigningKeyAvailable),
+
+                Err(CspDkgLoadPrivateKeyError::KeyNotFoundError(_)) => {
+                    info!(logger;
+                          crypto.error =>
+                          "Warning: unable to load the threshold signing key because the
+                               decryption key was not found in the secret key store. Still proceeding to insert
+                               the transcript data into the threshold signature data store. Verifying signature
+                               shares, combining shares and verifying combined signatures is still possible, but
+                               signing is not.",
+                    );
+                    Ok(LoadTranscriptResult::SigningKeyUnavailable)
+                }
+                Err(CspDkgLoadPrivateKeyError::EpochTooOldError {
+                    ciphertext_epoch,
+                    secret_key_epoch,
+                }) => {
+                    info!(logger;
+                          crypto.error =>
+                          format!(
+                              "Warning: threshold signing key was found but is for a newer epoch <{}> than this transcript <{}>.
+                                   Still proceeding to insert the transcript data into the threshold signature data store.
+                                   Verifying signature shares, combining shares and verifying combined signatures is still
+                                   possible, but signing is not.", secret_key_epoch, ciphertext_epoch),
+                    );
+                    Ok(LoadTranscriptResult::SigningKeyUnavailableDueToDiscard)
+                }
+                Err(e) => Err(e),
+            }
+        } else {
+            // If our node ID is not listed in the transcript then we
+            // certainly do not have access to the associated key
+            Ok(LoadTranscriptResult::NodeNotInCommittee)
+        }
     }
 
     fn csp_load_threshold_signing_key<C: NiDkgCspClient>(
@@ -300,22 +337,5 @@ mod loading {
             indices.insert(node_id, index);
         });
         indices
-    }
-
-    fn map_decryption_key_not_found_error_to_ok_and_log(
-        load_private_key_error: CspDkgLoadPrivateKeyError,
-        logger: &ReplicaLogger,
-    ) -> Result<(), CspDkgLoadPrivateKeyError> {
-        if let CspDkgLoadPrivateKeyError::KeyNotFoundError(_) = load_private_key_error {
-            info!(logger;
-                crypto.error => "Warning: unable to load the threshold signing key because the
-                decryption key was not found in the secret key store. Still proceeding to insert
-                the transcript data into the threshold signature data store. Verifying signature
-                shares, combining shares and verifying combined signatures is still possible, but
-                signing is not.",
-            );
-            return Ok(());
-        }
-        Err(load_private_key_error)
     }
 }

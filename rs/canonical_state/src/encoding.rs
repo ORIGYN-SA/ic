@@ -10,12 +10,16 @@
 //! concise encoding. This is safe to do given the use of canonical types
 //! covered by compatibility tests.
 
+use crate::CertificationVersion;
 use ic_protobuf::proxy::ProxyDecodeError;
 use ic_replicated_state::metadata_state::SystemMetadata;
-use ic_types::{messages::RequestOrResponse, xnet::StreamHeader};
+use ic_types::{messages::RequestOrResponse, xnet::StreamHeader, PrincipalId};
+use serde::Serialize;
+use std::collections::BTreeSet;
 use std::convert::TryInto;
 
-pub(crate) mod types;
+pub mod old_types;
+pub mod types;
 
 #[cfg(test)]
 mod tests {
@@ -63,8 +67,11 @@ where
 }
 
 /// Encodes a `RequestOrResponse` into canonical CBOR representation.
-pub fn encode_message(msg: &RequestOrResponse) -> Vec<u8> {
-    types::RequestOrResponse::proxy_encode(msg).unwrap()
+pub fn encode_message(
+    msg: &RequestOrResponse,
+    certification_version: CertificationVersion,
+) -> Vec<u8> {
+    types::RequestOrResponse::proxy_encode((msg, certification_version)).unwrap()
 }
 
 /// Decodes a `RequestOrResponse` from canonical CBOR representation.
@@ -73,8 +80,11 @@ pub fn decode_message(bytes: &[u8]) -> Result<RequestOrResponse, ProxyDecodeErro
 }
 
 /// Encodes a `StreamHeader` into canonical CBOR representation.
-pub fn encode_stream_header(header: &StreamHeader) -> Vec<u8> {
-    types::StreamHeader::proxy_encode(header).unwrap()
+pub fn encode_stream_header(
+    header: &StreamHeader,
+    certification_version: CertificationVersion,
+) -> Vec<u8> {
+    types::StreamHeader::proxy_encode((header, certification_version)).unwrap()
 }
 
 /// Decodes a `StreamHeader` from canonical CBOR representation.
@@ -83,6 +93,40 @@ pub fn decode_stream_header(bytes: &[u8]) -> Result<StreamHeader, ProxyDecodeErr
 }
 
 /// Encodes a `SystemMetadata` into canonical CBOR representation.
-pub fn encode_metadata(msg: &SystemMetadata) -> Vec<u8> {
-    types::SystemMetadata::proxy_encode(msg).unwrap()
+pub fn encode_metadata(
+    metadata: &SystemMetadata,
+    certification_version: CertificationVersion,
+) -> Vec<u8> {
+    types::SystemMetadata::proxy_encode((metadata, certification_version)).unwrap()
+}
+
+/// Encodes the list of canister ID ranges assigned to a subnet according to
+/// the interface specification.
+///
+/// See https://sdk.dfinity.org/docs/interface-spec/index.html#state-tree-subnet
+pub fn encode_subnet_canister_ranges(ranges: Option<&Vec<(PrincipalId, PrincipalId)>>) -> Vec<u8> {
+    let mut serializer = serde_cbor::Serializer::new(vec![]);
+    serializer.self_describe().unwrap();
+    match ranges {
+        Some(ranges) => ranges.serialize(&mut serializer).unwrap(),
+        None => Vec::<(PrincipalId, PrincipalId)>::new()
+            .serialize(&mut serializer)
+            .unwrap(),
+    }
+    serializer.into_inner()
+}
+
+/// Serializes controllers as a CBOR list.
+///
+/// From the spec:
+///
+/// The value consists of a CBOR data item with major type 6
+/// (“Semantic tag”) and tag value `55799` followed by an array
+/// of principals in their binary form
+/// (CDDL `#6.55799([* bytes .size (0..29)])`)
+pub fn encode_controllers(controllers: &BTreeSet<PrincipalId>) -> Vec<u8> {
+    let mut serializer = serde_cbor::ser::Serializer::new(vec![]);
+    serializer.self_describe().unwrap();
+    controllers.serialize(&mut serializer).unwrap();
+    serializer.into_inner()
 }

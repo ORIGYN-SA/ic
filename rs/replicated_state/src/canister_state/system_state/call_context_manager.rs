@@ -1,16 +1,24 @@
-use ic_interfaces::{execution_environment::HypervisorError, messages::RequestOrIngress};
+#[cfg(test)]
+mod tests;
+
+use crate::StateError;
+use ic_interfaces::messages::CanisterCallOrTask;
+use ic_interfaces::{execution_environment::HypervisorError, messages::CanisterCall};
 use ic_protobuf::proxy::{try_from_option_field, ProxyDecodeError};
 use ic_protobuf::state::canister_state_bits::v1 as pb;
 use ic_protobuf::types::v1 as pb_types;
+use ic_types::messages::Response;
+use ic_types::Time;
 use ic_types::{
     ingress::WasmResult,
     messages::{CallContextId, CallbackId, MessageId},
     methods::Callback,
-    user_id_into_protobuf, user_id_try_from_protobuf, CanisterId, Cycles, Funds, UserId, ICP,
+    user_id_into_protobuf, user_id_try_from_protobuf, CanisterId, Cycles, Funds, UserId,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::convert::{From, TryFrom, TryInto};
+use std::time::Duration;
 
 /// Call context contains all context information related to an incoming call.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -30,6 +38,10 @@ pub struct CallContext {
 
     /// Cycles that were sent in the request that created the CallContext.
     available_cycles: Cycles,
+
+    /// Time that the call context was created. This field is only optional to
+    /// accomodate contexts that were created before this field was created.
+    time: Option<Time>,
 }
 
 impl CallContext {
@@ -38,12 +50,14 @@ impl CallContext {
         responded: bool,
         deleted: bool,
         available_cycles: Cycles,
+        time: Time,
     ) -> Self {
         Self {
             call_origin,
             responded,
             deleted,
             available_cycles,
+            time: Some(time),
         }
     }
 
@@ -87,18 +101,25 @@ impl CallContext {
 
     /// Mark the call context as responded.
     pub fn mark_responded(&mut self) {
+        self.available_cycles = Cycles::new(0);
         self.responded = true;
+    }
+
+    /// The time at which the call context was created.
+    pub fn time(&self) -> Option<Time> {
+        self.time
     }
 }
 
 impl From<&CallContext> for pb::CallContext {
     fn from(item: &CallContext) -> Self {
-        let funds = Funds::new(item.available_cycles, ICP::zero());
+        let funds = Funds::new(item.available_cycles);
         Self {
             call_origin: Some((&item.call_origin).into()),
             responded: item.responded,
             deleted: item.deleted,
             available_funds: Some((&funds).into()),
+            time_nanos: item.time.map(|t| t.as_nanos_since_unix_epoch()),
         }
     }
 }
@@ -114,6 +135,7 @@ impl TryFrom<pb::CallContext> for CallContext {
             responded: value.responded,
             deleted: value.deleted,
             available_cycles: funds.cycles(),
+            time: value.time_nanos.map(Time::from_nanos_since_unix_epoch),
         })
     }
 }
@@ -126,9 +148,9 @@ pub enum CallContextError {
     },
 }
 
-impl Into<HypervisorError> for CallContextError {
-    fn into(self) -> HypervisorError {
-        match self {
+impl From<CallContextError> for HypervisorError {
+    fn from(val: CallContextError) -> Self {
+        match val {
             CallContextError::InsufficientCyclesInCall {
                 available,
                 requested,
@@ -197,7 +219,8 @@ pub enum CallOrigin {
     CanisterUpdate(CanisterId, CallbackId),
     Query(UserId),
     CanisterQuery(CanisterId, CallbackId),
-    Heartbeat,
+    /// System task is either a Heartbeat or a GlobalTimer.
+    SystemTask,
 }
 
 impl From<&CallOrigin> for pb::call_context::CallOrigin {
@@ -220,7 +243,7 @@ impl From<&CallOrigin> for pb::call_context::CallOrigin {
                     callback_id: callback_id.get(),
                 })
             }
-            CallOrigin::Heartbeat => Self::Heartbeat(pb::call_context::Heartbeat {}),
+            CallOrigin::SystemTask => Self::SystemTask(pb::call_context::SystemTask {}),
         }
     }
 }
@@ -260,7 +283,7 @@ impl TryFrom<pb::call_context::CallOrigin> for CallOrigin {
                 try_from_option_field(canister_id, "CallOrigin::CanisterQuery::canister_id")?,
                 callback_id.into(),
             ),
-            pb::call_context::CallOrigin::Heartbeat { .. } => Self::Heartbeat,
+            pb::call_context::CallOrigin::SystemTask { .. } => Self::SystemTask,
         };
         Ok(call_origin)
     }
@@ -269,7 +292,12 @@ impl TryFrom<pb::call_context::CallOrigin> for CallOrigin {
 impl CallContextManager {
     /// Must be used to create a new call context at the beginning of every new
     /// ingress or inter-canister message.
-    pub fn new_call_context(&mut self, call_origin: CallOrigin, cycles: Cycles) -> CallContextId {
+    pub fn new_call_context(
+        &mut self,
+        call_origin: CallOrigin,
+        cycles: Cycles,
+        time: Time,
+    ) -> CallContextId {
         self.next_call_context_id += 1;
         let id = CallContextId::from(self.next_call_context_id);
         self.call_contexts.insert(
@@ -279,6 +307,7 @@ impl CallContextManager {
                 responded: false,
                 deleted: false,
                 available_cycles: cycles,
+                time: Some(time),
             },
         );
         id
@@ -309,21 +338,73 @@ impl CallContextManager {
         &self.callbacks
     }
 
+    /// Returns a reference to the callback with `callback_id`.
+    pub fn callback(&self, callback_id: &CallbackId) -> Option<&Callback> {
+        self.callbacks.get(callback_id)
+    }
+
+    /// Validates the given response before inducting it into the queue.
+    /// Verifies that the stored respondent and originator associated with the
+    /// `callback_id` match with details provided by the response.
+    ///
+    /// Returns a `StateError::NonMatchingResponse` if could not find the `callback_id` or
+    /// if the response is not valid.
+    pub(crate) fn validate_response(&self, response: &Response) -> Result<(), StateError> {
+        match self.callback(&response.originator_reply_callback) {
+            Some(callback) => {
+                // (EXC-877) Once this is deployed in production,
+                // it's safe to make `respondent` and `originator` non-optional.
+                // Currently optional to ensure backwards compatibility.
+                match (callback.respondent, callback.originator) {
+                    (Some(respondent), Some(originator))
+                        if response.respondent != respondent
+                            || response.originator != originator =>
+                    {
+                        Err(StateError::NonMatchingResponse {
+                                err_str: format!(
+                                    "invalid details, expected => [originator => {}, respondent => {}], but got response with",
+                                    originator, respondent,
+                                ),
+                                originator: response.originator,
+                                callback_id: response.originator_reply_callback,
+                                respondent: response.respondent,
+                            })
+                    }
+                    _ => Ok(()),
+                }
+            }
+            None => {
+                // Received an unknown callback ID.
+                Err(StateError::NonMatchingResponse {
+                    err_str: "unknown callback id".to_string(),
+                    originator: response.originator,
+                    callback_id: response.originator_reply_callback,
+                    respondent: response.respondent,
+                })
+            }
+        }
+    }
+
     /// Accepts a canister result and produces an action that should be taken
     /// by the caller.
     pub fn on_canister_result(
         &mut self,
         call_context_id: CallContextId,
+        callback_id: Option<CallbackId>,
         result: Result<Option<WasmResult>, HypervisorError>,
     ) -> CallContextAction {
         enum OutstandingCalls {
             Yes,
             No,
-        };
+        }
         enum Responded {
             Yes,
             No,
-        };
+        }
+
+        if let Some(callback_id) = callback_id {
+            self.unregister_callback(callback_id);
+        }
 
         let outstanding_calls = if self.outstanding_calls(call_context_id) > 0 {
             OutstandingCalls::Yes
@@ -369,11 +450,9 @@ impl CallContextManager {
                 CallContextAction::Reply { payload, refund }
             }
             (Ok(Some(WasmResult::Reply(payload))), Responded::No, OutstandingCalls::Yes) => {
-                context.responded = true;
-                CallContextAction::Reply {
-                    payload,
-                    refund: context.available_cycles,
-                }
+                let refund = context.available_cycles;
+                context.mark_responded();
+                CallContextAction::Reply { payload, refund }
             }
 
             (Ok(Some(WasmResult::Reject(payload))), Responded::No, OutstandingCalls::No) => {
@@ -382,11 +461,9 @@ impl CallContextManager {
                 CallContextAction::Reject { payload, refund }
             }
             (Ok(Some(WasmResult::Reject(payload))), Responded::No, OutstandingCalls::Yes) => {
-                context.responded = true;
-                CallContextAction::Reject {
-                    payload,
-                    refund: context.available_cycles,
-                }
+                let refund = context.available_cycles;
+                context.mark_responded();
+                CallContextAction::Reject { payload, refund }
             }
 
             (Err(error), Responded::No, OutstandingCalls::No) => {
@@ -427,13 +504,6 @@ impl CallContextManager {
         self.callbacks.remove(&callback_id)
     }
 
-    pub fn unregister_call_context(
-        &mut self,
-        call_context_id: CallContextId,
-    ) -> Option<CallContext> {
-        self.call_contexts.remove(&call_context_id)
-    }
-
     /// Returns the call origin, which is either the message id of the ingress
     /// message or the canister id of the canister that sent the initial
     /// request.
@@ -456,17 +526,71 @@ impl CallContextManager {
             .filter(|(_, callback)| callback.call_context_id == call_context_id)
             .count()
     }
+
+    /// Returns true iff all open call contexts are marked as deleted
+    /// and all outstanding callbacks refer to open call contexts.
+    pub fn canister_ready_to_stop(&self) -> bool {
+        self.call_contexts()
+            .iter()
+            .all(|(_, ctxt)| ctxt.is_deleted())
+            && self
+                .callbacks
+                .iter()
+                .all(|(_, callback)| self.call_contexts.contains_key(&callback.call_context_id))
+    }
+
+    /// Expose the `next_callback_id` field so that the canister sandbox can
+    /// predict what the new ids will be.
+    pub fn next_callback_id(&self) -> u64 {
+        self.next_callback_id
+    }
+
+    /// Returns a collection of all call contexts older than the provided age.
+    pub fn call_contexts_older_than(
+        &self,
+        current_time: Time,
+        age: Duration,
+    ) -> Vec<(&CallOrigin, Time)> {
+        // Call contexts are stored in order of increasing CallContextId, and
+        // the IDs are generated sequentially, so we are iterating in order of
+        // creation time. This means we can stop as soon as we encounter a call
+        // context that isn't old enough.
+        self.call_contexts
+            .iter()
+            .take_while(|(_, call_context)| match call_context.time() {
+                Some(context_time) => context_time + age <= current_time,
+                None => true,
+            })
+            .filter_map(|(_, call_context)| {
+                if let Some(time) = call_context.time() {
+                    if !call_context.is_deleted() {
+                        return Some((call_context.call_origin(), time));
+                    }
+                }
+                None
+            })
+            .collect()
+    }
 }
 
-impl From<&RequestOrIngress> for CallOrigin {
-    fn from(msg: &RequestOrIngress) -> Self {
+impl From<&CanisterCall> for CallOrigin {
+    fn from(msg: &CanisterCall) -> Self {
         match msg {
-            RequestOrIngress::Request(request) => {
+            CanisterCall::Request(request) => {
                 CallOrigin::CanisterUpdate(request.sender, request.sender_reply_callback)
             }
-            RequestOrIngress::Ingress(ingress) => {
+            CanisterCall::Ingress(ingress) => {
                 CallOrigin::Ingress(ingress.source, ingress.message_id.clone())
             }
+        }
+    }
+}
+
+impl From<&CanisterCallOrTask> for CallOrigin {
+    fn from(call_or_task: &CanisterCallOrTask) -> Self {
+        match call_or_task {
+            CanisterCallOrTask::Call(call) => CallOrigin::from(call),
+            CanisterCallOrTask::Task(_) => CallOrigin::SystemTask,
         }
     }
 }
@@ -528,219 +652,5 @@ impl TryFrom<pb::CallContextManager> for CallContextManager {
             call_contexts,
             callbacks,
         })
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use ic_test_utilities::types::ids::canister_test_id;
-    use ic_types::methods::WasmClosure;
-
-    #[test]
-    fn call_context_origin() {
-        let mut ccm = CallContextManager::default();
-        let id = canister_test_id(42);
-        let cb_id = CallbackId::from(1);
-        let cc_id = ccm.new_call_context(CallOrigin::CanisterUpdate(id, cb_id), Cycles::from(10));
-        assert_eq!(
-            ccm.call_contexts().get(&cc_id).unwrap().call_origin,
-            CallOrigin::CanisterUpdate(id, cb_id)
-        );
-    }
-
-    #[test]
-    // This test is close to the minimal one and I don't want to delete comments
-    #[allow(clippy::cognitive_complexity)]
-    fn call_context_handling() {
-        let mut ccm = CallContextManager::default();
-
-        // On two incoming calls
-        let cc_id = ccm.new_call_context(
-            CallOrigin::CanisterUpdate(canister_test_id(123), CallbackId::from(1)),
-            Cycles::from(0),
-        );
-        let cc_id2 = ccm.new_call_context(
-            CallOrigin::CanisterUpdate(canister_test_id(123), CallbackId::from(2)),
-            Cycles::from(0),
-        );
-
-        let cc_id3 = ccm.new_call_context(
-            CallOrigin::CanisterUpdate(canister_test_id(123), CallbackId::from(3)),
-            Cycles::from(0),
-        );
-
-        // Call context 3 was not responded and does not have outstanding calls,
-        // so we should generate the response ourselves.
-        assert_eq!(
-            ccm.on_canister_result(cc_id3, Ok(None)),
-            CallContextAction::NoResponse {
-                refund: Cycles::from(0),
-            }
-        );
-
-        // First they're unanswered
-        assert!(!ccm.call_contexts().get(&cc_id).unwrap().responded);
-        assert!(!ccm.call_contexts().get(&cc_id2).unwrap().responded);
-
-        // First call (CallContext 1) makes two outgoing calls
-        let cb_id = ccm.register_callback(Callback::new(
-            cc_id,
-            Cycles::from(0),
-            WasmClosure::new(0, 1),
-            WasmClosure::new(2, 3),
-            None,
-        ));
-        let cb_id2 = ccm.register_callback(Callback::new(
-            cc_id,
-            Cycles::from(0),
-            WasmClosure::new(4, 5),
-            WasmClosure::new(6, 7),
-            None,
-        ));
-
-        // There are 2 ougoing calls
-        assert_eq!(ccm.outstanding_calls(cc_id), 2);
-
-        // Second one (CallContext 2) has one outgoing call
-        let cb_id3 = ccm.register_callback(Callback::new(
-            cc_id2,
-            Cycles::from(0),
-            WasmClosure::new(8, 9),
-            WasmClosure::new(10, 11),
-            None,
-        ));
-        // There is 1 outgoing call
-        assert_eq!(ccm.outstanding_calls(cc_id2), 1);
-
-        assert_eq!(ccm.callbacks().len(), 3);
-
-        // Still unanswered
-        assert!(!ccm.call_contexts().get(&cc_id).unwrap().responded);
-        assert!(!ccm.call_contexts().get(&cc_id2).unwrap().responded);
-
-        // One outstanding call is closed
-        let callback = ccm.unregister_callback(cb_id).unwrap();
-        assert_eq!(
-            callback.on_reply,
-            WasmClosure {
-                func_idx: 0,
-                env: 1
-            }
-        );
-        assert_eq!(
-            callback.on_reject,
-            WasmClosure {
-                func_idx: 2,
-                env: 3
-            }
-        );
-        assert_eq!(ccm.callbacks().len(), 2);
-        // There is 1 outstanding call left
-        assert_eq!(ccm.outstanding_calls(cc_id), 1);
-
-        assert_eq!(
-            ccm.on_canister_result(cc_id, Ok(Some(WasmResult::Reply(vec![1])))),
-            CallContextAction::Reply {
-                payload: vec![1],
-                refund: Cycles::from(0),
-            }
-        );
-
-        // CallContext 1 is answered, CallContext 2 is not
-        assert!(ccm.call_contexts().get(&cc_id).unwrap().responded);
-        assert!(!ccm.call_contexts().get(&cc_id2).unwrap().responded);
-
-        // The outstanding call of CallContext 2 is back
-        let callback = ccm.unregister_callback(cb_id3).unwrap();
-        assert_eq!(
-            callback.on_reply,
-            WasmClosure {
-                func_idx: 8,
-                env: 9
-            }
-        );
-        assert_eq!(
-            callback.on_reject,
-            WasmClosure {
-                func_idx: 10,
-                env: 11
-            }
-        );
-
-        // Only one outstanding call left
-        assert_eq!(ccm.callbacks().len(), 1);
-
-        // Since we didn't mark CallContext 2 as answered we still have two
-        assert_eq!(ccm.call_contexts().len(), 2);
-
-        // We mark the CallContext 2 as responded and it is deleted as it has no
-        // outstanding calls
-        assert_eq!(
-            ccm.on_canister_result(cc_id2, Ok(Some(WasmResult::Reply(vec![])))),
-            CallContextAction::Reply {
-                payload: vec![],
-                refund: Cycles::from(0),
-            }
-        );
-        assert_eq!(ccm.call_contexts().len(), 1);
-
-        // the last outstanding call of CallContext 1 is finished
-        let callback = ccm.unregister_callback(cb_id2).unwrap();
-        assert_eq!(
-            callback.on_reply,
-            WasmClosure {
-                func_idx: 4,
-                env: 5
-            }
-        );
-        assert_eq!(
-            callback.on_reject,
-            WasmClosure {
-                func_idx: 6,
-                env: 7
-            }
-        );
-        assert_eq!(
-            ccm.on_canister_result(cc_id, Ok(None)),
-            CallContextAction::AlreadyResponded
-        );
-
-        // Since CallContext 1 was already responded, make sure we're in a clean state
-        assert_eq!(ccm.callbacks().len(), 0);
-        assert_eq!(ccm.call_contexts().len(), 0);
-    }
-
-    #[test]
-    fn withdraw_cycles_fails_when_not_enough_available_cycles() {
-        let mut ccm = CallContextManager::default();
-        let id = canister_test_id(42);
-        let cb_id = CallbackId::from(1);
-        let cc_id = ccm.new_call_context(CallOrigin::CanisterUpdate(id, cb_id), Cycles::from(30));
-
-        assert_eq!(
-            ccm.call_context_mut(cc_id)
-                .unwrap()
-                .withdraw_cycles(Cycles::from(40)),
-            Err(CallContextError::InsufficientCyclesInCall {
-                available: Cycles::from(30),
-                requested: Cycles::from(40),
-            })
-        );
-    }
-
-    #[test]
-    fn withdraw_cycles_succeeds_when_enough_available_cycles() {
-        let mut ccm = CallContextManager::default();
-        let id = canister_test_id(42);
-        let cb_id = CallbackId::from(1);
-        let cc_id = ccm.new_call_context(CallOrigin::CanisterUpdate(id, cb_id), Cycles::from(30));
-
-        assert_eq!(
-            ccm.call_context_mut(cc_id)
-                .unwrap()
-                .withdraw_cycles(Cycles::from(25)),
-            Ok(())
-        );
     }
 }

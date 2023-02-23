@@ -1,5 +1,6 @@
 use ic_logger::{warn, ReplicaLogger};
 use ic_utils::fs::copy_file_sparse;
+use std::io::Error;
 use std::path::Path;
 
 /// Copies `src` into `dst`.
@@ -14,10 +15,22 @@ pub fn do_copy(log: &ReplicaLogger, src: &Path, dst: &Path) -> std::io::Result<(
     static ON_COW_FS: AtomicBool = AtomicBool::new(true);
     static SAME_FS: AtomicBool = AtomicBool::new(true);
 
+    let on_err = |e: Error| -> Error {
+        Error::new(
+            e.kind(),
+            format!(
+                "failed to copy {} -> {}: {}",
+                src.display(),
+                dst.display(),
+                e
+            ),
+        )
+    };
+
     if ON_COW_FS.load(Ordering::Relaxed) && SAME_FS.load(Ordering::Relaxed) {
         match ic_sys::fs::clone_file(src, dst) {
             Err(FileCloneError::DifferentFileSystems) => {
-                if SAME_FS.compare_and_swap(true, false, Ordering::Relaxed) {
+                if SAME_FS.swap(false, Ordering::Relaxed) {
                     warn!(
                         log,
                         "state_manager.state_root spans multiple filesystems \
@@ -26,11 +39,11 @@ pub fn do_copy(log: &ReplicaLogger, src: &Path, dst: &Path) -> std::io::Result<(
                         dst.display()
                     );
                 }
-                copy_file_sparse(src, dst)?;
+                copy_file_sparse(src, dst).map_err(on_err)?;
                 Ok(())
             }
             Err(FileCloneError::OperationNotSupported) => {
-                if ON_COW_FS.compare_and_swap(true, false, Ordering::Relaxed) {
+                if ON_COW_FS.swap(false, Ordering::Relaxed) {
                     warn!(
                         log,
                         "StateManager runs on a filesystem not supporting reflinks \
@@ -39,14 +52,22 @@ pub fn do_copy(log: &ReplicaLogger, src: &Path, dst: &Path) -> std::io::Result<(
                         dst.display(),
                     );
                 }
-                copy_file_sparse(src, dst)?;
+                copy_file_sparse(src, dst).map_err(on_err)?;
                 Ok(())
             }
-            Err(FileCloneError::IoError(e)) => Err(e),
+            Err(FileCloneError::IoError(e)) => Err(Error::new(
+                e.kind(),
+                format!(
+                    "failed to clone {} -> {}: {}",
+                    src.display(),
+                    dst.display(),
+                    e
+                ),
+            )),
             Ok(()) => Ok(()),
         }
     } else {
-        copy_file_sparse(src, dst)?;
+        copy_file_sparse(src, dst).map_err(on_err)?;
         Ok(())
     }
 }
@@ -55,7 +76,7 @@ pub fn do_copy(log: &ReplicaLogger, src: &Path, dst: &Path) -> std::io::Result<(
 /// it exists
 pub fn do_copy_overwrite(log: &ReplicaLogger, src: &Path, dst: &Path) -> std::io::Result<()> {
     if dst.exists() {
-        std::fs::remove_file(&dst)?;
+        std::fs::remove_file(dst)?;
     }
     do_copy(log, src, dst)
 }

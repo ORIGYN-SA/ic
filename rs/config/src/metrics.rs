@@ -1,4 +1,3 @@
-use ic_protobuf::registry::crypto::v1::X509PublicKeyCert;
 use serde::{Deserialize, Serialize};
 use std::{net::SocketAddr, path::PathBuf};
 
@@ -13,16 +12,37 @@ pub enum Exporter {
     File(PathBuf),
 }
 
-impl Default for Exporter {
+impl Default for Config {
     fn default() -> Self {
-        Exporter::Log
+        Self {
+            exporter: Exporter::Log,
+            connection_read_timeout_seconds: 300, // 5 min
+            max_outstanding_connections: 20,
+            max_concurrent_requests: 50,
+            request_timeout_seconds: 30,
+        }
     }
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct Config {
     pub exporter: Exporter,
-    /// Clients X509 certificate used for establishing TLS protocol. The field
-    /// is base64 encoded DER certificate.
-    pub clients_x509_cert: Option<X509PublicKeyCert>,
+
+    /// If no bytes are read from a connection for the duration of
+    /// 'connection_read_timeout_seconds', then the connection is dropped.
+    /// There is no point is setting a timeout on the write bytes since
+    /// they are conditioned on the received requests.
+    pub connection_read_timeout_seconds: u64,
+
+    /// We can serve from at most 'max_outstanding_connections'
+    /// live TCP connections. If we are at the limit and a new
+    /// TCP connection arrives, we accept and drop it immediately.
+    pub max_outstanding_connections: usize,
+
+    /// There can be at most 'max_concurrent_requests' in-flight requests.
+    pub max_concurrent_requests: usize,
+
+    /// Per request timeout in seconds before the server replies with 504 Gateway Timeout.
+    pub request_timeout_seconds: u64,
 }

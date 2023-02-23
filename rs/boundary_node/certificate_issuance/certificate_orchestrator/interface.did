@@ -1,0 +1,198 @@
+type Id = text;
+type Name = text;
+type Canister = principal;
+type Timestamp = nat64;
+
+type State = variant {
+    failed: text;
+    pendingOrder;
+    pendingChallengeResponse;
+    pendingAcmeApproval;
+    available;
+};
+
+type Registration = record {
+    name: Name;
+    canister: principal;
+    state: State;
+};
+
+type EncryptedPair = record {
+    blob; // privateKey
+    blob; // certificate
+};
+
+type ExportPackage = record {
+    name: Name;
+    canister: principal;
+    pair: EncryptedPair;
+};
+
+type InitArg = record {
+    rootPrincipals: vec principal;
+    idSeed: nat;
+};
+
+type CreateRegistrationError = variant {
+    Duplicate: Id;
+    NameError: text;
+    Unauthorized;
+    UnexpectedError: text;
+};
+
+type CreateRegistrationResponse = variant {
+    Ok: Id;
+    Err: CreateRegistrationError;
+};
+
+type GetRegistrationError = variant {
+    NotFound;
+    Unauthorized;
+    UnexpectedError: text;
+};
+
+type GetRegistrationResponse = variant {
+    Ok: Registration;
+    Err: GetRegistrationError;
+};
+
+type UpdateType = variant {
+    Canister: principal;
+    State: State;
+};
+
+type UpdateRegistrationError = variant {
+    NotFound;
+    Unauthorized;
+    UnexpectedError: text;
+};
+
+type UpdateRegistrationResponse = variant {
+    Ok;
+    Err: UpdateRegistrationError;
+};
+
+type RemoveRegistrationError = variant {
+    NotFound;
+    Unauthorized;
+    UnexpectedError: text;
+};
+
+type RemoveRegistrationResponse = variant {
+    Ok;
+    Err: RemoveRegistrationError;
+};
+
+type UploadCertificateError = variant {
+    NotFound;
+    Unauthorized;
+    UnexpectedError: text;
+};
+
+type UploadCertificateResponse = variant {
+    Ok;
+    Err: UploadCertificateError;
+};
+
+type ExportCertificatesError = variant {
+    Unauthorized;
+    UnexpectedError: text;
+};
+
+type ExportCertificatesResponse = variant {
+    Ok: vec ExportPackage;
+    Err: ExportCertificatesError;
+};
+
+type QueueTaskError = variant {
+    NotFound;
+    Unauthorized;
+    UnexpectedError: text;
+};
+
+type QueueTaskResponse = variant {
+    Ok;
+    Err: QueueTaskError;
+};
+
+type PeekTaskError = variant {
+    NoTasksAvailable;
+    Unauthorized;
+    UnexpectedError: text;
+};
+
+type PeekTaskResponse = variant {
+    Ok: Id;
+    Err: PeekTaskError;
+};
+
+type DispenseTaskError = variant {
+    NoTasksAvailable;
+    Unauthorized;
+    UnexpectedError: text;
+};
+
+type DispenseTaskResponse = variant {
+    Ok: Id;
+    Err: DispenseTaskError;
+};
+
+type ModifyAllowedPrincipalError = variant {
+    Unauthorized;
+    UnexpectedError: text;
+};
+
+type ModifyAllowedPrincipalResponse = variant {
+    Ok;
+    Err: ModifyAllowedPrincipalError;
+};
+
+type ListAllowedPrincipalsError = variant {
+    Unauthorized;
+    UnexpectedError: text;
+};
+
+type LisAllowedPrincipalsResponse = variant {
+    Ok: vec principal;
+    Err: ListAllowedPrincipalsError;
+};
+
+type HeaderField = record { text; text; };
+
+type HttpRequest = record {
+  method: text;
+  url: text;
+  headers: vec HeaderField;
+  body: blob;
+};
+
+type HttpResponse = record {
+  status_code: nat16;
+  headers: vec HeaderField;
+  body: blob;
+};
+
+service: (InitArg) -> {
+    // Registrations
+    createRegistration: (Name, Canister) -> (CreateRegistrationResponse);
+    getRegistration: (Id) -> (GetRegistrationResponse) query;
+    updateRegistration: (Id, UpdateType) -> (UpdateRegistrationResponse);
+    removeRegistration: (Id) -> (RemoveRegistrationResponse);
+
+    // Certificates
+    uploadCertificate: (Id, EncryptedPair) -> (UploadCertificateResponse);
+    exportCertificates: () -> (ExportCertificatesResponse);
+
+    // Tasks
+    queueTask: (Id, Timestamp) -> (QueueTaskResponse);
+    dispenseTask: () -> (DispenseTaskResponse);
+    peekTask: () -> (PeekTaskResponse) query;
+
+    // Metrics (Http Interface)
+    http_request: (HttpRequest) -> (HttpResponse) query;
+
+    // ACL
+    listAllowedPrincipals: () -> (LisAllowedPrincipalsResponse) query;
+    addAllowedPrincipal: (principal) -> (ModifyAllowedPrincipalResponse);
+    rmAllowedPrincipal: (principal) -> (ModifyAllowedPrincipalResponse);
+};

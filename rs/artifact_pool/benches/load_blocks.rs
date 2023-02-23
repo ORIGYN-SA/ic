@@ -3,18 +3,17 @@
 
 use criterion::{criterion_group, criterion_main, Criterion};
 use ic_artifact_pool::consensus_pool::ConsensusPoolImpl;
-use ic_consensus_message::{make_genesis, ConsensusMessageHashable};
 use ic_interfaces::consensus_pool::{ChangeAction, ChangeSet, ConsensusPool, MutableConsensusPool};
 use ic_logger::replica_logger::no_op_logger;
 use ic_test_utilities::FastForwardTimeSource;
 use ic_test_utilities::{
-    consensus::fake::*,
+    consensus::{fake::*, make_genesis},
     types::ids::{node_test_id, subnet_test_id},
     types::messages::SignedIngressBuilder,
 };
 use ic_types::{
-    batch::{BatchPayload, IngressPayload, XNetPayload},
-    consensus::{dkg, Block, BlockProposal, HasHeight, Payload, Rank},
+    batch::{BatchPayload, IngressPayload},
+    consensus::{dkg, Block, BlockProposal, ConsensusMessageHashable, HasHeight, Payload, Rank},
     Height,
 };
 
@@ -52,17 +51,20 @@ fn prepare(pool: &mut ConsensusPoolImpl, num: usize) {
         let ingress = IngressPayload::from(vec![SignedIngressBuilder::new()
             .method_payload(vec![0; 128 * 1024])
             .build()]);
-        let xnet = XNetPayload::default();
         block.payload = Payload::new(
-            ic_crypto::crypto_hash,
+            ic_types::crypto::crypto_hash,
             (
-                BatchPayload::new(ingress, xnet),
+                BatchPayload {
+                    ingress,
+                    ..BatchPayload::default()
+                },
                 dkg::Dealings::new_empty(parent.payload.as_ref().dkg_interval_start_height()),
+                None,
             )
                 .into(),
         );
         let proposal = BlockProposal::fake(block, node_test_id(i as u64));
-        changeset.push(ChangeAction::AddToValidated(proposal.to_message()));
+        changeset.push(ChangeAction::AddToValidated(proposal.into_message()));
     }
     let time_source = FastForwardTimeSource::new();
     pool.apply_changes(time_source.as_ref(), changeset);
@@ -82,7 +84,7 @@ fn sum_ingress_counts(pool: &dyn ConsensusPool) -> usize {
         .get_all()
         .map(|proposal| {
             let block: Block = proposal.into();
-            let batch = block.payload.as_ref().as_batch_payload();
+            let batch = &block.payload.as_ref().as_data().batch;
             batch.ingress.message_count()
         })
         .sum::<usize>()

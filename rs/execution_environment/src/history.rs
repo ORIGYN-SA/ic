@@ -1,16 +1,13 @@
-use ic_interfaces::{
-    execution_environment::{IngressHistoryError, IngressHistoryReader, IngressHistoryWriter},
-    state_manager::StateReader,
+use ic_config::execution_environment::Config;
+use ic_error_types::{ErrorCode, RejectCode};
+use ic_interfaces::execution_environment::{
+    IngressHistoryError, IngressHistoryReader, IngressHistoryWriter,
 };
+use ic_interfaces_state_manager::{StateManagerError, StateReader};
 use ic_logger::{fatal, ReplicaLogger};
 use ic_metrics::{buckets::decimal_buckets, MetricsRegistry, Timer};
 use ic_replicated_state::ReplicatedState;
-use ic_types::{
-    ingress::IngressStatus,
-    messages::MessageId,
-    user_error::{ErrorCode, RejectCode},
-    Height, Time,
-};
+use ic_types::{ingress::IngressState, ingress::IngressStatus, messages::MessageId, Height, Time};
 use prometheus::{Histogram, HistogramVec};
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
@@ -46,7 +43,15 @@ impl IngressHistoryReader for IngressHistoryReaderImpl {
         &self,
         height: Height,
     ) -> Result<Box<dyn Fn(&MessageId) -> IngressStatus>, IngressHistoryError> {
-        let labeled_state = self.state_reader.get_state_at(height)?;
+        let labeled_state = self
+            .state_reader
+            .get_state_at(height)
+            .map_err(|e| match e {
+                StateManagerError::StateRemoved(h) => IngressHistoryError::StateRemoved(h),
+                StateManagerError::StateNotCommittedYet(h) => {
+                    IngressHistoryError::StateNotAvailableYet(h)
+                }
+            })?;
         let history = labeled_state.take().get_ingress_history();
         Ok(Box::new(move |message_id| {
             history
@@ -69,6 +74,7 @@ struct TransitionStartTime {
 /// Struct that implements the ingress history writer trait. Consumers of this
 /// trait can use this to update the ingress history.
 pub struct IngressHistoryWriterImpl {
+    config: Config,
     log: ReplicaLogger,
     // Wrapped in a RwLock for interior mutability, otherwise &self in methods
     // has to be &mut self.
@@ -80,38 +86,43 @@ pub struct IngressHistoryWriterImpl {
 }
 
 impl IngressHistoryWriterImpl {
-    pub fn new(log: ReplicaLogger, metrics_registry: &MetricsRegistry) -> Self {
+    pub fn new(config: Config, log: ReplicaLogger, metrics_registry: &MetricsRegistry) -> Self {
         Self {
+            config,
             log,
             received_time: RwLock::new(HashMap::new()),
             message_state_transition_completed_ic_duration_seconds: metrics_registry.histogram(
                 "message_state_transition_completed_ic_duration_seconds",
                 "The IC time taken for a message to transition from the Received state to Completed state",
-                decimal_buckets(-4, 0),
+                // 100μs, 200μs, 500μs, ..., 10s, 20s, 50s
+                decimal_buckets(-4, 1),
             ),
             message_state_transition_completed_wall_clock_duration_seconds: metrics_registry.histogram(
                 "message_state_transition_completed_wallclock_duration_seconds",
                 "The wall-clock time taken for a message to transition from the Received state to Completed state",
-                decimal_buckets(-4, 0),
+                // 100μs, 200μs, 500μs, ..., 10s, 20s, 50s
+                decimal_buckets(-4, 1),
             ),
             message_state_transition_failed_ic_duration_seconds: metrics_registry.histogram_vec(
                 "message_state_transition_failed_ic_duration_seconds",
                 "The IC time taken for a message to transition from the Received state to Failed state",
+                // 100μs, 200μs, 500μs, ..., 10s, 20s, 50s
+                decimal_buckets(-4, 1),
                 // The `reject_code` label corresponds to the rejection codes described in
                 // the public spec.
                 // The `user_error_code` label is internal information that provides more
                 // detail about the reason for rejection.
-                decimal_buckets(-4, 0),
                 &["reject_code", "user_error_code"],
             ),
             message_state_transition_failed_wall_clock_duration_seconds: metrics_registry.histogram_vec(
                 "message_state_transition_failed_wall_clock_duration_seconds",
                 "The wall-clock time taken for a message to transition from the Received state to Failed state",
+                // 100μs, 200μs, 500μs, ..., 10s, 20s, 50s
+                decimal_buckets(-4, 1),
                 // The `reject_code` label corresponds to the rejection codes described in
                 // the public spec.
                 // The `user_error_code` label is internal information that provides more
                 // detail about the reason for rejection.
-                decimal_buckets(-4, 0),
                 &["reject_code", "user_error_code"],
             )
         }
@@ -126,26 +137,39 @@ impl IngressHistoryWriter for IngressHistoryWriterImpl {
         let current_status = state.get_ingress_status(&message_id);
 
         // Guard against an invalid state transition
+        use IngressState::*;
         use IngressStatus::*;
-        match (&current_status, &status) {
-            (Unknown, _) => {}
-            (Received { .. }, Processing { .. }) => {}
-            (Received { .. }, Completed { .. }) => {}
-            (Received { .. }, Failed { .. }) => {}
-            (Processing { .. }, Processing { .. }) => {}
-            (Processing { .. }, Completed { .. }) => {}
-            (Processing { .. }, Failed { .. }) => {}
-            _ => fatal!(
+        if match (&current_status, &status) {
+            (Unknown, _) => false,
+            (Known { .. }, Unknown) => true,
+            (
+                Known {
+                    state: current_state,
+                    ..
+                },
+                Known { state, .. },
+            ) => !matches!(
+                (&current_state, &state),
+                (Received, Processing)
+                    | (Received, Completed(_))
+                    | (Received, Failed(_))
+                    | (Processing, Processing)
+                    | (Processing, Completed(_))
+                    | (Processing, Failed(_))
+            ),
+        } {
+            fatal!(
                 self.log,
                 "message (id='{}', current_status='{:?}') cannot be transitioned to '{:?}'",
                 message_id,
                 current_status,
                 status
-            ),
+            );
         }
-
         match &status {
-            Received { .. } => {
+            Known {
+                state: Received, ..
+            } => {
                 let mut map = self.received_time.write().unwrap();
                 map.insert(
                     message_id.clone(),
@@ -155,7 +179,10 @@ impl IngressHistoryWriter for IngressHistoryWriterImpl {
                     },
                 );
             }
-            Completed { .. } => {
+            Known {
+                state: Completed(_),
+                ..
+            } => {
                 if let Some((ic_duration, wall_duration)) =
                     self.calculate_durations(&message_id, time)
                 {
@@ -165,8 +192,9 @@ impl IngressHistoryWriter for IngressHistoryWriterImpl {
                         .observe(wall_duration);
                 }
             }
-            Failed {
-                error: user_error, ..
+            Known {
+                state: Failed(user_error),
+                ..
             } => {
                 if let Some((ic_duration, wall_duration)) =
                     self.calculate_durations(&message_id, time)
@@ -176,18 +204,22 @@ impl IngressHistoryWriter for IngressHistoryWriterImpl {
                     let user_error_code_string = dashboard_label_value_from(user_error_code);
 
                     self.message_state_transition_failed_ic_duration_seconds
-                        .with_label_values(&[&reject_code, &user_error_code_string])
+                        .with_label_values(&[&reject_code, user_error_code_string])
                         .observe(ic_duration);
 
                     self.message_state_transition_failed_wall_clock_duration_seconds
-                        .with_label_values(&[&reject_code, &user_error_code_string])
+                        .with_label_values(&[&reject_code, user_error_code_string])
                         .observe(wall_duration);
                 }
             }
             _ => {}
         };
 
-        state.set_ingress_status(message_id, status);
+        state.set_ingress_status(
+            message_id,
+            status,
+            self.config.ingress_history_memory_capacity,
+        );
     }
 }
 
@@ -217,6 +249,8 @@ fn dashboard_label_value_from(code: ErrorCode) -> &'static str {
     // of these values you will need to plan to change dashboards as well.
     match code {
         SubnetOversubscribed => "Subnet Oversubscribed",
+        MaxNumberOfCanistersReached => "Max Number of Canisters Reached",
+        IngressHistoryFull => "Ingress History Full",
         CanisterInvalidController => "Canister Invalid Controller",
         CanisterNotFound => "Canister Not Found",
         CanisterMethodNotFound => "Canister Method Not Found",
@@ -224,7 +258,6 @@ fn dashboard_label_value_from(code: ErrorCode) -> &'static str {
         CanisterAlreadyInstalled => "Canister Already Installed",
         CanisterWasmModuleNotFound => "Canister WASM Module Not Found",
         CanisterNonEmpty => "Canister Non-Empty",
-        CanisterEmpty => "Canister Empty",
         CanisterOutOfCycles => "Canister Out Of Cycles",
         CanisterTrapped => "Canister Trapped",
         CanisterCalledTrap => "Canister Called Trap",
@@ -232,21 +265,35 @@ fn dashboard_label_value_from(code: ErrorCode) -> &'static str {
         CanisterInvalidWasm => "Canister Invalid WASM",
         CanisterDidNotReply => "Canister Did Not Reply",
         CanisterOutputQueueFull => "Canister Output Queue Full",
+        CanisterQueueNotEmpty => "Canister Queues Not Empty",
         CanisterOutOfMemory => "Canister Out Of Memory",
         CanisterStopped => "Canister Stopped",
         CanisterStopping => "Canister Stopping",
         CanisterNotStopped => "Canister Not Stopped",
         IngressMessageTimeout => "Ingress Message Timeout",
         CanisterStoppingCancelled => "Canister Stopping Cancelled",
-        InsufficientTransferFunds => "Insufficient Funds For Transfer",
         InsufficientCyclesForCreateCanister => "Insufficient Cycles for Create Canister Request",
         CertifiedStateUnavailable => "Certified State Unavailable",
         InsufficientMemoryAllocation => "Insufficient memory allocation given to canister",
         SubnetNotFound => "Subnet not found",
         CanisterRejectedMessage => "Canister rejected the message",
-        InterCanisterQueryLoopDetected => "Loop in inter-canister query call graph",
+        QueryCallGraphLoopDetected => "Loop in inter-canister query call graph",
         UnknownManagementMessage => "Unknown management method",
         InvalidManagementPayload => "Invalid management message payload",
         InsufficientCyclesInCall => "Canister tried to keep more cycles than available in the call",
+        CanisterWasmEngineError => "Wasm engine error",
+        CanisterInstructionLimitExceeded => {
+            "Canister exceeded the instruction limit for single message execution"
+        }
+        CanisterInstallCodeRateLimited => {
+            "Canister is rate limited because it executed too many instructions in the previous install_code messages"
+        }
+        CanisterMemoryAccessLimitExceeded => {
+            "Canister exceeded the limit for the number of modified stable memory pages for a single message execution"
+        }
+        QueryCallGraphTooDeep => "Query call graph contains too many nested calls",
+        QueryCallGraphTotalInstructionLimitExceeded => "Total instructions limit exceeded for query call graph",
+        CompositeQueryCalledInReplicatedMode => "Composite query cannot be called in replicated mode",
+        CanisterNotHostedBySubnet => "Canister is not hosted by subnet",
     }
 }

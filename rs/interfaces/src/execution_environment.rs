@@ -1,30 +1,33 @@
 //! The execution environment public interface.
 mod errors;
 
-use crate::{messages::CanisterInputMessage, state_manager::StateManagerError};
-pub use errors::{CanisterHeartbeatError, MessageAcceptanceError};
-pub use errors::{HypervisorError, TrapCode};
-use ic_base_types::{NumBytes, SubnetId};
+pub use errors::{CanisterOutOfCyclesError, HypervisorError, TrapCode};
+use ic_base_types::NumBytes;
+use ic_error_types::UserError;
+use ic_ic00_types::EcdsaKeyId;
 use ic_registry_provisional_whitelist::ProvisionalWhitelist;
-use ic_registry_routing_table::RoutingTable;
 use ic_registry_subnet_type::SubnetType;
+use ic_sys::{PageBytes, PageIndex};
 use ic_types::{
+    crypto::canister_threshold_sig::MasterEcdsaPublicKey,
     ingress::{IngressStatus, WasmResult},
-    messages::{MessageId, SignedIngressContent, UserQuery},
-    user_error::UserError,
-    Height, NumInstructions, Time,
+    messages::{
+        AnonymousQuery, AnonymousQueryResponse, CertificateDelegation, HttpQueryResponse,
+        MessageId, SignedIngressContent, UserQuery,
+    },
+    CpuComplexity, Cycles, ExecutionRound, Height, NumInstructions, NumPages, Randomness, Time,
 };
-use rand::RngCore;
 use serde::{Deserialize, Serialize};
-use std::{
-    collections::BTreeMap,
-    sync::{Arc, RwLock},
-};
+use std::convert::TryFrom;
+use std::sync::Arc;
+use std::{collections::BTreeMap, ops};
+use std::{convert::Infallible, fmt};
+use tower::{limit::ConcurrencyLimit, util::BoxCloneService};
 
 /// Instance execution statistics. The stats are cumulative and
 /// contain measurements from the point in time when the instance was
 /// created up until the moment they are requested.
-#[derive(Serialize, Deserialize, Clone)]
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
 pub struct InstanceStats {
     /// Total number of (host) pages accessed (read or written) by the instance
     /// and loaded into the linear memory.
@@ -34,315 +37,255 @@ pub struct InstanceStats {
     /// By definition a page that has been dirtied has also been accessed,
     /// hence this dirtied_pages <= accessed_pages
     pub dirty_pages: usize,
+
+    /// Number of times a write access is handled when the page has already been
+    /// read.
+    pub read_before_write_count: usize,
+
+    /// Number of times a write access is handled when the page has not yet been
+    /// read.
+    pub direct_write_count: usize,
 }
 
 /// Errors that can be returned when fetching the available memory on a subnet.
+#[derive(Debug)]
 pub enum SubnetAvailableMemoryError {
     InsufficientMemory {
-        requested: NumBytes,
-        available: NumBytes,
+        requested_total: NumBytes,
+        message_requested: NumBytes,
+        available_total: i64,
+        available_messages: i64,
     },
 }
 
-/// This struct is used to manage the view of the current amount of memory
-/// available on the subnet between multiple canisters executing in parallel.
+/// Performance counter type.
+#[derive(Debug)]
+pub enum PerformanceCounterType {
+    // The number of WebAssembly instructions the canister has executed based on
+    // the given `i64` instruction counter.
+    Instructions(i64),
+}
+
+/// Tracks the execution complexity.
 ///
-/// The problem is that when canisters with no memory reservations want to
-/// expand their memory consumption, we need to ensure that they do not go over
-/// subnet's capacity. As we execute canisters in parallel, we need to
-/// provide them with a way to view the latest state of memory availble in a
-/// thread safe way. Hence, we use `Arc<RwLock<>>` here.
-#[derive(Serialize, Deserialize, Clone)]
-pub struct SubnetAvailableMemory(Arc<RwLock<NumBytes>>);
+/// Each execution has an associated complexity, i.e. how much CPU, memory,
+/// disk or network bandwidth it takes.
+///
+/// For now, the complexity counters do not translate into Cycles, but they are rather
+/// used to prevent too complex messages to slow down the whole subnet.
+///
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
+pub struct ExecutionComplexity {
+    /// Accumulated CPU complexity, in instructions.
+    pub cpu: CpuComplexity,
+    /// The number of dirty pages in stable memory.
+    pub stable_dirty_pages: NumPages,
+}
+
+impl ExecutionComplexity {
+    /// Execution complexity with maximum values.
+    pub const MAX: Self = Self {
+        cpu: CpuComplexity::new(i64::MAX),
+        stable_dirty_pages: NumPages::new(u64::MAX),
+    };
+
+    /// Creates execution complexity with a specified CPU complexity.
+    pub fn with_cpu(cpu: NumInstructions) -> Self {
+        Self {
+            cpu: (cpu.get() as i64).into(),
+            ..Default::default()
+        }
+    }
+
+    /// Returns true if the CPU complexity reached the specified
+    /// instructions limit.
+    pub fn cpu_reached(&self, limit: NumInstructions) -> bool {
+        self.cpu.get() >= limit.get() as i64
+    }
+
+    /// Returns the maximum of each complexity.
+    pub fn max(&self, rhs: Self) -> Self {
+        Self {
+            cpu: self.cpu.max(rhs.cpu),
+            stable_dirty_pages: self.stable_dirty_pages.max(rhs.stable_dirty_pages),
+        }
+    }
+}
+
+impl ops::Add for &ExecutionComplexity {
+    type Output = ExecutionComplexity;
+
+    fn add(self, rhs: &ExecutionComplexity) -> ExecutionComplexity {
+        ExecutionComplexity {
+            cpu: self.cpu + rhs.cpu,
+            stable_dirty_pages: self
+                .stable_dirty_pages
+                .get()
+                .saturating_add(rhs.stable_dirty_pages.get())
+                .into(),
+        }
+    }
+}
+
+impl ops::Sub for &ExecutionComplexity {
+    type Output = ExecutionComplexity;
+
+    fn sub(self, rhs: &ExecutionComplexity) -> ExecutionComplexity {
+        ExecutionComplexity {
+            cpu: self.cpu - rhs.cpu,
+            stable_dirty_pages: self
+                .stable_dirty_pages
+                .get()
+                .saturating_sub(rhs.stable_dirty_pages.get())
+                .into(),
+        }
+    }
+}
+
+impl fmt::Display for ExecutionComplexity {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "{{ cpu = {} stable_dirty_pages = {} }}",
+            self.cpu, self.stable_dirty_pages,
+        )
+    }
+}
+
+/// Tracks the available memory on a subnet. The main idea is to separately track
+/// the total available memory and the message available memory. When trying to
+/// allocate message memory one can do this as long as there is sufficient total
+/// memory as well as message memory available. When trying to allocate non-message
+/// memory only the total memory needs to suffice.
+///
+/// Note that there are situations where total available memory is smaller than
+/// the available message memory, i.e., when the memory is consumed by something
+/// other than messages.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, Default)]
+pub struct SubnetAvailableMemory {
+    /// The total memory available on the subnet
+    total_memory: i64,
+    /// The memory available for messages
+    message_memory: i64,
+}
 
 impl SubnetAvailableMemory {
-    pub fn new(amount: NumBytes) -> Self {
-        Self(Arc::new(RwLock::new(amount)))
+    pub fn new(total_memory: i64, message_memory: i64) -> Self {
+        SubnetAvailableMemory {
+            total_memory,
+            message_memory,
+        }
+    }
+
+    /// Returns the total available memory.
+    pub fn get_total_memory(&self) -> i64 {
+        self.total_memory
+    }
+
+    /// Returns the memory available for messages, ignoring the totally available memory.
+    pub fn get_message_memory(&self) -> i64 {
+        self.message_memory
+    }
+
+    /// Returns the maximal amount of memory that is available for messages.
+    ///
+    /// This amount is computed as the minimum of total available memory and available
+    /// message memory. This is useful to decide whether it is still possible to allocate
+    /// memory for messages.
+    pub fn max_available_message_memory(&self) -> i64 {
+        self.total_memory.min(self.message_memory)
     }
 
     /// Try to use some memory capacity and fail if not enough is available
-    pub fn try_decrement(&self, requested: NumBytes) -> Result<(), SubnetAvailableMemoryError> {
-        let mut available = self.0.write().unwrap();
-        if requested <= *available {
-            *available -= requested;
+    pub fn try_decrement(
+        &mut self,
+        requested: NumBytes,
+        message_requested: NumBytes,
+    ) -> Result<(), SubnetAvailableMemoryError> {
+        debug_assert!(requested >= message_requested);
+
+        let total_is_available = match i64::try_from(requested.get()) {
+            Ok(x) => x <= self.total_memory || x == 0,
+            Err(_) => false,
+        };
+        let message_is_available = match i64::try_from(message_requested.get()) {
+            Ok(x) => x <= self.message_memory || x == 0,
+            Err(_) => false,
+        };
+
+        if total_is_available && message_is_available {
+            self.total_memory -= requested.get() as i64;
+            self.message_memory -= message_requested.get() as i64;
             Ok(())
         } else {
             Err(SubnetAvailableMemoryError::InsufficientMemory {
-                requested,
-                available: *available,
+                requested_total: requested,
+                message_requested,
+                available_total: self.total_memory,
+                available_messages: self.message_memory,
             })
         }
     }
-}
 
-/// ExecutionEnvironment is the component responsible for executing messages
-/// on the IC.
-pub trait ExecutionEnvironment: Sync + Send {
-    /// Type modelling the replicated state.
-    ///
-    /// Should typically be
-    /// `ic_replicated_state::ReplicatedState`.
-    // Note [Associated Types in Interfaces]
-    type State;
+    pub fn increment(&mut self, total_amount: NumBytes, message_amount: NumBytes) {
+        debug_assert!(total_amount >= message_amount);
 
-    /// Type modelling the canister state.
-    ///
-    /// Should typically be
-    /// `ic_replicated_state::CanisterState`.
-    // Note [Associated Types in Interfaces]
-    type CanisterState;
-
-    /// Executes a message sent to a subnet.
-    //
-    // A deterministic cryptographically secure pseudo-random number generator
-    // is created per round and per thread and passed to this method to be used
-    // while responding to randomness requests (i.e. raw_rand). Using the type
-    // "&mut RngCore" imposes a problem with our usage of "mockall" library in
-    // the test_utilities. Mockall's doc states: "The only restrictions on
-    // mocking generic methods are that all generic parameters must be 'static,
-    // and generic lifetime parameters are not allowed." Hence, the type of the
-    // parameter is "&mut (dyn RngCore + 'static)".
-    #[allow(clippy::too_many_arguments)]
-    fn execute_subnet_message(
-        &self,
-        msg: CanisterInputMessage,
-        state: Self::State,
-        instructions_limit: NumInstructions,
-        rng: &mut (dyn RngCore + 'static),
-        provisional_whitelist: &ProvisionalWhitelist,
-        subnet_available_memory: SubnetAvailableMemory,
-    ) -> Self::State;
-
-    /// Executes a message sent to a canister.
-    #[allow(clippy::too_many_arguments)]
-    fn execute_canister_message(
-        &self,
-        canister_state: Self::CanisterState,
-        instructions_limit: NumInstructions,
-        msg: CanisterInputMessage,
-        time: Time,
-        routing_table: Arc<RoutingTable>,
-        subnet_records: Arc<BTreeMap<SubnetId, SubnetType>>,
-        subnet_available_memory: SubnetAvailableMemory,
-    ) -> ExecResult<ExecuteMessageResult<Self::CanisterState>>;
-
-    /// Asks the canister if it is willing to accept the provided ingress
-    /// message.
-    fn should_accept_ingress_message(
-        &self,
-        state: Arc<Self::State>,
-        provisional_whitelist: &ProvisionalWhitelist,
-        ingress: &SignedIngressContent,
-    ) -> Result<(), MessageAcceptanceError>;
-
-    /// Executes a heartbeat of a given canister.
-    fn execute_canister_heartbeat(
-        &self,
-        canister_state: Self::CanisterState,
-        instructions_limit: NumInstructions,
-        routing_table: Arc<RoutingTable>,
-        subnet_records: Arc<BTreeMap<SubnetId, SubnetType>>,
-        time: Time,
-        subnet_available_memory: SubnetAvailableMemory,
-    ) -> ExecResult<(
-        Self::CanisterState,
-        NumInstructions,
-        Result<NumBytes, CanisterHeartbeatError>,
-    )>;
-
-    /// Look up the current amount of memory available on the subnet.
-    /// EXC-185 will make this method obsolete.
-    fn subnet_available_memory(&self, state: &Self::State) -> NumBytes;
-}
-
-/// The data structure returned by
-/// `ExecutionEnvironment.execute_canister_message()`.
-pub struct ExecuteMessageResult<CanisterState> {
-    /// The `CanisterState` after message execution
-    pub canister: CanisterState,
-    /// The amount of instructions left after message execution. This must be <=
-    /// to the instructions_limit that `execute_canister_message()` was called
-    /// with.
-    pub num_instructions_left: NumInstructions,
-    /// Optional status for an Ingress message if available.
-    pub ingress_status: Option<(MessageId, IngressStatus)>,
-    /// The size of the heap delta the canister produced
-    pub heap_delta: NumBytes,
-}
-
-/// An underlying struct/helper for implementing select() on multiple
-/// AsyncResult<T>'s. If an AsyncResult is really an ongoing computation, we
-/// have to obtain its result from a channel. However, some AsyncResults are of
-/// type EarlyResult, which only emulates being async, but in reality is a ready
-/// value (mostly used for early errors). In such case, there is no channel
-/// present and we can simply return the value without waiting.
-pub enum TrySelect<T> {
-    EarlyResult(T),
-    // These Box<Any>'s are here only to hide internal data types from the interfaces crate.
-    // These are known types (crossbeam channnel, WasmExecutionOutput),
-    // and if we restructure our dependency tree we may put the real types here.
-    Channel(
-        Box<dyn std::any::Any + 'static>,
-        Box<dyn FnOnce(Box<dyn std::any::Any + 'static>) -> T>,
-    ),
-}
-
-/// An execution can finish successfully or get interrupted (out of cycles).
-pub enum ExecResultVariant<T> {
-    Completed(T),
-    Interrupted(Box<dyn InterruptedExec<T>>),
-}
-
-// Most likely these traits can be moved to embedders crate if we restructure
-// ExecutionEnvironment a little.
-
-/// An async result which allows for sync wait and select.
-pub trait AsyncResult<T> {
-    fn get(self: Box<Self>) -> ExecResultVariant<T>;
-    fn try_select(self: Box<Self>) -> TrySelect<T>;
-}
-
-/// Interrupted execution. Can be resumed or canceled.
-pub trait InterruptedExec<T> {
-    fn resume(self: Box<Self>, cycles_topup: NumInstructions) -> ExecResult<T>;
-    fn cancel(self: Box<Self>) -> ExecResult<T>;
-}
-
-impl<A: 'static> dyn InterruptedExec<A> {
-    /// Add post-processing on the output received after resume/cancel.
-    pub fn and_then<B: 'static, F: 'static + FnOnce(A) -> B>(
-        self: Box<Self>,
-        f: F,
-    ) -> Box<dyn InterruptedExec<B>> {
-        Box::new(ResumeTokenWrapper {
-            resume_token: self,
-            f,
-        })
+        self.total_memory += total_amount.get() as i64;
+        self.message_memory += message_amount.get() as i64;
     }
 }
 
-// A wrapper which allows for post processing of the ExecResult returned by
-// original resume/cancel.
-struct ResumeTokenWrapper<A, B, F: FnOnce(A) -> B> {
-    resume_token: Box<dyn InterruptedExec<A>>,
-    f: F,
-}
+impl ops::Div<i64> for SubnetAvailableMemory {
+    type Output = Self;
 
-impl<A, B, F> InterruptedExec<B> for ResumeTokenWrapper<A, B, F>
-where
-    A: 'static,
-    B: 'static,
-    F: 'static + FnOnce(A) -> B,
-{
-    fn resume(self: Box<Self>, cycles_topup: NumInstructions) -> ExecResult<B> {
-        self.resume_token.resume(cycles_topup).and_then(self.f)
-    }
-
-    fn cancel(self: Box<Self>) -> ExecResult<B> {
-        self.resume_token.cancel().and_then(self.f)
-    }
-}
-
-/// Generic async result of an execution.
-pub struct ExecResult<T> {
-    result: Box<dyn AsyncResult<T>>,
-}
-
-impl<T> ExecResult<T> {
-    pub fn new(result: Box<dyn AsyncResult<T>>) -> Self {
-        Self { result }
-    }
-
-    /// Wait for the result
-    pub fn get(self) -> ExecResultVariant<T> {
-        self.result.get()
-    }
-
-    /// Wait for the final result without allowing for a pause.
-    /// If pause occurs, the execution is automatically cancelled.
-    pub fn get_no_pause(self) -> T {
-        match self.result.get() {
-            ExecResultVariant::Completed(x) => x,
-            ExecResultVariant::Interrupted(resume_token) => {
-                if let ExecResultVariant::Completed(x) = resume_token.cancel().get() {
-                    x
-                } else {
-                    panic!("Unexpected response from execution cancel request");
-                }
-            }
-        }
-    }
-
-    /// This function allows to extract an underlying channel to perform a
-    /// select. It is used to implement 'ic_embedders::ExecSelect' and is
-    /// not meant to be used explicitly.
-    pub fn try_select(self) -> TrySelect<T> {
-        self.result.try_select()
-    }
-}
-
-impl<A: 'static> ExecResult<A> {
-    /// Add post-processing on the result.
-    pub fn and_then<B: 'static, F: 'static + FnOnce(A) -> B>(self, f: F) -> ExecResult<B> {
-        ExecResult::new(Box::new(ExecResultWrapper { result: self, f }))
-    }
-}
-
-// A wrapper which allows for post processing of the original ExecResult.
-struct ExecResultWrapper<A, B, F: FnOnce(A) -> B> {
-    result: ExecResult<A>,
-    f: F,
-}
-
-impl<A, B, F> AsyncResult<B> for ExecResultWrapper<A, B, F>
-where
-    A: 'static,
-    B: 'static,
-    F: 'static + FnOnce(A) -> B,
-{
-    fn get(self: Box<Self>) -> ExecResultVariant<B> {
-        match self.result.get() {
-            ExecResultVariant::Completed(x) => ExecResultVariant::Completed((self.f)(x)),
-            ExecResultVariant::Interrupted(resume_token) => {
-                ExecResultVariant::Interrupted(resume_token.and_then(self.f))
-            }
-        }
-    }
-
-    fn try_select(self: Box<Self>) -> TrySelect<B> {
-        let f = self.f;
-        match self.result.try_select() {
-            TrySelect::EarlyResult(res) => TrySelect::EarlyResult(f(res)),
-            TrySelect::Channel(a, p) => TrySelect::Channel(a, Box::new(move |x| f(p(x)))),
+    fn div(self, rhs: i64) -> Self::Output {
+        Self {
+            total_memory: self.total_memory / rhs,
+            message_memory: self.message_memory / rhs,
         }
     }
 }
 
-/// Sync result implementing async interface.
-pub struct EarlyResult<T> {
-    result: T,
-}
-
-impl<T: 'static> EarlyResult<T> {
-    #[allow(clippy::new_ret_no_self)]
-    pub fn new(result: T) -> ExecResult<T> {
-        ExecResult {
-            result: Box::new(Self { result }),
-        }
-    }
-}
-
-impl<T: 'static> AsyncResult<T> for EarlyResult<T> {
-    fn get(self: Box<Self>) -> ExecResultVariant<T> {
-        ExecResultVariant::Completed(self.result)
-    }
-
-    fn try_select(self: Box<Self>) -> TrySelect<T> {
-        TrySelect::EarlyResult(self.result)
-    }
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub enum ExecutionMode {
+    Replicated,
+    NonReplicated,
 }
 
 pub type HypervisorResult<T> = Result<T, HypervisorError>;
+
+/// Interface for the component to execute internal queries triggered by IC.
+// Since this service will be shared across many connections we must
+// make it cloneable by introducing a bounded buffer infront of it.
+// https://docs.rs/tower/0.4.10/tower/buffer/index.html
+// The buffer also dampens usage by reducing the risk of
+// spiky traffic when users retry in case failed requests.
+pub type AnonymousQueryService =
+    ConcurrencyLimit<BoxCloneService<AnonymousQuery, AnonymousQueryResponse, Infallible>>;
+
+/// Interface for the component to filter out ingress messages that
+/// the canister is not willing to accept.
+// Since this service will be shared across many connections we must
+// make it cloneable by introducing a bounded buffer infront of it.
+// https://docs.rs/tower/0.4.10/tower/buffer/index.html
+// The buffer also dampens usage by reducing the risk of
+// spiky traffic when users retry in case failed requests.
+pub type IngressFilterService = ConcurrencyLimit<
+    BoxCloneService<
+        (ProvisionalWhitelist, SignedIngressContent),
+        Result<(), UserError>,
+        Infallible,
+    >,
+>;
+
+// Since this service will be shared across many connections we must
+// make it cloneable by introducing a bounded buffer infront of it.
+// https://docs.rs/tower/0.4.10/tower/buffer/index.html
+// The buffer also dampens usage by reducing the risk of
+// spiky traffic when users retry in case failed requests.
+pub type QueryExecutionService = ConcurrencyLimit<
+    BoxCloneService<(UserQuery, Option<CertificateDelegation>), HttpQueryResponse, Infallible>,
+>;
 
 /// Interface for the component to execute queries on canisters.  It can be used
 /// by the HttpHandler and other system components to execute queries.
@@ -356,8 +299,8 @@ pub trait QueryHandler: Send + Sync {
     /// Handle a query of type `UserQuery` which was sent by an end user.
     fn query(
         &self,
-        q: UserQuery,
-        processing_state: Arc<Self::State>,
+        query: UserQuery,
+        state: Arc<Self::State>,
         data_certificate: Vec<u8>,
     ) -> Result<WasmResult, UserError>;
 }
@@ -369,16 +312,8 @@ pub enum IngressHistoryError {
     StateNotAvailableYet(Height),
 }
 
-impl From<StateManagerError> for IngressHistoryError {
-    fn from(source: StateManagerError) -> Self {
-        match source {
-            StateManagerError::StateRemoved(height) => Self::StateRemoved(height),
-            StateManagerError::StateNotCommittedYet(height) => Self::StateNotAvailableYet(height),
-        }
-    }
-}
-
 /// Interface for reading the history of ingress messages.
+#[allow(clippy::type_complexity)]
 pub trait IngressHistoryReader: Send + Sync {
     /// Returns a function that can be used to query the status for a given
     /// `message_id` using the latest execution state.
@@ -411,22 +346,93 @@ pub trait IngressHistoryWriter: Send + Sync {
     fn set_status(&self, state: &mut Self::State, message_id: MessageId, status: IngressStatus);
 }
 
+/// A trait for handling `out_of_instructions()` calls from the Wasm module.
+pub trait OutOfInstructionsHandler {
+    // This function is invoked if the Wasm instruction counter is negative.
+    //
+    // If it is impossible to recover from the out-of-instructions error then
+    // the function returns `Err(HypervisorError::InstructionLimitExceeded)`.
+    // Otherwise, the function returns a new positive instruction counter.
+    fn out_of_instructions(
+        &self,
+        instruction_counter: i64,
+        execution_complexity: ExecutionComplexity,
+    ) -> HypervisorResult<i64>;
+}
+
+/// Indicates the type of stable memory API being used.
+pub enum StableMemoryApi {
+    Stable64 = 0,
+    Stable32 = 1,
+}
+
+impl TryFrom<i32> for StableMemoryApi {
+    type Error = ();
+
+    fn try_from(value: i32) -> Result<Self, Self::Error> {
+        match value {
+            0 => Ok(Self::Stable64),
+            1 => Ok(Self::Stable32),
+            _ => Err(()),
+        }
+    }
+}
+
+#[test]
+fn stable_memory_api_round_trip() {
+    for i in 0..10 {
+        if let Ok(api) = StableMemoryApi::try_from(i) {
+            assert_eq!(i, api as i32)
+        }
+    }
+}
+
+/// Indicates whether an attempt to grow stable memory succeeded or failed.
+pub enum StableGrowOutcome {
+    Success,
+    Failure,
+}
+
 /// A trait for providing all necessary imports to a Wasm module.
 pub trait SystemApi {
+    /// Stores the complexity accumulated during the message execution.
+    fn set_execution_complexity(&mut self, complexity: ExecutionComplexity);
+
+    /// Returns the accumulated execution complexity.
+    fn execution_complexity(&self) -> &ExecutionComplexity;
+
     /// Stores the execution error, so that the user can evaluate it later.
     fn set_execution_error(&mut self, error: HypervisorError);
 
     /// Returns the reference to the execution error.
     fn get_execution_error(&self) -> Option<&HypervisorError>;
 
-    /// Returns the amount of available instructions.
-    fn get_available_num_instructions(&self) -> NumInstructions;
+    /// Returns the amount of instructions needed to copy `num_bytes`.
+    fn get_num_instructions_from_bytes(&self, num_bytes: NumBytes) -> NumInstructions;
 
-    /// Returns the stable memory delta that the canister produced
-    fn get_stable_memory_delta_pages(&self) -> usize;
+    /// Returns the indexes of all dirty pages in stable memory.
+    fn stable_memory_dirty_pages(&self) -> Vec<(PageIndex, &PageBytes)>;
 
-    /// Sets the amount of available instructions.
-    fn set_available_num_instructions(&mut self, num_instructions: NumInstructions);
+    /// Returns the current size of the stable memory in wasm pages.
+    fn stable_memory_size(&self) -> usize;
+
+    /// Returns the subnet type the replica runs on.
+    fn subnet_type(&self) -> SubnetType;
+
+    /// Returns the message instruction limit, which is the total instruction
+    /// limit for all slices combined.
+    fn message_instruction_limit(&self) -> NumInstructions;
+
+    /// Returns the number of instructions executed in the current message,
+    /// which is the sum of instructions executed in all slices including the
+    /// current one.
+    fn message_instructions_executed(&self, instruction_counter: i64) -> NumInstructions;
+
+    /// Returns the instruction limit for the current execution slice.
+    fn slice_instruction_limit(&self) -> NumInstructions;
+
+    /// Returns the number of instructions executed in the current slice.
+    fn slice_instructions_executed(&self, instruction_counter: i64) -> NumInstructions;
 
     /// Copies `size` bytes starting from `offset` inside the opaque caller blob
     /// and copies them to heap[dst..dst+size]. The caller is the canister
@@ -547,32 +553,10 @@ pub trait SystemApi {
     ) -> HypervisorResult<()>;
 
     /// Outputs the specified bytes on the heap as a string on STDOUT.
-    fn ic0_debug_print(&self, src: u32, size: u32, heap: &[u8]);
-
-    /// Just like `exec` in C replaces the current process with a new process,
-    /// this system call replaces the current canister with a new canister.
-    fn ic0_exec(&mut self, bytes: Vec<u8>, payload: Vec<u8>) -> HypervisorError;
+    fn ic0_debug_print(&self, src: u32, size: u32, heap: &[u8]) -> HypervisorResult<()>;
 
     /// Traps, with a possibly helpful message
-    fn ic0_trap(&self, src: u32, size: u32, heap: &[u8]) -> HypervisorError;
-
-    /// Creates a pending inter-canister message that will be scheduled if the
-    /// current message execution completes successfully.
-    #[allow(clippy::too_many_arguments)]
-    fn ic0_call_simple(
-        &mut self,
-        callee_src: u32,
-        callee_size: u32,
-        method_name_src: u32,
-        method_name_len: u32,
-        reply_fun: u32,
-        reply_env: u32,
-        reject_fun: u32,
-        reject_env: u32,
-        data_src: u32,
-        data_len: u32,
-        heap: &[u8],
-    ) -> HypervisorResult<i32>;
+    fn ic0_trap(&self, src: u32, size: u32, heap: &[u8]) -> HypervisorResult<()>;
 
     /// Begins assembling a call to the canister specified by
     /// callee_src/callee_size at method name_src/name_size. Two mandatory
@@ -609,6 +593,20 @@ pub trait SystemApi {
     /// See https://sdk.dfinity.org/docs/interface-spec/index.html#system-api-call
     fn ic0_call_on_cleanup(&mut self, fun: u32, env: u32) -> HypervisorResult<()>;
 
+    /// (deprecated) Please use `ic0_call_cycles_add128` instead, as this API
+    /// can only add a 64-bit value.
+    ///
+    /// Adds cycles to a call by moving them from the
+    /// canister's balance onto the call under construction.
+    /// The cycles are deducted immediately from the canister's
+    /// balance and moved back if the call cannot be performed (e.g. if
+    /// `ic0.call_perform` signals an error or if the canister invokes
+    /// `ic0.call_new` or returns without invoking `ic0.call_perform`).
+    ///
+    /// This traps if trying to transfer more cycles than are in the current
+    /// balance of the canister.
+    fn ic0_call_cycles_add(&mut self, amount: u64) -> HypervisorResult<()>;
+
     /// Adds cycles to a call by moving them from the canister's balance onto
     /// the call under construction. The cycles are deducted immediately
     /// from the canister's balance and moved back if the call cannot be
@@ -618,7 +616,7 @@ pub trait SystemApi {
     ///
     /// This traps if trying to transfer more cycles than are in the current
     /// balance of the canister.
-    fn ic0_call_cycles_add(&mut self, amount: u64) -> HypervisorResult<()>;
+    fn ic0_call_cycles_add128(&mut self, amount: Cycles) -> HypervisorResult<()>;
 
     /// This call concludes assembling the call. It queues the call message to
     /// the given destination, but does not actually act on it until the current
@@ -658,6 +656,7 @@ pub trait SystemApi {
     ///
     /// This system call traps if src+size exceeds the size of the WebAssembly
     /// memory or offset+size exceeds the size of the stable memory.
+    /// Returns the number of **new** dirty pages created by the write.
     fn ic0_stable_write(
         &mut self,
         offset: u32,
@@ -666,36 +665,168 @@ pub trait SystemApi {
         heap: &[u8],
     ) -> HypervisorResult<()>;
 
+    /// Returns the current size of the stable memory in WebAssembly pages.
+    ///
+    /// It supports bigger stable memory sizes indexed by 64 bit pointers.
+    fn ic0_stable64_size(&self) -> HypervisorResult<u64>;
+
+    /// Tries to grow the stable memory by additional_pages many pages
+    /// containing zeros.
+    /// If successful, returns the previous size of the memory (in pages).
+    /// Otherwise, returns -1
+    ///
+    /// It supports bigger stable memory sizes indexed by 64 bit pointers.
+    fn ic0_stable64_grow(&mut self, additional_pages: u64) -> HypervisorResult<i64>;
+
+    /// Copies the data from location [offset, offset+size) of the stable memory
+    /// to the location [dst, dst+size) in the canister memory.
+    ///
+    /// This system call traps if dst+size exceeds the size of the WebAssembly
+    /// memory or offset+size exceeds the size of the stable memory.
+    ///
+    /// It supports bigger stable memory sizes indexed by 64 bit pointers.
+    fn ic0_stable64_read(
+        &self,
+        dst: u64,
+        offset: u64,
+        size: u64,
+        heap: &mut [u8],
+    ) -> HypervisorResult<()>;
+
+    /// Copies the data from location [src, src+size) of the canister memory to
+    /// location [offset, offset+size) in the stable memory.
+    ///
+    /// This system call traps if src+size exceeds the size of the WebAssembly
+    /// memory or offset+size exceeds the size of the stable memory.
+    ///
+    /// It supports bigger stable memory sizes indexed by 64 bit pointers.
+    /// Returns the number of **new** dirty pages created by the write.
+    fn ic0_stable64_write(
+        &mut self,
+        offset: u64,
+        src: u64,
+        size: u64,
+        heap: &[u8],
+    ) -> HypervisorResult<()>;
+
+    /// Determines the number of dirty pages that a stable write would create
+    /// and the cost for those dirty pages (without actually doing the write).
+    fn dirty_pages_from_stable_write(
+        &self,
+        offset: u64,
+        size: u64,
+    ) -> HypervisorResult<(NumPages, NumInstructions)>;
+
+    /// The canister can query the IC for the current time.
     fn ic0_time(&self) -> HypervisorResult<Time>;
 
-    /// This system call is not part of the public spec and used by the
-    /// hypervisor, when execution runs out of instructions. Higher levels
-    /// can decide how to proceed, by either providing more instructions
-    /// or aborting the execution (typically with an out-of-instructions
-    /// error).
-    fn out_of_instructions(&self) -> HypervisorResult<NumInstructions>;
+    /// The canister can set a global one-off timer at the specific time.
+    fn ic0_global_timer_set(&mut self, time: Time) -> HypervisorResult<Time>;
+
+    /// The canister can query the IC for its version.
+    fn ic0_canister_version(&self) -> HypervisorResult<u64>;
+
+    /// The canister can query the "performance counter", which is
+    /// a deterministic monotonically increasing integer approximating
+    /// the amount of work the canister has done since the beginning of
+    /// the current execution.
+    ///
+    /// The argument type decides which performance counter to return:
+    ///     0 : instruction counter. The number of WebAssembly
+    ///         instructions the system has determined that the canister
+    ///         has executed.
+    ///
+    /// Note: as the instruction counters are not available on the SystemApi level,
+    /// the `ic0_performance_counter_helper()` in `wasmtime_embedder` module does
+    /// most of the work. Yet the function is still implemented here for the consistency.
+    fn ic0_performance_counter(
+        &self,
+        performance_counter_type: PerformanceCounterType,
+    ) -> HypervisorResult<u64>;
+
+    /// This system call is not part of the public spec and it is invoked when
+    /// Wasm execution has run out of instructions.
+    ///
+    /// If it is impossible to recover from the out-of-instructions error then
+    /// the functions return `Err(HypervisorError::InstructionLimitExceeded)`.
+    /// Otherwise, the function return a new non-negative instruction counter.
+    fn out_of_instructions(&mut self, instruction_counter: i64) -> HypervisorResult<i64>;
 
     /// This system call is not part of the public spec. It's called after a
     /// native `memory.grow` has been called to check whether there's enough
     /// available memory left.
     fn update_available_memory(
         &mut self,
-        native_memory_grow_res: i32,
-        additional_pages: u32,
-    ) -> HypervisorResult<i32>;
+        native_memory_grow_res: i64,
+        additional_pages: u64,
+    ) -> HypervisorResult<()>;
 
+    /// Attempts to allocate memory before calling stable grow. Will also check
+    /// that the current size if valid for the stable memory API being used.
+    fn try_grow_stable_memory(
+        &mut self,
+        current_size: u64,
+        additional_pages: u64,
+        stable_memory_api: StableMemoryApi,
+    ) -> HypervisorResult<StableGrowOutcome>;
+
+    /// Return memory from a previous call to `update_available_memory`.
+    fn deallocate_pages(&mut self, additional_pages: u64);
+
+    /// (deprecated) Please use `ic0_canister_cycle_balance128` instead.
+    /// This API supports only 64-bit values.
+    ///
     /// Returns the current balance in cycles.
+    ///
+    /// Traps if current canister balance cannot fit in a 64-bit value.
     fn ic0_canister_cycle_balance(&self) -> HypervisorResult<u64>;
 
+    /// This system call indicates the current cycle balance
+    /// of the canister.
+    ///
+    /// The amount of cycles is represented by a 128-bit value
+    /// and is copied in the canister memory starting
+    /// starting at the location `dst`.
+    fn ic0_canister_cycle_balance128(&self, dst: u32, heap: &mut [u8]) -> HypervisorResult<()>;
+
+    /// (deprecated) Please use `ic0_msg_cycles_available128` instead.
+    /// This API supports only 64-bit values.
+    ///
     /// Cycles sent in the current call and still available.
+    ///
+    /// Traps if the amount of cycles available cannot fit in a 64-bit value.
     fn ic0_msg_cycles_available(&self) -> HypervisorResult<u64>;
 
+    /// This system call indicates the amount of cycles sent
+    /// in the current call and still available.
+    ///
+    /// The amount of cycles is represented by a 128-bit value
+    /// and is copied in the canister memory starting
+    /// starting at the location `dst`.
+    fn ic0_msg_cycles_available128(&self, dst: u32, heap: &mut [u8]) -> HypervisorResult<()>;
+
+    /// (deprecated) Please use `ic0_msg_cycles_refunded128` instead.
+    /// This API supports only 64-bit values.
+    ///
     /// Cycles that came back with the response, as a refund.
+    ///
+    /// Traps if the amount of refunded cycles cannot fit in a 64-bit value.
     fn ic0_msg_cycles_refunded(&self) -> HypervisorResult<u64>;
 
-    /// This moves cycles from the call to the canister balance.
-    /// It can be called multiple times, each time adding more cycles to the
-    /// balance.
+    /// This system call indicates the amount of cycles sent
+    /// that came back with the response as a refund.
+    ///
+    /// The amount of cycles is represented by a 128-bit value
+    /// and is copied in the canister memory starting
+    /// starting at the location `dst`.
+    fn ic0_msg_cycles_refunded128(&self, dst: u32, heap: &mut [u8]) -> HypervisorResult<()>;
+
+    /// (deprecated) Please use `ic0_msg_cycles_accept128` instead.
+    /// This API supports only 64-bit values.
+    ///
+    /// This moves cycles from the
+    /// call to the canister balance. It can be called multiple times, each
+    /// time adding more cycles to the balance.
     ///
     /// It moves no more cycles than `max_amount`.
     ///
@@ -712,6 +843,31 @@ pub trait SystemApi {
     /// refund can come back to the canister after this call finishes which
     /// causes the canister's balance to overflow.
     fn ic0_msg_cycles_accept(&mut self, max_amount: u64) -> HypervisorResult<u64>;
+
+    /// This moves cycles from the call to the canister balance.
+    /// It can be called multiple times, each time adding more cycles to the
+    /// balance.
+    ///
+    /// It moves no more cycles than `max_amount`.
+    ///
+    /// It moves no more cycles than available according to
+    /// `ic0.msg_cycles_available128`, and
+    ///
+    /// The canister balance afterwards does not exceed
+    /// maximum amount of cycles it can hold (public spec refers to this
+    /// constant as MAX_CANISTER_BALANCE) minus any possible outstanding
+    /// balances. However, canisters on system subnets have no balance
+    /// limit.
+    ///
+    /// EXE-117: the last point is not properly handled yet.  In particular, a
+    /// refund can come back to the canister after this call finishes which
+    /// causes the canister's balance to overflow.
+    fn ic0_msg_cycles_accept128(
+        &mut self,
+        max_amount: Cycles,
+        dst: u32,
+        heap: &mut [u8],
+    ) -> HypervisorResult<()>;
 
     /// Sets the certified data for the canister.
     /// See: https://sdk.dfinity.org/docs/interface-spec/index.html#system-api-certified-data
@@ -754,4 +910,185 @@ pub trait SystemApi {
     ///
     /// Returns the amount of cycles added to the canister's balance.
     fn ic0_mint_cycles(&mut self, amount: u64) -> HypervisorResult<u64>;
+}
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+
+/// Indicate whether a checkpoint will be taken after the current round or not.
+pub enum ExecutionRoundType {
+    CheckpointRound,
+    OrdinaryRound,
+}
+
+/// Configuration of execution that comes from the registry.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RegistryExecutionSettings {
+    pub max_number_of_canisters: u64,
+    pub provisional_whitelist: ProvisionalWhitelist,
+    pub max_ecdsa_queue_size: u32,
+    pub subnet_size: usize,
+}
+
+pub trait Scheduler: Send {
+    /// Type modelling the replicated state.
+    ///
+    /// Should typically be
+    /// `ic_replicated_state::ReplicatedState`.
+    // Note [Associated Types in Interfaces]
+    type State;
+
+    /// Executes a list of messages. Triggered by the Coordinator as part of
+    /// processing a batch.
+    ///
+    /// # Configuration parameters that might affect a round's execution
+    ///
+    /// * `scheduler_cores`: number of concurrent threads that the scheduler can
+    ///   use during an execution round.
+    /// * `max_instructions_per_round`: max number of instructions a single
+    ///   round on a single thread can
+    /// consume.
+    /// * `max_instructions_per_message`: max number of instructions a single
+    ///   message execution can consume.
+    ///
+    /// # Walkthrough of a round
+    ///
+    /// The scheduler decides on a deterministic and fair order of canisters to
+    /// execute on each thread (not fully implemented yet).
+    /// For each thread we want to schedule **at least** a `pulse` for the first
+    /// canister. The canister's `pulse` can consume the entire round of the
+    /// thread if it has enough messages or, if not, we can give a `pulse` to
+    /// the next canister. Similarly, the second canister can use the rest
+    /// of the round of the thread if it has enough messages or we can give
+    /// a `pulse` to the next canister and so on.
+    ///
+    /// # Constraints
+    ///
+    /// * To be able to start a pulse for a canister we need to have at least
+    ///   `max_instructions_per_message` left in the current round (basically we
+    ///   need a guarantee that we are able to execute successfully at least one
+    ///   message).
+    /// * The round (and thus the first `pulse`) starts with a limit of
+    ///   `max_instructions_per_round`. When the `pulse` ends it returns how
+    ///   many instructions is left which is used to update the limit for the
+    ///   next `pulse` and if the above constraint is satisfied, we can start
+    ///   the `pulse`. And so on.
+    #[allow(clippy::too_many_arguments)]
+    fn execute_round(
+        &self,
+        state: Self::State,
+        randomness: Randomness,
+        ecdsa_subnet_public_keys: BTreeMap<EcdsaKeyId, MasterEcdsaPublicKey>,
+        current_round: ExecutionRound,
+        current_round_type: ExecutionRoundType,
+        registry_settings: &RegistryExecutionSettings,
+    ) -> Self::State;
+}
+
+#[derive(Clone, Serialize, Deserialize, Debug)]
+pub struct WasmExecutionOutput {
+    pub wasm_result: Result<Option<WasmResult>, HypervisorError>,
+    pub num_instructions_left: NumInstructions,
+    pub allocated_bytes: NumBytes,
+    pub allocated_message_bytes: NumBytes,
+    pub instance_stats: InstanceStats,
+}
+
+impl fmt::Display for WasmExecutionOutput {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let wasm_result_str = match &self.wasm_result {
+            Ok(result) => match result {
+                None => "None".to_string(),
+                Some(wasm_result) => format!("{}", wasm_result),
+            },
+            Err(err) => format!("{}", err),
+        };
+        write!(f, "wasm_result => [{}], instructions left => {}, instance_stats => [ accessed pages => {}, dirty pages => {}]",
+               wasm_result_str,
+               self.num_instructions_left,
+               self.instance_stats.accessed_pages,
+               self.instance_stats.dirty_pages,
+        )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_available_memory() {
+        let available = SubnetAvailableMemory::new(20, 10);
+        assert_eq!(available.get_total_memory(), 20);
+        assert_eq!(available.get_message_memory(), 10);
+        assert_eq!(available.max_available_message_memory(), 10);
+
+        let available = available / 2;
+        assert_eq!(available.get_total_memory(), 10);
+        assert_eq!(available.get_message_memory(), 5);
+        assert_eq!(available.max_available_message_memory(), 5);
+    }
+
+    #[test]
+    fn test_subnet_available_memory() {
+        let mut available: SubnetAvailableMemory =
+            SubnetAvailableMemory::new(1 << 30, (1 << 30) - 5);
+        assert!(available
+            .try_decrement(NumBytes::from(10), NumBytes::from(5))
+            .is_ok());
+        assert!(available
+            .try_decrement(
+                NumBytes::from((1 << 30) - 10),
+                NumBytes::from((1 << 30) - 10)
+            )
+            .is_ok());
+        assert!(available
+            .try_decrement(NumBytes::from(1), NumBytes::from(1))
+            .is_err());
+        assert!(available
+            .try_decrement(NumBytes::from(1), NumBytes::from(0))
+            .is_err());
+
+        let mut available: SubnetAvailableMemory = SubnetAvailableMemory::new(1 << 30, -1);
+        assert!(available
+            .try_decrement(NumBytes::from(1), NumBytes::from(1))
+            .is_err());
+        assert!(available
+            .try_decrement(NumBytes::from(10), NumBytes::from(0))
+            .is_ok());
+        assert!(available
+            .try_decrement(NumBytes::from((1 << 30) - 10), NumBytes::from(0))
+            .is_ok());
+        assert!(available
+            .try_decrement(NumBytes::from(1), NumBytes::from(0))
+            .is_err());
+
+        assert!(available
+            .try_decrement(NumBytes::from(u64::MAX), NumBytes::from(0))
+            .is_err());
+        assert!(available
+            .try_decrement(NumBytes::from(u64::MAX), NumBytes::from(u64::MAX))
+            .is_err());
+        assert!(available
+            .try_decrement(NumBytes::from(i64::MAX as u64 + 1), NumBytes::from(0))
+            .is_err());
+        assert!(available
+            .try_decrement(
+                NumBytes::from(i64::MAX as u64 + 1),
+                NumBytes::from(i64::MAX as u64 + 1)
+            )
+            .is_err());
+
+        let mut available: SubnetAvailableMemory = SubnetAvailableMemory::new(42, 43);
+        assert_eq!(available.get_total_memory(), 42);
+        assert_eq!(available.get_message_memory(), 43);
+        available = SubnetAvailableMemory::new(44, 45);
+        assert_eq!(available.get_total_memory(), 44);
+        assert_eq!(available.get_message_memory(), 45);
+        available.increment(NumBytes::from(1), NumBytes::from(0));
+        assert_eq!(available.get_total_memory(), 45);
+        assert_eq!(available.get_message_memory(), 45);
+        available.increment(NumBytes::from(1), NumBytes::from(1));
+        assert_eq!(available.get_total_memory(), 46);
+        assert_eq!(available.get_message_memory(), 46);
+    }
 }

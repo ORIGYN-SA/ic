@@ -1,0 +1,48 @@
+load("@rules_rust//rust:defs.bzl", "rust_library", "rust_test")
+load("//bazel:prost.bzl", "generated_files_check")
+
+package(default_visibility = ["//visibility:public"])
+
+filegroup(
+    name = "protos",
+    srcs = glob(["proto/**"]),
+)
+
+rust_library(
+    name = "transport",
+    srcs = glob([
+        "src/**",
+        "gen/**",
+    ]),
+    crate_name = "ic_registry_transport",
+    proc_macro_deps = [
+    ],
+    version = "0.8.0",
+    deps = [
+        "//rs/protobuf",
+        "@crate_index//:bytes",
+        "@crate_index//:candid",
+        "@crate_index//:prost",
+        "@crate_index//:serde",
+    ],
+)
+
+rust_test(
+    name = "lib_tests",
+    crate = ":transport",
+)
+
+generated_files_check(
+    name = "check_generated_files",
+    srcs = ["tests/check_generated_files.rs"],
+    data = [
+        ":protos",
+        "//rs/protobuf:protos",
+    ] + glob(["gen/**"]),
+    manifest_dir = "rs/registry/transport",
+    deps = [
+        "//rs/registry/transport/protobuf_generator:lib",
+        "//rs/test_utilities/compare_dirs",
+        "@crate_index//:tempfile",
+    ],
+)

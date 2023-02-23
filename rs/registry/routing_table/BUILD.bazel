@@ -1,0 +1,25 @@
+load("@rules_rust//rust:defs.bzl", "rust_library", "rust_test")
+
+package(default_visibility = ["//visibility:public"])
+
+rust_library(
+    name = "routing_table",
+    srcs = glob(["src/**"]),
+    crate_name = "ic_registry_routing_table",
+    version = "0.8.0",
+    deps = [
+        "//rs/protobuf",
+        "//rs/types/base_types",
+        "@crate_index//:candid",
+        "@crate_index//:serde",
+    ],
+)
+
+rust_test(
+    name = "routing_table_test",
+    crate = ":routing_table",
+    deps = [
+        "//rs/test_utilities",
+        "@crate_index//:assert_matches",
+    ],
+)

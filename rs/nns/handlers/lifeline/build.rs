@@ -3,7 +3,7 @@ use ic_nns_constants::{GOVERNANCE_CANISTER_ID, ROOT_CANISTER_ID};
 use std::env;
 use std::fs;
 use std::io;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::result::Result;
 use std::str::FromStr;
@@ -39,7 +39,7 @@ impl BuildError {
     }
 }
 
-/// Create a gen/<canister_id>.did file pointing at the .did file for a canister
+/// Create a $OUT_DIR/<canister_id>.did file pointing at the .did file for a canister
 /// that the lifeline interacts with.
 ///
 /// - `relative_path`: path to the .did file, relative to this directory. Used
@@ -47,10 +47,11 @@ impl BuildError {
 /// - `name`: name of the canister.
 /// - `id`: the CanisterId of that canister.
 /// - `modify_did`: callback to modify the .did file before copying it to
-///   `gen/`.
+///   `$OUT_DIR`.
 ///
 /// Returns args to be passed to `moc`
 fn create_did_alias<F>(
+    out_dir: &Path,
     relative_path: &str,
     name: &str,
     id: CanisterId,
@@ -60,11 +61,11 @@ where
     F: FnOnce(&mut String),
 {
     println!("cargo:rerun-if-changed={}", relative_path);
-    let target_file_path = format!("gen/{}.did", id);
+    let target_file_path = out_dir.join(format!("{}.did", id));
     // Delete the old if it's already there
     let _ = std::fs::remove_file(&target_file_path);
     // On CI, we use environment variables to know where the .did files are.
-    // For local development, we use paths relative to gen/.
+    // For local development, we use paths relative to $OUT_DIR.
     let env_var = format!("{}_DID", name.to_ascii_uppercase());
     let did_file_path = env::var(env_var).unwrap_or_else(|_| relative_path.to_string());
 
@@ -95,20 +96,20 @@ fn remove_governance_service_args(did: &mut String) {
     *did = did.replace("service : (Governance) ->", "service :");
 }
 
-fn compile_lifeline() -> Result<(), BuildError> {
+const GOVERNANCE_DID: &str = "../../governance/canister/governance.did";
+const ROOT_DID: &str = "../root/canister/root.did";
+
+fn compile_lifeline(out: &Path) -> Result<PathBuf, BuildError> {
     // Add symlinks to the .did files for foreign canisters
     let governance_args = create_did_alias(
-        "../../governance/canister/governance.did",
+        out,
+        GOVERNANCE_DID,
         "governance",
         GOVERNANCE_CANISTER_ID,
         remove_governance_service_args,
     )?;
-    let root_args = create_did_alias(
-        "../root/canister/root.did",
-        "root",
-        ROOT_CANISTER_ID,
-        |_| {},
-    )?;
+
+    let root_args = create_did_alias(out, ROOT_DID, "root", ROOT_CANISTER_ID, |_| {})?;
 
     // Compile the lifeline to Wasm
     let output = Command::new("moc")
@@ -117,22 +118,13 @@ fn compile_lifeline() -> Result<(), BuildError> {
         .args(root_args)
         // `--actor-idl` teaches `moc` to where to look for the `.did` files.
         .arg("--actor-idl")
-        .arg("gen")
-        // Put the output file in a location that:
-        // - is ignored by git
-        // - is easily findable for manual inspection
-        // - is easy to embed in rust using `include_bytes!`
+        .arg(out)
         .arg("-o")
-        .arg("gen/lifeline.wasm")
-        // Setting the environment variable `MOC_UNLOCK_PRIM` to `yesplease` unlocks the primitive
-        // `serialize` (among others) that is necessary to externalise method call arguments into a
-        // `Blob`. This ability is considered test-only, but the Languages team is in the process of
-        // designing a mechanism that is user-facing (and supported) as well as more general.
-        .env("MOC_UNLOCK_PRIM", "yesplease")
+        .arg(out.join("lifeline.wasm"))
         .output()?;
 
     if output.status.success() {
-        Ok(())
+        Ok(out.join("lifeline.wasm"))
     } else {
         Err(BuildError::MocFailure(output))
     }
@@ -142,8 +134,13 @@ fn main() {
     println!("cargo:rerun-if-changed=lifeline.mo");
     println!("cargo:rerun-if-changed=lifeline.did");
     println!("cargo:rerun-if-changed=build.rs");
+    println!("cargo:rerun-if-changed={}", ROOT_DID);
+    println!("cargo:rerun-if-changed={}", GOVERNANCE_DID);
 
-    compile_lifeline().unwrap_or_else(|e| {
+    let out_dir = PathBuf::from(env::var("OUT_DIR").expect("OUT_DIR environment variable not set"));
+    let out_did = out_dir.join("rrkah-fqaaa-aaaaa-aaaaq-cai.did");
+
+    let lifeline_wasm = compile_lifeline(&out_dir).unwrap_or_else(|e| {
         eprintln!("Could not build the Wasm for the lifeline canister. Error:");
         e.print_stderr();
 
@@ -153,7 +150,7 @@ fn main() {
             IN_NIX_SHELL={:?}.\n\
             NIX_BUILD_TOP={:?}.\n\
             lifeline.mo exists? {:?}.\n\
-            gen/rrkah-fqaaa-aaaaa-aaaaq-cai.did exists? {:?}.\n\
+            $OUT_DIR/rrkah-fqaaa-aaaaa-aaaaq-cai.did exists? {:?}.\n\
             PATH={:?}.\n\
             `ls` output: {:?}.",
             env::current_dir().map(|pb| pb.as_path().display().to_string()),
@@ -161,12 +158,16 @@ fn main() {
             env::var("IN_NIX_SHELL"),
             env::var("NIX_BUILD_TOP"),
             PathBuf::from_str("lifeline.mo").map(|pb| pb.as_path().is_file()),
-            PathBuf::from_str("gen/rrkah-fqaaa-aaaaa-aaaaq-cai.did")
-                .map(|pb| pb.as_path().is_file()),
+            out_did.is_file(),
             env::var("PATH"),
             Command::new("ls").output()
         );
 
         panic!()
     });
+
+    println!(
+        "cargo:rustc-env=LIFELINE_CANISTER_WASM_PATH={}",
+        lifeline_wasm.display()
+    );
 }

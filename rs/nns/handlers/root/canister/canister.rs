@@ -1,26 +1,18 @@
-use prost::Message;
-
-use candid::Decode;
 use dfn_candid::candid;
 use dfn_core::{
-    api::arg_data,
+    api::caller,
     endpoint::{over, over_async},
     stable,
 };
-use ic_nns_common::{
-    access_control::{check_caller_is_governance, current_canister_authz, init_canister_authz},
-    types::NeuronId,
+use ic_base_types::PrincipalId;
+use ic_nervous_system_root::{
+    change_canister, AddCanisterProposal, CanisterIdRecord, ChangeCanisterProposal,
+    StopOrStartCanisterProposal, LOG_PREFIX,
 };
-use ic_nns_governance::handler_utils;
-use ic_nns_governance::pb::v1::NnsFunction;
+use ic_nns_common::access_control::check_caller_is_governance;
 use ic_nns_handler_root::{
     canister_management,
-    common::{
-        AddNnsCanisterProposalPayload, CanisterIdRecord, ChangeNnsCanisterProposalPayload,
-        StopOrStartNnsCanisterProposalPayload, LOG_PREFIX,
-    },
-    init::RootCanisterInitPayload,
-    pb::v1::RootCanisterStableStorage,
+    root_proposals::{GovernanceUpgradeRootProposal, RootProposalBallot},
 };
 
 fn main() {}
@@ -35,39 +27,19 @@ use ic_nns_handler_root::canister_management::do_add_nns_canister;
 #[export_name = "canister_init"]
 fn canister_init() {
     dfn_core::printer::hook();
-
-    let init_payload =
-        Decode!(&arg_data(), RootCanisterInitPayload).expect("Failed to decode init arguments");
-    println!(
-        "{}canister_init: Initializing with: {:?}",
-        LOG_PREFIX, init_payload
-    );
-    init_canister_authz(init_payload.authz_info);
-}
-
-#[export_name = "canister_pre_upgrade"]
-fn canister_pre_upgrade() {
-    println!("{}canister_pre_upgrade", LOG_PREFIX);
-    let mut serialized = Vec::new();
-    let ss = RootCanisterStableStorage {
-        authz: Some(current_canister_authz()),
-    };
-    ss.encode(&mut serialized)
-        .expect("Error serializing to stable.");
-    stable::set(&serialized);
+    println!("{}canister_init", LOG_PREFIX);
 }
 
 #[export_name = "canister_post_upgrade"]
 fn canister_post_upgrade() {
     dfn_core::printer::hook();
     println!("{}canister_post_upgrade", LOG_PREFIX);
-    // Purposefully fail the upgrade if we can't find authz information.
-    // Best to have a broken canister, which we can reinstall, than a
-    // canister without authz information.
-    let ss = RootCanisterStableStorage::decode(stable::get().as_slice())
-        .expect("Error decoding from stable.");
-    init_canister_authz(ss.authz.expect("Canister must have authz info in stable"));
+    // Wipe out stable memory, because earlier version of this canister were
+    // stateful. This minimizes risk of future mis-interpretation of data.
+    stable::set(&[]);
 }
+
+ic_nervous_system_common_build_metadata::define_get_build_metadata_candid_method! {}
 
 /// Returns the status of the canister specified in the input.
 ///
@@ -79,29 +51,54 @@ fn canister_post_upgrade() {
 #[export_name = "canister_update canister_status"]
 fn canister_status() {
     println!("{}canister_status", LOG_PREFIX);
-    over_async(
-        candid,
-        |(canister_id_record,): (CanisterIdRecord,)| async move {
-            canister_management::canister_status(canister_id_record).await
-        },
-    )
+    over_async(candid, |(canister_id_record,): (CanisterIdRecord,)| {
+        ic_nervous_system_root::canister_status(canister_id_record)
+    })
 }
 
 #[export_name = "canister_update submit_change_nns_canister_proposal"]
 fn submit_change_nns_canister_proposal() {
+    panic!(
+        "This method was removed in PR 11215. \
+            Use instead function `manage_neuron` on the Governance canister \
+            to submit a proposal to change an NNS canister."
+    );
+}
+
+#[export_name = "canister_update submit_root_proposal_to_upgrade_governance_canister"]
+fn submit_root_proposal_to_upgrade_governance_canister() {
     over_async(
         candid,
-        |(proposer, payload): (NeuronId, ChangeNnsCanisterProposalPayload)| async move {
-            println!("{}submit_change_nns_canister_proposal: received a proposal to with a wasm size {:e} B.", LOG_PREFIX, payload.wasm_module.len() as f64);
-            handler_utils::submit_proposal(
-                &proposer,
-                NnsFunction::NnsCanisterUpgrade,
-                &payload,
-                LOG_PREFIX,
+        |(expected_governance_wasm_sha, proposal): (Vec<u8>, ChangeCanisterProposal)| {
+            ic_nns_handler_root::root_proposals::submit_root_proposal_to_upgrade_governance_canister(
+                caller(),
+                expected_governance_wasm_sha,
+                proposal,
             )
-            .await
         },
     );
+}
+
+#[export_name = "canister_update vote_on_root_proposal_to_upgrade_governance_canister"]
+fn vote_on_root_proposal_to_upgrade_governance_canister() {
+    over_async(
+        candid,
+        |(proposer, wasm_sha256, ballot): (PrincipalId, Vec<u8>, RootProposalBallot)| {
+            ic_nns_handler_root::root_proposals::vote_on_root_proposal_to_upgrade_governance_canister(
+                caller(),
+                proposer,
+                wasm_sha256,
+                ballot,
+            )
+        },
+    );
+}
+
+#[export_name = "canister_update get_pending_root_proposals_to_upgrade_governance_canister"]
+fn get_pending_root_proposals_to_upgrade_governance_canister() {
+    over(candid, |()| -> Vec<GovernanceUpgradeRootProposal> {
+        ic_nns_handler_root::root_proposals::get_pending_root_proposals_to_upgrade_governance_canister()
+    })
 }
 
 /// Executes a proposal to change an NNS canister.
@@ -117,11 +114,11 @@ fn change_nns_canister() {
     // To do so, we use `over` instead of the more common `over_async`.
     //
     // This will effectively reply synchronously with the first call to the
-    // management canister in do_change_nns_canister.
-    over(candid, |(payload,): (ChangeNnsCanisterProposalPayload,)| {
-        // Because do_change_nns_canister is async, and because we can't directly use
+    // management canister in change_canister.
+    over(candid, |(proposal,): (ChangeCanisterProposal,)| {
+        // Because change_canister is async, and because we can't directly use
         // `await`, we need to use the `spawn` trick.
-        let future = canister_management::do_change_nns_canister(payload);
+        let future = change_canister(proposal);
 
         // Starts the proposal execution, which will continue after this function has
         // returned.
@@ -132,12 +129,9 @@ fn change_nns_canister() {
 #[export_name = "canister_update add_nns_canister"]
 fn add_nns_canister() {
     check_caller_is_governance();
-    over_async(
-        candid,
-        |(payload,): (AddNnsCanisterProposalPayload,)| async move {
-            do_add_nns_canister(payload).await;
-        },
-    );
+    over_async(candid, |(proposal,): (AddCanisterProposal,)| async move {
+        do_add_nns_canister(proposal).await;
+    });
 }
 
 // Executes a proposal to stop/start an nns canister.
@@ -146,18 +140,18 @@ fn stop_or_start_nns_canister() {
     check_caller_is_governance();
     over_async(
         candid,
-        |(payload,): (StopOrStartNnsCanisterProposalPayload,)| async move {
+        |(proposal,): (StopOrStartCanisterProposal,)| async move {
             // Can't stop/start the governance canister since that would mean
             // we couldn't submit any more proposals.
             // Since this canister is the only possible caller, it's then safe
             // to call stop/start inline.
-            if payload.canister_id == ic_nns_constants::GOVERNANCE_CANISTER_ID
-                || payload.canister_id == ic_nns_constants::ROOT_CANISTER_ID
-                || payload.canister_id == ic_nns_constants::LIFELINE_CANISTER_ID
+            if proposal.canister_id == ic_nns_constants::GOVERNANCE_CANISTER_ID
+                || proposal.canister_id == ic_nns_constants::ROOT_CANISTER_ID
+                || proposal.canister_id == ic_nns_constants::LIFELINE_CANISTER_ID
             {
                 panic!("The governance, root and lifeline canisters can't be stopped or started.")
             }
-            canister_management::stop_or_start_nns_canister(payload).await
+            canister_management::stop_or_start_nns_canister(proposal).await
         },
     );
 }

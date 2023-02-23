@@ -78,6 +78,17 @@ message RegistryStableStorage {
 // A container for the what gets written to stable storage,
 // from the registry canister.
 message RegistryCanisterStableStorage {
-  ic_nns_common.pb.v1.CanisterAuthzInfo authz = 1;
   RegistryStableStorage registry = 2;
+
+  // Used to check that the latest version of the registry has not been rolled
+  // back after an upgrade
+  optional uint64 pre_upgrade_version = 3;
+
+  reserved 1;
+}
+
+// Maps Node Provider IDs to the amount (in 10,000ths of an SDR) they should be
+// rewarded for providing nodes to the Internet Computer for the month.
+message NodeProvidersMonthlyXdrRewards {
+    map<string, uint64> rewards = 1;
 }

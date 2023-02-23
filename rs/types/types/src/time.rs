@@ -2,14 +2,17 @@
 #![cfg_attr(test, allow(clippy::unit_arg))]
 //! Defines the [`Time`] type used by the Internet Computer.
 
-use crate::ingress::{MAX_INGRESS_TTL, PERMITTED_DRIFT};
-use chrono::{TimeZone, Utc};
+#[cfg(test)]
+mod tests;
+
+use ic_constants::{MAX_INGRESS_TTL, PERMITTED_DRIFT};
 #[cfg(test)]
 use proptest_derive::Arbitrary;
 use serde::{Deserialize, Serialize};
-use std::convert::TryInto;
+use std::convert::TryFrom;
 use std::fmt;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
+use thiserror::Error;
 
 /// Time since UNIX_EPOCH (in nanoseconds). Just like 'std::time::Instant' or
 /// 'std::time::SystemTime', [Time] does not implement the [Default] trait.
@@ -20,6 +23,12 @@ pub struct Time(u64);
 
 /// The unix epoch.
 pub const UNIX_EPOCH: Time = Time(0);
+
+/// The Genesis launch timestamp.
+/// Corresponds to 2021-05-06T19:17:10 UTC
+pub const GENESIS: Time = Time::from_nanos_since_unix_epoch(1_620_328_630_000_000_000);
+
+const NANOS_PER_MILLI: u64 = 1_000_000;
 
 impl std::ops::Add<Duration> for Time {
     type Output = Time;
@@ -35,9 +44,9 @@ impl std::ops::AddAssign<Duration> for Time {
 }
 
 impl std::ops::Sub<Time> for Time {
-    type Output = std::time::Duration;
+    type Output = Duration;
 
-    fn sub(self, other: Time) -> std::time::Duration {
+    fn sub(self, other: Time) -> Duration {
         let lhs = Duration::from_nanos(self.0);
         let rhs = Duration::from_nanos(other.0);
         lhs - rhs
@@ -59,22 +68,141 @@ impl Time {
         self.0
     }
 
-    pub fn from_nanos_since_unix_epoch(nanos: u64) -> Self {
+    pub const fn from_nanos_since_unix_epoch(nanos: u64) -> Self {
         Time(nanos)
+    }
+
+    /// Number of milliseconds since UNIX EPOCH
+    pub fn as_millis_since_unix_epoch(self) -> u64 {
+        self.as_nanos_since_unix_epoch() / NANOS_PER_MILLI
+    }
+
+    pub fn from_millis_since_unix_epoch(millis: u64) -> Result<Self, TimeInstantiationError> {
+        millis
+            .checked_mul(NANOS_PER_MILLI )
+            .map(Time)
+            .ok_or_else(|| {
+                TimeInstantiationError::Overflow(format!(
+                    "The number of milliseconds {} is too large and cannot be converted into a u64 of nanoseconds",
+                    millis
+                ))
+            })
     }
 
     /// A private function to cast from [Duration] to [Time].
     fn from_duration(t: Duration) -> Self {
         Time(t.as_nanos() as u64)
     }
+
+    /// Checked `Time` addition. Computes `self + rhs`, returning [`None`]
+    /// if overflow occurred.
+    ///
+    /// # Examples
+    ///
+    /// Basic usage:
+    ///
+    /// ```
+    /// use ic_types::Time;
+    ///
+    /// assert_eq!(Time::from_nanos_since_unix_epoch(0).checked_add(Time::from_nanos_since_unix_epoch(1)), Some(Time::from_nanos_since_unix_epoch(1)));
+    /// assert_eq!(Time::from_nanos_since_unix_epoch(1).checked_add(Time::from_nanos_since_unix_epoch(u64::MAX)), None);
+    /// ```
+    pub const fn checked_add(self, rhs: Time) -> Option<Time> {
+        if let Some(result) = self.0.checked_add(rhs.0) {
+            Some(Time(result))
+        } else {
+            None
+        }
+    }
+
+    /// Checked `Time` addition with a `Duration`. Computes `self + rhs`, returning [`None`]
+    /// if overflow occurred.
+    ///
+    /// # Examples
+    ///
+    /// Basic usage:
+    ///
+    /// ```
+    /// use std::time::Duration;
+    /// use ic_types::Time;
+    ///
+    /// assert_eq!(Time::from_nanos_since_unix_epoch(0).checked_add_duration(Duration::from_nanos(1)), Some(Time::from_nanos_since_unix_epoch(1)));
+    /// assert_eq!(Time::from_nanos_since_unix_epoch(0).checked_add_duration(Duration::MAX), None);
+    /// assert_eq!(Time::from_nanos_since_unix_epoch(1).checked_add_duration(Duration::from_nanos(u64::MAX)), None);
+    /// ```
+    pub fn checked_add_duration(self, rhs: Duration) -> Option<Time> {
+        if let Ok(rhs_time) = Time::try_from(rhs) {
+            self.checked_add(rhs_time)
+        } else {
+            None
+        }
+    }
 }
 
+#[derive(Error, Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum TimeInstantiationError {
+    #[error("Time cannot be instantiated as it would overflow: {0}")]
+    Overflow(String),
+}
+
+impl TryFrom<Duration> for Time {
+    type Error = TimeInstantiationError;
+    fn try_from(d: Duration) -> Result<Self, Self::Error> {
+        u64::try_from(d.as_nanos())
+            .map_err(|_| {
+                TimeInstantiationError::Overflow(
+                    "Duration is too large to be converted into a u64 of nanoseconds!".to_string(),
+                )
+            })
+            .map(Time)
+    }
+}
+
+impl From<Time> for Duration {
+    fn from(val: Time) -> Self {
+        Duration::from_nanos(val.0)
+    }
+}
+
+impl TryFrom<SystemTime> for Time {
+    type Error = TimeInstantiationError;
+
+    /// Performs conversion from `SystemTime` to `Time`.
+    ///
+    /// # Panics
+    ///
+    /// The function panics when `duration_since(UNIX_EPOCH)` fails,
+    /// i.e. when the `SystemTime` measurement is earlier than the
+    /// `UNIX_EPOCH`.
+    fn try_from(st: SystemTime) -> Result<Self, Self::Error> {
+        st.duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .try_into()
+    }
+}
+
+impl From<Time> for SystemTime {
+    fn from(t: Time) -> Self {
+        SystemTime::UNIX_EPOCH + Duration::from(t)
+    }
+}
+
+#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
 impl fmt::Display for Time {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        use chrono::{TimeZone, Utc};
+
         match self.0.try_into() {
             Ok(signed) => write!(f, "{}", Utc.timestamp_nanos(signed)),
             Err(_) => write!(f, "{}ns", self.0),
         }
+    }
+}
+
+#[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+impl fmt::Display for Time {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}ns", self.0)
     }
 }
 

@@ -24,6 +24,8 @@ pub enum Error {
     UnknownError(String),
 }
 
+impl std::error::Error for Error {}
+
 impl fmt::Display for Error {
     fn fmt(&self, fmt: &mut fmt::Formatter<'_>) -> fmt::Result {
         fmt.write_str("Registry Canister Error. Msg: ")?;
@@ -33,19 +35,19 @@ impl fmt::Display for Error {
             }
             Error::KeyNotPresent(key) => fmt.write_fmt(format_args!(
                 "Key not present: {}",
-                std::str::from_utf8(&key).expect("key is not a str")
+                std::str::from_utf8(key).expect("key is not a str")
             ))?,
             Error::KeyAlreadyPresent(key) => fmt.write_fmt(format_args!(
                 "Key already present: {}",
-                std::str::from_utf8(&key).expect("key is not a str")
+                std::str::from_utf8(key).expect("key is not a str")
             ))?,
             Error::VersionNotLatest(key) => fmt.write_fmt(format_args!(
                 "Specified version was not the last version of the key: {}",
-                std::str::from_utf8(&key).expect("key is not a str")
+                std::str::from_utf8(key).expect("key is not a str")
             ))?,
             Error::VersionBeyondLatest(key) => fmt.write_fmt(format_args!(
                 "Specified version for key {} is beyond the latest registry version",
-                std::str::from_utf8(&key).expect("key is not a str")
+                std::str::from_utf8(key).expect("key is not a str")
             ))?,
             Error::RegistryUnreachable(error) => fmt.write_fmt(format_args!(
                 "Can't reach the registry canister: {}",
@@ -115,8 +117,10 @@ pub fn serialize_get_value_request(
     key: Vec<u8>,
     version_opt: Option<u64>,
 ) -> Result<Vec<u8>, Error> {
-    let mut request: pb::v1::RegistryGetValueRequest = pb::v1::RegistryGetValueRequest::default();
-    request.key = key;
+    let mut request: pb::v1::RegistryGetValueRequest = pb::v1::RegistryGetValueRequest {
+        key,
+        ..Default::default()
+    };
     if let Some(version) = version_opt {
         request.version = Some(version);
     }
@@ -222,8 +226,7 @@ pub fn serialize_get_changes_since_response(
 // be used in the registry canister only and thus there is no problem with
 // leaking the PB structs to the rest of the code base.
 pub fn serialize_get_changes_since_request(version: u64) -> Result<Vec<u8>, Error> {
-    let mut request = pb::v1::RegistryGetChangesSinceRequest::default();
-    request.version = version;
+    let request = pb::v1::RegistryGetChangesSinceRequest { version };
     let mut buf = Vec::new();
     match request.encode(&mut buf) {
         Ok(_) => Ok(buf),
@@ -378,9 +381,11 @@ mod tests {
     fn test_serde_get_value_response() {
         let value = vec![1, 2, 3, 4];
         let version = 10;
-        let mut response = pb::v1::RegistryGetValueResponse::default();
-        response.version = version;
-        response.value = value.clone();
+        let response = pb::v1::RegistryGetValueResponse {
+            version,
+            value: value.clone(),
+            ..Default::default()
+        };
 
         let bytes = serialize_get_value_response(response).unwrap();
         let (ret_value, ret_version) = deserialize_get_value_response(bytes).unwrap();
@@ -392,8 +397,10 @@ mod tests {
     #[should_panic]
     fn test_serde_get_value_response_with_error() {
         let mut response = pb::v1::RegistryGetValueResponse::default();
-        let mut error = RegistryError::default();
-        error.code = 1;
+        let error = RegistryError {
+            code: 1,
+            ..Default::default()
+        };
         response.error = Some(error);
         let bytes = serialize_get_value_response(response).unwrap();
         // Should panic on the unwrap because this returns an error.

@@ -7,12 +7,10 @@ use bincode::{deserialize, serialize};
 use byteorder::{BigEndian, ReadBytesExt};
 use ic_config::artifact_pool::RocksDBConfig;
 
-use ic_consensus_message::ConsensusMessageHashable;
 use ic_interfaces::artifact_pool::ValidatedArtifact;
 use ic_interfaces::consensus_pool::{
     HeightIndexedPool, HeightRange, OnlyError, PoolSection, ValidatedConsensusArtifact,
 };
-use ic_interfaces::crypto::CryptoHashable;
 use ic_logger::{info, warn, ReplicaLogger};
 use ic_protobuf::types::v1 as pb;
 use ic_types::{
@@ -23,9 +21,10 @@ use ic_types::{
         certification::{Certification, CertificationMessage, CertificationShare},
         dkg::Dealings,
         BlockProposal, CatchUpPackage, CatchUpPackageShare, ConsensusMessage, ConsensusMessageHash,
-        Finalization, FinalizationShare, HasHeight, Notarization, NotarizationShare, Payload,
-        RandomBeacon, RandomBeaconShare, RandomTape, RandomTapeShare,
+        ConsensusMessageHashable, Finalization, FinalizationShare, HasHeight, Notarization,
+        NotarizationShare, Payload, RandomBeacon, RandomBeaconShare, RandomTape, RandomTapeShare,
     },
+    crypto::CryptoHashable,
     Height, Time,
 };
 use rocksdb::{
@@ -302,7 +301,7 @@ impl<T: HasCFInfos> PersistentHeightIndexedPool<T> {
         }
 
         iter.key().map(|key| {
-            let (height, _) = decompose_key(&key);
+            let (height, _) = decompose_key(key);
             Height::new(height)
         })
     }
@@ -425,11 +424,15 @@ impl MutablePoolSection<ValidatedConsensusArtifact>
                                 block.payload.get_hash().clone(),
                                 block.payload.payload_type(),
                                 Box::new(move || {
-                                    (BatchPayload::default(), Dealings::new_empty(start_height))
+                                    (
+                                        BatchPayload::default(),
+                                        Dealings::new_empty(start_height),
+                                        None,
+                                    )
                                         .into()
                                 }),
                             );
-                            artifact.msg = proposal.to_message();
+                            artifact.msg = proposal.into_message();
                             batch.put_cf(cf_handle, key, check_ok_uw!(serialize(&artifact)));
                         }
                         ConsensusMessage::CatchUpPackage(cup) => {
@@ -507,7 +510,7 @@ fn remove_block_payload(db: &DB, batch: &mut WriteBatch, bytes: &[u8]) {
 }
 
 fn deserialize_catch_up_package(bytes: &[u8]) -> Option<ValidatedArtifact<pb::CatchUpPackage>> {
-    deserialize(&bytes).ok()
+    deserialize(bytes).ok()
 }
 
 fn deserialize_catch_up_package_fn(
@@ -550,7 +553,7 @@ fn deserialize_consensus_artifact(
                         .unwrap_or_else(|| panic!("Failed to deserialize payload: {:?}", key))
                 }),
             );
-            artifact.msg = proposal.to_message();
+            artifact.msg = proposal.into_message();
             Some(artifact)
         }
         _ => Some(artifact),
@@ -570,7 +573,7 @@ impl PoolSection<ValidatedConsensusArtifact> for PersistentHeightIndexedPool<Con
         self.lookup_key(msg_id).and_then(|key| {
             let info = info_for_msg_id(msg_id);
             let cf_handle = check_not_none_uw!(self.db.cf_handle(info.name));
-            let bytes = check_ok_uw!(self.db.get_cf(cf_handle, &key))?;
+            let bytes = check_ok_uw!(self.db.get_cf(cf_handle, key))?;
             deserialize_consensus_artifact(
                 Arc::new(StandaloneSnapshot::new(self.db.clone())),
                 &bytes,
@@ -583,7 +586,7 @@ impl PoolSection<ValidatedConsensusArtifact> for PersistentHeightIndexedPool<Con
         self.lookup_key(msg_id).and_then(|key| {
             let info = info_for_msg_id(msg_id);
             let cf_handle = check_not_none_uw!(self.db.cf_handle(info.name));
-            let bytes = check_ok_uw!(self.db.get_cf(cf_handle, &key))?;
+            let bytes = check_ok_uw!(self.db.get_cf(cf_handle, key))?;
             deserialize_consensus_artifact(
                 Arc::new(StandaloneSnapshot::new(self.db.clone())),
                 &bytes,
@@ -935,7 +938,7 @@ const MAX_KEY: [u8; KEY_SIZE] = [0xff; KEY_SIZE];
 /// Makes a key from a height and a hash (in Vec<u8> form).
 fn make_key(height: u64, hash: &[u8]) -> Vec<u8> {
     let mut key = Vec::with_capacity(KEY_SIZE);
-    key.extend(&height.to_be_bytes());
+    key.extend(height.to_be_bytes());
     key.extend(hash);
     key
 }
@@ -952,20 +955,14 @@ fn decompose_key(key: &[u8]) -> (u64, Vec<u8>) {
 /// Builds a key which is the lexicographical minimum for a given height and is
 /// guaranteed to be less than or equal to any artifact at that height.
 fn make_min_key(height: u64) -> Vec<u8> {
-    make_key(
-        height,
-        &check_not_none_uw!(&MIN_KEY.get(HASH_POS..KEY_SIZE)).to_vec(),
-    )
+    make_key(height, check_not_none_uw!(&MIN_KEY.get(HASH_POS..KEY_SIZE)))
 }
 
 /// Builds a key which is the lexicographical maximum for a given height
 /// and is guaranteed to be higher than or equal to all the artifacts at
 /// height.
 fn make_max_key(height: u64) -> Vec<u8> {
-    make_key(
-        height,
-        &check_not_none_uw!(&MAX_KEY.get(HASH_POS..KEY_SIZE)).to_vec(),
-    )
+    make_key(height, check_not_none_uw!(&MAX_KEY.get(HASH_POS..KEY_SIZE)))
 }
 
 const CERTIFICATION_CF_INFO: ArtifactCFInfo = ArtifactCFInfo::new("CE");
@@ -1037,7 +1034,10 @@ impl PersistentHeightIndexedPool<CertificationMessage> {
         value: &T,
     ) {
         let info = T::info();
-        let key = make_key(value.height().get(), &ic_crypto::crypto_hash(value).get().0);
+        let key = make_key(
+            value.height().get(),
+            &ic_types::crypto::crypto_hash(value).get().0,
+        );
         let cf_handle = check_not_none_uw!(self.db.cf_handle(info.name));
         check_ok!(self
             .db
@@ -1142,41 +1142,12 @@ impl<Message: CertificationType + PerTypeCFInfo + 'static> HeightIndexedPool<Mes
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ic_consensus_message::make_genesis;
-    use ic_test_utilities::types::ids::node_test_id;
-    use ic_test_utilities::{consensus::fake::*, mock_time};
-    use ic_types::{
-        consensus::{
-            dkg::Summary, Block, BlockPayload, BlockProposal, FinalizationContent, MultiSignature,
-            MultiSignatureShare, NotarizationContent, RandomBeaconContent, RandomTapeContent,
-            ThresholdSignatureShare,
-        },
-        crypto::{ThresholdSigShare, ThresholdSigShareOf},
-    };
+    use crate::test_utils::*;
+    use ic_test_utilities::consensus::make_genesis;
     use slog::Drain;
     use std::panic;
-    use std::path::Path;
-    use std::time::Duration;
 
     const SLOG_ASYNC_CHAN_SIZE: usize = 10000;
-
-    fn make_summary(genesis_height: Height) -> Summary {
-        let mut summary = Summary::fake();
-        summary.height = genesis_height;
-        summary
-    }
-
-    fn fake_block_proposal(h: Height) -> BlockProposal {
-        let parent = make_genesis(make_summary(h.decrement())).content.block;
-        BlockProposal::fake(Block::from_parent(parent.as_ref()), node_test_id(0))
-    }
-
-    fn fake_random_beacon(h: Height) -> RandomBeacon {
-        let parent = make_genesis(make_summary(h.decrement()))
-            .content
-            .random_beacon;
-        RandomBeacon::from_parent(parent.as_ref())
-    }
 
     #[test]
     fn test_encode_decode_key() {
@@ -1214,6 +1185,7 @@ mod tests {
         ));
     }
 
+    // TODO: Remove this after it is no longer needed
     // Helper to run the persistence tests below.
     // It creates the config and logger that is passed to the instances and then
     // makes sure that the the databases are destroyed before the test fails.
@@ -1228,615 +1200,58 @@ mod tests {
         })
     }
 
-    // Tests the pool though the PoolSection trait, including inserting
-    // and rebooting.
+    impl PoolTestHelper for RocksDBConfig {
+        type PersistentHeightIndexedPool = PersistentHeightIndexedPool<ConsensusMessage>;
+
+        fn run_persistent_pool_test<T, R>(_test_name: &str, test: T) -> R
+        where
+            T: FnOnce(RocksDBConfig, ReplicaLogger) -> R + panic::UnwindSafe,
+        {
+            ic_test_utilities::artifact_pool_config::with_test_rocksdb_pool_config(|config| {
+                let result = panic::catch_unwind(|| test(config.clone(), make_logger()));
+                destroy(&config);
+                assert!(result.is_ok());
+                result.unwrap()
+            })
+        }
+
+        fn new_consensus_pool(self, log: ReplicaLogger) -> Self::PersistentHeightIndexedPool {
+            PersistentHeightIndexedPool::new_consensus_pool(self, log)
+        }
+
+        fn persistent_pool_validated_persistent_db_path(&self) -> &PathBuf {
+            &self.persistent_pool_validated_persistent_db_path
+        }
+    }
+
     #[test]
     fn test_as_pool_section() {
-        run_persistent_pool_test("test_as_pool_section", |config, log| {
-            let height = Height::from(11);
-            let block_proposal = fake_block_proposal(Height::from(11));
-            let msg = ConsensusMessage::BlockProposal(block_proposal);
-            let msg_expected = msg.clone();
-            let hash = msg_expected.get_cm_hash();
-            let msg_id = ConsensusMessageId { height, hash };
-            // Create a pool and insert an item.
-            {
-                let mut pool =
-                    PersistentHeightIndexedPool::new_consensus_pool(config.clone(), log.clone());
-                let mut ops = PoolSectionOps::new();
-                ops.insert(ValidatedConsensusArtifact {
-                    msg,
-                    timestamp: mock_time(),
-                });
-                pool.mutate(ops);
-            }
-            // Test that we can get the item after rebuilding the pool.
-            {
-                let mut pool =
-                    PersistentHeightIndexedPool::new_consensus_pool(config.clone(), log.clone());
-                assert!(pool.contains(&msg_id));
-                let get_result = pool.get(&msg_id);
-                match get_result {
-                    Some(artifact_result) => {
-                        assert_eq!(artifact_result, msg_expected);
-                    }
-                    None => {
-                        panic!("Get failed");
-                    }
-                }
-                let mut ops = PoolSectionOps::new();
-                ops.remove(msg_id.clone());
-                pool.mutate(ops);
-            }
-            // Test that the item's removal survived a reboot.
-            {
-                let pool = PersistentHeightIndexedPool::new_consensus_pool(config, log);
-                assert!(!pool.contains(&msg_id));
-                assert!(pool.get(&msg_id).is_none());
-            }
-        })
+        crate::test_utils::test_as_pool_section::<RocksDBConfig>()
     }
 
-    fn random_beacon_ops() -> PoolSectionOps<ValidatedConsensusArtifact> {
-        let mut ops = PoolSectionOps::new();
-        for i in 3..19 {
-            let random_beacon = fake_random_beacon(Height::from(i));
-            let msg = ConsensusMessage::RandomBeacon(random_beacon);
-            ops.insert(ValidatedConsensusArtifact {
-                msg,
-                timestamp: mock_time(),
-            });
-        }
-        ops
-    }
-
-    fn block_proposal_ops() -> PoolSectionOps<ValidatedConsensusArtifact> {
-        let mut ops = PoolSectionOps::new();
-        for i in 1..18 {
-            let block_proposal = fake_block_proposal(Height::from(i));
-            let msg = ConsensusMessage::BlockProposal(block_proposal);
-            ops.insert(ValidatedConsensusArtifact {
-                msg,
-                timestamp: mock_time(),
-            });
-        }
-        ops
-    }
-
-    fn finalization_ops() -> PoolSectionOps<ValidatedConsensusArtifact> {
-        let mut ops = PoolSectionOps::new();
-        for i in 2..13 {
-            let height = Height::from(i);
-            let block_proposal = fake_block_proposal(height);
-            let block = block_proposal.content.get_hash().clone();
-            let content = FinalizationContent::new(height, block);
-            let signature = MultiSignature::fake();
-            let msg = ConsensusMessage::Finalization(Finalization { content, signature });
-            ops.insert(ValidatedConsensusArtifact {
-                msg,
-                timestamp: mock_time(),
-            });
-        }
-        ops
-    }
-
-    fn notarization_ops() -> PoolSectionOps<ValidatedConsensusArtifact> {
-        let mut ops = PoolSectionOps::new();
-        for i in 2..14 {
-            let height = Height::from(i);
-            let block_proposal = fake_block_proposal(height);
-            let block = block_proposal.content.get_hash().clone();
-            let content = NotarizationContent::new(height, block);
-            let signature = MultiSignature::fake();
-            let msg = ConsensusMessage::Notarization(Notarization { content, signature });
-            ops.insert(ValidatedConsensusArtifact {
-                msg,
-                timestamp: mock_time(),
-            });
-        }
-        ops
-    }
-
-    fn random_beacon_share_ops() -> PoolSectionOps<ValidatedConsensusArtifact> {
-        let mut ops = PoolSectionOps::new();
-        for i in 3..21 {
-            let height = Height::from(i);
-            for j in 0..3 {
-                let random_beacon = fake_random_beacon(Height::from(i));
-                let parent = ic_crypto::crypto_hash(&random_beacon);
-                let content = RandomBeaconContent::new(height, parent);
-                let signature = ThresholdSigShareOf::new(ThresholdSigShare(vec![]));
-                let signer = node_test_id(j);
-                let signature = ThresholdSignatureShare { signature, signer };
-                let msg =
-                    ConsensusMessage::RandomBeaconShare(RandomBeaconShare { content, signature });
-                ops.insert(ValidatedConsensusArtifact {
-                    msg,
-                    timestamp: mock_time(),
-                });
-            }
-        }
-        ops
-    }
-
-    fn notarization_share_ops() -> PoolSectionOps<ValidatedConsensusArtifact> {
-        let mut ops = PoolSectionOps::new();
-        for i in 4..16 {
-            let height = Height::from(i);
-            let block_proposal = fake_block_proposal(height);
-            for j in 0..3 {
-                let block = block_proposal.content.get_hash().clone();
-                let content = NotarizationContent::new(height, block);
-                let signature = MultiSignatureShare::fake(node_test_id(j));
-                let msg =
-                    ConsensusMessage::NotarizationShare(NotarizationShare { content, signature });
-                ops.insert(ValidatedConsensusArtifact {
-                    msg,
-                    timestamp: mock_time(),
-                });
-            }
-        }
-        ops
-    }
-
-    fn finalization_share_ops() -> PoolSectionOps<ValidatedConsensusArtifact> {
-        let mut ops = PoolSectionOps::new();
-        for i in 5..14 {
-            let height = Height::from(i);
-            let block_proposal = fake_block_proposal(height);
-            for j in 0..3 {
-                let block = block_proposal.content.get_hash().clone();
-                let content = FinalizationContent::new(height, block);
-                let signature = MultiSignatureShare::fake(node_test_id(j));
-                let msg =
-                    ConsensusMessage::FinalizationShare(FinalizationShare { content, signature });
-                ops.insert(ValidatedConsensusArtifact {
-                    msg,
-                    timestamp: mock_time(),
-                });
-            }
-        }
-        ops
-    }
-
-    fn random_tape_ops() -> PoolSectionOps<ValidatedConsensusArtifact> {
-        let mut ops = PoolSectionOps::new();
-        for i in 3..19 {
-            let random_tape = RandomTape::fake(RandomTapeContent::new(Height::from(i)));
-            let msg = ConsensusMessage::RandomTape(random_tape);
-            ops.insert(ValidatedConsensusArtifact {
-                msg,
-                timestamp: mock_time(),
-            });
-        }
-        ops
-    }
-
-    fn random_tape_share_ops() -> PoolSectionOps<ValidatedConsensusArtifact> {
-        let mut ops = PoolSectionOps::new();
-        for i in 5..20 {
-            let height = Height::from(i);
-            for j in 0..3 {
-                let content = RandomTapeContent::new(height);
-                let signature = ThresholdSigShareOf::new(ThresholdSigShare(vec![]));
-                let signer = node_test_id(j);
-                let signature = ThresholdSignatureShare { signature, signer };
-                let msg = ConsensusMessage::RandomTapeShare(RandomTapeShare { content, signature });
-                ops.insert(ValidatedConsensusArtifact {
-                    msg,
-                    timestamp: mock_time(),
-                });
-            }
-        }
-        ops
-    }
-
-    // Tests that the messages from the pool match the messages that we inserted,
-    // namely:
-    // - That we get the same number of messages back.
-    // - That height is monotonically increasing (iterators are in order, for
-    //   height).
-    // - That the max and min match.
-    // - That all the messages are present in the original messages.
-    //
-    // Returns the min/max height found to use in later tests.
-    fn match_all_ops<T: ConsensusMessageHashable + Eq + std::fmt::Debug>(
-        msgs_from_pool: &[T],
-        original_ops: &[T],
-        multiple_values: bool,
-    ) -> (Height, Height) {
-        let mut min_height = Height::from(1000 * 1000);
-        let mut max_height = Height::from(0);
-        let mut monotonic_height = Height::from(0);
-        assert_eq!(msgs_from_pool.len(), original_ops.len());
-        for msg in msgs_from_pool.iter() {
-            let msg_height = msg.get_id().height;
-            if msg_height < min_height {
-                min_height = msg_height;
-            }
-            if msg_height > max_height {
-                max_height = msg_height;
-            }
-            if multiple_values {
-                assert!(monotonic_height <= msg_height);
-            } else {
-                assert!(monotonic_height < msg_height);
-            }
-            monotonic_height = msg_height;
-            assert!(original_ops.contains(msg));
-        }
-        assert_eq!(min_height, original_ops[0].get_id().height);
-        assert_eq!(
-            max_height,
-            original_ops[original_ops.len() - 1].get_id().height
-        );
-        (min_height, max_height)
-    }
-
-    fn match_ops_to_results<T: ConsensusMessageHashable + Eq + std::fmt::Debug>(
-        ops: &PoolSectionOps<ValidatedConsensusArtifact>,
-        pool_by_type: &dyn HeightIndexedPool<T>,
-        multiple_values: bool,
-    ) {
-        let mut ops_vec = Vec::new();
-        for op in &ops.ops {
-            if let PoolSectionOp::Insert(artifact) = op {
-                ops_vec.push(T::assert(&artifact.msg).unwrap().clone())
-            }
-        }
-        let min_height;
-        let max_height;
-        //Test that all the ops are found in the results.
-        {
-            let msgs_from_pool: Vec<T> = pool_by_type.get_all().collect();
-            let (new_min, new_max) = match_all_ops(&msgs_from_pool, &ops_vec, multiple_values);
-            min_height = new_min;
-            max_height = new_max;
-        }
-
-        // Test get by range
-        {
-            let msgs_from_pool: Vec<T> = pool_by_type
-                .get_by_height_range(HeightRange::new(min_height, max_height))
-                .collect();
-            match_all_ops(&msgs_from_pool, &ops_vec, multiple_values);
-        }
-
-        // Test get highest
-        if !multiple_values {
-            let result = pool_by_type.get_highest();
-            if let Ok(highest) = &result {
-                if let PoolSectionOp::Insert(artifact) = &ops.ops[ops.ops.len() - 1] {
-                    assert_eq!(T::assert(&artifact.msg).unwrap(), highest);
-                } else {
-                    panic!("Got error: {:?}", result.err());
-                }
-            }
-        // Test get highest iter
-        } else {
-            let result_vec: Vec<T> = pool_by_type.get_highest_iter().collect();
-            assert_eq!(result_vec.len(), 3);
-        }
-    }
-
-    // Tests the pool through the HeightIndexedPool trait.
-    //
-    // This is the most comprehensive functional test. It directly tests all
-    // of the HeightIndexedPool methods, it also indirectly tests whether
-    // reference counting is working properly. This because if we have
-    // reference count leak and some instance of DB is alive, the destroy()
-    // call in run_persistent_pool_test() will fail as it requires exclusive
-    // access to the DB directory.
     #[test]
     fn test_as_height_indexed_pool() {
-        run_persistent_pool_test("test_as_height_indexed_pool", |config, log| {
-            let rb_ops = random_beacon_ops();
-            let fz_ops = finalization_ops();
-            let nz_ops = notarization_ops();
-            let bp_ops = block_proposal_ops();
-            let rbs_ops = random_beacon_share_ops();
-            let nzs_ops = notarization_share_ops();
-            let fzs_ops = finalization_share_ops();
-            let rt_ops = random_tape_ops();
-            let rts_ops = random_tape_share_ops();
-
-            // Insert a bunch of items and test that the pool returns them
-            {
-                let mut pool =
-                    PersistentHeightIndexedPool::new_consensus_pool(config.clone(), log.clone());
-
-                pool.mutate(rb_ops.clone());
-                match_ops_to_results(&rb_ops, pool.random_beacon(), false);
-
-                pool.mutate(fz_ops.clone());
-                match_ops_to_results(&fz_ops, pool.finalization(), false);
-
-                pool.mutate(nz_ops.clone());
-                match_ops_to_results(&nz_ops, pool.notarization(), false);
-
-                pool.mutate(bp_ops.clone());
-                match_ops_to_results(&bp_ops, pool.block_proposal(), false);
-
-                pool.mutate(rbs_ops.clone());
-                match_ops_to_results(&rbs_ops, pool.random_beacon_share(), true);
-
-                pool.mutate(nzs_ops.clone());
-                match_ops_to_results(&nzs_ops, pool.notarization_share(), true);
-
-                pool.mutate(fzs_ops.clone());
-                match_ops_to_results(&fzs_ops, pool.finalization_share(), true);
-
-                pool.mutate(rt_ops.clone());
-                match_ops_to_results(&rt_ops, pool.random_tape(), false);
-
-                pool.mutate(rts_ops.clone());
-                match_ops_to_results(&rts_ops, pool.random_tape_share(), true);
-            }
-
-            // Test the matching after a reboot.
-            {
-                let pool = PersistentHeightIndexedPool::new_consensus_pool(config, log);
-                match_ops_to_results(&rb_ops, pool.random_beacon(), false);
-                match_ops_to_results(&fz_ops, pool.finalization(), false);
-                match_ops_to_results(&nz_ops, pool.notarization(), false);
-                match_ops_to_results(&bp_ops, pool.block_proposal(), false);
-                match_ops_to_results(&rbs_ops, pool.random_beacon_share(), true);
-                match_ops_to_results(&nzs_ops, pool.notarization_share(), true);
-                match_ops_to_results(&fzs_ops, pool.finalization_share(), true);
-                match_ops_to_results(&rt_ops, pool.random_tape(), false);
-                match_ops_to_results(&rts_ops, pool.random_tape_share(), true);
-            }
-        })
+        crate::test_utils::test_as_height_indexed_pool::<RocksDBConfig>()
     }
 
-    fn make_random_beacon_at_height(i: u64) -> ValidatedConsensusArtifact {
-        let random_beacon = fake_random_beacon(Height::from(i));
-        ValidatedConsensusArtifact {
-            msg: ConsensusMessage::RandomBeacon(random_beacon),
-            timestamp: mock_time(),
-        }
-    }
-
-    fn make_random_beacon_msg_id_at_height(i: u64) -> ConsensusMessageId {
-        let hash = make_random_beacon_at_height(i).msg.get_cm_hash();
-        let height = Height::from(i);
-        ConsensusMessageId { hash, height }
-    }
-
-    fn check_iter_original(iter: Box<dyn Iterator<Item = RandomBeacon>>) {
-        // Now make sure the iterator still sees the old values
-        // and doesn't see the new ones.
-        let msgs_from_pool: Vec<RandomBeacon> = iter.collect();
-        assert_eq!(msgs_from_pool.len(), 16);
-        for i in 3..15 {
-            let msg = &msgs_from_pool[i - 3];
-            assert_eq!(msg.content.height, Height::from(i as u64));
-        }
-    }
-
-    fn check_iter_mutated(iter: Box<dyn Iterator<Item = RandomBeacon>>) {
-        let msgs_from_pool: Vec<RandomBeacon> = iter.collect();
-        assert_eq!(msgs_from_pool.len(), 3);
-        assert_eq!(msgs_from_pool[0].content.height, Height::from(1));
-        assert_eq!(msgs_from_pool[1].content.height, Height::from(2));
-        assert_eq!(msgs_from_pool[2].content.height, Height::from(20));
-    }
-
-    // Tests if payloads are persisted and removed correctly together with block
-    // proposals.
     #[test]
     fn test_block_proposal_and_payload_correspondence() {
-        run_persistent_pool_test(
-            "test_block_proposal_and_payload_correspondence",
-            |config, log| {
-                let insert_ops = block_proposal_ops();
-                let msgs = insert_ops
-                    .ops
-                    .iter()
-                    .map(|op| {
-                        if let PoolSectionOp::Insert(artifact) = op {
-                            &artifact.msg
-                        } else {
-                            panic!("Expect Insert but found {:?}", op)
-                        }
-                    })
-                    .collect::<Vec<_>>();
-                let mut remove_ops = msgs
-                    .iter()
-                    .map(|msg| PoolSectionOp::Remove(msg.get_id()))
-                    .collect::<Vec<PoolSectionOp<ValidatedConsensusArtifact>>>();
-                let mut payloads: Vec<BlockPayload> = msgs
-                    .iter()
-                    .map(|msg| {
-                        BlockProposal::assert(msg)
-                            .unwrap()
-                            .as_ref()
-                            .payload
-                            .as_ref()
-                            .clone()
-                    })
-                    .collect::<Vec<_>>();
-                let mut pool = PersistentHeightIndexedPool::new_consensus_pool(config, log);
-                pool.mutate(insert_ops);
-                let proposals = pool.block_proposal().get_all().collect::<Vec<_>>();
-                assert!(proposals.iter().all(|proposal| proposal.check_integrity()));
-                assert_eq!(
-                    payloads,
-                    proposals
-                        .iter()
-                        .map(|proposal| proposal.as_ref().payload.as_ref().clone())
-                        .collect::<Vec<_>>()
-                );
-
-                // Remove the first 5 block proposals
-                let _ = payloads.split_off(5);
-                let remove_first_5 = remove_ops.split_off(5);
-                pool.mutate(PoolSectionOps {
-                    ops: remove_first_5,
-                });
-                let iter = pool.block_proposal().get_all();
-                assert_eq!(
-                    payloads,
-                    iter.map(|proposal| proposal.as_ref().payload.as_ref().clone())
-                        .collect::<Vec<_>>()
-                );
-
-                // Remove all
-                pool.mutate(PoolSectionOps { ops: remove_ops });
-                let mut iter = pool.block_proposal().get_all();
-                assert!(iter.next().is_none());
-            },
-        )
+        crate::test_utils::test_block_proposal_and_payload_correspondence::<RocksDBConfig>()
     }
 
-    // Tests that iterators are created on snapshots of the pool and that
-    // the returned values do not reflect any updates after the iterator
-    // was created.
-    //
-    // This also illustrates passing iterators by value when the pool is
-    // left behind, emulating how iterators might be used to perform
-    // async work.
     #[test]
     fn test_iterating_while_inserting_doesnt_see_new_updates() {
-        run_persistent_pool_test(
-            "test_iterating_while_inserting_doesnt_see_new_updates",
-            |config, log| {
-                let rb_ops = random_beacon_ops();
-                let mut pool = PersistentHeightIndexedPool::new_consensus_pool(config, log);
-                pool.mutate(rb_ops);
-                let iter = pool.random_beacon().get_all();
-
-                // Before we go through the iterator values we'll remove all of
-                // of the values in the current range and add values before and after
-                // the iterator's initial range (3..15).
-                let mut ops = PoolSectionOps::new();
-                ops.insert(make_random_beacon_at_height(1));
-                ops.insert(make_random_beacon_at_height(2));
-                ops.insert(make_random_beacon_at_height(20));
-                for i in 3..20 {
-                    ops.remove(make_random_beacon_msg_id_at_height(i));
-                }
-                pool.mutate(ops);
-
-                // The original iterator shouldn't observe the changes
-                // we made above
-                check_iter_original(iter);
-
-                // A new iterator should see the new values.
-                check_iter_mutated(pool.random_beacon().get_all());
-            },
-        );
+        crate::test_utils::test_iterating_while_inserting_doesnt_see_new_updates::<RocksDBConfig>()
     }
 
-    // Tests that iterators obtained from the pool can outlive it, meaning it's
-    // safe to pass them around without the pool itself. Even though it isn't
-    // likely that the iterator will outlive the pool, ever, it is necessary
-    // to make make sure it can to guarantee the safety of passing it as an
-    // argument without the pool.
     #[test]
     fn test_iterator_can_outlive_the_pool() {
-        run_persistent_pool_test("test_iterator_can_outlive_the_pool", |config, log| {
-            let rb_ops = random_beacon_ops();
-            let iter;
-
-            // Create a pool in this inner scope, which will be destroyed
-            // before the iterator is used.
-            {
-                let mut pool = PersistentHeightIndexedPool::new_consensus_pool(config, log);
-                pool.mutate(rb_ops.clone());
-                iter = pool.random_beacon().get_all();
-            }
-
-            let msgs_from_pool: Vec<RandomBeacon> = iter.collect();
-            assert_eq!(msgs_from_pool.len(), rb_ops.ops.len());
-            for (i, op) in rb_ops.ops.iter().enumerate() {
-                if let PoolSectionOp::Insert(artifact) = &op {
-                    assert_eq!(
-                        RandomBeacon::assert(&artifact.msg).unwrap(),
-                        &msgs_from_pool[i]
-                    );
-                }
-            }
-        });
+        crate::test_utils::test_iterator_can_outlive_the_pool::<RocksDBConfig>()
     }
 
-    // Tests that, if configured to do so, the pool will delete the data
-    // directories on drop. This is useful to cleanup after running
-    // tests.
     #[test]
     fn test_persistent_pool_path_is_cleanedup_after_tests() {
-        let tmp =
-            ic_test_utilities::artifact_pool_config::with_test_rocksdb_pool_config(|config| {
-                let path = config.persistent_pool_validated_persistent_db_path.clone();
-                let rb_ops = random_beacon_ops();
-                {
-                    let mut pool = PersistentHeightIndexedPool::new_consensus_pool(
-                        config.clone(),
-                        make_logger(),
-                    );
-                    pool.mutate(rb_ops);
-                }
-                destroy(&config);
-                path
-            });
-        assert!(!Path::new(&tmp).exists());
-    }
-
-    // Test purge by compaction actually purges.
-    // TODO CON-383: This test is currently disabled as it seem to fail on linux
-    // sometimes with this error: `IO error: lock :
-    // /build/ic_testsJ2Zq00/test_purge_by_compaction/LOCK: No locks available`.
-    #[ignore]
-    #[test]
-    fn test_purge_by_compaction() {
-        run_persistent_pool_test("test_purge_by_compaction", |mut config, log| {
-            // set a small purge interval
-            config.persistent_pool_validated_purge_interval = Height::from(8);
-            let mut pool = PersistentHeightIndexedPool::new_consensus_pool(config, log);
-            // insert a few things
-            let rb_ops = random_beacon_ops();
-            pool.mutate(rb_ops.clone());
-            // check if read is ok after insertion
-            let iter = pool.random_beacon().get_all();
-            let msgs_from_pool: Vec<RandomBeacon> = iter.collect();
-            assert_eq!(msgs_from_pool.len(), rb_ops.ops.len());
-            let min_height = msgs_from_pool.iter().map(|x| x.height()).min().unwrap();
-            // purge below height 5
-            let mut purge_ops = PoolSectionOps::new();
-            purge_ops.purge_below(Height::from(5));
-            pool.mutate(purge_ops);
-            let mut iter = pool.random_beacon().get_all();
-            assert!(iter.all(|x| x.height() >= Height::from(5)));
-            // range becomes (5, 18) after purge
-            assert_eq!(
-                pool.random_beacon().height_range().map(|r| r.min),
-                Some(Height::from(5))
-            );
-            // But real min height is unchanged because compaction didn't happen
-            assert_eq!(
-                pool.get_first_height(&RANDOM_BEACON_CF_INFO, SeekPos::Start),
-                Some(min_height)
-            );
-            // trigger compaction by purging again at height 10
-            let mut purge_ops = PoolSectionOps::new();
-            purge_ops.purge_below(Height::from(10));
-            pool.mutate(purge_ops);
-            assert_eq!(
-                pool.random_beacon().height_range().map(|r| r.min),
-                Some(Height::from(10))
-            );
-            // min height becomes 10 after compaction
-            // Due to asynchrony, we'll wait at most 5s for this to happen.
-            for _ in 0..50 {
-                std::thread::sleep(std::time::Duration::from_millis(100));
-                if pool.get_first_height(&RANDOM_BEACON_CF_INFO, SeekPos::Start)
-                    == Some(Height::from(10))
-                {
-                    return;
-                }
-            }
-            panic!("compaction did not purge")
-        });
+        crate::test_utils::test_persistent_pool_path_is_cleanedup_after_tests::<RocksDBConfig>()
     }
 
     // Test if purge survives reboot.
@@ -1853,8 +1268,8 @@ mod tests {
                 let rb_ops = random_beacon_ops();
                 pool.mutate(rb_ops.clone());
                 let iter = pool.random_beacon().get_all();
-                let msgs_from_pool: Vec<RandomBeacon> = iter.collect();
-                assert_eq!(msgs_from_pool.len(), rb_ops.ops.len());
+                let msgs_from_pool = iter;
+                assert_eq!(msgs_from_pool.count(), rb_ops.ops.len());
                 // purge at height 10
                 let mut purge_ops = PoolSectionOps::new();
                 purge_ops.purge_below(Height::from(10));
@@ -1877,40 +1292,8 @@ mod tests {
         });
     }
 
-    // Test if timestamp survives reboot.
     #[test]
     fn test_timestamp_survives_reboot() {
-        run_persistent_pool_test("test_purge_survives_reboot", |config, log| {
-            let time_0 = mock_time() + Duration::from_secs(1234);
-            // create a pool and insert an artifact
-            {
-                let mut pool =
-                    PersistentHeightIndexedPool::new_consensus_pool(config.clone(), log.clone());
-                // insert a few things
-                let mut ops = PoolSectionOps::new();
-                let random_beacon = fake_random_beacon(Height::from(10));
-                let msg = ConsensusMessage::RandomBeacon(random_beacon);
-                let msg_id = msg.get_id();
-                ops.insert(ValidatedConsensusArtifact {
-                    msg,
-                    timestamp: time_0,
-                });
-                pool.mutate(ops);
-
-                assert_eq!(pool.get_timestamp(&msg_id), Some(time_0));
-            }
-
-            // create the same pool again, check if timestamp was preserved
-            {
-                let pool = PersistentHeightIndexedPool::new_consensus_pool(config, log);
-                let random_beacon = pool
-                    .random_beacon()
-                    .get_by_height(Height::from(10))
-                    .next()
-                    .unwrap();
-                let msg_id = random_beacon.get_id();
-                assert_eq!(pool.get_timestamp(&msg_id), Some(time_0));
-            }
-        });
+        crate::test_utils::test_timestamp_survives_reboot::<RocksDBConfig>()
     }
 }

@@ -19,18 +19,9 @@ pub struct ScopedMmap {
 unsafe impl Sync for ScopedMmap {}
 unsafe impl Send for ScopedMmap {}
 
-fn nix_to_io_err(err: nix::Error) -> io::Error {
-    match &err {
-        nix::Error::Sys(errno) => io::Error::from_raw_os_error(*errno as i32),
-        nix::Error::InvalidPath => io::Error::new(io::ErrorKind::InvalidData, err),
-        nix::Error::InvalidUtf8 => io::Error::new(io::ErrorKind::InvalidData, err),
-        nix::Error::UnsupportedOperation => io::Error::new(io::ErrorKind::Other, err),
-    }
-}
-
 impl ScopedMmap {
     /// Creates a new mapping from a file descriptor and length.
-    pub fn from_readonly_file<FD: AsRawFd>(fd: FD, len: usize) -> io::Result<Self> {
+    pub fn from_readonly_file<FD: AsRawFd>(fd: &FD, len: usize) -> io::Result<Self> {
         // mmap fails on 0-size requests, which is extremely annoying in
         // practice, so we construct a bogus 0-sized mapping instead.
         if len == 0 {
@@ -51,16 +42,19 @@ impl ScopedMmap {
                 fd.as_raw_fd(),
                 /* offset = */ 0,
             )
-        }
-        .map_err(nix_to_io_err)?;
+        }?;
         Ok(Self { addr, len })
     }
 
     /// Creates a new mapping for a file at specified `path`.
     pub fn from_path<P: AsRef<Path>>(path: P) -> io::Result<Self> {
-        let f = std::fs::File::open(path)?;
+        Self::mmap_file_readonly(std::fs::File::open(path)?)
+    }
+
+    /// Creates a full read-only mapping for the specified file.
+    pub fn mmap_file_readonly(f: std::fs::File) -> io::Result<Self> {
         let len = f.metadata()?.len() as usize;
-        Self::from_readonly_file(f, len)
+        Self::from_readonly_file(&f, len)
     }
 
     /// Returns start address of the memory mapping.

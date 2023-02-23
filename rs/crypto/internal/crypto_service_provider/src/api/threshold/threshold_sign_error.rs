@@ -1,7 +1,8 @@
 use super::*;
+use crate::KeyId;
 use ic_crypto_internal_threshold_sig_bls12381::api::threshold_sign_error::ClibThresholdSignError;
 
-/// Errors occuring while performing threshold signature generation
+/// Errors occurring while performing threshold signature generation
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum CspThresholdSignError {
     SecretKeyNotFound {
@@ -14,6 +15,9 @@ pub enum CspThresholdSignError {
     WrongSecretKeyType {},
     MalformedSecretKey {
         algorithm: AlgorithmId,
+    },
+    InternalError {
+        internal_error: String,
     },
 }
 
@@ -60,6 +64,9 @@ impl fmt::Display for CspThresholdSignError {
                 "Unable to parse the secret key with algorithm id {:?}",
                 algorithm
             ),
+            CspThresholdSignError::InternalError { internal_error } => {
+                write!(f, "Internal error: {}", internal_error)
+            }
         }
     }
 }

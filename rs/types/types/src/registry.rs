@@ -4,30 +4,12 @@
 #![allow(clippy::redundant_closure)]
 //! Types for working with the registry.
 
-use crate::crypto::KeyPurpose;
 use crate::RegistryVersion;
 use serde::{Deserialize, Serialize};
 use std::fmt;
-use std::result::Result;
-use std::str::FromStr;
 use thiserror::Error;
 
 pub mod connection_endpoint;
-
-// FromStr implementation for the the registry admin tool.
-impl FromStr for KeyPurpose {
-    type Err = String;
-
-    fn from_str(string: &str) -> Result<Self, <Self as FromStr>::Err> {
-        match string {
-            "node_signing" => Ok(KeyPurpose::NodeSigning),
-            "query_response_signing" => Ok(KeyPurpose::QueryResponseSigning),
-            "dkg_dealing_encryption" => Ok(KeyPurpose::DkgDealingEncryption),
-            "committee_signing" => Ok(KeyPurpose::CommitteeSigning),
-            _ => Err(format!("Invalid key purpose: {:?}", string)),
-        }
-    }
-}
 
 /// Errors returned when requesting a value from the registry.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -118,31 +100,19 @@ impl fmt::Display for RegistryError {
 
 impl RegistryError {
     pub fn is_version_too_old(&self) -> bool {
-        match self {
-            RegistryError::VersionTooOld { .. } => true,
-            _ => false,
-        }
+        matches!(self, RegistryError::VersionTooOld { .. })
     }
 
     pub fn is_version_too_new(&self) -> bool {
-        match self {
-            RegistryError::VersionTooNew { .. } => true,
-            _ => false,
-        }
+        matches!(self, RegistryError::VersionTooNew { .. })
     }
 
     pub fn is_duplicate_key(&self) -> bool {
-        match self {
-            RegistryError::DuplicateKey { .. } => true,
-            _ => false,
-        }
+        matches!(self, RegistryError::DuplicateKey { .. })
     }
 
     pub fn is_validation_error(&self) -> bool {
-        match self {
-            RegistryError::ValidationError { .. } => true,
-            _ => false,
-        }
+        matches!(self, RegistryError::ValidationError { .. })
     }
 }
 
@@ -153,9 +123,7 @@ pub enum RegistryDataProviderError {
     /// canister.
     Timeout,
     /// Error when using registry transfer
-    Transfer {
-        source: ic_registry_transport::Error,
-    },
+    Transfer { source: String },
 }
 
 impl std::error::Error for RegistryDataProviderError {}
@@ -190,4 +158,10 @@ pub enum RegistryClientError {
         // which 'infects' this enum, and everything that uses it.
         error: String,
     },
+
+    #[error("failed to report the same version twice after {retries} times")]
+    PollingLatestVersionFailed { retries: usize },
+
+    #[error("failed to decode registry contents: {error}")]
+    DecodeError { error: String },
 }

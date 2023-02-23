@@ -1,33 +1,33 @@
-use crate::protocol::{logging::LogRequest, structs, syscall};
+use crate::{fdenum::EnumerateInnerFileDescriptors, protocol::logging::LogRequest};
+use ic_embedders::wasm_executor::SliceExecutionOutput;
 use serde::{Deserialize, Serialize};
+
+use super::{id::ExecId, structs::SandboxExecOutput};
 
 // This defines the RPC service methods offered by the controller process
 // (used by the sandbox) as well as the expected replies.
 
 // Notify controller that a canister run has finished.
 #[derive(Serialize, Deserialize, Clone)]
-pub struct ExecFinishedRequest {
+pub struct ExecutionFinishedRequest {
     // Id for this run, as set up by controller.
-    pub exec_id: String,
-    pub exec_output: structs::ExecOutput,
-}
-#[derive(Serialize, Deserialize, Clone)]
-pub struct ExecFinishedReply {}
+    pub exec_id: ExecId,
 
-// Relay system call made by canister to controller.
-#[derive(Serialize, Deserialize, Clone)]
-pub struct CanisterSystemCallRequest {
-    // Id for this run, as set up by controller.
-    pub exec_id: String,
+    pub exec_output: SandboxExecOutput,
+}
 
-    // The actual system call and its arguments.
-    pub request: syscall::Request,
-}
 #[derive(Serialize, Deserialize, Clone)]
-pub struct CanisterSystemCallReply {
-    // Response to the system call.
-    pub reply: syscall::Reply,
+pub struct ExecutionFinishedReply {}
+
+// Notify controller that a canister run is paused.
+#[derive(Serialize, Deserialize, Clone)]
+pub struct ExecutionPausedRequest {
+    pub exec_id: ExecId,
+    pub slice: SliceExecutionOutput,
 }
+
+#[derive(Serialize, Deserialize, Clone)]
+pub struct ExecutionPausedReply {}
 
 /// We reply to the replica controller that either the execution was
 /// finished or the request failed, or request a system call or a log
@@ -35,9 +35,13 @@ pub struct CanisterSystemCallReply {
 #[allow(clippy::large_enum_variant)]
 #[derive(Serialize, Deserialize, Clone)]
 pub enum Request {
-    ExecFinished(ExecFinishedRequest),
-    CanisterSystemCall(CanisterSystemCallRequest),
+    ExecutionFinished(ExecutionFinishedRequest),
+    ExecutionPaused(ExecutionPausedRequest),
     LogViaReplica(LogRequest),
+}
+
+impl EnumerateInnerFileDescriptors for Request {
+    fn enumerate_fds<'a>(&'a mut self, _fds: &mut Vec<&'a mut std::os::unix::io::RawFd>) {}
 }
 
 /// We reply to the replica controller that either the execution was
@@ -45,7 +49,11 @@ pub enum Request {
 #[allow(clippy::large_enum_variant)]
 #[derive(Serialize, Deserialize, Clone)]
 pub enum Reply {
-    ExecFinished(ExecFinishedReply),
-    CanisterSystemCall(CanisterSystemCallReply),
+    ExecutionFinished(ExecutionFinishedReply),
+    ExecutionPaused(ExecutionPausedReply),
     LogViaReplica(()),
+}
+
+impl EnumerateInnerFileDescriptors for Reply {
+    fn enumerate_fds<'a>(&'a mut self, _fds: &mut Vec<&'a mut std::os::unix::io::RawFd>) {}
 }

@@ -40,8 +40,8 @@ use proc_macro2::{Ident, Span, TokenStream};
 use quote::{quote, quote_spanned};
 use std::collections::VecDeque;
 use syn::{
-    punctuated::Punctuated, spanned::Spanned, token::Comma, token::Paren, Attribute, Expr,
-    ExprCall, ExprPath, FnArg, ItemFn, Pat, PatIdent, PatTuple, Path, PathArguments, PathSegment,
+    punctuated::Punctuated, spanned::Spanned, token::Comma, token::Paren, Expr, ExprCall, ExprPath,
+    FnArg, ItemFn, Pat, PatIdent, PatTuple, Path, PathArguments, PathSegment,
 };
 
 #[derive(Clone)]
@@ -84,7 +84,7 @@ impl Errors {
                 .iter()
                 .map(|(msg, span)| format!("{}\nAt: {:?}", msg, span));
 
-            panic!(errors.collect::<Vec<_>>().join("\n"))
+            panic!("{}", errors.collect::<Vec<_>>().join("\n"))
         }
     }
 }
@@ -121,7 +121,6 @@ fn get_ident(arg: &FnArg, default_id: &str, method: &str) -> Result<PatIdent, (S
 struct FunctionInfo {
     pub function_call: ExprCall,
     pub tuple_pat: Pat,
-    pub attrs: Vec<Attribute>,
     pub name: Ident,
     pub is_async: bool,
 }
@@ -169,7 +168,6 @@ fn function_info(
     });
 
     let name = signature.ident;
-    let attrs = fun.attrs;
 
     let args: Punctuated<ExprPath, Comma> = tuple_elems
         .iter()
@@ -219,7 +217,6 @@ fn function_info(
             function_call,
             tuple_pat,
             name,
-            attrs,
             is_async,
         },
     ))
@@ -258,7 +255,7 @@ fn dfn_macro(
         },
     ) = function_info(&item, method, errors)?;
 
-    let async_runner_fn = Ident::new(&format!("{}___", name.to_string()), Span::call_site());
+    let async_runner_fn = Ident::new(&format!("{}___", name), Span::call_site());
 
     let export_name = format!("canister_{0} {1}", method, name);
 

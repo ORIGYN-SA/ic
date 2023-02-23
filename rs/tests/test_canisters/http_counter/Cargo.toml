@@ -1,0 +1,16 @@
+[package]
+name = "http_counter"
+version = "0.1.0"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[lib]
+crate-type = ["cdylib"]
+
+[target.wasm32-unknown-unknown.dependencies]
+candid = "0.8"
+ic-cdk = "0.6"
+ic-cdk-macros = "0.6"
+ic-certified-map = "0.3.1"
+serde = "1"

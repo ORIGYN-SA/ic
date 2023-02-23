@@ -6,11 +6,9 @@ use std::sync::RwLock;
 use lazy_static::lazy_static;
 
 use ic_base_types::PrincipalId;
+use ic_nervous_system_common::{AuthzChangeOp, MethodAuthzChange};
 
-use crate::{
-    pb::v1::{CanisterAuthzInfo, MethodAuthzInfo},
-    types::{AuthzChangeOp, MethodAuthzChange},
-};
+use crate::pb::v1::{CanisterAuthzInfo, MethodAuthzInfo};
 
 #[cfg(target_arch = "wasm32")]
 use dfn_core::println;
@@ -80,22 +78,6 @@ pub fn update_methods_authz(methods_authz_change: Vec<MethodAuthzChange>, log_pr
                 }
             }
         }
-    }
-}
-
-/// Checks that the caller (as returned by dfn_core::api::caller()) is
-/// authorized to access the given method.
-///
-/// To reduce boilerplate this additionally add the log trace indicating that
-/// the method was called.
-pub fn check_caller_authz_and_log(method_name: &str, log_prefix: &str) {
-    let principal = caller();
-    println!("{}call: {} from: {}", log_prefix, method_name, principal);
-    if !is_authorized(method_name, principal) {
-        panic!(
-            "{}Principal: {} is not authorized to call this method: {}",
-            log_prefix, principal, method_name
-        );
     }
 }
 

@@ -2,60 +2,66 @@ use crate::{
     routing, scheduling,
     state_machine::{StateMachine, StateMachineImpl},
 };
-use actix::{Actor, SyncContext};
+use ic_config::execution_environment::{BitcoinConfig, Config as HypervisorConfig};
+use ic_constants::SMALL_APP_SUBNET_MAX_SIZE;
 use ic_cycles_account_manager::CyclesAccountManager;
-use ic_interfaces::state_manager::{CertificationScope, StateManagerError};
+use ic_ic00_types::EcdsaKeyId;
 use ic_interfaces::{
-    certified_stream_store::CertifiedStreamStore,
-    execution_environment::{ExecutionEnvironment, IngressHistoryWriter},
+    execution_environment::{IngressHistoryWriter, RegistryExecutionSettings, Scheduler},
     messaging::{MessageRouting, MessageRoutingError},
-    registry::RegistryClient,
-    state_manager::StateManager,
 };
+use ic_interfaces_certified_stream_store::CertifiedStreamStore;
+use ic_interfaces_registry::RegistryClient;
+use ic_interfaces_state_manager::{CertificationScope, StateManager, StateManagerError};
 use ic_logger::{debug, fatal, info, warn, ReplicaLogger};
 use ic_metrics::buckets::{add_bucket, decimal_buckets};
 use ic_metrics::{MetricsRegistry, Timer};
-use ic_registry_client::helper::{
+use ic_protobuf::registry::subnet::v1::SubnetRecord;
+use ic_registry_client_helpers::{
     crypto::CryptoRegistry,
+    ecdsa_keys::EcdsaKeysRegistry,
     node::NodeRegistry,
     provisional_whitelist::ProvisionalWhitelistRegistry,
     routing_table::RoutingTableRegistry,
     subnet::{SubnetListRegistry, SubnetRegistry},
 };
 use ic_registry_provisional_whitelist::ProvisionalWhitelist;
+use ic_registry_subnet_features::SubnetFeatures;
 use ic_registry_subnet_type::SubnetType;
-use ic_replicated_state::{
-    CanisterState, NetworkTopology, NodeTopology, ReplicatedState, SubnetTopology,
-};
+use ic_replicated_state::{NetworkTopology, NodeTopology, ReplicatedState, SubnetTopology};
 use ic_types::{
     batch::Batch,
-    ingress::IngressStatus,
-    messages::MessageId,
+    malicious_flags::MaliciousFlags,
     registry::RegistryClientError,
     xnet::{StreamHeader, StreamIndex},
-    CanisterId, Height, NodeId, NumBytes, RegistryVersion, SubnetId,
+    Height, NodeId, NumBytes, RegistryVersion, SubnetId,
 };
 use ic_utils::thread::JoinOnDrop;
 #[cfg(test)]
 use mockall::automock;
-use prometheus::{Histogram, HistogramVec, IntCounterVec, IntGauge};
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use prometheus::{Histogram, HistogramVec, IntCounter, IntCounterVec, IntGauge};
 use std::convert::TryFrom;
 use std::ops::Range;
 use std::sync::mpsc::{sync_channel, TrySendError};
 use std::sync::{Arc, Mutex, RwLock};
 use std::thread::sleep;
+use std::{
+    collections::{BTreeMap, BTreeSet, VecDeque},
+    time::Instant,
+};
 
 // How many batches we allow in the execution queue before we start rejecting
 // incoming batches.
 const BATCH_QUEUE_BUFFER_SIZE: usize = 16;
 
 const METRIC_DELIVER_BATCH_COUNT: &str = "mr_deliver_batch_count";
+const METRIC_EXPECTED_BATCH_HEIGHT: &str = "mr_expected_batch_height";
+const METRIC_REGISTRY_VERSION: &str = "mr_registry_version";
 pub(crate) const METRIC_TIME_IN_BACKLOG: &str = "mr_time_in_backlog";
 pub(crate) const METRIC_TIME_IN_STREAM: &str = "mr_time_in_stream";
 
 const LABEL_STATUS: &str = "status";
-pub(crate) const LABEL_SUBNET: &str = "subnet";
+pub(crate) const LABEL_REMOTE: &str = "remote";
 
 const STATUS_IGNORED: &str = "ignored";
 const STATUS_QUEUE_FULL: &str = "queue_full";
@@ -66,9 +72,13 @@ const PHASE_COMMIT: &str = "commit";
 
 const METRIC_PROCESS_BATCH_DURATION: &str = "mr_process_batch_duration_seconds";
 const METRIC_PROCESS_BATCH_PHASE_DURATION: &str = "mr_process_batch_phase_duration_seconds";
+const METRIC_TIMED_OUT_REQUESTS_TOTAL: &str = "mr_timed_out_requests_total";
 
-/// Records the timestamp when a message and those before/after it up to the
-/// next `MessageTime` were first learned about in a stream.
+const CRITICAL_ERROR_MISSING_SUBNET_SIZE: &str = "cycles_account_manager_missing_subnet_size_error";
+const CRITICAL_ERROR_NO_CANISTER_ALLOCATION_RANGE: &str = "mr_empty_canister_allocation_range";
+
+/// Records the timestamp when all messages before the given index (down to the
+/// previous `MessageTime`) were first added to / learned about in a stream.
 struct MessageTime {
     index: StreamIndex,
     time: Timer,
@@ -85,14 +95,20 @@ impl MessageTime {
 
 /// A timeline consisting of the timestamps of messages in a stream (usually at
 /// block boundaries) providing the base for computing the time spent in the
-/// stream / time spent in the backlog by each message; plus a histogram to
-/// record these observations.
+/// stream / backlog by each message; plus a histogram to record these
+/// observations.
 struct StreamTimeline {
+    /// A [`MessageTime`] queue with strictly increasing `index` and `time`
+    /// values.
     entries: VecDeque<MessageTime>,
+
+    /// Histogram to record the duration spent by a message in a stream /
+    /// backlog.
     histogram: Histogram,
 }
 
 impl StreamTimeline {
+    /// Creates a timeline to record message durations in the given `Histogram`.
     fn new(histogram: Histogram) -> Self {
         StreamTimeline {
             entries: VecDeque::new(),
@@ -100,6 +116,8 @@ impl StreamTimeline {
         }
     }
 
+    /// Adds a [`MessageTime`] with the given index and the current wall time to
+    /// `entries` iff `index > self.entries.back().index`.
     fn add_entry(&mut self, index: StreamIndex) {
         match self.entries.back() {
             None => self.entries.push_back(MessageTime::new(index)),
@@ -110,6 +128,9 @@ impl StreamTimeline {
         };
     }
 
+    /// Records one histogram observation for every message in the given index
+    /// range, with the time elapsed since the matching `MessageTime` entry (the
+    /// first one with `index >= message.index`).
     fn observe(&mut self, index_range: Range<StreamIndex>) {
         for index in index_range.start.get()..index_range.end.get() {
             let entry = loop {
@@ -133,7 +154,10 @@ impl StreamTimeline {
 /// Bundle of message latency metrics for incoming or outgoing streams and the
 /// corresponding [`StreamTimelines`](StreamTimeline) needed to compute them.
 pub(crate) struct LatencyMetrics {
+    /// Map of message timelines by remote subnet ID.
     timelines: BTreeMap<SubnetId, StreamTimeline>,
+
+    /// Per-remote-subnet histograms of message durations.
     histograms: HistogramVec,
 }
 
@@ -147,27 +171,34 @@ impl LatencyMetrics {
 
         Self {
             timelines: BTreeMap::new(),
-            histograms: metrics_registry.histogram_vec(name, description, buckets, &[LABEL_SUBNET]),
+            histograms: metrics_registry.histogram_vec(name, description, buckets, &[LABEL_REMOTE]),
         }
     }
 
+    /// Creates the `LatencyMetrics` to record [`METRIC_TIME_IN_STREAM`]
+    /// observations.
     pub(crate) fn new_time_in_stream(metrics_registry: &MetricsRegistry) -> LatencyMetrics {
         LatencyMetrics::new(
             metrics_registry,
             METRIC_TIME_IN_STREAM,
-            "Time messages spend in the stream before they are garbage collected based\
-                            on a signal from the receiving subnet",
+            "Per-destination-subnet histogram of wall time spent by messages in the stream \
+                before they are garbage collected.",
         )
     }
 
+    /// Creates the `LatencyMetrics` to record [`METRIC_TIME_IN_BACKLOG`]
+    /// observations.
     pub(crate) fn new_time_in_backlog(metrics_registry: &MetricsRegistry) -> LatencyMetrics {
         LatencyMetrics::new(
             metrics_registry,
             METRIC_TIME_IN_BACKLOG,
-            "Average time it takes to consume a message from the backlog, per sending subnet",
+            "Per-source-subnet histogram of wall time between finding out about the \
+                existence of a message from an incoming stream header; and inducting it.",
         )
     }
 
+    /// Helper function: invokes the given function on the [`StreamTimeline`]
+    /// for the given remote subnet, creating one if it doesn't exist yet.
     fn with_timeline(&mut self, subnet_id: SubnetId, f: impl FnOnce(&mut StreamTimeline)) {
         use std::collections::btree_map::Entry;
 
@@ -180,11 +211,20 @@ impl LatencyMetrics {
         }
     }
 
-    pub(crate) fn observe_header(&mut self, subnet_id: SubnetId, header: &StreamHeader) {
+    /// Records a `MessageTime` entry for messages to/from `subnet_id` before
+    /// `header.end` (if not already recorded).
+    pub(crate) fn record_header(&mut self, subnet_id: SubnetId, header: &StreamHeader) {
         self.with_timeline(subnet_id, |t| t.add_entry(header.end));
     }
 
-    pub(crate) fn observe_indexes(&mut self, subnet_id: SubnetId, index_range: Range<StreamIndex>) {
+    /// Observes message durations for all messages to/from `subnet_id` with
+    /// indices in the given `index_range`, as the time elapsed since the
+    /// respective matching timeline entries.
+    pub(crate) fn observe_message_durations(
+        &mut self,
+        subnet_id: SubnetId,
+        index_range: Range<StreamIndex>,
+    ) {
         self.with_timeline(subnet_id, |t| t.observe(index_range));
     }
 }
@@ -193,6 +233,10 @@ impl LatencyMetrics {
 pub(crate) struct MessageRoutingMetrics {
     /// Number of `deliver_batch()` calls, by status.
     deliver_batch_count: IntCounterVec,
+    /// Expected batch height.
+    expected_batch_height: IntGauge,
+    /// Registry version referenced in the most recently executed batch.
+    registry_version: IntGauge,
     /// Batch processing durations.
     process_batch_duration: Histogram,
     /// Batch processing phase durations, by phase.
@@ -202,6 +246,13 @@ pub(crate) struct MessageRoutingMetrics {
     /// for the extra copies of the state that the protocol has to store for
     /// correct operations.
     canisters_memory_usage_bytes: IntGauge,
+    /// Critical error for not being able to calculate a subnet size.
+    critical_error_missing_subnet_size: IntCounter,
+    /// Critical error: subnet has no canister allocation range to generate new
+    /// canister IDs from.
+    critical_error_no_canister_allocation_range: IntCounter,
+    /// Number of timed out requests.
+    pub timed_out_requests_total: IntCounter,
 }
 
 impl MessageRoutingMetrics {
@@ -222,6 +273,14 @@ impl MessageRoutingMetrics {
                 // 1ms - 50s
                 decimal_buckets(-3, 1),
             ),
+            expected_batch_height: metrics_registry.int_gauge(
+                METRIC_EXPECTED_BATCH_HEIGHT,
+                "Height of the batch that MR expects to be delivered next.",
+            ),
+            registry_version: metrics_registry.int_gauge(
+                METRIC_REGISTRY_VERSION,
+                "Registry version referenced in the most recently executed batch.",
+            ),
             process_batch_phase_duration: metrics_registry.histogram_vec(
                 METRIC_PROCESS_BATCH_PHASE_DURATION,
                 "Batch processing phase durations, by phase.",
@@ -233,7 +292,25 @@ impl MessageRoutingMetrics {
                 "canister_memory_usage_bytes",
                 "Total memory footprint of all canisters on this subnet.",
             ),
+            critical_error_missing_subnet_size: metrics_registry
+                .error_counter(CRITICAL_ERROR_MISSING_SUBNET_SIZE),
+            critical_error_no_canister_allocation_range: metrics_registry
+                .error_counter(CRITICAL_ERROR_NO_CANISTER_ALLOCATION_RANGE),
+            timed_out_requests_total: metrics_registry.int_counter(
+                METRIC_TIMED_OUT_REQUESTS_TOTAL,
+                "Count of timed out requests.",
+            ),
         }
+    }
+
+    pub fn observe_no_canister_allocation_range(&self, log: &ReplicaLogger, message: String) {
+        self.critical_error_no_canister_allocation_range.inc();
+        warn!(
+            log,
+            "{}: {}. Subnet is unable to generate new canister IDs.",
+            message,
+            CRITICAL_ERROR_NO_CANISTER_ALLOCATION_RANGE
+        );
     }
 }
 
@@ -250,16 +327,6 @@ pub struct MessageRoutingImpl {
     _batch_processor_handle: JoinOnDrop<()>,
 }
 
-/// The message routing implementation realizes a synchronous
-/// actor. Namely, it has a synchronous context, that processes each
-/// request without preemption. Note that threads of execution running
-/// in a SyncContext are supervised by the main system via a
-/// SyncArbiter and run on dedicated threads -- in this case it should
-/// be a single thread.
-impl Actor for MessageRoutingImpl {
-    type Context = SyncContext<Self>;
-}
-
 /// A component that executes Consensus [batches](Batch) sequentially, by
 /// retrieving the matching state, applying the batch and committing the result.
 #[cfg_attr(test, automock)]
@@ -272,8 +339,11 @@ struct BatchProcessorImpl {
     state_manager: Arc<dyn StateManager<State = ReplicatedState>>,
     state_machine: Box<dyn StateMachine>,
     registry: Arc<dyn RegistryClient>,
+    bitcoin_config: BitcoinConfig,
     metrics: Arc<MessageRoutingMetrics>,
     log: ReplicaLogger,
+    #[allow(dead_code)]
+    malicious_flags: MaliciousFlags,
 }
 
 impl BatchProcessorImpl {
@@ -281,15 +351,19 @@ impl BatchProcessorImpl {
         state_manager: Arc<dyn StateManager<State = ReplicatedState>>,
         state_machine: Box<dyn StateMachine>,
         registry: Arc<dyn RegistryClient>,
+        bitcoin_config: BitcoinConfig,
         metrics: Arc<MessageRoutingMetrics>,
         log: ReplicaLogger,
+        malicious_flags: MaliciousFlags,
     ) -> Self {
         Self {
             state_manager,
             state_machine,
             registry,
+            bitcoin_config,
             metrics,
             log,
+            malicious_flags,
         }
     }
 
@@ -305,20 +379,11 @@ impl BatchProcessorImpl {
     fn observe_canisters_memory_usage(&self, state: &ReplicatedState) {
         let mut memory_usage = NumBytes::from(0);
         for canister in state.canister_states.values() {
-            memory_usage += canister.memory_usage();
+            memory_usage += canister.memory_usage(state.metadata.own_subnet_type);
         }
-
-        // Based on
-        // https://prometheus.io/docs/introduction/faq/#why-are-all-sample-values-64-bit-floats-i-want-integers,
-        // this number cannot be larger than 2^53. 2^53 is 8192 TiB. We will
-        // probably not be supporting so much storage on a single subnet anytime
-        // soon.
-        let ceiling: i64 = 1 << 53;
-        let memory_usage = std::cmp::min(
-            i64::try_from(memory_usage.get()).unwrap_or_else(|_| ceiling),
-            ceiling,
-        );
-        self.metrics.canisters_memory_usage_bytes.set(memory_usage);
+        self.metrics
+            .canisters_memory_usage_bytes
+            .set(memory_usage.get() as i64);
     }
 
     // Retrieve the `ProvisionalWhitelist` from the registry.  We do this at the
@@ -378,7 +443,7 @@ impl BatchProcessorImpl {
         let subnet_ids = subnet_ids_record.unwrap_or_default();
 
         // Populate subnet topologies.
-        let mut subnets: BTreeMap<SubnetId, SubnetTopology> = BTreeMap::new();
+        let mut subnets = BTreeMap::new();
 
         for subnet_id in &subnet_ids {
             let mut nodes: BTreeMap<NodeId, NodeTopology> = BTreeMap::new();
@@ -443,51 +508,63 @@ impl BatchProcessorImpl {
             let public_key =
                 get_subnet_public_key(Arc::clone(&self.registry), *subnet_id, registry_version)?;
             let subnet_type = self.get_subnet_type(*subnet_id, registry_version);
+            let subnet_features = self.get_subnet_features(*subnet_id, registry_version);
+            let ecdsa_keys_held = self.get_ecdsa_keys_held(*subnet_id, registry_version);
             subnets.insert(
                 *subnet_id,
                 SubnetTopology {
                     public_key,
                     nodes,
                     subnet_type,
+                    subnet_features,
+                    ecdsa_keys_held,
                 },
             );
         }
 
         let routing_table_record = self.registry.get_routing_table(registry_version)?;
         let routing_table = routing_table_record.unwrap_or_default();
-        let nns_subnet_id = self.get_nns_subnet_id(subnet_ids, registry_version);
+        let canister_migrations = self
+            .registry
+            .get_canister_migrations(registry_version)?
+            .unwrap_or_default();
+        let nns_subnet_id = self.get_nns_subnet_id(registry_version);
+
+        let ecdsa_signing_subnets = self
+            .registry
+            .get_ecdsa_signing_subnets(registry_version)?
+            .unwrap_or_default();
 
         Ok(NetworkTopology {
             subnets,
-            routing_table,
+            routing_table: Arc::new(routing_table),
             nns_subnet_id,
+            canister_migrations: Arc::new(canister_migrations),
+            ecdsa_signing_subnets,
+            bitcoin_testnet_canister_id: self.bitcoin_config.testnet_canister_id,
+            bitcoin_mainnet_canister_id: self.bitcoin_config.mainnet_canister_id,
         })
     }
 
-    fn get_nns_subnet_id(
-        &self,
-        subnet_ids: Vec<SubnetId>,
-        registry_version: RegistryVersion,
-    ) -> SubnetId {
-        for subnet_id in subnet_ids {
-            if self.get_subnet_type(subnet_id, registry_version) == SubnetType::System {
-                return subnet_id;
-            }
+    fn get_nns_subnet_id(&self, registry_version: RegistryVersion) -> SubnetId {
+        // Note: The following assumes that root == NNS subnet.
+        match self.registry.get_root_subnet_id(registry_version) {
+            Ok(Some(subnet_id)) => subnet_id,
+            Ok(None) => unreachable!("Could not find the NNS subnet id"),
+            Err(err) => unreachable!("Could not find the NNS subnet id: {}", err),
         }
-        unreachable!("Could not find the NNS subnet id.");
     }
 
-    fn get_subnet_type(
+    fn get_subnet_record(
         &self,
         subnet_id: SubnetId,
         registry_version: RegistryVersion,
-    ) -> SubnetType {
+    ) -> SubnetRecord {
         loop {
             match self.registry.get_subnet_record(subnet_id, registry_version) {
                 Ok(subnet_record) => {
                     break match subnet_record {
-                        Some(record) => SubnetType::try_from(record.subnet_type)
-                            .expect("Could not parse SubnetType"),
+                        Some(record) => record,
                         // This can only happen if the registry is corrupted, so better to crash.
                         None => fatal!(
                             self.log,
@@ -507,6 +584,62 @@ impl BatchProcessorImpl {
             sleep(std::time::Duration::from_millis(100));
         }
     }
+
+    fn get_subnet_type(
+        &self,
+        subnet_id: SubnetId,
+        registry_version: RegistryVersion,
+    ) -> SubnetType {
+        let record = self.get_subnet_record(subnet_id, registry_version);
+        SubnetType::try_from(record.subnet_type).expect("Could not parse SubnetType")
+    }
+
+    fn get_subnet_features(
+        &self,
+        subnet_id: SubnetId,
+        registry_version: RegistryVersion,
+    ) -> SubnetFeatures {
+        let record = self.get_subnet_record(subnet_id, registry_version);
+        record.features.unwrap_or_default().into()
+    }
+
+    fn get_ecdsa_keys_held(
+        &self,
+        subnet_id: SubnetId,
+        registry_version: RegistryVersion,
+    ) -> BTreeSet<EcdsaKeyId> {
+        let record = self.get_subnet_record(subnet_id, registry_version);
+        record
+            .ecdsa_config
+            .map(|ecdsa_config| {
+                ecdsa_config
+                    .key_ids
+                    .into_iter()
+                    .map(|k| {
+                        EcdsaKeyId::try_from(k).expect("Could not read EcdsaKeyId from protobuf")
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    fn get_max_number_of_canisters(
+        &self,
+        subnet_id: SubnetId,
+        registry_version: RegistryVersion,
+    ) -> u64 {
+        let record = self.get_subnet_record(subnet_id, registry_version);
+        record.max_number_of_canisters
+    }
+
+    fn get_max_ecdsa_queue_size(
+        &self,
+        subnet_id: SubnetId,
+        registry_version: RegistryVersion,
+    ) -> u32 {
+        let record = self.get_subnet_record(subnet_id, registry_version);
+        record.ecdsa_config.map(|c| c.max_queue_size).unwrap_or(0)
+    }
 }
 
 fn get_subnet_public_key(
@@ -514,14 +647,14 @@ fn get_subnet_public_key(
     subnet_id: SubnetId,
     registry_version: RegistryVersion,
 ) -> Result<Vec<u8>, RegistryClientError> {
-    use ic_crypto::threshold_sig_public_key_to_der;
+    use ic_crypto_utils_threshold_sig_der::public_key_to_der;
     Ok(registry
         .get_initial_dkg_transcripts(subnet_id, registry_version)?
         .value
         .map(|transcripts| {
             let transcript = transcripts.high_threshold;
             let pk = transcript.public_key();
-            threshold_sig_public_key_to_der(pk).unwrap_or_else(|err| {
+            public_key_to_der(&pk.into_bytes()).unwrap_or_else(|err| {
                 panic!("Invalid public key for subnet {}: {:?}", subnet_id, err)
             })
         })
@@ -530,6 +663,7 @@ fn get_subnet_public_key(
 
 impl BatchProcessor for BatchProcessorImpl {
     fn process_batch(&self, batch: Batch) {
+        let _process_batch_start = Instant::now();
         let timer = Timer::start();
 
         // Fetch the mutable tip from StateManager
@@ -565,21 +699,51 @@ impl BatchProcessor for BatchProcessorImpl {
             CertificationScope::Metadata
         };
 
-        // TODO (MR-29) Cache network topology and only populate if version
-        // referenced in batch changes.
-        let network_topology = self.populate_network_topology(batch.registry_version);
-        let provisional_whitelist = self.get_provisional_whitelist(batch.registry_version);
+        // TODO (MR-29) Cache network topology and subnet_features; and populate only
+        // if version referenced in batch changes.
+        let registry_version = batch.registry_version;
+        let network_topology = self.populate_network_topology(registry_version);
+        let provisional_whitelist = self.get_provisional_whitelist(registry_version);
+        let subnet_features =
+            self.get_subnet_features(state.metadata.own_subnet_id, registry_version);
+        let max_number_of_canisters =
+            self.get_max_number_of_canisters(state.metadata.own_subnet_id, registry_version);
+        let max_ecdsa_queue_size =
+            self.get_max_ecdsa_queue_size(state.metadata.own_subnet_id, registry_version);
 
-        let batch_requires_full_state_hash = batch.requires_full_state_hash;
-        let mut state_after_round =
-            self.state_machine
-                .execute_round(state, network_topology, batch, provisional_whitelist);
+        let subnet_size = network_topology
+            .get_subnet_size(&state.metadata.own_subnet_id)
+            .unwrap_or_else(|| {
+                self.metrics.critical_error_missing_subnet_size.inc();
+                warn!(
+                    self.log,
+                    "{}: [EXC-1168] Unable to get subnet size from network topology. Cycles accounting may no longer be accurate.",
+                    CRITICAL_ERROR_MISSING_SUBNET_SIZE
+                );
+                SMALL_APP_SUBNET_MAX_SIZE
+            });
+
+        let mut state_after_round = self.state_machine.execute_round(
+            state,
+            network_topology,
+            batch,
+            subnet_features,
+            &RegistryExecutionSettings {
+                max_number_of_canisters,
+                provisional_whitelist,
+                max_ecdsa_queue_size,
+                subnet_size,
+            },
+        );
+        // Garbage collect empty canister queue pairs before checkpointing.
+        if certification_scope == CertificationScope::Full {
+            state_after_round.garbage_collect_canister_queues();
+        }
         self.observe_canisters_memory_usage(&state_after_round);
 
-        // See documentation around the definition of `heap_delta_estimate` for
-        // an explanation.
-        if batch_requires_full_state_hash {
-            state_after_round.metadata.heap_delta_estimate = NumBytes::from(0);
+        #[cfg(feature = "malicious_code")]
+        if let Some(delay) = self.malicious_flags.delay_execution(_process_batch_start) {
+            info!(self.log, "[MALICIOUS]: Delayed execution by {:?}", delay);
         }
 
         let phase_timer = Timer::start();
@@ -592,6 +756,9 @@ impl BatchProcessor for BatchProcessorImpl {
         self.observe_phase_duration(PHASE_COMMIT, &phase_timer);
 
         self.metrics.process_batch_duration.observe(timer.elapsed());
+        self.metrics
+            .registry_version
+            .set(registry_version.get() as i64);
     }
 }
 
@@ -615,26 +782,6 @@ impl FakeBatchProcessorImpl {
             ingress_history_writer,
             log,
         }
-    }
-}
-
-fn update_state(
-    ingress_history_writer: &dyn IngressHistoryWriter<State = ReplicatedState>,
-    not_run_canisters: BTreeMap<CanisterId, CanisterState>,
-    state: &mut ReplicatedState,
-    all_canister_states: Vec<CanisterState>,
-    all_ingress_execution_results: Vec<(MessageId, IngressStatus)>,
-) {
-    state.put_canister_states(
-        all_canister_states
-            .into_iter()
-            .map(|canister| (canister.canister_id(), canister))
-            .chain(not_run_canisters.into_iter())
-            .collect(),
-    );
-
-    for (msg_id, status) in all_ingress_execution_results {
-        ingress_history_writer.set_status(state, msg_id, status);
     }
 }
 
@@ -666,41 +813,35 @@ impl BatchProcessor for FakeBatchProcessorImpl {
         debug!(self.log, "Processing batch {}", batch.batch_number);
         let commit_height = Height::from(batch.batch_number.get());
 
-        let mut metadata = state.system_metadata().clone();
         let time = batch.time;
-        metadata.batch_time = time;
-        state.set_system_metadata(metadata);
+        state.metadata.batch_time = time;
 
-        // Get only ingress and ignore xnet messages
-        let (signed_ingress_msgs, _certified_stream_slices) =
+        // Get only ingress and ignore xnet and self-validating messages
+        let (signed_ingress_msgs, _certified_stream_slices, _get_successors_response) =
             batch.payload.into_messages().unwrap();
 
         // Treat all ingress messages as already executed.
-        let canisters = state.take_canister_states();
-        let all_canister_states = Vec::new();
-        let all_ingress_execution_results = signed_ingress_msgs
-            .into_iter()
-            .map(|ingress| {
-                // It is safe to assume valid expiry time here
-                (
-                    ingress.id(),
-                    ic_types::ingress::IngressStatus::Completed {
-                        receiver: ingress.canister_id().get(),
-                        user_id: ingress.sender(),
+        let all_ingress_execution_results = signed_ingress_msgs.into_iter().map(|ingress| {
+            // It is safe to assume valid expiry time here
+            (
+                ingress.id(),
+                ic_types::ingress::IngressStatus::Known {
+                    receiver: ingress.canister_id().get(),
+                    user_id: ingress.sender(),
+                    time,
+                    state: ic_types::ingress::IngressState::Completed(
                         // The byte content mimicks a good reply for the counter example
-                        result: ic_types::ingress::WasmResult::Reply(vec![68, 73, 68, 76, 0, 0]),
-                        time,
-                    },
-                )
-            })
-            .collect::<Vec<_>>();
-        update_state(
-            self.ingress_history_writer.as_ref(),
-            canisters,
-            &mut state,
-            all_canister_states,
-            all_ingress_execution_results,
-        );
+                        ic_types::ingress::WasmResult::Reply(vec![68, 73, 68, 76, 0, 0]),
+                    ),
+                },
+            )
+        });
+
+        for (msg_id, status) in all_ingress_execution_results {
+            self.ingress_history_writer
+                .set_status(&mut state, msg_id, status);
+        }
+
         state.prune_ingress_history();
 
         // Postprocess the state and consolidate the Streams.
@@ -757,33 +898,21 @@ impl MessageRoutingImpl {
         state_manager: Arc<dyn StateManager<State = ReplicatedState>>,
         certified_stream_store: Arc<dyn CertifiedStreamStore>,
         ingress_history_writer: Arc<dyn IngressHistoryWriter<State = ReplicatedState> + 'static>,
-        exec_env: Arc<
-            dyn ExecutionEnvironment<State = ReplicatedState, CanisterState = CanisterState>
-                + 'static,
-        >,
+        scheduler: Box<dyn Scheduler<State = ReplicatedState>>,
+        hypervisor_config: HypervisorConfig,
         cycles_account_manager: Arc<CyclesAccountManager>,
-        scheduler_config: ic_config::subnet_config::SchedulerConfig,
         subnet_id: SubnetId,
-        subnet_type: SubnetType,
         metrics_registry: &MetricsRegistry,
         log: ReplicaLogger,
         registry: Arc<dyn RegistryClient>,
+        malicious_flags: MaliciousFlags,
     ) -> Self {
-        let scheduler = Box::new(scheduling::scheduler::SchedulerImpl::new(
-            scheduler_config,
-            subnet_id,
-            subnet_type,
-            Arc::clone(&ingress_history_writer),
-            exec_env,
-            Arc::clone(&cycles_account_manager),
-            metrics_registry,
-            log.clone(),
-        ));
         let time_in_stream_metrics = Arc::new(Mutex::new(LatencyMetrics::new_time_in_stream(
             metrics_registry,
         )));
         let stream_handler = Box::new(routing::stream_handler::StreamHandlerImpl::new(
             subnet_id,
+            hypervisor_config.clone(),
             metrics_registry,
             Arc::clone(&time_in_stream_metrics),
             log.clone(),
@@ -820,8 +949,10 @@ impl MessageRoutingImpl {
             state_manager.clone(),
             state_machine,
             registry,
+            hypervisor_config.bitcoin,
             Arc::clone(&metrics),
             log.clone(),
+            malicious_flags,
         ));
 
         Self::from_batch_processor(state_manager, batch_processor, Arc::clone(&metrics), log)
@@ -840,7 +971,7 @@ impl MessageRoutingImpl {
             subnet_id,
             metrics_registry,
             Arc::new(Mutex::new(LatencyMetrics::new_time_in_stream(
-                &metrics_registry,
+                metrics_registry,
             ))),
             log.clone(),
         ));
@@ -873,6 +1004,9 @@ impl MessageRouting for MessageRoutingImpl {
     fn deliver_batch(&self, batch: Batch) -> Result<(), MessageRoutingError> {
         let batch_number = batch.batch_number;
         let expected_number = self.expected_batch_height();
+        self.metrics
+            .expected_batch_height
+            .set(expected_number.get() as i64);
         if batch_number != expected_number {
             self.inc_deliver_batch(STATUS_IGNORED);
             info!(
@@ -897,7 +1031,7 @@ impl MessageRouting for MessageRoutingImpl {
             // resend the overflowing batches later.
             Err(TrySendError::Full(_)) => {
                 self.inc_deliver_batch(STATUS_QUEUE_FULL);
-                info!(
+                debug!(
                     self.log,
                     "Rejecting batch {}: execution queue overflow ({} batches queued)",
                     batch_number,
@@ -925,13 +1059,13 @@ impl MessageRouting for MessageRoutingImpl {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ic_interfaces_state_manager_mocks::MockStateManager;
     use ic_test_utilities::{
-        metrics::{fetch_int_counter_vec, metric_vec},
         notification::{Notification, WaitResult},
-        state_manager::MockStateManager,
         types::batch::BatchBuilder,
-        with_test_replica_logger,
     };
+    use ic_test_utilities_logger::with_test_replica_logger;
+    use ic_test_utilities_metrics::{fetch_int_counter_vec, metric_vec};
     use std::sync::Arc;
     use std::time::Duration;
 

@@ -44,7 +44,8 @@
 //!                  · chunk_hash
 //! ```
 //!
-//! * The hash of the whole manifest is computed by hashing the file table:
+//! * When the manifest version is less than or equal to `STATE_SYNC_V1`,
+//!   the hash of the whole manifest is computed by hashing the file table:
 //! ```text
 //!   manifest_hash := hash(dsep("ic-state-manifest")
 //!                    · version as u32
@@ -61,15 +62,34 @@
 //! where
 //! ```text
 //! dsep(seq) = byte(len(seq)) · seq
-//! ``
+//! ```
+//! * When the manifest version is greater than or equal to `STATE_SYNC_V2`,
+//!   the hash of the meta-manifest functions as the manifest hash.
 pub mod proto;
 
 use crate::chunkable::ChunkId;
 use ic_protobuf::state::sync::v1 as pb;
-use std::fmt;
+use serde::{Deserialize, Serialize};
+use std::{
+    collections::BTreeMap,
+    fmt,
+    ops::{Deref, Range},
+    sync::Arc,
+};
 
 /// Id of the manifest chunk in StateSync artifact.
 pub const MANIFEST_CHUNK: ChunkId = ChunkId::new(0);
+
+/// Some small files are grouped into chunks during state sync and
+/// they need to use a separate range of chunk id to avoid conflicts with normal chunks.
+//
+// The value of `FILE_GROUP_CHUNK_ID_OFFSET` is set as 1 << 30 (1_073_741_824).
+// It is within the whole chunk id range and also large enough to avoid conflicts as shown in the calculations below.
+// Every subnet starts off with an allocation of 1 << 20 canister IDs. Suppose a subnet ends up with 10 * 1 << 20 canisters and 100 TiB state.
+// Given that each canister has fewer than 10 files in a checkpoint and 1 TiB of state has approximately 1 << 20 chunks,
+// the length of chunk table will be smaller than 10 * 10 * 1 << 20 + 100 * 1 << 20 = 209_715_200.
+// The real number of canisters and size of state are not even close to the assumption so the value of `FILE_GROUP_CHUNK_ID_OFFSET` is chosen safely.
+pub const FILE_GROUP_CHUNK_ID_OFFSET: u32 = 1 << 30;
 
 /// An entry of the file table.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
@@ -97,6 +117,40 @@ pub struct ChunkInfo {
     pub hash: [u8; 32],
 }
 
+impl ChunkInfo {
+    /// Returns the range of bytes belonging to this chunk.
+    pub fn byte_range(&self) -> Range<usize> {
+        self.offset as usize..(self.offset as usize + self.size_bytes as usize)
+    }
+}
+
+/// We wrap the actual Manifest (ManifestData) in an Arc, in order to
+/// make Manifest both immutable and cheap to copy
+#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+pub struct Manifest(
+    #[serde(serialize_with = "ic_utils::serde_arc::serialize_arc")]
+    #[serde(deserialize_with = "ic_utils::serde_arc::deserialize_arc")]
+    Arc<ManifestData>,
+);
+
+impl Manifest {
+    pub fn new(version: u32, file_table: Vec<FileInfo>, chunk_table: Vec<ChunkInfo>) -> Self {
+        Self(Arc::new(ManifestData {
+            version,
+            file_table,
+            chunk_table,
+        }))
+    }
+}
+
+impl Deref for Manifest {
+    type Target = ManifestData;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
 /// Manifest is a short description of the checkpoint contents.
 ///
 /// The manifest is structured as 2 tables: a file table and a chunk table,
@@ -115,13 +169,37 @@ pub struct ChunkInfo {
 /// ...
 /// [45]: (8, 93000, 0, <hash>)
 /// ```
-#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
-pub struct Manifest {
+#[derive(Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+pub struct ManifestData {
     /// Which version of the hashing procedure should be used.
     #[serde(default)]
     pub version: u32,
     pub file_table: Vec<FileInfo>,
     pub chunk_table: Vec<ChunkInfo>,
+}
+
+/// MetaManifest describes how the manifest is encoded, split and hashed.
+///
+/// The meta-manifest is built in the following way:
+///     1. Use protobuf to encode the manifest into raw bytes
+///     2. Split the encoded manifest into chunks of `DEFAULT_CHUNK_SIZE` bytes, called sub-manifests.
+///     3. Hash each sub-manifest and collect their hashes
+///
+/// The hash of meta-manifest is computed by hashing the version, the length and `sub_manifest_hashes`:
+/// ```text
+///   meta_manifest_hash := hash(dsep("ic-state-meta-manifest")
+///                         · version as u32
+///                         · len(sub_manifest_hashes) as u32
+///                         · sub_manifest_hashes
+///                         )
+///   sub_manifest_hash  := hash(dsep("ic-state-sub-manifest") · encoded_manifest[offset:offset + size_bytes])
+/// ```
+///
+/// The `meta_manifest_hash` is used as the manifest hash when the manifest version is greater than or equal to `STATE_SYNC_V2`.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+pub struct MetaManifest {
+    pub version: u32,
+    pub sub_manifest_hashes: Vec<[u8; 32]>,
 }
 
 impl fmt::Display for Manifest {
@@ -157,6 +235,7 @@ impl fmt::Display for Manifest {
             .max()
             .unwrap_or(6);
 
+        writeln!(f, "MANIFEST VERSION: {}", self.version)?;
         writeln!(f, "FILE TABLE")?;
         write_header(
             f,
@@ -218,11 +297,42 @@ pub fn encode_manifest(manifest: &Manifest) -> Vec<u8> {
 /// Deserializes the manifest from a byte array.
 pub fn decode_manifest(bytes: &[u8]) -> Result<Manifest, String> {
     use prost::Message;
-    use std::convert::TryInto;
 
     let pb_manifest = pb::Manifest::decode(bytes)
         .map_err(|err| format!("failed to decode Manifest proto {}", err))?;
     pb_manifest
         .try_into()
         .map_err(|err| format!("failed to convert Manifest proto into an object: {}", err))
+}
+
+type P2PChunkId = u32;
+type ManifestChunkTableIndex = u32;
+
+/// A chunk id from the P2P level is mapped to a group of indices from the manifest chunk table.
+/// `FileGroupChunks` stores the mapping and can be used to assemble or split the file group chunk.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FileGroupChunks(BTreeMap<P2PChunkId, Vec<ManifestChunkTableIndex>>);
+
+impl FileGroupChunks {
+    pub fn new(value: BTreeMap<P2PChunkId, Vec<ManifestChunkTableIndex>>) -> Self {
+        FileGroupChunks(value)
+    }
+
+    pub fn keys(&self) -> impl Iterator<Item = &ManifestChunkTableIndex> {
+        self.0.keys()
+    }
+
+    pub fn iter(
+        &self,
+    ) -> impl Iterator<Item = (&ManifestChunkTableIndex, &Vec<ManifestChunkTableIndex>)> {
+        self.0.iter()
+    }
+
+    pub fn get(&self, chunk_id: &P2PChunkId) -> Option<&Vec<ManifestChunkTableIndex>> {
+        self.0.get(chunk_id)
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
 }

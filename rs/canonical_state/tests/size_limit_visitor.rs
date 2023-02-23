@@ -1,10 +1,10 @@
 use ic_canonical_state::{
     size_limit_visitor::{Matcher::*, SizeLimitVisitor},
     subtree_visitor::{Pattern, SubtreeVisitor},
-    traverse_partial, Control, LabelLike, Visitor,
+    traverse, Control, LabelLike, Visitor, MAX_SUPPORTED_CERTIFICATION_VERSION,
 };
 use ic_registry_subnet_type::SubnetType;
-use ic_replicated_state::ReplicatedState;
+use ic_replicated_state::{testing::ReplicatedStateTesting, ReplicatedState};
 use ic_test_utilities::{state::arb_stream, types::ids::subnet_test_id};
 use proptest::prelude::*;
 
@@ -26,15 +26,16 @@ struct Fixture {
 prop_compose! {
     /// An arbitrary fixture with default `slice_begin` and `size_limit` values.
     fn arb_barebone_fixture(max_size: usize)
-                   (stream in arb_stream(0, max_size)) -> Fixture {
-        let begin = stream.messages.begin().get();
-        let end = stream.messages.end().get();
+                   (stream in arb_stream(0, max_size, 0, max_size)) -> Fixture {
+        let begin = stream.messages_begin().get();
+        let end = stream.messages_end().get();
 
-        let mut state = ReplicatedState::new_rooted_at(subnet_test_id(1), SubnetType::Application, "NOT_USED".into());
+        let mut state = ReplicatedState::new(subnet_test_id(1), SubnetType::Application);
         let subnet = subnet_test_id(42);
-        let mut streams = state.take_streams();
-        streams.insert(subnet, stream);
-        state.put_streams(streams);
+        state.modify_streams(|streams| {
+            streams.insert(subnet, stream);
+        });
+        state.metadata.certification_version = MAX_SUPPORTED_CERTIFICATION_VERSION;
 
         let size = compute_message_sizes(&state, begin, end);
 
@@ -55,7 +56,7 @@ prop_compose! {
                   (fixture in arb_barebone_fixture(max_size))
                   (
                       slice_begin in fixture.begin..fixture.end + 1,
-                      size_limit in 0..fixture.size + 1,
+                      size_limit in 0..=fixture.size,
                       fixture in Just(fixture),
                   ) -> Fixture {
         Fixture {
@@ -84,7 +85,7 @@ proptest! {
             size_limit,
             SubtreeVisitor::new(&subtree_pattern, MessageSpyVisitor::default()),
         );
-        let (actual_size, actual_begin, actual_end) = traverse_partial(&state, visitor);
+        let (actual_size, actual_begin, actual_end) = traverse(&state, visitor);
 
         if let (Some(actual_begin), Some(actual_end)) = (actual_begin, actual_end) {
             // Non-empty slice.
@@ -115,7 +116,7 @@ fn compute_message_sizes(state: &ReplicatedState, begin: u64, end: u64) -> usize
     // Traverse the stream once to collect its messages' total byte size.
     let pattern = make_slice_pattern(begin, end);
     let visitor = SubtreeVisitor::new(&pattern, MessageSpyVisitor::default());
-    let (size, tbegin, tend) = traverse_partial(&state, visitor);
+    let (size, tbegin, tend) = traverse(state, visitor);
 
     // Sanity check MessageSpyVisitor.
     if let (Some(tbegin), Some(tend)) = (tbegin, tend) {
@@ -148,7 +149,11 @@ fn make_slice_pattern(begin: u64, end: u64) -> Pattern {
                 ("header", P::all()),
                 (
                     "messages",
-                    P::match_range(begin.to_label(), end.to_label(), P::all()),
+                    P::match_range(
+                        begin.to_label().as_bytes(),
+                        end.to_label().as_bytes(),
+                        P::all(),
+                    ),
                 ),
             ]
             .into_iter(),

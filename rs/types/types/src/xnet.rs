@@ -1,7 +1,5 @@
 //! Types used by the Xnet component.
-use crate::{
-    consensus::certification::Certification, messages::RequestOrResponse, CanisterId, CountBytes,
-};
+use crate::{consensus::certification::Certification, messages::RequestOrResponse, CanisterId};
 use phantom_newtype::{AmountOf, Id};
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
@@ -14,27 +12,16 @@ pub struct StreamIndexTag;
 pub type StreamIndex = AmountOf<StreamIndexTag, u64>;
 
 /// A gap-free `StreamIndex`-ed queue for the messages and signals of a stream.
-#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct StreamIndexedQueue<T> {
     begin: StreamIndex,
     queue: VecDeque<T>,
 }
 
-impl<T> StreamIndexedQueue<T> {
-    /// Constructs a `StreamIndexedQueue` beginning at the given index.
-    pub fn with_begin(begin: StreamIndex) -> Self {
-        StreamIndexedQueue {
-            begin,
-            queue: VecDeque::new(),
-        }
-    }
-
+impl<T: Clone> StreamIndexedQueue<T> {
     /// Extracts a slice of the given queue beginning at `slice_begin` and
     /// containing at most `max` items.
-    pub fn slice(&self, slice_begin: StreamIndex, max: Option<usize>) -> StreamIndexedQueue<T>
-    where
-        T: Clone,
-    {
+    pub fn slice(&self, slice_begin: StreamIndex, max: Option<usize>) -> StreamIndexedQueue<T> {
         assert!(
             slice_begin >= self.begin(),
             "Requested `slice_begin` ({}) before `self.begin()` ({})",
@@ -57,8 +44,18 @@ impl<T> StreamIndexedQueue<T> {
                 .iter()
                 .skip(skip)
                 .take(max)
-                .map(T::clone)
+                .cloned()
                 .collect::<VecDeque<_>>(),
+        }
+    }
+}
+
+impl<T> StreamIndexedQueue<T> {
+    /// Constructs a `StreamIndexedQueue` beginning at the given index.
+    pub fn with_begin(begin: StreamIndex) -> Self {
+        StreamIndexedQueue {
+            begin,
+            queue: VecDeque::new(),
         }
     }
 
@@ -78,7 +75,10 @@ impl<T> StreamIndexedQueue<T> {
     }
 
     /// Pops the next item with its index, if one is available.
-    pub fn pop(&mut self) -> Option<(StreamIndex, T)> {
+    pub fn pop(&mut self) -> Option<(StreamIndex, T)>
+    where
+        T: Clone,
+    {
         self.queue.pop_front().map(|msg| {
             let index = self.begin;
             self.begin.inc_assign();
@@ -129,7 +129,7 @@ impl<T> StreamIndexedQueue<T> {
     }
 
     /// Returns an iterator over the items in the queue, with their indices.
-    pub fn iter<'a>(&'a self) -> impl std::iter::Iterator<Item = (StreamIndex, &T)> + 'a {
+    pub fn iter(&self) -> impl std::iter::Iterator<Item = (StreamIndex, &T)> {
         (self.begin.get()..)
             .zip(self.queue.iter())
             .map(|(index, item)| (StreamIndex::from(index), item))
@@ -151,23 +151,26 @@ impl<T> Default for StreamIndexedQueue<T> {
 ///
 /// The idea behind this digest is that a subnet can obtain just the header and
 /// decide how many messages it wants to pull.
+///
+/// Conceptually we use a gap-free queue containing one signal for each
+/// inducted message; but because most signals are `Accept`we represent that
+/// queue as a combination of `signals_end` (pointing just beyond the last
+/// signal) and a collection of `reject_signals`.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct StreamHeader {
     pub begin: StreamIndex,
     pub end: StreamIndex,
 
-    /// Index of the next expected reverse stream message.
-    ///
-    /// Conceptually we use a gap-free queue containing one signal for each
-    /// inducted message; but because these signals are all "Accept" (as we
-    /// generate responses when rejecting messages), that queue can be safely
-    /// represented by its end index (pointing just beyond the last signal).
+    /// Index of the next expected message.
     pub signals_end: StreamIndex,
+
+    /// Stream indices of rejected messages, in ascending order.
+    pub reject_signals: VecDeque<StreamIndex>,
 }
 
 /// A continuous slice of messages pulled from a remote subnet.  The slice also
 /// includes the header with the communication session metadata.
-#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct StreamSlice {
     header: StreamHeader,
     // Messages coming from a remote subnet, together with their indices.
@@ -239,12 +242,6 @@ pub struct CertifiedStreamSlice {
     pub certification: Certification,
 }
 
-impl CountBytes for CertifiedStreamSlice {
-    fn count_bytes(&self) -> usize {
-        self.payload.len() + self.merkle_proof.len() + self.certification.count_bytes()
-    }
-}
-
 pub struct SessionTag {}
 /// Identifies a session between a given pair of sender,receiver canisters.
 pub type SessionId = Id<SessionTag, u64>;
@@ -282,6 +279,10 @@ pub mod testing {
                     q.push(message);
                     self.messages = Some(q);
                 }
+            }
+            let messages_end = self.messages.as_ref().unwrap().end();
+            if self.header.end < messages_end {
+                self.header.end = messages_end;
             }
         }
 

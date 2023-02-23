@@ -1,10 +1,11 @@
 [package]
 name = "ic-wasm-types"
 version = "0.8.0"
-edition = "2018"
+edition = "2021"
 
 [dependencies]
-ic-crypto-sha256 = { path = "../../crypto/sha256" }
+ic-crypto-sha = { path = "../../crypto/sha" }
+ic-protobuf = { path = "../../protobuf" }
 ic-sys = { path = "../../sys" }
 ic-utils = { path = "../../utils" }
 serde = { version = "1.0.99", features = ["derive"] }

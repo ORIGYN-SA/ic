@@ -1,0 +1,63 @@
+load("@bazel_gazelle//:def.bzl", "gazelle")
+
+package(default_visibility = ["//visibility:public"])
+
+exports_files([
+    ".rclone.conf",
+    ".rclone-anon.conf",
+    "clippy.toml",
+    "rustfmt.toml",
+    "WORKSPACE.bazel",
+])
+
+# bazel/workspace_status.sh will write the current timestamp to this file on every run to provade an input that always changes for some targets.
+# The file does not have to and should not be commited, therefore will not exist on the first run on a clean source tree.
+# Therefore glob is used to not fail when the file does not exist.
+# buildifier: disable=constant-glob
+filegroup(
+    name = "bazel-timestamp",
+    srcs = glob(["bazel-timestamp.txt"]),
+)
+
+alias(
+    name = "buildifier",
+    actual = "//bazel:buildifier",
+)
+
+test_suite(
+    name = "precommit",
+    tests = ["//bazel:buildifier_test"],
+)
+
+alias(
+    name = "bazelifier",
+    actual = "//rs/bazelifier",
+)
+
+alias(
+    name = "rustfmt",
+    actual = "@rules_rust//:rustfmt",
+)
+
+# See https://github.com/bazelbuild/bazel-gazelle#running-gazelle-with-bazel
+# gazelle:prefix github.com/dfinity/ic
+# gazelle:proto disable
+gazelle(
+    name = "gazelle",
+)
+
+gazelle(
+    name = "gazelle-update-repos",
+    args = [
+        "-from_file=go.mod",
+        "-to_macro=go_deps.bzl%go_dependencies",
+        "-prune",
+    ],
+    command = "update-repos",
+)
+
+alias(
+    name = "gobin",
+    actual = "@go_sdk//:bin/go",
+    visibility = ["//visibility:public"],
+)

@@ -1,0 +1,42 @@
+load("@rules_rust//rust:defs.bzl", "rust_library", "rust_test")
+
+rust_library(
+    name = "types",
+    srcs = glob(["src/**"]),
+    crate_name = "ic_crypto_internal_types",
+    proc_macro_deps = [
+        "@crate_index//:strum_macros",
+    ],
+    version = "0.8.0",
+    visibility = [
+        "//rs/canister_client/sender:__pkg__",
+        "//rs/certification:__pkg__",
+        "//rs/certification/test-utils:__pkg__",
+        "//rs/crypto:__subpackages__",
+        "//rs/identity:__pkg__",
+        "//rs/registry/admin:__pkg__",
+        "//rs/replay:__pkg__",
+        "//rs/scenario_tests:__pkg__",
+        "//rs/state_machine_tests:__pkg__",
+        "//rs/test_utilities:__pkg__",
+        "//rs/test_utilities/identity:__pkg__",
+        "//rs/types/types:__pkg__",
+    ],
+    deps = [
+        "//rs/phantom_newtype",
+        "//rs/protobuf",
+        "@crate_index//:arrayvec",
+        "@crate_index//:base64",
+        "@crate_index//:hex",
+        "@crate_index//:serde",
+        "@crate_index//:serde_cbor",
+        "@crate_index//:strum",
+        "@crate_index//:thiserror",
+        "@crate_index//:zeroize",
+    ],
+)
+
+rust_test(
+    name = "types_test",
+    crate = ":types",
+)

@@ -6,7 +6,7 @@ use ic_nns_test_utils::{
         forward_call_via_universal_canister, local_test_on_nns_subnet, set_up_registry_canister,
         set_up_universal_canister,
     },
-    registry::{get_value, invariant_compliant_mutation_as_atomic_req},
+    registry::{get_value_or_panic, invariant_compliant_mutation_as_atomic_req},
 };
 use ic_protobuf::registry::{
     replica_version::v1::{BlessedReplicaVersions, ReplicaVersionRecord},
@@ -18,6 +18,7 @@ use ic_registry_keys::{
 use ic_test_utilities::types::ids::subnet_test_id;
 
 use assert_matches::assert_matches;
+use ic_types::ReplicaVersion;
 use registry_canister::{
     init::RegistryCanisterInitPayloadBuilder,
     mutations::{
@@ -39,13 +40,14 @@ fn test_the_anonymous_user_cannot_bless_a_version() {
 
         let payload = BlessReplicaVersionPayload {
             replica_version_id: "version_43".to_string(),
-            binary_url: "http://megaupload.com/replica_version_43_definitely_not_a_scam"
-                .to_string(),
-            sha256_hex: "d1bc8d3ba4afc7e109612cb73acbdddac052c93025aa1f82942edabb7deb82a1".into(),
+            binary_url: "".into(),
+            sha256_hex: "".into(),
             node_manager_binary_url: "".into(),
             node_manager_sha256_hex: "".into(),
             release_package_url: "".into(),
             release_package_sha256_hex: "".into(),
+            release_package_urls: None,
+            guest_launch_measurement_sha256_hex: None,
         };
         // The anonymous end-user tries to bless a version, bypassing the proposals
         // This should be rejected.
@@ -56,13 +58,13 @@ fn test_the_anonymous_user_cannot_bless_a_version() {
                 Err(s) if s.contains("is not authorized to call this method: bless_replica_version"));
         // .. And there should therefore be no blessed version
         assert_eq!(
-            get_value::<BlessedReplicaVersions>(
+            get_value_or_panic::<BlessedReplicaVersions>(
                 &registry,
                 make_blessed_replica_version_key().as_bytes()
             )
             .await,
             BlessedReplicaVersions {
-                blessed_version_ids: vec!["version_42".to_string()]
+                blessed_version_ids: vec![ReplicaVersion::default().into()]
             }
         );
 
@@ -74,13 +76,13 @@ fn test_the_anonymous_user_cannot_bless_a_version() {
         assert_matches!(response,
                 Err(s) if s.contains("is not authorized to call this method: bless_replica_version"));
         assert_eq!(
-            get_value::<BlessedReplicaVersions>(
+            get_value_or_panic::<BlessedReplicaVersions>(
                 &registry,
                 make_blessed_replica_version_key().as_bytes()
             )
             .await,
             BlessedReplicaVersions {
-                blessed_version_ids: vec!["version_42".to_string()]
+                blessed_version_ids: vec![ReplicaVersion::default().into()]
             }
         );
 
@@ -109,12 +111,14 @@ fn test_a_canister_other_than_the_proposals_canister_cannot_bless_a_version() {
         .await;
         let payload = BlessReplicaVersionPayload {
             replica_version_id: "version_43".to_string(),
-            binary_url: "http://invalid/replica_version_43_definitely_not_a_scam".to_string(),
-            sha256_hex: "d1bc8d3ba4afc7e109612cb73acbdddac052c93025aa1f82942edabb7deb82a1".into(),
+            binary_url: "".into(),
+            sha256_hex: "".into(),
             node_manager_binary_url: "".into(),
             node_manager_sha256_hex: "".into(),
             release_package_url: "".into(),
             release_package_sha256_hex: "".into(),
+            release_package_urls: None,
+            guest_launch_measurement_sha256_hex: None,
         };
         // The attacker canister tries to bless a version, pretending to be the
         // proposals canister. This should have no effect.
@@ -129,13 +133,13 @@ fn test_a_canister_other_than_the_proposals_canister_cannot_bless_a_version() {
         );
         // But there should be no blessed version
         assert_eq!(
-            get_value::<BlessedReplicaVersions>(
+            get_value_or_panic::<BlessedReplicaVersions>(
                 &registry,
                 make_blessed_replica_version_key().as_bytes()
             )
             .await,
             BlessedReplicaVersions {
-                blessed_version_ids: vec!["version_42".to_string()]
+                blessed_version_ids: vec![ReplicaVersion::default().into()]
             }
         );
         Ok(())
@@ -165,13 +169,14 @@ fn test_accepted_proposal_mutates_the_registry() {
         // We can bless a new version, the version already in the registry is 42
         let payload_v43 = BlessReplicaVersionPayload {
             replica_version_id: "version_43".to_string(),
-            binary_url: "http://megaupload.com/replica_version_43_definitely_not_a_scam"
-                .to_string(),
-            sha256_hex: MOCK_HASH.into(),
-            node_manager_binary_url: "http://nodemanager.tar.gz".into(),
-            node_manager_sha256_hex: MOCK_HASH.into(),
-            release_package_url: "http://release_package.tar.gz".into(),
+            binary_url: "".into(),
+            sha256_hex: "".into(),
+            node_manager_binary_url: "".into(),
+            node_manager_sha256_hex: "".into(),
+            release_package_url: "".into(),
             release_package_sha256_hex: MOCK_HASH.into(),
+            release_package_urls: Some(vec!["http://release_package.tar.gz".into()]),
+            guest_launch_measurement_sha256_hex: None,
         };
         assert!(
             forward_call_via_universal_canister(
@@ -183,25 +188,30 @@ fn test_accepted_proposal_mutates_the_registry() {
             .await
         );
         assert_eq!(
-            get_value::<BlessedReplicaVersions>(
+            get_value_or_panic::<BlessedReplicaVersions>(
                 &registry,
                 make_blessed_replica_version_key().as_bytes()
             )
             .await,
             BlessedReplicaVersions {
-                blessed_version_ids: vec!["version_42".to_string(), "version_43".to_string()]
+                blessed_version_ids: vec![
+                    ReplicaVersion::default().into(),
+                    "version_43".to_string()
+                ]
             }
         );
 
         // Trying to mutate an existing record should have no effect.
         let payload_v42_mutate = BlessReplicaVersionPayload {
-            replica_version_id: "version_42".to_string(),
-            binary_url: "http://megaupload.com/new_version_42_definitely_not_a_scam".to_string(),
-            sha256_hex: MOCK_HASH.into(),
-            node_manager_binary_url: "http://nodemanager.tar.gz".into(),
-            node_manager_sha256_hex: MOCK_HASH.into(),
+            replica_version_id: ReplicaVersion::default().into(),
+            binary_url: "".into(),
+            sha256_hex: "".into(),
+            node_manager_binary_url: "".into(),
+            node_manager_sha256_hex: "".into(),
             release_package_url: "".into(),
             release_package_sha256_hex: "".into(),
+            release_package_urls: None,
+            guest_launch_measurement_sha256_hex: None,
         };
         assert!(
             !forward_call_via_universal_canister(
@@ -213,20 +223,17 @@ fn test_accepted_proposal_mutates_the_registry() {
             .await
         );
         // The URL in the registry should still the old one.
+        let release_package_url = "http://release_package.tar.gz".to_string();
         assert_eq!(
-            get_value::<ReplicaVersionRecord>(
+            get_value_or_panic::<ReplicaVersionRecord>(
                 &registry,
-                make_replica_version_key("version_42".to_string()).as_bytes()
+                make_replica_version_key(&ReplicaVersion::default()).as_bytes()
             )
             .await,
             ReplicaVersionRecord {
-                sha256_hex: MOCK_HASH.into(),
-                binary_url: "http://megaupload.com/replica_version_42_definitely_not_a_scam"
-                    .to_string(),
-                node_manager_binary_url: "http://nodemanager.tar.gz".into(),
-                node_manager_sha256_hex: MOCK_HASH.into(),
-                release_package_url: "http://release_package.tar.gz".into(),
                 release_package_sha256_hex: MOCK_HASH.into(),
+                release_package_urls: vec![release_package_url.clone()],
+                guest_launch_measurement_sha256_hex: None,
             }
         );
 
@@ -236,7 +243,7 @@ fn test_accepted_proposal_mutates_the_registry() {
         // Set the subnet to a blessed version: it should work
         let set_to_blessed_ = UpdateSubnetReplicaVersionPayload {
             subnet_id: subnet_test_id(999).get(),
-            replica_version_id: "version_42".to_string(),
+            replica_version_id: ReplicaVersion::default().into(),
         };
         assert!(
             forward_call_via_universal_canister(
@@ -248,13 +255,13 @@ fn test_accepted_proposal_mutates_the_registry() {
             .await
         );
         assert_eq!(
-            get_value::<SubnetRecord>(
+            get_value_or_panic::<SubnetRecord>(
                 &registry,
                 make_subnet_record_key(subnet_test_id(999)).as_bytes()
             )
             .await
             .replica_version_id,
-            "version_42"
+            ReplicaVersion::default().to_string(),
         );
 
         // Try to set the subnet to an unblessed version: it should fail
@@ -272,13 +279,13 @@ fn test_accepted_proposal_mutates_the_registry() {
             .await
         );
         assert_eq!(
-            get_value::<SubnetRecord>(
+            get_value_or_panic::<SubnetRecord>(
                 &registry,
                 make_subnet_record_key(subnet_test_id(999)).as_bytes()
             )
             .await
             .replica_version_id,
-            "version_42"
+            ReplicaVersion::default().to_string(),
         );
 
         Ok(())

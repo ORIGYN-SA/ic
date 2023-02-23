@@ -1,13 +1,14 @@
 //! A custom, configurable TLS client that does not rely on the crypto
 //! implementation. It is purely for testing the server.
 #![allow(clippy::unwrap_used)]
-use crate::tls::set_peer_verification_cert_store;
 use crate::tls::x509_certificates::CertWithPrivateKey;
 use ic_protobuf::registry::crypto::v1::X509PublicKeyCert;
 use ic_types::NodeId;
 use openssl::pkey::{PKey, Private};
 use openssl::ssl::{ConnectConfiguration, SslConnector, SslContextBuilder, SslMethod, SslVersion};
+use openssl::x509::store::{X509Store, X509StoreBuilder};
 use openssl::x509::X509;
+use std::pin::Pin;
 use tokio::io::{AsyncReadExt, ReadHalf};
 use tokio::net::TcpStream;
 use tokio_openssl::SslStream;
@@ -114,7 +115,6 @@ pub struct CustomClient {
     msg_expected_from_server: Option<String>,
 }
 
-#[allow(unused)]
 impl CustomClient {
     pub fn builder() -> CustomClientBuilder {
         CustomClientBuilder {
@@ -130,21 +130,26 @@ impl CustomClient {
 
     /// Run this client asynchronously. This tries to connect to the configured
     /// server.
-    pub async fn run(self, server_port: u16) {
+    pub async fn run(&self, server_port: u16) {
         let tcp_stream = TcpStream::connect(("127.0.0.1", server_port))
             .await
             .expect("failed to connect");
-        let tls_connector = self.tls_connector();
-        let result = tokio_openssl::connect(
-            tls_connector,
-            "domain is irrelevant, because hostname verification is disabled",
-            tcp_stream,
-        )
-        .await;
 
-        if let Some(expected_error) = self.expected_error {
-            let error = result.err().expect("expected error");
-            if !error.to_string().contains(&expected_error) {
+        let tls_connector = self.tls_connector();
+        let tls_state = tls_connector
+            // Even though the domain is irrelevant here because hostname verification is disabled,
+            // it is important that the domain is well-formed because some TLS implementations
+            // (e.g., Rustls) abort the handshake if parsing of the domain fails (e.g., for SNI when
+            // sent to the server)
+            .into_ssl("www.domain-is-irrelevant-because-hostname-verification-is-disabled.com")
+            .expect("failed to convert TLS connector to state object");
+        let mut tls_stream = tokio_openssl::SslStream::new(tls_state, tcp_stream)
+            .expect("failed to create tokio_openssl::SslStream");
+        let result = Pin::new(&mut tls_stream).connect().await;
+
+        if let Some(expected_error) = &self.expected_error {
+            let error = result.expect_err("expected error");
+            if !error.to_string().contains(expected_error) {
                 panic!(
                     "expected the client error to contain \"{}\" but got error: {:?}",
                     expected_error, error
@@ -156,8 +161,8 @@ impl CustomClient {
                     "expected the client result to be ok but got error: {}",
                     error
                 ),
-                Ok(stream) => {
-                    let (mut tls_read_half, tls_write_half) = tokio::io::split(stream);
+                Ok(()) => {
+                    let (mut tls_read_half, _tls_write_half) = tokio::io::split(tls_stream);
                     self.expect_msg_from_server_if_configured(&mut tls_read_half)
                         .await;
                 }
@@ -184,7 +189,9 @@ impl CustomClient {
         }
         if let Some(extra_chain_certs) = &self.extra_chain_certs {
             for extra_chain_cert in extra_chain_certs {
-                builder.add_extra_chain_cert(extra_chain_cert.clone());
+                builder
+                    .add_extra_chain_cert(extra_chain_cert.clone())
+                    .expect("Failed to add extra chain certificate.");
             }
         }
         let mut connect_config = builder
@@ -231,4 +238,38 @@ impl CustomClient {
             assert_eq!(msg_from_server, msg_expected_from_server.clone());
         }
     }
+}
+
+/// Sets the peer verification cert store for the `SslContext` to a store
+/// containing `certs`.
+///
+/// # Panics
+/// * if the store cannot be set for the `SSLContext`.
+fn set_peer_verification_cert_store(certs: Vec<X509>, builder: &mut SslContextBuilder) {
+    // `SslConnector::builder` calls `set_default_verify_paths`, automatically
+    // adding many CA certificates to the context's `cert_store`. Thus, we overwrite
+    // the cert_store with an empty one:
+    set_empty_cert_store(builder);
+    let store = cert_store(certs);
+    builder
+        .set_verify_cert_store(store)
+        .expect("Failed to set the verify_cert_store.");
+}
+
+fn set_empty_cert_store(builder: &mut SslContextBuilder) {
+    let empty_cert_store = X509StoreBuilder::new()
+        .expect("Failed to init X509 store builder.")
+        .build();
+    builder.set_cert_store(empty_cert_store);
+}
+
+fn cert_store(certs: Vec<X509>) -> X509Store {
+    let mut cert_store_builder =
+        X509StoreBuilder::new().expect("Failed to init X509 store builder.");
+    for cert in certs {
+        cert_store_builder
+            .add_cert(cert.clone())
+            .expect("Failed to add the certificate to the cert_store.");
+    }
+    cert_store_builder.build()
 }

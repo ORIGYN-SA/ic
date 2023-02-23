@@ -1,21 +1,26 @@
+mod bitcoin;
+pub mod bitcoin_state;
 pub mod canister_state;
+pub(crate) mod hash;
 pub mod metadata_state;
 pub mod page_map;
 pub mod replicated_state;
-pub mod stable_memory;
 pub mod testing {
+    pub use super::canister_state::system_state::testing::SystemStateTesting;
     pub use super::canister_state::testing::CanisterQueuesTesting;
+    pub use super::replicated_state::testing::ReplicatedStateTesting;
 }
+pub use bitcoin_state::{BitcoinState, BitcoinStateError};
 pub use canister_state::{
-    num_bytes_from,
+    execution_state::Memory,
+    num_bytes_try_from,
     system_state::{
-        CallContext, CallContextAction, CallContextManager, CallOrigin, CanisterMetrics,
-        CanisterStatus, CyclesAccount, CyclesAccountError, SystemState,
+        memory_required_to_push_request, CallContext, CallContextAction, CallContextManager,
+        CallOrigin, CanisterMetrics, CanisterStatus, ExecutionTask, SystemState,
     },
     CanisterQueues, CanisterState, EmbedderCache, ExecutionState, ExportedFunctions, Global,
     NumWasmPages, SchedulerState,
 };
 pub use metadata_state::{NetworkTopology, NodeTopology, Stream, SubnetTopology, SystemMetadata};
-pub use page_map::{PageDelta, PageIndex, PageMap};
-pub use replicated_state::{ReplicatedState, StateError};
-pub use stable_memory::{StableMemory, StableMemoryError};
+pub use page_map::{PageIndex, PageMap};
+pub use replicated_state::{InputQueueType, NextInputQueue, ReplicatedState, StateError};
